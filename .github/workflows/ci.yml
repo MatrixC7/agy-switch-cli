@@ -1,0 +1,254 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality-and-tests:
+    name: Format, Clippy & 3-Tier Isolated Tests (x86_64 GNU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install isolated test dependencies (dbus-daemon & python3 secret-service mock deps)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dbus python3-dbus python3-gi python3-cryptography binutils
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy across all 3 feature tiers
+        run: |
+          cargo clippy --locked --all-targets --no-default-features -- -D warnings
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Run 3-tier test suite + 64-thread concurrency gate in isolated sandbox
+        run: |
+          ISO_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$ISO_ROOT"' EXIT
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          mkdir -p "$ISO_ROOT/home" "$ISO_ROOT/data" "$ISO_ROOT/cache" "$ISO_ROOT/config" "$ISO_ROOT/run" "$ISO_ROOT/tmp"
+          export HOME="$ISO_ROOT/home"
+          export XDG_DATA_HOME="$ISO_ROOT/data"
+          export XDG_CACHE_HOME="$ISO_ROOT/cache"
+          export XDG_CONFIG_HOME="$ISO_ROOT/config"
+          export XDG_RUNTIME_DIR="$ISO_ROOT/run"
+          export TMPDIR="$ISO_ROOT/tmp"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$ISO_ROOT/no-bus"
+          export NO_PROXY="*"
+          export AGY_SWITCH_CLI_PROXY="direct"
+          cargo test --locked --no-default-features
+          cargo test --locked
+          cargo test --locked --all-features
+          cargo test --locked --all-features -- --test-threads=64
+
+  msrv:
+    name: MSRV Check & Tests (Rust 1.89.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: clippy
+      - name: Install isolated test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dbus python3-dbus python3-gi python3-cryptography
+      - name: Verify locked Clippy & 3-tier tests on Rust 1.89.0
+        run: |
+          ISO_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$ISO_ROOT"' EXIT
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          mkdir -p "$ISO_ROOT/home" "$ISO_ROOT/data" "$ISO_ROOT/cache" "$ISO_ROOT/config" "$ISO_ROOT/run" "$ISO_ROOT/tmp"
+          export HOME="$ISO_ROOT/home"
+          export XDG_DATA_HOME="$ISO_ROOT/data"
+          export XDG_CACHE_HOME="$ISO_ROOT/cache"
+          export XDG_CONFIG_HOME="$ISO_ROOT/config"
+          export XDG_RUNTIME_DIR="$ISO_ROOT/run"
+          export TMPDIR="$ISO_ROOT/tmp"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$ISO_ROOT/no-bus"
+          export NO_PROXY="*"
+          export AGY_SWITCH_CLI_PROXY="direct"
+          cargo clippy --locked --all-targets --no-default-features -- -D warnings
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --no-default-features
+          cargo test --locked
+          cargo test --locked --all-features
+
+  dependency-audit:
+    name: License & Advisory Audit (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Run cargo-deny across all features and all 4 Linux targets
+        run: cargo deny check advisories bans licenses sources
+
+  elf-headless-audit:
+    name: Release ELF Zero-GUI Dependency Audit (x86_64 GNU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build 3 Release tiers and verify zero GUI / libdbus dynamic linkage
+        run: |
+          for flags in "--no-default-features" "" "--all-features"; do
+            cargo build --release --locked $flags
+            needed="$(readelf -d target/release/agy-switch-cli | grep '(NEEDED)' || true)"
+            echo "=== Release ($flags) NEEDED ==="
+            echo "$needed"
+            if echo "$needed" | grep -Eiq 'gtk|webkit|x11|wayland|xcb|dbus'; then
+              echo "Forbidden GUI/desktop shared library detected!"
+              exit 1
+            fi
+            sha256sum target/release/agy-switch-cli
+          done
+
+  musl-and-aarch64-matrix:
+    name: Static musl & aarch64 Cross Build + QEMU Smoke Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, aarch64-unknown-linux-gnu
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Install musl, aarch64 GNU cross toolchain & QEMU user-mode emulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools gcc-aarch64-linux-gnu libc6-dev-arm64-cross libc6-arm64-cross libgcc-s1-arm64-cross qemu-user dbus python3-dbus python3-gi python3-cryptography binutils file
+      - name: Build, test & verify static x86_64-unknown-linux-musl (3 tiers)
+        run: |
+          ISO_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$ISO_ROOT"' EXIT
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          mkdir -p "$ISO_ROOT/home" "$ISO_ROOT/data" "$ISO_ROOT/cache" "$ISO_ROOT/config" "$ISO_ROOT/run" "$ISO_ROOT/tmp"
+          export HOME="$ISO_ROOT/home"
+          export XDG_DATA_HOME="$ISO_ROOT/data"
+          export XDG_CACHE_HOME="$ISO_ROOT/cache"
+          export XDG_CONFIG_HOME="$ISO_ROOT/config"
+          export XDG_RUNTIME_DIR="$ISO_ROOT/run"
+          export TMPDIR="$ISO_ROOT/tmp"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$ISO_ROOT/no-bus"
+          export NO_PROXY="*"
+          export AGY_SWITCH_CLI_PROXY="direct"
+          cargo test --locked --target x86_64-unknown-linux-musl --no-default-features
+          cargo test --locked --target x86_64-unknown-linux-musl
+          cargo test --locked --target x86_64-unknown-linux-musl --all-features
+          for flags in "--no-default-features" "" "--all-features"; do
+            cargo build --release --locked --target x86_64-unknown-linux-musl $flags
+            bin="target/x86_64-unknown-linux-musl/release/agy-switch-cli"
+            file "$bin"
+            if readelf -l "$bin" | grep -q 'INTERP' || readelf -d "$bin" | grep -q '(NEEDED)'; then
+              echo "Expected static musl ELF without PT_INTERP or NEEDED!"
+              exit 1
+            fi
+            "$bin" status --json >/dev/null
+            sha256sum "$bin"
+          done
+      - name: Build & QEMU-verify static aarch64-unknown-linux-musl (3 tiers + negative guards)
+        run: |
+          ISO_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$ISO_ROOT"' EXIT
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          mkdir -p "$ISO_ROOT/home" "$ISO_ROOT/data" "$ISO_ROOT/cache" "$ISO_ROOT/config" "$ISO_ROOT/run" "$ISO_ROOT/tmp"
+          export HOME="$ISO_ROOT/home"
+          export XDG_DATA_HOME="$ISO_ROOT/data"
+          export XDG_CACHE_HOME="$ISO_ROOT/cache"
+          export XDG_CONFIG_HOME="$ISO_ROOT/config"
+          export XDG_RUNTIME_DIR="$ISO_ROOT/run"
+          export TMPDIR="$ISO_ROOT/tmp"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$ISO_ROOT/no-bus"
+          export NO_PROXY="*"
+          export AGY_SWITCH_CLI_PROXY="direct"
+          QEMU_AARCH64="$(command -v qemu-aarch64-static || command -v qemu-aarch64)"
+          mkfifo -m 0600 "$ISO_ROOT/pipe.json"
+          for flags in "--no-default-features" "" "--all-features"; do
+            cargo zigbuild --release --locked --target aarch64-unknown-linux-musl $flags
+            bin="target/aarch64-unknown-linux-musl/release/agy-switch-cli"
+            file "$bin"
+            if readelf -l "$bin" | grep -q 'INTERP' || readelf -d "$bin" | grep -q '(NEEDED)'; then
+              echo "Expected static aarch64-musl ELF without PT_INTERP or NEEDED!"
+              exit 1
+            fi
+            "$QEMU_AARCH64" "$bin" --no-remote-version status --json >/dev/null
+            "$QEMU_AARCH64" "$bin" --no-remote-version doctor --json >/dev/null
+            set +e
+            bad_err="$("$QEMU_AARCH64" "$bin" --json auth login "4/PART1'CI_ARM_SECRET_999" 2>&1)"
+            bad_rc=$?
+            "$QEMU_AARCH64" "$bin" --no-remote-version --json accounts import "$ISO_ROOT/pipe.json" >/dev/null 2>&1
+            fifo_rc=$?
+            set -e
+            if [ "$bad_rc" -ne 2 ] || echo "$bad_err" | grep -iq 'ci_arm_secret_999' || [ "$fifo_rc" -ne 2 ]; then
+              echo "QEMU aarch64-musl negative guard check failed (bad_rc=$bad_rc fifo_rc=$fifo_rc)!"
+              exit 1
+            fi
+            sha256sum "$bin"
+          done
+      - name: Build & QEMU-verify aarch64-unknown-linux-gnu (3 tiers + zero-GUI NEEDED + negative guards)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: |
+          ISO_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$ISO_ROOT"' EXIT
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          mkdir -p "$ISO_ROOT/home" "$ISO_ROOT/data" "$ISO_ROOT/cache" "$ISO_ROOT/config" "$ISO_ROOT/run" "$ISO_ROOT/tmp"
+          export HOME="$ISO_ROOT/home"
+          export XDG_DATA_HOME="$ISO_ROOT/data"
+          export XDG_CACHE_HOME="$ISO_ROOT/cache"
+          export XDG_CONFIG_HOME="$ISO_ROOT/config"
+          export XDG_RUNTIME_DIR="$ISO_ROOT/run"
+          export TMPDIR="$ISO_ROOT/tmp"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$ISO_ROOT/no-bus"
+          export NO_PROXY="*"
+          export AGY_SWITCH_CLI_PROXY="direct"
+          QEMU_AARCH64="$(command -v qemu-aarch64-static || command -v qemu-aarch64)"
+          mkfifo -m 0600 "$ISO_ROOT/pipe.json"
+          for flags in "--no-default-features" "" "--all-features"; do
+            cargo build --release --locked --target aarch64-unknown-linux-gnu $flags
+            bin="target/aarch64-unknown-linux-gnu/release/agy-switch-cli"
+            file "$bin"
+            needed="$(readelf -d "$bin" | grep '(NEEDED)' || true)"
+            echo "$needed"
+            if echo "$needed" | grep -Eiq 'gtk|webkit|x11|wayland|xcb|dbus'; then
+              echo "Forbidden GUI/desktop shared library detected in aarch64-gnu ELF!"
+              exit 1
+            fi
+            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version status --json >/dev/null
+            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version doctor --json >/dev/null
+            set +e
+            bad_err="$("$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --json auth login "4/PART1'CI_ARM_GNU_SECRET_999" 2>&1)"
+            bad_rc=$?
+            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version --json accounts import "$ISO_ROOT/pipe.json" >/dev/null 2>&1
+            fifo_rc=$?
+            set -e
+            if [ "$bad_rc" -ne 2 ] || echo "$bad_err" | grep -iq 'ci_arm_gnu_secret_999' || [ "$fifo_rc" -ne 2 ]; then
+              echo "QEMU aarch64-gnu negative guard check failed (bad_rc=$bad_rc fifo_rc=$fifo_rc)!"
+              exit 1
+            fi
+            sha256sum "$bin"
+          done

@@ -1,0 +1,21 @@
+/target
+*.swp
+.DS_Store
+.env
+.env.*
+*.bak
+
+# 严防本地账号库、导出备份、OAuth 临时令牌与密钥文件被误提交进版本库
+*.secret
+*.token
+*.key
+*.pem
+*oauth-token*
+*transfer-bundle*.json
+*accounts-backup*.json
+*backup*.json
+/data/
+/state/
+/locks/
+/pending_auth/
+/accounts/

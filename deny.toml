@@ -1,0 +1,55 @@
+# agy-switch-cli 的 cargo-deny 依赖安全与许可证审计配置
+# 说明：
+# 1. 根包自身严格继承上游 agy-switch 的 CC-BY-NC-SA-4.0 非商业-相同方式共享许可证；
+# 2. 所有第三方 Rust 依赖库均来自 crates.io 官方索引，采用宽松开源许可证；
+# 3. 当前 Cargo.lock 锁定的 ring 0.17.14 已在自身 Cargo.toml 原生声明标准 SPDX 表达式 `Apache-2.0 AND ISC`，
+#    无需旧版 ring 0.16 的 clarify 哈希覆盖；分发二进制时须一并保留 PROVENANCE.md 中的第三方署名说明。
+
+[graph]
+all-features = true
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-unknown-linux-musl" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-musl" },
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # 以下 3 条均为架构合并维护性通告（zbus 6.0 已将独立子包收归主包），并非安全漏洞（CVE / unsound）：
+    # 当前可选特性 `secret-service-backend` 所用 `secret-service 5.2.0` 为 crates.io 最新稳定版（6.0 仍处 rc 阶段），
+    # 其内部锁定 `zbus 5.19.0` 暂无可用升级路径；默认构建与 `--no-default-features` 构建均不引入该依赖链。
+    # 待上游 `secret-service 6.0` 正式发布后应升级依赖并移除本豁免项。
+    { id = "RUSTSEC-2026-0370", reason = "Optional secret-service 5.2.0 -> zbus 5.19.0 pulls zvariant 5.15.1 (merged into zbus 6.0, informational unmaintained notice, not a vulnerability; secret-service 6.0 is still RC)" },
+    { id = "RUSTSEC-2026-0371", reason = "Optional secret-service 5.2.0 -> zbus 5.19.0 pulls zbus_names 4.3.5 (merged into zbus 6.0, informational unmaintained notice, not a vulnerability; secret-service 6.0 is still RC)" },
+    { id = "RUSTSEC-2026-0372", reason = "Optional secret-service 5.2.0 -> zbus 5.19.0 pulls zvariant_derive 5.15.1 (merged into zbus 6.0, informational unmaintained notice, not a vulnerability; secret-service 6.0 is still RC)" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "CC-BY-NC-SA-4.0",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unlicense",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "BSL-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,23 @@
+[Unit]
+Description=Antigravity CLI 无头多账号自动切换守护服务 (agy-switch-cli)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+UMask=0077
+Environment="RUST_LOG=agy_switch_cli=info"
+# 如在交互式终端中使用了自定义数据目录或代理，请在此显式对齐声明：
+# Environment="AGY_SWITCH_CLI_DATA_DIR=%h/.local/share/agy-switch-cli"
+ExecStart=%h/.local/bin/agy-switch-cli daemon
+Restart=on-failure
+RestartSec=10
+
+# 文件系统最小权限沙盒边界：保持系统目录只读，仅显式放行官方生效位目录、独立无头数据目录与全局锁/缓存目录的写权限
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/.gemini/antigravity-cli %h/.local/share/agy-switch-cli %h/.cache/agy-switch-cli
+
+[Install]
+WantedBy=default.target
