@@ -156,7 +156,7 @@ pub fn read_secret_from_tty_with_mode(prompt: &str, json_mode: bool) -> CliResul
     let stdin_fd: RawFd = libc::STDIN_FILENO;
     if unsafe { libc::isatty(stdin_fd) } != 1 {
         return Err(CliError::usage(
-            "Interactive token entry requires a TTY with echo suppression. In non-interactive scripts/pipes, pass `--stdin` or `--token-file <PATH>` explicitly.",
+            "Interactive token entry requires a TTY with echo suppression. In non-interactive scripts/pipes, pass `--from-local`, `--stdin`, or `--token-file <PATH>` explicitly.",
         ));
     }
 

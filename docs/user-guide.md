@@ -34,13 +34,17 @@
 
 在 GitHub Releases 发布页中，提供了按 **CPU 架构**（常见电脑与云服务器为 `x86_64`，树莓派与 ARM 云服务器为 `aarch64`，可在终端输入 `uname -m` 确认）以及 **是否带 `-all-features` 后缀** 区分的 4 个压缩包。它们均为 **100% 纯静态单文件程序**，解压即可运行，不依赖系统动态库。
 
-两者的唯一区别在于**是否支持同步修改 Linux 图形桌面的系统钥匙串（Keyring）**：
+两者的唯一区别在于**是否内置 Linux 图形桌面的系统钥匙串（D-Bus Secret Service）通信协议栈**：
 
 | 对比维度 | 标准版（文件名不带 `-all-features`） | 全特性版（文件名带 `-all-features`） |
 | :--- | :--- | :--- |
-| **包含功能** | 全部 CLI 命令 + SSH 交互式终端看板 `tui` | 标准版全部功能 + **Linux 桌面系统钥匙串（GNOME Keyring / KDE Wallet）双写同步** |
-| **支持的 `--backend`** | `file`（默认，仅读写 `~/.gemini/antigravity-cli/antigravity-oauth-token` 文件） | `file`（默认）**或** `secret-service`（同时更新系统钥匙串与凭据文件，失败自动回滚） |
-| **适用人群** | **绝大多数场景首选**：远程 SSH 服务器、Docker 容器、Windows WSL2，以及在桌面上使用 `run --isolate-dbus` 启动 `agy` 的用户 | 在带有图形界面的 Linux 桌面上使用，且习惯在终端里**直接裸敲 `agy`**（不加任何包装前缀）的用户 |
+| **包含功能** | 全部 CLI 命令 + SSH 交互式终端看板 `tui` | 标准版全部功能 + **Linux 桌面系统钥匙串（GNOME Keyring / KDE Wallet）自动检测与双写同步** |
+| **默认 `--backend`（`auto`）行为** | 固定为 `file`（仅读写本地 `~/.gemini/antigravity-cli/antigravity-oauth-token` 文件） | **自动智能识别**：检测到活跃桌面钥匙串服务时**自动启用 `secret-service` 双写模式**（无需手传额外参数）；若在无钥匙串的 SSH 服务器上运行则自动回退为 `file` 模式 |
+| **纯静态二进制体积（`x86_64`）** | 约 `8.2 MiB` | 约 `10.3 MiB`（静态内嵌纯 Rust `zbus` 协议栈与 DH/AES 通道加密库，同样零系统 `.so` 动态库依赖） |
+| **适用人群** | 远程 SSH 服务器、Docker 容器、无桌面 WSL2 用户（或在桌面上固定使用 `run --isolate-dbus` 启动 `agy` 的用户） | **Linux 图形桌面（如 KDE Plasma、GNOME）用户**：安装后直接运行 `switch` 或 `tui` 即可同步更新钥匙串与凭据文件，之后直接输入 `agy` 立即生效 |
+
+> **为什么要拆出 `-all-features` 版本？**  
+> 为了保持 **100% 纯静态单文件（不依赖系统是否安装了 `libsecret.so` 或 `libdbus-1.so`）**，支持系统钥匙串需要在程序内部完整编入纯 Rust 实现的 D-Bus 协议栈与加密协商库，这会增加约 `2.1 MiB` 体积。考虑到绝大多数无头服务器和容器环境根本不存在图形桌面钥匙串，将两者分开打包可以让服务器版保持精简纯粹，同时让 Linux 桌面用户下载 `-all-features` 版也能开箱即用。
 
 ### 1.2 下载、校验与安装步骤
 
@@ -48,14 +52,14 @@
 
 ```bash
 # 第 1 步：校验压缩包完整性（输出显示成功 / OK 即可）
-sha256sum -c agy-switch-cli-v1.1.0-x86_64-unknown-linux-musl.tar.gz.sha256
+sha256sum -c agy-switch-cli-v1.1.1-x86_64-unknown-linux-musl.tar.gz.sha256
 
 # 第 2 步：解压压缩包
-tar -xzf agy-switch-cli-v1.1.0-x86_64-unknown-linux-musl.tar.gz
+tar -xzf agy-switch-cli-v1.1.1-x86_64-unknown-linux-musl.tar.gz
 
 # 第 3 步：安装到当前用户的可执行目录 ~/.local/bin（无需 sudo 权限）
 mkdir -p ~/.local/bin
-install -m 0755 agy-switch-cli-v1.1.0-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
+install -m 0755 agy-switch-cli-v1.1.1-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
 ```
 
 > **提示：如果输入 `agy-switch-cli --version` 提示 `command not found（找不到命令）` 怎么办？**  
@@ -84,10 +88,20 @@ cargo build --release --locked --target x86_64-unknown-linux-musl    # 纯静态
    - **直接输入邮箱**（如 `alice@example.com`，不区分大小写，直观且安全）；
    - **输入内部账号 ID**（如 `acc-0001...`，可通过 `accounts list` 查看，用于区分极少数同邮箱重复记录）。  
    如果你不想在命令行手动输入邮箱，可以直接运行 `agy-switch-cli tui` 打开可视化交互看板，通过上下方向键高亮选中账号后一键完成切号、调序、启停与候选池配置。
-2. **切换账号后什么时候生效？**  
-   执行切号更新的是磁盘上的官方凭据槽位文件（`~/.gemini/antigravity-cli/antigravity-oauth-token`）。
-   - 它对**切换完成之后新启动的 `agy` 命令**立即生效；
-   - 它**不会中途篡改或强行打断另一个终端窗口里正在运行的 `agy`**，从而保证正在执行的任务不受影响。
+2. **官方 `agy` 把当前登录账号保存在哪里？（桌面钥匙串 D-Bus 与本地文件的双层优先级机制）**  
+   理解这一机制能彻底解开“为什么在图形桌面上改了文件却没切号”以及“`~/.gemini` 下好几个文件分别是什么”的疑惑。官方 `agy` CLI（以及新版桌面端 Antigravity App）内部采用同一套双层凭据存储逻辑（`composite_token_storage`），读取当前登录账号时按以下固定顺序查找：
+   - **第一优先级：Linux 桌面系统钥匙串（D-Bus Secret Service，即 GNOME Keyring 或 KDE Wallet）**
+     - 在带有图形界面的 Linux 桌面上，终端环境中存在活跃的用户 D-Bus 会话总线（`DBUS_SESSION_BUS_ADDRESS` 或 `$XDG_RUNTIME_DIR/bus`）。
+     - 官方 `agy` 与桌面端 Antigravity App 都会优先通过 D-Bus 访问系统钥匙串（加密存储在 `~/.local/share/keyrings/` 或 `~/.local/share/kwalletd/` 中），读写标签为 `Password for 'antigravity' on 'gemini'`（属性 `service="gemini", username="antigravity"`）的同一条记录。
+     - **核心表现**：在图形桌面上，**Antigravity App 与 `agy` CLI 完全互通共用这同一个钥匙串条目**；只要系统钥匙串处于解锁状态且存有该条目，`agy` 启动时会**直接采用钥匙串里的账号，完全忽略磁盘上的备份文件**。
+   - **第二优先级（回退位置）：磁盘凭据槽位文件 `~/.gemini/antigravity-cli/antigravity-oauth-token`（权限 `0600`）**
+     - 只有在**没有桌面钥匙串环境**（如远程 SSH 服务器、Docker 容器、无桌面 WSL2）、系统钥匙串中尚未写入该条目，或者启动子进程时通过 `--isolate-dbus` 屏蔽了 D-Bus 总线的情况下，`agy` 才会回退去读写磁盘上的 `~/.gemini/antigravity-cli/antigravity-oauth-token`（两处保存的 JSON 内容结构完全相同）。
+   - **附：`~/.gemini` 目录下常见凭据文件的区别与清理说明**
+     - `~/.gemini/antigravity-cli/antigravity-oauth-token`：官方 `agy` CLI 的标准磁盘凭据槽位文件。
+     - `~/.gemini/jetski-standalone-oauth-token`：桌面端 Antigravity App（及 VS Code 中的 Antigravity 扩展插件）在无系统钥匙串环境下的回退凭据文件。
+     - `~/.gemini/oauth_creds.json`：**并非**官方 Antigravity App 或 `agy` CLI 使用的凭据文件（在两者的官方二进制中均不存在该文件名）。它通常由 Google Gemini CLI（`gemini` 命令）或其他复用了同源 OAuth `client_id` 的第三方代理/脚本工具生成；保留或删除它均不影响官方 `agy` 当前登录身份。
+     - **在有桌面钥匙串的系统上能否删除磁盘凭据文件？** 只要 GNOME Keyring / KDE Wallet 中已存有当前登录记录，手动删掉磁盘上残留的旧 `oauth_creds.json` 或 `antigravity-oauth-token` **文件**不会引起任何报错，官方 App 与 `agy` 会直接按第一优先级从钥匙串正常登录。
+   - **切号生效时机**：无论更新的是文件还是钥匙串，切号均对**切换完成之后新启动的 `agy` 命令**（或重启后的桌面端 App）立即生效，**绝不会中途篡改或强行打断正在运行中的 `agy` 会话**。
 3. **配额池（`Gemini` vs `Claude / GPT`）与双窗口（`Weekly` 周额度 vs `5h` 五小时额度）**：  
    Google Antigravity 的额度按**配额池**共享计算：
    - **`Gemini` 池**：常规 Gemini 系列模型共用；
@@ -108,8 +122,8 @@ cargo build --release --locked --target x86_64-unknown-linux-musl    # 纯静态
 | 全局选项 | 对应环境变量 | 默认行为与通俗说明 |
 | :--- | :--- | :--- |
 | `--data-dir <目录路径>` | `AGY_SWITCH_CLI_DATA_DIR` | 指定账号库存储目录。默认位于 `~/.local/share/agy-switch-cli`（目录权限自动设为 `0700`）。 |
-| `--proxy <代理地址\|direct>` | `AGY_SWITCH_CLI_PROXY` | 指定访问 Google 的网络代理，如 `--proxy socks5h://127.0.0.1:1080` 或 `--proxy http://127.0.0.1:7890`；填 `direct` 表示强制直连。不填时自动读取 `config.json` 或系统 `HTTPS_PROXY` / `ALL_PROXY`。 |
-| `--backend <file\|secret-service>` | — | 默认为 `file`；安装了 `-all-features` 版且需要同步更新 Linux 桌面钥匙串时可设为 `secret-service`。 |
+| `--proxy <代理地址\|direct>` | `AGY_SWITCH_CLI_PROXY` | 指定访问 Google 的网络代理，支持 `socks5h://127.0.0.1:1080`、`socks://127.0.0.1:1080`、`http://127.0.0.1:7890`、省略协议头的 `127.0.0.1:7890`，或填 `direct` 强制直连。不填时优先读取 `config.json`，其次自动读取并规范化终端环境变量 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`（注意 Linux 图形界面的“系统代理”不会自动注入终端，若不想每次传 `--proxy`，需在终端导出代理环境变量或写入 `config.json`）。 |
+| `--backend <auto\|file\|secret-service>` | `AGY_SWITCH_CLI_BACKEND` | 凭据槽位后端模式，默认为 **`auto`（智能自适应）**：标准版自动使用 `file`；`-all-features` 版检测到活跃桌面钥匙串服务时自动使用 `secret-service` 双写模式，无钥匙串时自动回退为 `file`。也可显式传 `file` 或 `secret-service` 强制指定（亦可在 `config.json` 中固定配置）。 |
 | `--no-remote-version` | — | 关闭联网命令每 24 小时一次的客户端最新版本号缓存查询。 |
 | `--json` | — | 输出机器可读的标准 JSON 格式（供自动化脚本解析使用）。 |
 
@@ -200,17 +214,26 @@ agy-switch-cli accounts list --order bob@example.com charlie@example.com alice@e
 
 > **提示**：你也可以运行 `agy-switch-cli tui` 进入可视化看板，按 **`K`（上移）** 或 **`J`（下移）** 实时调整顺序。
 
-#### （2）通过 Refresh Token 添加单个或多个账号：`accounts add`
+#### （2）导入本机已登录账号或通过 Refresh Token 添加账号：`accounts add`
 
-> **安全保护说明**：为防止机密 Token 留在终端历史记录（`.bash_history`）或被系统进程表泄露，工具禁止将 Token 直接作为命令行位置参数传入，而是提供支持**单条无回显输入**和**多条文件批量导入**的安全方式：
+> **安全保护说明**：为防止机密 Token 留在终端历史记录（`.bash_history`）或被系统进程表泄露，工具禁止将 Token 直接作为命令行位置参数传入，而是提供**一键读取本机当前登录态**、**单条无回显输入**和**多条文件批量导入**三种安全方式：
 
-**场景 A：手动安全粘贴单条 `refresh_token`**
+**场景 A：当前设备已经登录过官方 `agy`（或桌面端 Antigravity），一键抓入账号库（`--from-local`）**
+```bash
+agy-switch-cli accounts add --from-local --label "本机当前账号"
+```
+- **标准版与 `-all-features` 版均可直接运行**：
+  - 在 **`-all-features` 版**（且处于有 GNOME Keyring / KDE Wallet 的图形桌面）下：程序优先读取系统钥匙串（`Password for 'antigravity' on 'gemini'`）中当前真正生效的账号令牌；若钥匙串中尚无记录，则自动回退读取本地 `antigravity-oauth-token` 文件。
+  - 在 **标准版**（或无桌面服务器 / 容器环境，或显式传了 `--backend file`）下：程序直接读取 `~/.gemini/antigravity-cli/antigravity-oauth-token`。
+- 读取到 `refresh_token` 后，程序会自动联网核验令牌有效性、拉取对应的真实邮箱并安全落盘（若该邮箱已在库中则自动刷新更新，不会重复建号）。
+
+**场景 B：手动安全粘贴单条 `refresh_token`**
 ```bash
 # 运行后终端会自动关闭字符回显（粘贴时不显示字符属于正常保护），粘贴后按回车即可：
 agy-switch-cli accounts add --label "备用号"
 ```
 
-**场景 B：手里有多条裸 `refresh_token`（无需事先知道邮箱），一次性批量添加**
+**场景 C：手里有多条裸 `refresh_token`（无需事先知道邮箱），一次性批量添加**
 1. 新建一个权限为 `0600` 的私密文本文件（例如 `~/tokens.txt`）：
    ```bash
    install -m 0600 /dev/null ~/tokens.txt
@@ -309,16 +332,35 @@ Supported models : 15 available (cached)
 - **`Live agy runtime`**：当前系统中是否有正在运行的 `agy` 进程（`idle` 表示空闲）。
 - **`Supported models`**：当前账号可使用的全部模型清单（读取自最近一次配额刷新缓存，自动剔除未开放模型并按模型家族分组展示）。
 
-#### （2）手动切换生效账号：`switch`
+#### （2）手动切换生效账号：`switch`（无头环境与桌面钥匙串环境详解）
 
 `switch` 通过**邮箱**或**账号 ID**精确指定目标账号（日常交互切号也可直接使用 `agy-switch-cli tui`）：
 
 ```bash
 agy-switch-cli switch bob@example.com                   # 按邮箱切换到指定账号
 agy-switch-cli switch acc-0002                          # 或按内部账号 ID 切换到指定账号
-agy-switch-cli switch bob@example.com --dry-run         # 仅做切换前条件预检，不发网络请求也不修改文件
-agy-switch-cli switch bob@example.com --allow-running   # 即使当前有正在运行的旧 agy 进程，也允许更新槽位供后续新窗口使用
+agy-switch-cli switch bob@example.com --dry-run         # 仅做切换前条件预检，不发网络请求也不修改任何凭据
+agy-switch-cli switch bob@example.com --allow-running   # 即使检测到正在运行的旧 agy 进程，也允许更新槽位供后续新窗口使用
 ```
+
+根据当前机器是否存在**桌面系统钥匙串（GNOME Keyring / KDE Wallet）**，`switch` 的工作方式与推荐搭配如下：
+
+- **情况一：纯无头环境（远程 SSH 服务器、Docker 容器、无桌面 WSL2）**
+  - 系统中没有桌面钥匙串，官方 `agy` 直接从 `~/.gemini/antigravity-cli/antigravity-oauth-token` 读取登录信息。
+  - 无论是标准版还是 `-all-features` 版，直接运行 `agy-switch-cli switch bob@example.com` 都会以 `0600` 权限原子替换该文件；切完后在终端直接运行 `agy` 即刻生效。
+
+- **情况二：带有桌面系统钥匙串的 Linux 图形桌面环境（如 KDE Plasma、GNOME）**
+  - 在图形桌面上，官方 `agy` 启动时会优先读取系统钥匙串（第一优先级），如果只改磁盘文件而不改钥匙串，裸敲 `agy` 仍会沿用钥匙串里的旧账号。针对这一环境有两种处理方式：
+  - **方式 1（直接安装 `-all-features` 全特性版，开箱即用事务性双写）**：
+    - 下载安装带 `-all-features` 后缀的二进制后，日常直接运行 `agy-switch-cli switch bob@example.com`（无需手传额外参数）。
+    - 默认的 `auto` 模式会自动检测到当前桌面活跃的钥匙串服务，并启用 **`secret-service` 事务性双写（Dual-Write）**：
+      1. 先对钥匙串内的 `login` / `default` 集合以及磁盘上的 `antigravity-oauth-token` 做切换前快照；
+      2. 通过加密 D-Bus 通道更新钥匙串中的 `Password for 'antigravity' on 'gemini'` 条目，并立即读回比对字节一致性；
+      3. 再以双 `fsync` 原子更新磁盘上的 `~/.gemini/antigravity-cli/antigravity-oauth-token` 文件（若中间任一步写入失败，会自动把钥匙串与磁盘文件双双回滚到切换前状态，避免两边账号不一致）。
+    - 双写完成后，你在任意终端直接输入 `agy` 立即使用新账号（若重开共享同一钥匙串条目的桌面端 Antigravity App，App 也会同步切换为新账号）。
+  - **方式 2（仅安装了不带 `-all-features` 的标准版，配合 `run --isolate-dbus` 屏蔽钥匙串）**：
+    - 注意 `--isolate-dbus` 是 **`run` 命令的子进程启动参数**（而非 `switch` 的参数，因为子命令退出后无法修改父级 Shell 的环境变量）。
+    - 若你使用的是标准版二进制、不想修改系统钥匙串，可先执行 `agy-switch-cli switch bob@example.com` 更新本地 `antigravity-oauth-token` 文件，随后通过 `agy-switch-cli run --isolate-dbus -- agy` 启动 `agy`。`--isolate-dbus` 会在拉起该 `agy` 子进程时将其 `DBUS_SESSION_BUS_ADDRESS` 指向 `/dev/null`，使该进程跳过桌面钥匙串并强制读取刚切好的本地文件。
 
 ---
 
@@ -452,6 +494,7 @@ agy-switch-cli tui
 
 #### 界面说明
 - **自适应窗口尺寸与滚动视口**：看板实时适配当前终端宽高并响应窗口缩放；顶栏 `Session:` 精简展示当前槽位邮箱与本机本地时区过期时间（`YYYY-MM-DD HH:MM`）；在宽度小于 `152` 列的常规或窄屏窗口中会自动隐藏冗长的 36 位 `ID` 列以保持每账号单行清晰排版，当账号数量超出当前窗口高度时会自动保持顶栏、表头与底栏固定，并跟随光标平滑上下滚动（顶部标题栏同步显示 `[Showing X-Y of N]` 范围提示）；在极窄或极矮的终端分屏中还会自动降级为紧凑单行焦点视图，确保不超出物理宽高且当前光标所在账号始终可见。
+- **无头环境与 D-Bus 桌面钥匙串自动适配**：`tui` 完全共享全局 `--backend` 的自适应行为——在无 D-Bus 的远程服务器上运行 `agy-switch-cli tui` 时直接读写 `antigravity-oauth-token`；在有 GNOME Keyring / KDE Wallet 的图形桌面上使用 `-all-features` 版直接运行 `agy-switch-cli tui` 时，顶栏 `Session:` 会自动实时读取系统钥匙串中的真实生效身份，按 `Enter` 或 `s` 切号时也会自动执行“系统钥匙串 + 本地凭据文件”事务性双写。
 - **`#`、`Sel` 与 `Plan`**：`#` 为右对齐账号序号；`>` 表示当前光标所在行，`*` 表示当前选中的账号；`Plan` 列在所有宽度下自动去除 `Google AI` / `AI` 等冗余前缀，统一简写为 `Free` / `Pro` / `Ultra`（未知新套餐名原样兜底保留）。
 - **`Gemini (5h / W)` 与 `Claude/GPT (5h / W)`**（窄屏紧凑表头为 `Gemini 5h/W` 与 `Claude/GPT 5h/W`）：斜杠左侧为 `5h`（五小时短期窗口剩余额度），右侧为 `W`（Weekly 周剩余额度），如 `100% /  72%`；单元格内对百分比做了固定宽度字符级填充与居中对齐，使上下各行的百分比与斜杠 `/` 保持严格垂直对齐。灰度专属池 `Argon (W)` 在所有账号均无该池数据时会自动隐藏，存在数据时自动展开。
 - **`Policy`**：显示该账号在自动切号候选池中的顺位（如 `cand #1`、`cand #2`，未加入显示 `—`）；若候选池中的某个账号当前处于已禁用（`disabled`）状态，自动切号调度时会自动跳过该账号，并在该列明确标注为 `cand #2 (skip)`。顶部状态栏同步显示 `Policy: ON / off` 及当前模式与策略。
@@ -515,7 +558,7 @@ agy-switch-cli tui
 
 `~/.local/share/agy-switch-cli/config.json` 是**完全可选**的配置文件。默认情况下该文件不存在，所有功能均可直接使用（程序已内置与官方 `agy` 一致的默认 OAuth 客户端 `antigravity_enterprise`）。只有当你遇到以下两类需求时，才需要手动创建它：
 
-1. **固定网络代理**：本机需要通过固定的 HTTP 或 SOCKS5 代理连接 Google 服务，希望写入配置文件省去每次加 `--proxy` 参数；
+1. **固定网络代理**：在 Linux 环境下，图形界面的“系统代理”设置并不会自动注入命令行终端或后台 `daemon` 服务的环境变量中。如果你不想每次在命令行手敲 `--proxy`，也不想每次新开终端都手动执行 `export https_proxy=...`，可以将代理地址写入 `config.json` 实现跨终端与后台守护进程的永久生效；
 2. **自定义 OAuth 客户端（进阶场景）**：你手头拥有由其他 Google Cloud OAuth 客户端（例如企业自建项目或其他兼容客户端）签发的 `refresh_token`，或者希望使用自建 OAuth 客户端进行登录。根据 OAuth 2.0 协议规范，由哪个 `client_id` 签发的 `refresh_token` 在刷新续期时必须继续搭配同一个 `client_id` 与 `client_secret` 使用，此时即可将其注册到 `oauth.clients` 中。
 
 > **文件权限要求**：由于 `config.json` 中可能包含带密码的代理地址或 `client_secret` 密钥，创建时请将文件权限设为仅当前用户可读写的 `0600`（若权限过宽如 `0644`，程序会输出安全提示，可执行 `chmod 600` 或 `agy-switch-cli doctor --fix` 收紧权限）：
@@ -530,6 +573,7 @@ agy-switch-cli tui
 ```json
 {
   "schema_version": 1,
+  "backend": "auto",
   "network": {
     "proxy_url": "socks5h://127.0.0.1:1080",
     "no_proxy": "internal.corp,10.0.0.0/8"
@@ -537,7 +581,8 @@ agy-switch-cli tui
 }
 ```
 
-- **`network.proxy_url`**：支持 `http://`、`https://`、`socks5://`、`socks5h://`（由代理端解析远端域名，可避免本地 DNS 污染）以及 `"direct"`（强制直连，忽略系统代理环境变量）。代理生效优先级为：`命令行 --proxy > config.json > 系统环境变量（HTTPS_PROXY / HTTP_PROXY / ALL_PROXY）`。
+- **`backend`**（可选）：固定指定凭据槽位后端（可选 `"auto"`、`"file"` 或 `"secret-service"`，省略时默认为 `"auto"`）。例如安装了 `-all-features` 版但在桌面上希望强制只改磁盘文件而不碰系统钥匙串时，可设为 `"file"`。生效优先级为：`命令行 --backend > AGY_SWITCH_CLI_BACKEND 环境变量 > config.json > 默认 auto`。
+- **`network.proxy_url`**：支持 `http://`、`https://`、`socks5://`、`socks5h://`（或 `socks://`，由代理端解析远端域名，可避免本地 DNS 污染）、省略协议头的 `127.0.0.1:1080`，以及 `"direct"`（强制直连，忽略系统代理环境变量）。代理生效优先级为：`命令行 --proxy > AGY_SWITCH_CLI_PROXY > config.json > 系统环境变量（HTTPS_PROXY / HTTP_PROXY / ALL_PROXY）`。
 - **`network.no_proxy`**：可选，逗号分隔的不走代理域名或网段列表。注意本机环回地址（`127.0.0.1`、`localhost`、`[::1]`，如 `--ssh` 登录回调监听端口）始终自动直连，不会被代理拦截。
 
 ### 6.2 场景二：注册并使用自定义 OAuth 客户端（完整字段详解）
@@ -736,6 +781,11 @@ supervisorctl stop agy-switch-cli      # 停止后台守护进程
 2. **问：登录或批量添加账号时遇到网络波动，查询邮箱信息超时报错，刚换出的令牌会丢失吗？**  
    **答**：不会丢失。新令牌在签发瞬间已以 `0600` 权限暂存在本地 `state/pending_auth/` 目录中。待网络恢复后，执行 `agy-switch-cli auth pending --resume` 即可继续完成绑定。
 3. **问：在 Linux 图形桌面上执行了 `switch`，但直接输入 `agy` 为什么仍在使用旧账号？**  
-   **答**：这是因为图形桌面的系统钥匙串（GNOME Keyring / KWallet）读取优先级高于本地凭据文件。可通过以下任一方式解决：① 使用 `agy-switch-cli run --isolate-dbus -- agy` 启动；② 安装 `-all-features` 版二进制并执行 `agy-switch-cli --backend secret-service switch <邮箱或ID>`。
-4. **问：日常使用时，手动切号、`run` 包装启动与后台 `daemon` 该如何选择？**  
+   **答**：这是因为你安装的是不带钥匙串支持的标准版二进制，而图形桌面的系统钥匙串（GNOME Keyring / KDE Wallet）读取优先级高于本地 `antigravity-oauth-token` 文件。可通过以下任一方式解决：① 改用带 `-all-features` 后缀的预编译版本，它会自动检测桌面钥匙串并同时更新钥匙串与本地文件，切完直接敲 `agy` 即可；② 若继续使用标准版，则在启动时用 `agy-switch-cli run --isolate-dbus -- agy` 屏蔽子进程的桌面钥匙串。
+4. **问：我已经开启了桌面代理软件的“系统代理”，为什么在终端里不加 `--proxy` 直接运行联网命令（如 `quota -r` 或 `accounts add`）仍然提示网络连接失败？**  
+   **答**：在 Linux 系统中，图形界面的“系统代理”只修改桌面配置，不会自动向新打开的命令行终端注入代理环境变量。按你的使用场景任选以下三种方式即可解决：
+   - **单次临时使用**：在命令中直接加上 `--proxy http://127.0.0.1:7890`（请替换为实际代理端口）；
+   - **当前终端内免重复传参**：在当前终端执行 `export https_proxy=http://127.0.0.1:7890`（或将其写入 `~/.bashrc` / `~/.zshrc`）；
+   - **所有终端与后台 `daemon` 持久生效**：按第 `6.1` 节编辑 `~/.local/share/agy-switch-cli/config.json`，写入 `"network": { "proxy_url": "http://127.0.0.1:7890" }`。
+5. **问：日常使用时，手动切号、`run` 包装启动与后台 `daemon` 该如何选择？**  
    **答**：三种方式均可按个人习惯选用：若平时习惯直接输入 `agy` 且切号时打开面板看一眼即可，直接使用 `agy-switch-cli tui` 最直观简单；若配好了 `policy` 且不想开后台常驻进程，可用 `agy-switch-cli run -- agy` 在启动前按需检查切号；若习惯直接输入裸 `agy` 又希望后台自动提前换好账号，则可开启每小时巡检一次的 `daemon`。

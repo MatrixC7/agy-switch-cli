@@ -931,6 +931,18 @@ fn secret_service_backend_live_isolated_dbus_never_unlocks_on_readonly_and_track
         "Isolated dbus-daemon socket did not appear"
     );
 
+    // 0. Before `org.freedesktop.secrets` is registered on `bus_addr`, default `--backend` (`auto`)
+    //    MUST fall back cleanly to `file_session` (simulating a headless SSH server with systemd user D-Bus)!
+    let doc_headless_bus = env
+        .cli_cmd()
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus_addr)
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert_eq!(doc_headless_bus.status.code(), Some(0));
+    let doc_hb_j: serde_json::Value = serde_json::from_slice(&doc_headless_bus.stdout).unwrap();
+    assert_eq!(doc_hb_j["backend"], "file_session");
+
     let ctrl_file = env._tmp.path().join("ss_ctrl.json");
     let stats_file = env._tmp.path().join("ss_stats.json");
     let ready_file = env._tmp.path().join("ss_ready");
@@ -1435,6 +1447,101 @@ GLib.MainLoop().run()
         .output()
         .unwrap();
     assert_eq!(sw_clean.status.code(), Some(0));
+
+    // 4b. Default `--backend` (`auto`, zero `--backend` flag!) with live `org.freedesktop.secrets`:
+    //     - Automatically selects `secret_service_dual` and suppresses false-positive `dbus_keyring_warning`;
+    //     - Continues reporting `matched` from keyring even when disk `antigravity-oauth-token` file is deleted
+    //       (while keeping `~/.gemini/antigravity-cli/` directory);
+    //     - Dual-writes keyring + recreates disk `antigravity-oauth-token` on `switch`;
+    //     - Prioritizes keyring over disk file in `accounts add --from-local` (pure child-process env);
+    //     - Honors `config.json` `"backend": "file"` override when configured!
+    {
+        let auto_cli = || {
+            let mut c = env.cli_cmd();
+            c.env("DBUS_SESSION_BUS_ADDRESS", &bus_addr);
+            c
+        };
+
+        let doc_auto = auto_cli().args(["--json", "doctor"]).output().unwrap();
+        assert_eq!(doc_auto.status.code(), Some(0));
+        let doc_auto_j: serde_json::Value = serde_json::from_slice(&doc_auto.stdout).unwrap();
+        assert_eq!(doc_auto_j["backend"], "secret_service_dual");
+        assert!(doc_auto_j["dbus_keyring_warning"].is_null());
+
+        // Delete disk `antigravity-oauth-token` file while keeping `~/.gemini/antigravity-cli/` directory
+        fs::remove_file(&env.paths().active_slot_file).unwrap();
+        assert!(!env.paths().active_slot_file.exists());
+        let cur_after_rm = auto_cli().args(["--json", "current"]).output().unwrap();
+        assert_eq!(cur_after_rm.status.code(), Some(0));
+        let cur_rm_j: serde_json::Value = serde_json::from_slice(&cur_after_rm.stdout).unwrap();
+        assert_eq!(cur_rm_j["session_identity"]["state"], "matched");
+        assert_eq!(cur_rm_j["session_identity"]["account_id"], "acc-kr1");
+
+        // Switch via default `auto` -> updates keyring AND recreates `antigravity-oauth-token`
+        let sw_auto = auto_cli()
+            .args(["--json", "switch", "acc-kr2"])
+            .output()
+            .unwrap();
+        assert_eq!(sw_auto.status.code(), Some(0));
+        assert!(env.paths().active_slot_file.exists());
+
+        // Put invalid JSON in disk `antigravity-oauth-token` while keyring holds valid `acc-kr2` payload:
+        // `auto_cli() accounts add --from-local` MUST read from keyring first (advancing past local parse to OAuth transport),
+        // whereas `--backend file` hits `data_error` on the corrupt disk file!
+        fs::write(&env.paths().active_slot_file, b"{corrupt-disk-json").unwrap();
+        let add_kr = auto_cli()
+            .args([
+                "--proxy",
+                "http://127.0.0.1:9",
+                "--json",
+                "accounts",
+                "add",
+                "--from-local",
+            ])
+            .output()
+            .unwrap();
+        let add_kr_err: serde_json::Value = serde_json::from_slice(&add_kr.stderr).unwrap();
+        assert_eq!(add_kr_err["error_code"], "oauth_network_error");
+
+        let add_file = auto_cli()
+            .args([
+                "--backend",
+                "file",
+                "--proxy",
+                "http://127.0.0.1:9",
+                "--json",
+                "accounts",
+                "add",
+                "--from-local",
+            ])
+            .output()
+            .unwrap();
+        let add_file_err: serde_json::Value = serde_json::from_slice(&add_file.stderr).unwrap();
+        assert_eq!(add_file_err["error_code"], "data_error");
+
+        // Remove corrupt disk file before restoring synced `acc-kr1`
+        fs::remove_file(&env.paths().active_slot_file).unwrap();
+
+        // `config.json` `"backend": "file"` overrides `auto`
+        fs::write(
+            env.paths().config_file(),
+            r#"{"schema_version":1,"backend":"file"}"#,
+        )
+        .unwrap();
+        fs::set_permissions(env.paths().config_file(), fs::Permissions::from_mode(0o600)).unwrap();
+        let doc_cfg_file = auto_cli().args(["--json", "doctor"]).output().unwrap();
+        assert_eq!(doc_cfg_file.status.code(), Some(0));
+        let doc_cf_j: serde_json::Value = serde_json::from_slice(&doc_cfg_file.stdout).unwrap();
+        assert_eq!(doc_cf_j["backend"], "file_session");
+        fs::remove_file(env.paths().config_file()).unwrap();
+
+        // Restore clean `acc-kr1` synced state before step 5
+        let sw_restore = ss_cli()
+            .args(["--json", "switch", "acc-kr1"])
+            .output()
+            .unwrap();
+        assert_eq!(sw_restore.status.code(), Some(0));
+    }
 
     let cur_stats: serde_json::Value =
         serde_json::from_slice(&fs::read(&stats_file).unwrap()).unwrap();

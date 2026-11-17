@@ -2119,6 +2119,20 @@ pub fn read_headless_config_readonly(
             STORE_SCHEMA_VERSION
         )));
     }
+    if let Some(ref raw_backend) = cfg.backend {
+        let b = raw_backend.trim().to_ascii_lowercase();
+        if !b.is_empty()
+            && !matches!(
+                b.as_str(),
+                "auto" | "file" | "file_session" | "secret-service" | "secret_service"
+            )
+        {
+            return Err(CliError::data(format!(
+                "Unsupported `backend` setting in '{}'. Supported values: `auto`, `file`, `secret-service`.",
+                path.display()
+            )));
+        }
+    }
     let mut warnings = Vec::new();
     let mode = meta.permissions().mode() & 0o777;
     let has_sensitive_cfg = !cfg.oauth.clients.is_empty()

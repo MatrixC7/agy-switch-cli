@@ -1388,6 +1388,37 @@ async fn socks5h_remote_dns_config_file_proxy_no_proxy_and_loopback_bypass_work_
         );
     }
 
+    // E2. Unnormalized desktop/CLI proxy env formats (`socks://127.0.0.1 <port>`, bare `127.0.0.1:<port>`,
+    //     and broken `ALL_PROXY=pac+http://...` alongside valid `HTTPS_PROXY=127.0.0.1:<port>`) work cleanly!
+    {
+        let _g_socks_kde = ScopedEnv::set("ALL_PROXY", &format!("socks://127.0.0.1 {socks_port}"));
+        let kde_mode = ProxyMode::resolve(None).unwrap();
+        let kde_transport = ReqwestTransport::build(kde_mode).unwrap();
+        let kde_resp = kde_transport
+            .execute(HttpRequest::get(
+                format!("http://kde-space-proxied.example.invalid:{http_port}/kde"),
+                TimeoutClass::VersionCheck,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(kde_resp.status, 200);
+        assert_eq!(observed_socks.lock().unwrap().len(), 3);
+        assert_eq!(
+            observed_socks.lock().unwrap()[2],
+            (
+                0x03,
+                "kde-space-proxied.example.invalid".to_string(),
+                http_port
+            )
+        );
+    }
+    {
+        let _g_https_bare = ScopedEnv::set("HTTPS_PROXY", &format!("127.0.0.1:{http_port}"));
+        let _g_all_broken = ScopedEnv::set("ALL_PROXY", "pac+http://127.0.0.1/wpad.dat");
+        let mixed_mode = ProxyMode::resolve(None).unwrap();
+        assert!(ReqwestTransport::build(mixed_mode).is_ok());
+    }
+
     // F. Authenticated RFC 1929 `socks5h://user:pass@127.0.0.1:<port>`:
     //    verifies username/password subnegotiation (`METHOD=0x02`, `VER=0x01`), `ATYP=0x03` remote DNS,
     //    and zero proxy-password leak when auth fails!
@@ -1522,4 +1553,89 @@ async fn socks5h_remote_dns_config_file_proxy_no_proxy_and_loopback_bypass_work_
     auth_socks_task.abort();
     socks_task.abort();
     http_task.abort();
+}
+
+#[tokio::test]
+async fn synthetic_accounts_add_from_local_reads_agy_slot_and_rejects_symlinks() {
+    use agy_switch_cli::oauth::refresh::bootstrap_and_persist_refresh_token;
+    use agy_switch_cli::session::backend::{read_local_active_refresh_token, FileSessionBackend};
+    use base64::engine::general_purpose::STANDARD;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = new_repo(tmp.path());
+    let paths = repo.paths().clone();
+    let backend = FileSessionBackend;
+
+    // 1. Missing `antigravity-oauth-token` (even if `jetski-standalone-oauth-token` exists) -> AccountNotFound (exit 3)
+    let gemini_dir = paths.home_dir.join(".gemini");
+    std::fs::create_dir_all(&gemini_dir).unwrap();
+    let standalone_path = gemini_dir.join("jetski-standalone-oauth-token");
+    std::fs::write(
+        &standalone_path,
+        r#"{"token":{"refresh_token":"1//ignored"}}"#,
+    )
+    .unwrap();
+    let err_missing = read_local_active_refresh_token(&paths, &backend).unwrap_err();
+    assert_eq!(err_missing.exit_code, ExitCode::AccountNotFound);
+
+    // 2. Official `~/.gemini/antigravity-cli/antigravity-oauth-token` (including `go-keyring-base64:` prefix) works
+    std::fs::create_dir_all(&paths.active_slot_dir).unwrap();
+    let agy_json = r#"{"token":{"access_token":"ya29.agy","token_type":"Bearer","refresh_token":"1//synthetic-agy-local-rt","expiry":"2099-01-01T00:00:00Z"},"auth_method":"consumer"}"#;
+    let b64_payload = format!("go-keyring-base64:{}", STANDARD.encode(agy_json));
+    std::fs::write(&paths.active_slot_file, b64_payload).unwrap();
+    std::fs::set_permissions(
+        &paths.active_slot_file,
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    let (rt_agy, src_agy) = read_local_active_refresh_token(&paths, &backend).unwrap();
+    assert_eq!(src_agy, "agy_session_file");
+    assert_eq!(rt_agy, "1//synthetic-agy-local-rt");
+
+    // Verify end-to-end bootstrap + persistence with MockTransport
+    let transport = MockTransport::from_handler(|req| {
+        if req.url.ends_with("/token") {
+            Ok(MockTransport::json_response(
+                200,
+                json!({
+                    "access_token": "ya29.fresh-from-local",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                    "scope": "openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email"
+                }),
+            ))
+        } else {
+            Ok(MockTransport::json_response(
+                200,
+                json!({
+                    "email": "alice@example.com",
+                    "name": "Alice Local"
+                }),
+            ))
+        }
+    });
+    let registry = OAuthClientRegistry::parse_from_raw(None, None);
+    let (saved, created) = bootstrap_and_persist_refresh_token(
+        &repo,
+        &transport,
+        &fast_oauth_endpoints(),
+        &registry,
+        "antigravity/1.5.7 linux/amd64",
+        &rt_agy,
+        None,
+        Some("本机账号"),
+        1_800_000_000,
+    )
+    .await
+    .unwrap();
+    assert!(created);
+    assert_eq!(saved.email, "alice@example.com");
+    assert_eq!(saved.custom_label.as_deref(), Some("本机账号"));
+
+    // 3. Symlinked `antigravity-oauth-token` MUST be rejected
+    std::fs::remove_file(&paths.active_slot_file).unwrap();
+    std::os::unix::fs::symlink(&standalone_path, &paths.active_slot_file).unwrap();
+    assert!(read_local_active_refresh_token(&paths, &backend).is_err());
 }

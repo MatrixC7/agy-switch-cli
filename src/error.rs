@@ -217,6 +217,10 @@ fn is_safe_public_cli_token(token: &str) -> bool {
             | "round_robin"
             | "immediate"
             | "wait"
+            | "auto"
+            | "file"
+            | "secret-service"
+            | "secret_service"
             | "true"
             | "false"
     ) || (t.starts_with('<') && t.ends_with('>'))
@@ -280,7 +284,7 @@ pub fn format_safe_clap_error(raw_args: &[String], clap_err: &clap::Error) -> St
             ErrorKind::UnknownArgument | ErrorKind::TooManyValues | ErrorKind::InvalidValue
         )
     {
-        return "Plaintext token positional arguments are forbidden on `accounts add` to prevent process-table and log exposure. Use the hidden-echo TTY prompt, `--stdin`, or `--token-file <PATH>`.".to_string();
+        return "Plaintext token positional arguments are forbidden on `accounts add` to prevent process-table and log exposure. Use the hidden-echo TTY prompt, `--from-local`, `--stdin`, or `--token-file <PATH>`.".to_string();
     }
 
     let safe_ctx_arg = |kind: ContextKind| -> Option<String> {

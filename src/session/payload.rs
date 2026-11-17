@@ -87,6 +87,50 @@ pub fn bytes_sha256_hex(bytes: &[u8]) -> String {
     hex_encode(&hasher.finalize())
 }
 
+/// Extract the raw `refresh_token` from an official Antigravity session JSON payload
+/// (supporting optional `go-keyring-base64:` prefix and both `token.refresh_token` and top-level `refresh_token`).
+/// Caller MUST treat the returned string as a secret and never echo or log it.
+pub fn extract_raw_refresh_token_from_session_bytes(
+    bytes: &[u8],
+    source_desc: &str,
+) -> CliResult<String> {
+    let raw_str = std::str::from_utf8(bytes)
+        .map_err(|_| CliError::data(format!("{source_desc} is not valid UTF-8.")))?;
+    let trimmed = raw_str.strip_prefix("go-keyring-base64:").and_then(|b64| {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        STANDARD
+            .decode(b64.trim())
+            .ok()
+            .and_then(|d| String::from_utf8(d).ok())
+    });
+    let effective_json_str = trimmed.as_deref().unwrap_or(raw_str);
+
+    let json: serde_json::Value = serde_json::from_str(effective_json_str)
+        .map_err(|e| CliError::data(format_safe_json_error(source_desc, &e)))?;
+
+    let refresh_token = json
+        .get("token")
+        .and_then(|t| t.get("refresh_token"))
+        .and_then(|v| v.as_str())
+        .or_else(|| json.get("refresh_token").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            CliError::data(format!(
+                "{source_desc} JSON is missing a non-empty `refresh_token`."
+            ))
+        })?;
+
+    if refresh_token.len() > crate::cli::secret_input::MAX_SECRET_BYTES {
+        return Err(CliError::data(format!(
+            "{source_desc} `refresh_token` exceeds maximum allowed size ({} bytes).",
+            crate::cli::secret_input::MAX_SECRET_BYTES
+        )));
+    }
+
+    Ok(refresh_token.to_string())
+}
+
 pub fn parse_session_payload_bytes(bytes: &[u8]) -> Result<ParsedSessionPayload, String> {
     let raw_str = std::str::from_utf8(bytes)
         .map_err(|_| "Active session file is not valid UTF-8.".to_string())?;

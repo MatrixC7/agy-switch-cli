@@ -22,13 +22,13 @@
 
 ### 方式一：下载预编译纯静态二进制（推荐）
 
-前往 Releases 页面下载对应架构的 `.tar.gz` 包（大多数服务器 / 容器 / WSL2 用户下载**不带 `-all-features` 的标准版**即可；若在开启了 GNOME Keyring / KWallet 的 Linux 图形桌面终端里直接裸敲 `agy`，可选 `-all-features` 版配合 `--backend secret-service` 使用）：
+前往 Releases 页面下载对应架构的 `.tar.gz` 包（远程 SSH 服务器 / Docker 容器 / WSL2 下载**不带 `-all-features` 的标准版**即可；若在开启了 GNOME Keyring / KDE Wallet 的 Linux 图形桌面环境中使用，建议下载 **`-all-features` 版**，程序会自动检测并同步更新系统钥匙串与本地凭据文件）：
 
 ```bash
-sha256sum -c agy-switch-cli-v1.1.0-x86_64-unknown-linux-musl.tar.gz.sha256
-tar -xzf agy-switch-cli-v1.1.0-x86_64-unknown-linux-musl.tar.gz
+sha256sum -c agy-switch-cli-v1.1.1-x86_64-unknown-linux-musl.tar.gz.sha256
+tar -xzf agy-switch-cli-v1.1.1-x86_64-unknown-linux-musl.tar.gz
 mkdir -p ~/.local/bin
-install -m 0755 agy-switch-cli-v1.1.0-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
+install -m 0755 agy-switch-cli-v1.1.1-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
 ```
 
 ### 方式二：从源码编译（要求 Linux + `rustc >= 1.89`）
@@ -48,6 +48,8 @@ agy-switch-cli doctor --verify-agy
 
 # 2. 登录添加账号（默认零配置手动粘贴回调 URL；如需本地监听可加 --ssh）
 agy-switch-cli auth login --label "主力账号"
+# 若当前设备已登录过官方 agy（或桌面端 Antigravity），也可一键读取本机当前登录账号入库：
+# agy-switch-cli accounts add --from-local --label "本机账号"
 # 或从原桌面版 ~/.antigravity_tools 只读迁移已有账号（不修改原目录）：
 # agy-switch-cli accounts import --from-legacy
 
@@ -61,6 +63,8 @@ agy-switch-cli current
 agy-switch-cli tui
 ```
 
+*(网络代理提示：Linux 图形界面的“系统代理”不会自动注入终端环境。若需走代理连接 Google，单次命令可加 `--proxy http://127.0.0.1:7890`，当前终端免重复传参可执行 `export https_proxy=http://127.0.0.1:7890`，需要跨终端与后台 `daemon` 持久生效则将其写入 `~/.local/share/agy-switch-cli/config.json`，详见使用手册第 6 节。)*
+
 ---
 
 ## 常用命令速查
@@ -69,10 +73,10 @@ agy-switch-cli tui
 |:------------------------------------------------------ |:---------------------------------------------------------------------------------- |
 | `agy-switch-cli doctor [--fix]`                        | 诊断本地存储、权限、D-Bus 环境，并对账修复未完成的切换日志                         |
 | `agy-switch-cli auth login [--ssh]`                    | 通过 PKCE (`S256`) 添加新 Google 账号（默认粘贴回调 URL；重新授权用 `reauthorize`） |
-| `agy-switch-cli accounts list / add / import / export` | 查看账号详情与排序（`--move`/`--order`）、单条或文件多行批量添加 Token、导入导出备份 |
+| `agy-switch-cli accounts list / add / import / export` | 查看账号详情与排序（`--move`/`--order`）、导入本机已登录号（`--from-local`）或批量添加 Token、导入导出备份 |
 | `agy-switch-cli current`                               | 查看当前生效身份、运行中进程状态及该账号支持的全部模型清单                         |
 | `agy-switch-cli quota [-r] [--all]`                    | 查看双窗口（`Weekly` + `5h`）配额进度表（加 `-r` 先联网刷新再展示）                |
-| `agy-switch-cli switch <ID\|EMAIL>`                   | 手动切换当前生效账号（按邮箱或账号 ID 精确指定，对后续新启动的 `agy` 生效）         |
+| `agy-switch-cli switch <ID\|EMAIL>`                   | 手动切换生效账号（标准版改本地槽位文件；`-all-features` 版自动检测并双写桌面钥匙串与文件） |
 | `agy-switch-cli policy set --all-candidates ...`       | 配置自动切号水位策略（可配合 `run` 启动前按需切号或 `daemon` 后台每小时巡检）      |
 | `agy-switch-cli run [--isolate-dbus] -- agy ...`       | 启动 `agy` 前按策略自动检查切号并隔离桌面钥匙串干扰                                |
 | `agy-switch-cli tui`                                   | 打开 SSH 交互式终端看板（支持切号、`r/R` 单条/批量刷新、`K/J` 调序与 `c/C/p` 策略管理） |

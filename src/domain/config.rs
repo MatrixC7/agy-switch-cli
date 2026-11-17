@@ -13,6 +13,9 @@ fn default_config_schema_version() -> u32 {
 pub struct HeadlessConfig {
     #[serde(default = "default_config_schema_version")]
     pub schema_version: u32,
+    /// Optional credential backend preference (`auto`, `file`, or `secret-service`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
@@ -23,16 +26,28 @@ impl Default for HeadlessConfig {
     fn default() -> Self {
         Self {
             schema_version: STORE_SCHEMA_VERSION,
+            backend: None,
             network: NetworkConfig::default(),
             oauth: OAuthFileConfig::default(),
         }
     }
 }
 
+fn sanitize_backend_for_debug(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => "auto",
+        "file" | "file_session" => "file",
+        "secret-service" | "secret_service" => "secret-service",
+        _ => "[INVALID_BACKEND]",
+    }
+}
+
 impl fmt::Debug for HeadlessConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let safe_backend = self.backend.as_deref().map(sanitize_backend_for_debug);
         f.debug_struct("HeadlessConfig")
             .field("schema_version", &self.schema_version)
+            .field("backend", &safe_backend)
             .field("network", &self.network)
             .field("oauth", &self.oauth)
             .finish()
@@ -137,6 +152,7 @@ mod tests {
     fn config_debug_redacts_client_secrets_and_proxy_credentials() {
         let cfg = HeadlessConfig {
             schema_version: 1,
+            backend: Some("auto".into()),
             network: NetworkConfig {
                 proxy_url: Some("socks5h://proxyuser:PROXY_PASS_SECRET@127.0.0.1:1080".into()),
                 no_proxy: Some("internal.corp".into()),

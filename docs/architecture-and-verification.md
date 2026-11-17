@@ -29,7 +29,7 @@
 | **运行形态与系统依赖** | 依赖 Tauri / GTK / WebKitGTK / X11 / Wayland 及系统动态库 | **零 GUI 动态库依赖**，预编译 `musl` 二进制为 100% 纯静态单文件 ELF（`NEEDED = 0`） |
 | **目标客户端范围** | 同时尝试操作桌面 App、VS Code / IDE 的 `state.vscdb` SQLite 数据库与网页注入 | **专注服务官方无头 `agy` CLI**，不触碰 IDE SQLite 数据库，不注入脚本，也不伪造桌面设备指纹 |
 | **切号生效方式** | 通过强杀并重启桌面客户端进程来切换会话 | **非侵入式原子替换凭据槽位**：仅对切换完成后新启动的 `agy` 进程生效，绝不强行中断正在运行中的 `agy` 任务 |
-| **桌面钥匙串兼容** | 绑定系统 `libsecret` 动态库 | 默认纯文件后端（`file`），可选内置纯 Rust `zbus` 协议栈实现 `org.freedesktop.secrets` 双写与失败回滚（`secret-service-backend` 特性），或通过 `run --isolate-dbus` 按子进程隔离钥匙串 |
+| **桌面钥匙串兼容** | 绑定系统 `libsecret` 动态库 | 默认 `auto` 自适应后端：无头环境走纯文件后端（`file`），`-all-features` 版在检测到活跃桌面钥匙串服务时自动启用纯 Rust `zbus` 协议栈实现 `org.freedesktop.secrets` 事务性双写与失败回滚（亦可配 `run --isolate-dbus` 按子进程隔离钥匙串） |
 
 ### 1.2 切号生效语义与进程边界
 
@@ -69,9 +69,9 @@ flowchart TD
 | `store/locks.rs` | 基于 POSIX `flock` + 线程级顺序守卫的四级单向锁实现（`L1`、`PendingAuthLock`、`L2`、`L3`）与 `DaemonInstanceLock` |
 | `store/fs_atomic.rs` | 全深度祖先符号链接拦截、`O_NOFOLLOW \| O_NONBLOCK` 有界普通文件读取、临时文件与父目录双 `fsync` 原子写入及故障注入钩子 |
 | `store/repository.rs` / `transfer.rs` | 账号库事务读写、单调授权序号 `auth_sequence.json`、两级轮换指纹谱系归档、备份包导入导出与旧桌面端只读迁移 |
-| `session/backend.rs` / `payload.rs` | 官方凭据 JSON 序列化校验、`file` 文件后端及可选纯 Rust `zbus` 系统钥匙串双写/自动回滚后端 |
+| `session/backend.rs` / `payload.rs` | 官方凭据 JSON 序列化校验、`auto` 自适应探测、`file` 纯文件后端、纯 Rust `zbus` 系统钥匙串事务性双写/自动回滚后端，以及 `--from-local` 本机已登录凭据提取器 |
 | `session/journal.rs` / `process.rs` | 三阶段崩溃恢复日志 `switch_journal.json` CAS 对账机、`/proc` 故障关闭进程扫描与双因子（`pid + starttime`）进程租约 |
-| `transport/client.rs` / `proxy.rs` / `user_agent.rs` | 基于 `reqwest` + `rustls` 的 HTTP 传输抽象、`socks5h` 与精确 `url::Host` 本地回环直连分流、`antigravity/hub/<ver>` 请求标识管理 |
+| `transport/client.rs` / `proxy.rs` / `user_agent.rs` | 基于 `reqwest` + `rustls` 的 HTTP 传输抽象、系统代理环境变量自动规范化与异常项容错隔离（支持 `socks5h`/`socks`、裸 `host:port` 与精确 `url::Host` 本地回环直连分流）、`antigravity/hub/<ver>` 请求标识管理 |
 | `oauth/registry.rs` / `flow.rs` / `refresh.rs` | 内置与自定义 OAuth 客户端注册表、PKCE（`S256`）授权流、全入口 `/token` 签发后立即 `0600` 落盘与并发防回退续期闭环 |
 | `quota/client.rs` / `fusion.rs` | 单环境隔离的 CloudCode 三步配额拉取（`Daily -> Sandbox -> Production`）、401 单次强刷重试与双窗口配额融合 |
 | `switching/executor.rs` / `runner.rs` / `daemon.rs` | 切号核心执行器、`run -- agy` 受管包装启动器与七阶段前台自动切号守护引擎 |
@@ -118,6 +118,20 @@ flowchart TD
 2. **父目录句柄与 `(dev, ino)` 双重锚定**：打开目标文件时结合 `O_PATH | O_DIRECTORY | O_NOFOLLOW` 校验父目录身份，并在打开前后核对设备号与 inode 一致性，消除路径检查与实际打开之间的竞态窗口（TOCTOU）。
 3. **非阻塞有界普通文件读取**：使用 `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` 打开文件并验证 `file_type().is_file()`，若攻击者或异常环境在状态文件路径放置了无写端命名管道（FIFO）或设备节点，可在毫秒级立即识别并报错退出，不会导致进程永久挂起；同时严格限制单文件最大读取字节数防止内存耗尽。
 4. **双 `fsync` 原子替换写入**：所有状态更新均先在同一父目录下创建带随机后缀的 `0600` 临时文件，写满后先对临时文件执行 `sync_all()`（`fsync`），再执行 POSIX 原子 `rename` 覆盖目标文件，最后对父目录句柄再次执行 `fsync`，确保断电或内核崩溃后不会出现半写损坏的 JSON 文件。
+
+### 3.3 官方客户端双层凭据存储与事务性双写机制（`session/backend.rs`）
+
+官方 `agy` CLI（及新版独立桌面端 Antigravity App）内部共用同一套双层凭据存储（`composite_token_storage.go`）与同一组 OAuth `client_id`，按以下固定优先级定位当前登录凭据：
+
+1. **第一优先级：Linux 桌面系统钥匙串（D-Bus Secret Service）**
+   - 当会话中存在可达的 D-Bus 总线且运行着 GNOME Keyring 或 KDE Wallet（`org.freedesktop.secrets`）时，官方 `agy` 与桌面端 Antigravity App 均优先读写钥匙串 `login` / `default` 集合中属性为 `service="gemini", username="antigravity"`（显示名 `Password for 'antigravity' on 'gemini'`）的加密条目。
+   - 只要钥匙串已解锁且存在该条目，官方客户端在启动阶段直接采用钥匙串中的凭据，不再读取磁盘文件；即便手动清理磁盘上的旧凭据文件，官方客户端与本工具的钥匙串后端均能正常按第一优先级读取当前身份。
+2. **第二优先级：磁盘凭据文件回退层**
+   - 当环境不存在桌面钥匙串（如纯无头 SSH 服务器、Docker 容器、无桌面 WSL2）、钥匙串中无对应条目，或通过 `run --isolate-dbus` 将子进程 `DBUS_SESSION_BUS_ADDRESS` 定向至 `/dev/null` 时，`agy` CLI 回退读写 `~/.gemini/antigravity-cli/antigravity-oauth-token`（桌面端 Antigravity App 与 VS Code 中的 Antigravity 扩展插件则回退读写 `~/.gemini/jetski-standalone-oauth-token`；而常见的 `~/.gemini/oauth_creds.json` 并非官方 Antigravity App 或 `agy` CLI 读写的槽位）。
+3. **`auto` 自适应后端与事务性双写（Dual-Write）协议**
+   - 为保持无头服务器标准版的最小体积（约 `8.2 MiB`）与精简依赖面，纯 Rust D-Bus 协议栈（`zbus`）与 DH/AES 通道加密库被隔离在 `secret-service-backend` 编译特性（即 `-all-features` 发行版，约 `10.3 MiB`，同样零外部 `.so` 依赖）中。
+   - 在默认 `--backend auto` 模式下，标准版直接使用 `FileSessionBackend`；`-all-features` 版先通过零副作用 `stat` 检查本机是否存在活跃 D-Bus 会话套接字，再以只读不解锁（零弹窗）方式探测 `org.freedesktop.secrets` 是否持有持久化集合——若存在桌面钥匙串则自动启用 `SecretServiceSessionBackend`（无论命令行 `switch`、`current`、`daemon`、`accounts add --from-local` 还是 `tui` 看板均自动生效），若处于无钥匙串的服务器环境则自动无感回退至 `FileSessionBackend`。
+   - 执行切号写入时，`SecretServiceSessionBackend` 在持有全局 `L1` 槽位锁与 UID 级钥匙串锁的前提下执行事务性双写：先快照备份所有目标钥匙串集合与磁盘槽位文件，随后写入钥匙串并通过即时回读校验字节一致性，最后原子写入磁盘 `antigravity-oauth-token`；若任意集合写入或磁盘落盘失败，自动将已修改的钥匙串集合逆序回滚至切换前快照（若回滚自身亦遭遇故障则持久化 `RecoveryIncomplete` 状态并以退出码 `7` 阻断后续写入，交由 `doctor --fix` 对账恢复）。
 
 ---
 
@@ -234,4 +248,4 @@ Google OAuth 刷新令牌在轮换或重新授权时，一旦服务端 `/token` 
 | **构建、MSRV 与云端 CI 门禁** | 本机隔离沙盒与 GitHub Actions 云端（`Ubuntu 26.04` 5 项门禁作业）均已实测通过：`cargo fmt --check`、`rustc 1.100.0` 与最低 MSRV `rustc 1.89.0` 三特性档零警告 `clippy`、三特性档全量单元与集成测试（含 `--test-threads=64` 高并发交错压测）、`x86_64` 与 `aarch64` 纯静态 `musl` 构建及 QEMU 端到端正负向冒烟（见 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)）。 | 云端与本机针对 `aarch64` 的自动化运行验证基于 QEMU 用户态仿真完成，不等同于原生物理 ARM64 服务器硬件上的高负载压测。 |
 | **官方 `agy` 契约与在线协议** | 已基于隔离临时 `HOME`、本地 HTTP/SOCKS5 Mock 服务及私有 Mock D-Bus Secret Service 完整验证凭据读写、双写回滚、PKCE 换码、401 强刷闭环、`Daily` 优先单环境配额融合与 3p-only 残缺摘要保底逻辑，并经维护者实机验证真实配额刷新与切号流程。 | Google CloudCode 内部接口（如 `:retrieveUserQuotaSummary` 的配额池命名与请求头策略）并非公开固定规范，若未来上游服务端调整返回结构，需随版本迭代同步适配。 |
 | **并发锁、崩溃恢复与防回退** | 已通过四轮独立第三方零信任代码审计，自动化测试覆盖跨目录混合后端 `L1` 锁互斥、四级锁序防死锁、`PendingAuthLock` 与 `auth_seq` 跨 pending 忙锁防回退、`email_mismatch` 异号保护、全深度符号链接与 FIFO 非阻塞拦截、真实子进程 `SIGKILL` 崩溃日志恢复，以及 `66,048` 级轮换谱系防旧备份覆盖（注：当既有 `index.json` 文件内容损坏而非缺失时，`doctor --fix` 会安全拒绝盲目覆盖并保留现场供人工核查）。 | 进程级故障注入与 `SIGKILL` 测试验证了应用层协议的一致性，不等同于物理断电或底层存储介质硬件损坏场景下的全矩阵测试。 |
-| **许可证与第三方依赖审计** | 完整保留 `CC-BY-NC-SA-4.0` [`LICENSE`](../LICENSE) 与 [`PROVENANCE.md`](../PROVENANCE.md)，通过 `cargo deny check advisories bans licenses sources` 四项全检及 `cargo audit`（0 安全漏洞）。 | 可选特性 `secret-service 5.2.0` 经 `zbus 5.19.0` 传递依赖 3 个已合并至 `zbus 6.0` 的子包（`RUSTSEC-2026-0370`/`0371`/`0372` 仓库合并维护提示，无安全漏洞），已在 [`deny.toml`](../deny.toml) 中记录说明，待上游 `secret-service 6.0` 正式稳定后可升级移除。 |
+| **许可证与第三方依赖审计** | 完整保留 `CC-BY-NC-SA-4.0` [`LICENSE`](../LICENSE) 与 [`PROVENANCE.md`](../PROVENANCE.md)，通过 `cargo deny check advisories bans licenses sources` 四项全检及 `cargo audit`（0 安全漏洞）。 | 可选特性 `secret-service 5.2.0` 经 `zbus 5.19.0` 传递依赖 3 个已合并至 `zbus 6.0` 的子包（`RUSTSEC-2026-0370`/`0371`/`0372` 仓库合并维护提示，无安全漏洞），以及 `chrono 0.4.45` 维护状态提示（`RUSTSEC-2026-0543`，非安全漏洞，计划在 `v1.2.0` 迁移至 `jiff`/`time`），均已在 [`deny.toml`](../deny.toml) 中记录说明。 |

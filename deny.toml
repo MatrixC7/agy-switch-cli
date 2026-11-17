@@ -25,6 +25,8 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "Optional secret-service 5.2.0 -> zbus 5.19.0 pulls zvariant 5.15.1 (merged into zbus 6.0, informational unmaintained notice, not a vulnerability; secret-service 6.0 is still RC)" },
     { id = "RUSTSEC-2026-0371", reason = "Optional secret-service 5.2.0 -> zbus 5.19.0 pulls zbus_names 4.3.5 (merged into zbus 6.0, informational unmaintained notice, not a vulnerability; secret-service 6.0 is still RC)" },
     { id = "RUSTSEC-2026-0372", reason = "Optional secret-service 5.2.0 -> zbus 5.19.0 pulls zvariant_derive 5.15.1 (merged into zbus 6.0, informational unmaintained notice, not a vulnerability; secret-service 6.0 is still RC)" },
+    # `chrono 0.4.45` 维护状态提示通告（非安全漏洞 CVE / unsound），计划在下一版本（v1.2.0）统一迁移至 `jiff` 或 `time` 并移除本豁免项。
+    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.45 informational unmaintained notice (not a security vulnerability); scheduled for migration to jiff/time in v1.2.0" },
 ]
 
 [licenses]

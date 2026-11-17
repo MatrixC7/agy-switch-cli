@@ -72,50 +72,49 @@ impl ProxyMode {
     ) -> CliResult<Self> {
         let env_override = std::env::var("AGY_SWITCH_CLI_PROXY")
             .ok()
-            .map(|s| s.trim().to_string())
+            .map(|s| strip_matching_quotes(s.trim()).to_string())
             .filter(|s| !s.is_empty());
         let cfg_proxy = network_cfg
             .and_then(|c| c.proxy_url.as_deref())
-            .map(str::trim)
+            .map(|s| strip_matching_quotes(s.trim()))
+            .filter(|s| !s.is_empty());
+        let cli_clean = cli_proxy
+            .map(|s| strip_matching_quotes(s.trim()))
             .filter(|s| !s.is_empty());
 
-        let chosen = cli_proxy
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .or(env_override.as_deref())
-            .or(cfg_proxy);
+        let explicit_choice: Option<(&str, &str)> = if let Some(c) = cli_clean {
+            Some((c, "`--proxy`"))
+        } else if let Some(ref e) = env_override {
+            Some((e.as_str(), "`AGY_SWITCH_CLI_PROXY`"))
+        } else {
+            cfg_proxy.map(|c| (c, "`config.json` (`network.proxy_url`)"))
+        };
 
         let cfg_no_proxy = network_cfg
             .and_then(|c| c.no_proxy.as_deref())
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let raw_no_proxy = first_non_empty_env(&["NO_PROXY", "no_proxy"]);
+        let raw_no_proxy = first_non_empty_env(&["NO_PROXY", "no_proxy"]).map(|(_, v)| v);
         let merged_no_proxy = Some(merge_no_proxy_sources(
             cfg_no_proxy,
             raw_no_proxy.as_deref(),
         ));
 
-        if let Some(spec) = chosen {
-            if spec.eq_ignore_ascii_case("direct") || spec.eq_ignore_ascii_case("none") {
+        if let Some((spec, source_name)) = explicit_choice {
+            if is_direct_keyword(spec) {
                 return Ok(Self::Direct);
             }
-            validate_proxy_url(spec)?;
+            let normalized = normalize_proxy_url(spec);
+            validate_proxy_url_for_source(&normalized, Some(source_name))?;
             return Ok(Self::Explicit {
-                proxy_url: spec.to_string(),
+                proxy_url: normalized,
                 no_proxy: merged_no_proxy,
             });
         }
 
-        let https_proxy = first_non_empty_env(&["HTTPS_PROXY", "https_proxy"]);
-        let http_proxy = first_non_empty_env(&["HTTP_PROXY", "http_proxy"]);
-        let all_proxy = first_non_empty_env(&["ALL_PROXY", "all_proxy"]);
-
-        for p in [&https_proxy, &http_proxy, &all_proxy]
-            .into_iter()
-            .flatten()
-        {
-            validate_proxy_url(p)?;
-        }
+        let https_proxy = resolve_ambient_proxy_env(&["HTTPS_PROXY", "https_proxy"]);
+        let http_proxy = resolve_ambient_proxy_env(&["HTTP_PROXY", "http_proxy"]);
+        let all_proxy = resolve_ambient_proxy_env(&["ALL_PROXY", "all_proxy"]);
 
         if https_proxy.is_none() && http_proxy.is_none() && all_proxy.is_none() {
             return Ok(Self::Direct);
@@ -144,22 +143,127 @@ impl ProxyMode {
     }
 }
 
+fn is_direct_keyword(raw: &str) -> bool {
+    raw.eq_ignore_ascii_case("direct") || raw.eq_ignore_ascii_case("none")
+}
+
+fn strip_matching_quotes(raw: &str) -> &str {
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        raw[1..raw.len() - 1].trim()
+    } else {
+        raw
+    }
+}
+
+/// Normalize common Linux / desktop proxy string formats into canonical `reqwest`-compatible URLs:
+/// - Strips surrounding whitespace and matching outer single/double quotes;
+/// - Rewrites KDE-style space-separated port (`http://127.0.0.1 2080` -> `http://127.0.0.1:2080`);
+/// - Maps `socks://` alias to `socks5h://` (remote DNS over SOCKS5);
+/// - Prepends `http://` to scheme-less `host:port` / `localhost:port` / `[::1]:port` specifications.
+pub fn normalize_proxy_url(raw: &str) -> String {
+    let unquoted = strip_matching_quotes(raw.trim());
+    if unquoted.is_empty() || is_direct_keyword(unquoted) {
+        return unquoted.to_string();
+    }
+
+    let (scheme_prefix, rest) = match unquoted.find("://") {
+        Some(idx) => (&unquoted[..idx + 3], &unquoted[idx + 3..]),
+        None => ("", unquoted),
+    };
+
+    // Convert trailing space-separated port (`host 2080`) when no path/query/fragment is present
+    let rest_no_trailing_slash = rest.trim_end_matches('/');
+    let host_port_fixed = if !rest_no_trailing_slash.contains(['/', '?', '#']) {
+        if let Some((host_part, port_part)) =
+            rest_no_trailing_slash.rsplit_once(char::is_whitespace)
+        {
+            let host_trimmed = host_part.trim();
+            let port_trimmed = port_part.trim();
+            if !host_trimmed.is_empty()
+                && !host_trimmed.contains(char::is_whitespace)
+                && port_trimmed.parse::<u16>().is_ok_and(|p| p > 0)
+            {
+                format!("{host_trimmed}:{port_trimmed}")
+            } else {
+                rest.to_string()
+            }
+        } else {
+            rest.to_string()
+        }
+    } else {
+        rest.to_string()
+    };
+
+    let with_scheme = if scheme_prefix.is_empty() {
+        let candidate = host_port_fixed.trim_end_matches('/');
+        if !candidate.contains(['/', '?', '#']) {
+            if let Some((host_or_auth, port_str)) = candidate.rsplit_once(':') {
+                if !host_or_auth.is_empty() && port_str.parse::<u16>().is_ok_and(|p| p > 0) {
+                    format!("http://{candidate}")
+                } else {
+                    host_port_fixed
+                }
+            } else {
+                host_port_fixed
+            }
+        } else {
+            host_port_fixed
+        }
+    } else if scheme_prefix.eq_ignore_ascii_case("socks://") {
+        format!("socks5h://{host_port_fixed}")
+    } else {
+        format!("{scheme_prefix}{host_port_fixed}")
+    };
+
+    with_scheme
+}
+
+fn resolve_ambient_proxy_env(names: &[&'static str]) -> Option<String> {
+    let (var_name, raw_val) = first_non_empty_env(names)?;
+    let unquoted = strip_matching_quotes(&raw_val);
+    if unquoted.is_empty() || is_direct_keyword(unquoted) {
+        return None;
+    }
+    let normalized = normalize_proxy_url(unquoted);
+    match validate_proxy_url(&normalized) {
+        Ok(_) => Some(normalized),
+        Err(_) => {
+            tracing::warn!(
+                env_var = var_name,
+                "Ignoring unsupported or malformed proxy URL in ambient environment variable"
+            );
+            None
+        }
+    }
+}
+
 pub fn validate_proxy_url(raw: &str) -> CliResult<Url> {
+    validate_proxy_url_for_source(raw, None)
+}
+
+fn validate_proxy_url_for_source(raw: &str, source_name: Option<&str>) -> CliResult<Url> {
+    let ctx = source_name.map(|s| format!(" in {s}")).unwrap_or_default();
     let parsed = Url::parse(raw.trim()).map_err(|_| {
-        CliError::usage(
-            "Invalid proxy URL format. Supported schemes: http://, https://, socks5://, socks5h://, or `direct`.",
-        )
+        CliError::usage(format!(
+            "Invalid proxy URL format{ctx}. Supported formats: http://host:port, https://host:port, socks5://host:port, socks5h://host:port, host:port, or `direct`."
+        ))
     })?;
     match parsed.scheme() {
         "http" | "https" | "socks5" | "socks5h" => {}
         _ => {
-            return Err(CliError::usage(
-                "Unsupported proxy scheme. Supported schemes: http, https, socks5, socks5h, or `direct`.",
-            ));
+            return Err(CliError::usage(format!(
+                "Unsupported proxy scheme{ctx}. Supported schemes: http, https, socks5, socks5h (or socks), or `direct`."
+            )));
         }
     }
     if parsed.host_str().is_none() {
-        return Err(CliError::usage("Proxy URL is missing a host."));
+        return Err(CliError::usage(format!(
+            "Proxy URL{ctx} is missing a host."
+        )));
     }
     Ok(parsed)
 }
@@ -238,12 +342,12 @@ fn merge_no_proxy_sources(cfg_no_proxy: Option<&str>, env_no_proxy: Option<&str>
     parts.join(",")
 }
 
-fn first_non_empty_env(names: &[&str]) -> Option<String> {
-    for name in names {
+fn first_non_empty_env<'a>(names: &'a [&'a str]) -> Option<(&'a str, String)> {
+    for &name in names {
         if let Ok(val) = std::env::var(name) {
             let trimmed = val.trim();
             if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+                return Some((name, trimmed.to_string()));
             }
         }
     }
@@ -271,5 +375,52 @@ mod tests {
         assert!(mode.should_bypass(&Url::parse("http://[::1]:8080/oauth-callback").unwrap()));
         assert!(mode.should_bypass(&Url::parse("https://api.internal.corp/v1").unwrap()));
         assert!(!mode.should_bypass(&Url::parse("https://oauth2.googleapis.com/token").unwrap()));
+    }
+
+    #[test]
+    fn normalizes_bare_host_port_space_ports_socks_alias_and_quotes() {
+        assert_eq!(
+            normalize_proxy_url("127.0.0.1:2080"),
+            "http://127.0.0.1:2080"
+        );
+        assert_eq!(
+            normalize_proxy_url("localhost:2080"),
+            "http://localhost:2080"
+        );
+        assert_eq!(normalize_proxy_url("[::1]:2080"), "http://[::1]:2080");
+        assert_eq!(
+            normalize_proxy_url("http://127.0.0.1 2080"),
+            "http://127.0.0.1:2080"
+        );
+        assert_eq!(
+            normalize_proxy_url("socks://127.0.0.1 2080"),
+            "socks5h://127.0.0.1:2080"
+        );
+        assert_eq!(
+            normalize_proxy_url("'socks://127.0.0.1:2080'"),
+            "socks5h://127.0.0.1:2080"
+        );
+        assert_eq!(
+            normalize_proxy_url("\"http://127.0.0.1:7890\""),
+            "http://127.0.0.1:7890"
+        );
+
+        // Explicit typos without port must still fail validation cleanly
+        assert!(ProxyMode::resolve_with_config(Some("directt"), None).is_err());
+        assert!(ProxyMode::resolve_with_config(Some("ftp://127.0.0.1:21"), None).is_err());
+
+        // Explicit bare host:port and socks:// succeed
+        assert_eq!(
+            ProxyMode::resolve_with_config(Some("127.0.0.1:2080"), None).unwrap(),
+            ProxyMode::Explicit {
+                proxy_url: "http://127.0.0.1:2080".into(),
+                no_proxy: Some(merge_no_proxy_sources(
+                    None,
+                    first_non_empty_env(&["NO_PROXY", "no_proxy"])
+                        .map(|(_, v)| v)
+                        .as_deref()
+                )),
+            }
+        );
     }
 }

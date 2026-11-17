@@ -25,8 +25,9 @@ use crate::oauth::registry::OAuthClientRegistry;
 use crate::paths::HeadlessPaths;
 use crate::quota::client::{refresh_account_quota_locked, CloudCodeEndpoints};
 use crate::session::backend::{
-    detect_dbus_session_socket_warning, resolve_credential_backend, CredentialBackend,
-    SlotInspectState,
+    detect_dbus_session_socket_warning, read_local_active_refresh_token,
+    resolve_credential_backend_with_config, validate_backend_choice, CredentialBackend,
+    FileSessionBackend, SlotInspectState,
 };
 use crate::session::journal::{
     diagnose_journal, read_journal_readonly, reconcile_journal_locked,
@@ -68,10 +69,34 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
+fn command_uses_backend(cmd: &Commands) -> bool {
+    match cmd {
+        Commands::Auth(AuthCommand::Clients) => false,
+        Commands::Auth(AuthCommand::Pending(args)) => args.purge || args.resume,
+        Commands::Accounts(AccountsCommand::List(args)) => {
+            args.move_target.is_some() || args.order.is_some()
+        }
+        Commands::Accounts(AccountsCommand::Export(_)) => false,
+        Commands::Quota(args) => args.refresh,
+        Commands::Policy(PolicyCommand::Show | PolicyCommand::Eval) => false,
+        _ => true,
+    }
+}
+
 pub async fn dispatch(cli: Cli) -> CliResult<i32> {
     let paths = HeadlessPaths::resolve(cli.data_dir.as_deref())?;
     let repo = StoreRepository::new(paths.clone());
-    let backend_box = resolve_credential_backend(cli.backend.as_deref())?;
+    let backend_box: Box<dyn CredentialBackend> = if matches!(cli.command, Commands::Doctor(_)) {
+        let cfg_backend = repo.read_config().ok().and_then(|c| c.backend);
+        resolve_credential_backend_with_config(cli.backend.as_deref(), cfg_backend.as_deref())?
+    } else if command_uses_backend(&cli.command) {
+        let cfg = repo.read_config()?;
+        resolve_credential_backend_with_config(cli.backend.as_deref(), cfg.backend.as_deref())?
+    } else {
+        let cfg_backend = repo.read_config().ok().and_then(|c| c.backend);
+        validate_backend_choice(cli.backend.as_deref(), cfg_backend.as_deref())?;
+        Box::new(FileSessionBackend)
+    };
     let backend: &dyn CredentialBackend = backend_box.as_ref();
     let now_unix = chrono::Utc::now().timestamp();
 
@@ -327,7 +352,12 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
         }
         Commands::Accounts(AccountsCommand::Add(args)) => {
             reconcile_pending_journal_before_write(&repo, backend, SystemClock.now_unix())?;
-            let token_entries: Vec<(String, Option<String>)> = if args.stdin {
+            let mut local_source_tag: Option<&'static str> = None;
+            let token_entries: Vec<(String, Option<String>)> = if args.from_local {
+                let (secret, src_tag) = read_local_active_refresh_token(&paths, backend)?;
+                local_source_tag = Some(src_tag);
+                vec![(secret, None)]
+            } else if args.stdin {
                 read_secrets_from_stdin()?
             } else if let Some(ref file_path) = args.token_file {
                 read_secrets_from_private_file(file_path)?
@@ -372,10 +402,21 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 let dto = AccountViewDto::from_record(&saved, is_sel);
 
                 if cli.json {
-                    print_json(&serde_json::json!({
+                    let mut out_obj = serde_json::json!({
                         "created": created,
                         "account": dto,
-                    }))?;
+                    });
+                    if let Some(src_tag) = local_source_tag {
+                        out_obj["local_source"] = serde_json::Value::String(src_tag.to_string());
+                    }
+                    print_json(&out_obj)?;
+                } else if let Some(src_tag) = local_source_tag {
+                    println!(
+                        "{} account {} ({}) from local credential ({src_tag})",
+                        if created { "Added" } else { "Updated" },
+                        terminal_text(&dto.id),
+                        terminal_text(&dto.email)
+                    );
                 } else {
                     println!(
                         "{} account {} ({})",
@@ -1910,7 +1951,9 @@ async fn handle_doctor(
     let slot_state = backend.inspect_slot(paths);
     let journal = read_journal_readonly(paths)?;
     let journal_diag = diagnose_journal(journal.as_ref(), &slot_state);
-    let dbus_warning = detect_dbus_session_socket_warning();
+    let dbus_warning = (!backend.uses_keyring())
+        .then(detect_dbus_session_socket_warning)
+        .flatten();
     let runtime_state = observe_runtime_state(paths);
     let dstate_res = read_daemon_state_readonly(paths);
 

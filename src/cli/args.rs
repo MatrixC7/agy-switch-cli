@@ -12,11 +12,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
 
-    /// Explicit proxy URL (http://, https://, socks5://, socks5h://, or `direct`)
+    /// Explicit proxy URL (http://, https://, socks5://, socks5h://, host:port, or `direct`)
     #[arg(long, global = true, value_name = "URL")]
     pub proxy: Option<String>,
 
-    /// Credential backend (`file` [default] or `secret-service` [requires `secret-service-backend` feature])
+    /// Credential backend (`auto` [default], `file`, or `secret-service` [requires `secret-service-backend` feature])
     #[arg(long, global = true, value_name = "BACKEND")]
     pub backend: Option<String>,
 
@@ -160,7 +160,7 @@ pub struct AuthReauthorizeArgs {
 pub enum AccountsCommand {
     /// List saved accounts with plan/status details, or reorder accounts (`--move` / `--order`)
     List(AccountsListArgs),
-    /// Add one or more accounts via masked TTY prompt, `--stdin`, or `0600` `--token-file` (no positional token!)
+    /// Add accounts via masked TTY prompt, `--from-local`, `--stdin`, or `0600` `--token-file` (no positional token!)
     Add(AccountsAddArgs),
     /// Import accounts from a v1/v2 JSON bundle or `--from-legacy` desktop directory
     Import(AccountsImportArgs),
@@ -209,12 +209,16 @@ pub struct AccountsListArgs {
 
 #[derive(Debug, Args)]
 pub struct AccountsAddArgs {
+    /// Import the currently signed-in local Antigravity account (from desktop keyring or `~/.gemini/antigravity-cli/antigravity-oauth-token`)
+    #[arg(long, conflicts_with_all = ["stdin", "token_file"])]
+    pub from_local: bool,
+
     /// Read one or more refresh tokens (one per line) from standard input pipe
-    #[arg(long, conflicts_with = "token_file")]
+    #[arg(long, conflicts_with_all = ["token_file", "from_local"])]
     pub stdin: bool,
 
     /// Read one or more refresh tokens (one per line; `# label` comments supported) from a `0600` regular file
-    #[arg(long, value_name = "PATH", conflicts_with = "stdin")]
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["stdin", "from_local"])]
     pub token_file: Option<PathBuf>,
 
     /// Optional default custom label
