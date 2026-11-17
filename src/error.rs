@@ -201,7 +201,6 @@ fn is_safe_public_cli_token(token: &str) -> bool {
             | "enable"
             | "disable"
             | "delete"
-            | "status"
             | "current"
             | "switch"
             | "run"
@@ -216,8 +215,8 @@ fn is_safe_public_cli_token(token: &str) -> bool {
             | "priority"
             | "round-robin"
             | "round_robin"
+            | "immediate"
             | "wait"
-            | "stop"
             | "true"
             | "false"
     ) || (t.starts_with('<') && t.ends_with('>'))
@@ -475,7 +474,7 @@ mod tests {
                 &[
                     "agy-switch-cli",
                     "--unknown-opt=GOCSPX-FlagInlineSecret999",
-                    "status",
+                    "current",
                 ],
                 "FlagInlineSecret999",
             ),
@@ -483,7 +482,7 @@ mod tests {
                 &[
                     "agy-switch-cli",
                     "--proyx=socks5h://proxyuser:PROXY_PASS_SECRET@127.0.0.1:1080",
-                    "status",
+                    "current",
                 ],
                 "PROXY_PASS_SECRET",
             ),

@@ -1890,7 +1890,7 @@ impl<'a> StoreWriteTx<'a> {
         let mut index = self.load_index_or_init(now_unix)?;
         if ordered_ids.len() != index.account_order.len() {
             return Err(CliError::usage(format!(
-                "`accounts order` requires every saved account exactly once (expected {}, got {}).",
+                "`accounts list --order` requires every saved account exactly once (expected {}, got {}).",
                 index.account_order.len(),
                 ordered_ids.len()
             )));

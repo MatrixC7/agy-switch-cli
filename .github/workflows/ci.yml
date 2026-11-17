@@ -164,7 +164,7 @@ jobs:
               echo "Expected static musl ELF without PT_INTERP or NEEDED!"
               exit 1
             fi
-            "$bin" status --json >/dev/null
+            "$bin" current --json >/dev/null
             sha256sum "$bin"
           done
       - name: Build & QEMU-verify static aarch64-unknown-linux-musl (3 tiers + negative guards)
@@ -193,7 +193,7 @@ jobs:
               echo "Expected static aarch64-musl ELF without PT_INTERP or NEEDED!"
               exit 1
             fi
-            "$QEMU_AARCH64" "$bin" --no-remote-version status --json >/dev/null
+            "$QEMU_AARCH64" "$bin" --no-remote-version current --json >/dev/null
             "$QEMU_AARCH64" "$bin" --no-remote-version doctor --json >/dev/null
             set +e
             bad_err="$("$QEMU_AARCH64" "$bin" --json auth login "4/PART1'CI_ARM_SECRET_999" 2>&1)"
@@ -238,7 +238,7 @@ jobs:
               echo "Forbidden GUI/desktop shared library detected in aarch64-gnu ELF!"
               exit 1
             fi
-            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version status --json >/dev/null
+            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version current --json >/dev/null
             "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version doctor --json >/dev/null
             set +e
             bad_err="$("$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --json auth login "4/PART1'CI_ARM_GNU_SECRET_999" 2>&1)"

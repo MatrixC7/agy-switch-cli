@@ -37,7 +37,7 @@ pub enum Commands {
     /// Environment diagnostics and journal reconciliation
     Doctor(DoctorArgs),
 
-    /// OAuth 2.0 authorization management (SSH port forwarding or `--manual` callback URL paste)
+    /// OAuth 2.0 authorization management (manual callback URL paste by default, or `--ssh` local listener)
     #[command(subcommand)]
     Auth(AuthCommand),
 
@@ -45,10 +45,7 @@ pub enum Commands {
     #[command(subcommand)]
     Accounts(AccountsCommand),
 
-    /// Inspect tri-state identity (`selected_account`, `session_identity`, `runtime_state`)
-    Status,
-
-    /// Read locally recorded `selected_account` (pure read-only, zero side effects)
+    /// Inspect current selected account, active `agy` slot sync, live runtime state, and supported models
     Current,
 
     /// Switch active `agy` credential slot to the selected account (applies to new `agy` invocations)
@@ -57,7 +54,7 @@ pub enum Commands {
     /// Pre-invocation managed wrapper (`agy-switch-cli run -- agy ...`)
     Run(RunArgs),
 
-    /// Read locally cached quota observations (pure read-only, zero network/writes)
+    /// View pool quota table (pure local read by default; pass `-r/--refresh` to fetch live quota first)
     Quota(QuotaArgs),
 
     /// Refresh OAuth tokens and CloudCode quotas over the network
@@ -114,12 +111,16 @@ pub struct AuthLoginArgs {
     #[arg(long, value_name = "KEY")]
     pub client: Option<String>,
 
-    /// Fixed loopback callback port on 127.0.0.1 (for SSH `-L` port forwarding)
+    /// Start local `127.0.0.1` HTTP callback listener (for SSH `-L` port forwarding or local desktop browser)
+    #[arg(long)]
+    pub ssh: bool,
+
+    /// Fixed loopback callback port on 127.0.0.1 (used in both default paste mode and `--ssh` listener mode)
     #[arg(long, value_name = "PORT")]
     pub port: Option<u16>,
 
-    /// Manual mode: paste full `http://127.0.0.1:<port>/oauth-callback?code=...&state=...` URL
-    #[arg(long)]
+    /// Compatibility alias (manual URL paste mode is now the default when `--ssh` is omitted)
+    #[arg(long, hide = true, conflicts_with = "ssh")]
     pub manual: bool,
 
     /// Attempt to launch local browser via `xdg-open` (disabled by default in headless mode)
@@ -133,17 +134,22 @@ pub struct AuthLoginArgs {
 
 #[derive(Debug, Args)]
 pub struct AuthReauthorizeArgs {
-    /// Exact Account ID or case-insensitive Email
+    /// Account ID or case-insensitive Email
     #[arg(value_name = "ID|EMAIL")]
     pub selector: String,
 
     #[arg(long, value_name = "KEY")]
     pub client: Option<String>,
 
+    /// Start local `127.0.0.1` HTTP callback listener (for SSH `-L` port forwarding or local desktop browser)
+    #[arg(long)]
+    pub ssh: bool,
+
     #[arg(long, value_name = "PORT")]
     pub port: Option<u16>,
 
-    #[arg(long)]
+    /// Compatibility alias (manual URL paste mode is now the default when `--ssh` is omitted)
+    #[arg(long, hide = true, conflicts_with = "ssh")]
     pub manual: bool,
 
     #[arg(long)]
@@ -152,16 +158,14 @@ pub struct AuthReauthorizeArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AccountsCommand {
-    /// List saved accounts (pure read-only)
-    List,
-    /// Add an account via masked TTY prompt, `--stdin`, or `0600` `--token-file` (no positional token!)
+    /// List saved accounts with plan/status details, or reorder accounts (`--move` / `--order`)
+    List(AccountsListArgs),
+    /// Add one or more accounts via masked TTY prompt, `--stdin`, or `0600` `--token-file` (no positional token!)
     Add(AccountsAddArgs),
     /// Import accounts from a v1/v2 JSON bundle or `--from-legacy` desktop directory
     Import(AccountsImportArgs),
     /// Export accounts to a `0600` private file (requires `--include-secrets`)
     Export(AccountsExportArgs),
-    /// Show or update account ordering
-    Order(AccountsOrderArgs),
     /// Enable a disabled account
     Enable {
         #[arg(value_name = "ID|EMAIL")]
@@ -179,16 +183,41 @@ pub enum AccountsCommand {
 }
 
 #[derive(Debug, Args)]
+pub struct AccountsListArgs {
+    /// Move a single account (by ID or Email) to `--to <POSITION>`
+    #[arg(
+        long = "move",
+        value_name = "ID|EMAIL",
+        requires = "to",
+        conflicts_with = "order"
+    )]
+    pub move_target: Option<String>,
+
+    /// Target 1-based position (`1..=N`) when using `--move`
+    #[arg(
+        long,
+        value_name = "POSITION",
+        requires = "move_target",
+        conflicts_with = "order"
+    )]
+    pub to: Option<usize>,
+
+    /// Reorder all accounts at once (pass every account by ID or Email)
+    #[arg(long, num_args = 1.., value_name = "ID|EMAIL")]
+    pub order: Option<Vec<String>>,
+}
+
+#[derive(Debug, Args)]
 pub struct AccountsAddArgs {
-    /// Read single refresh token from standard input pipe
+    /// Read one or more refresh tokens (one per line) from standard input pipe
     #[arg(long, conflicts_with = "token_file")]
     pub stdin: bool,
 
-    /// Read single refresh token from a `0600` regular file
+    /// Read one or more refresh tokens (one per line; `# label` comments supported) from a `0600` regular file
     #[arg(long, value_name = "PATH", conflicts_with = "stdin")]
     pub token_file: Option<PathBuf>,
 
-    /// Optional custom label
+    /// Optional default custom label
     #[arg(long, value_name = "TEXT")]
     pub label: Option<String>,
 
@@ -232,12 +261,6 @@ pub struct AccountsExportArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct AccountsOrderArgs {
-    #[arg(value_name = "ID|EMAIL")]
-    pub selectors: Vec<String>,
-}
-
-#[derive(Debug, Args)]
 pub struct AccountsDeleteArgs {
     #[arg(value_name = "ID|EMAIL")]
     pub selector: String,
@@ -253,6 +276,7 @@ pub struct AccountsDeleteArgs {
 
 #[derive(Debug, Args)]
 pub struct SwitchArgs {
+    /// Account ID or case-insensitive Email
     #[arg(value_name = "ID|EMAIL")]
     pub selector: String,
 
@@ -285,9 +309,17 @@ pub struct QuotaArgs {
     #[arg(value_name = "ID|EMAIL", conflicts_with = "all")]
     pub selector: Option<String>,
 
-    /// Show cached quotas for all accounts
+    /// Show quotas for all saved accounts
     #[arg(long)]
     pub all: bool,
+
+    /// Refresh CloudCode quota over the network first before displaying the quota table
+    #[arg(short = 'r', long)]
+    pub refresh: bool,
+
+    /// Bounded concurrency when refreshing multiple accounts with `--refresh --all` (`1..=5`, default `2`)
+    #[arg(long, default_value_t = 2, requires = "refresh", value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub concurrency: u8,
 }
 
 #[derive(Debug, Args)]
@@ -328,8 +360,8 @@ pub enum CliStrategy {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CliMode {
+    Immediate,
     Wait,
-    Stop,
 }
 
 #[derive(Debug, Args)]
@@ -352,30 +384,39 @@ pub struct PolicySetArgs {
     #[arg(long, value_name = "MODEL")]
     pub model: Option<String>,
 
-    #[arg(long, num_args = 1.., value_name = "ID|EMAIL", conflicts_with = "clear_candidates")]
+    #[arg(
+        long,
+        num_args = 1..,
+        value_name = "ID|EMAIL",
+        conflicts_with_all = ["clear_candidates", "all_candidates"]
+    )]
     pub candidates: Option<Vec<String>>,
 
-    #[arg(long)]
+    /// Automatically add all currently enabled accounts (in `accounts list` order) as candidates
+    #[arg(long, conflicts_with_all = ["candidates", "clear_candidates"])]
+    pub all_candidates: bool,
+
+    #[arg(long, conflicts_with_all = ["candidates", "all_candidates"])]
     pub clear_candidates: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct DaemonArgs {
-    /// Poll interval in seconds (default: 60)
+    /// Poll interval in seconds (default: 3600 / 1 hour)
     #[arg(
         long,
         env = "AGY_SWITCH_CLI_INTERVAL",
         hide_env_values = true,
-        default_value_t = 60
+        default_value_t = 3600
     )]
     pub interval: u64,
 
-    /// Post-switch cooldown in seconds (default: 300)
+    /// Post-switch cooldown in seconds (default: 3600 / 1 hour)
     #[arg(
         long,
         env = "AGY_SWITCH_CLI_COOLDOWN",
         hide_env_values = true,
-        default_value_t = 300
+        default_value_t = 3600
     )]
     pub cooldown: i64,
 
@@ -383,7 +424,7 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub once: bool,
 
-    /// In-memory override for active-process guard mode (`wait` or `stop`; does not modify `policy.json`)
+    /// In-memory override for active-process guard mode (`immediate` or `wait`; does not modify `policy.json`)
     #[arg(long, value_enum)]
     pub mode: Option<CliMode>,
 

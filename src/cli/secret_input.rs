@@ -11,6 +11,7 @@ use std::sync::{
 };
 
 pub const MAX_SECRET_BYTES: usize = 16 * 1024;
+pub const MAX_BATCH_SECRET_BYTES: usize = 64 * 1024;
 const GUARDED_SIGNALS: [libc::c_int; 4] =
     [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
@@ -202,19 +203,81 @@ pub fn read_secret_from_tty_with_mode(prompt: &str, json_mode: bool) -> CliResul
     Ok(secret)
 }
 
-pub fn read_secret_from_stdin() -> CliResult<String> {
-    let stdin = io::stdin();
-    let line = read_bounded_line(stdin.lock(), MAX_SECRET_BYTES, "Stdin token")?;
-    let secret = line.trim().to_string();
-    if secret.is_empty() {
-        return Err(CliError::usage("Token read from `--stdin` is empty."));
+/// Split optional inline `# label` comment ONLY when `#` is preceded by ASCII whitespace,
+/// preserving any literal `#` inside custom OAuth tokens that lack preceding whitespace.
+fn split_whitespace_comment(trimmed: &str) -> (&str, Option<&str>) {
+    let bytes = trimmed.as_bytes();
+    for (idx, &b) in bytes.iter().enumerate() {
+        if b == b'#' && idx > 0 && bytes[idx - 1].is_ascii_whitespace() {
+            return (trimmed[..idx].trim_end(), Some(trimmed[idx + 1..].trim()));
+        }
     }
-    Ok(secret)
+    (trimmed, None)
 }
 
-/// Read a single secret token from a private (`0600`) regular file, rejecting symlinks, directories,
-/// and group/world-accessible files (`mode & 0o077 != 0`) per Blueprint §8.2 rule 1.
-pub fn read_secret_from_private_file(path: &Path) -> CliResult<String> {
+/// Parse one or more `refresh_token` lines from text (`--stdin` or `--token-file`),
+/// skipping blank lines and `#` comment lines, and supporting optional inline `token # custom_label`.
+pub fn parse_token_lines_from_text(
+    raw: &str,
+    source_label: &str,
+) -> CliResult<Vec<(String, Option<String>)>> {
+    let mut entries = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let (tok_part, comment_part) = split_whitespace_comment(trimmed);
+        if tok_part.is_empty() {
+            continue;
+        }
+        if tok_part.len() > MAX_SECRET_BYTES {
+            return Err(CliError::usage(format!(
+                "Refresh token in {source_label} exceeds maximum allowed size ({MAX_SECRET_BYTES} bytes)."
+            )));
+        }
+        let inline_label = comment_part.filter(|s| !s.is_empty()).map(str::to_string);
+        entries.push((tok_part.to_string(), inline_label));
+    }
+    if entries.is_empty() {
+        return Err(CliError::usage(format!(
+            "No refresh_token found in {source_label}."
+        )));
+    }
+    Ok(entries)
+}
+
+pub fn read_secrets_from_stdin() -> CliResult<Vec<(String, Option<String>)>> {
+    let stdin = io::stdin();
+    let mut buf = Vec::with_capacity(1024);
+    stdin
+        .lock()
+        .take((MAX_SECRET_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| {
+            CliError::io(
+                "secret_read_error",
+                format!("Failed reading `--stdin`: {e}"),
+            )
+        })?;
+    if buf.len() > MAX_SECRET_BYTES {
+        return Err(CliError::usage(format!(
+            "`--stdin` input exceeds maximum allowed size ({MAX_SECRET_BYTES} bytes)."
+        )));
+    }
+    let content = String::from_utf8(buf)
+        .map_err(|_| CliError::usage("`--stdin` input is not valid UTF-8."))?;
+    parse_token_lines_from_text(&content, "`--stdin`")
+}
+
+pub fn read_secret_from_stdin() -> CliResult<String> {
+    let mut entries = read_secrets_from_stdin()?;
+    Ok(entries.remove(0).0)
+}
+
+/// Read raw UTF-8 text from a private (`0600`) regular file up to `max_bytes`, rejecting symlinks,
+/// FIFOs, directories, and group/world-accessible files (`mode & 0o077 != 0`) per Blueprint §8.2 rule 1.
+fn read_private_file_content(path: &Path, max_bytes: usize) -> CliResult<String> {
     if crate::error::looks_like_secret_value(&path.to_string_lossy()) {
         return Err(CliError::usage(
             "`--token-file` expects a filesystem path to a private `0600` file, not a literal credential value (redacted).",
@@ -297,29 +360,40 @@ pub fn read_secret_from_private_file(path: &Path) -> CliResult<String> {
             path.display()
         )));
     }
-    if meta.len() > MAX_SECRET_BYTES as u64 {
+    if meta.len() > max_bytes as u64 {
         return Err(CliError::usage(format!(
-            "Token file '{}' exceeds maximum allowed size (16 KiB).",
+            "Token file '{}' exceeds maximum allowed size ({max_bytes} bytes).",
             path.display()
         )));
     }
 
-    let mut raw = Vec::with_capacity((meta.len() as usize).min(MAX_SECRET_BYTES));
-    file.take((MAX_SECRET_BYTES as u64).saturating_add(1))
+    let mut raw = Vec::with_capacity((meta.len() as usize).min(max_bytes));
+    file.take((max_bytes as u64).saturating_add(1))
         .read_to_end(&mut raw)
         .map_err(|e| map_io_error(e, &format!("Cannot read token file '{}'", path.display())))?;
-    if raw.len() > MAX_SECRET_BYTES {
+    if raw.len() > max_bytes {
         return Err(CliError::usage(format!(
-            "Token file '{}' exceeds maximum allowed size (16 KiB).",
+            "Token file '{}' exceeds maximum allowed size ({max_bytes} bytes).",
             path.display()
         )));
     }
-    let content = String::from_utf8(raw).map_err(|_| {
+    String::from_utf8(raw).map_err(|_| {
         CliError::usage(format!(
             "Token file '{}' is not valid UTF-8.",
             path.display()
         ))
-    })?;
+    })
+}
+
+/// Read one or more refresh tokens (one per line) from a private (`0600`) regular file.
+pub fn read_secrets_from_private_file(path: &Path) -> CliResult<Vec<(String, Option<String>)>> {
+    let content = read_private_file_content(path, MAX_BATCH_SECRET_BYTES)?;
+    parse_token_lines_from_text(&content, &format!("token file '{}'", path.display()))
+}
+
+/// Read a single secret token from a private (`0600`) regular file.
+pub fn read_secret_from_private_file(path: &Path) -> CliResult<String> {
+    let content = read_private_file_content(path, MAX_SECRET_BYTES)?;
     let secret = content.trim().to_string();
     if secret.is_empty() {
         return Err(CliError::usage(format!(

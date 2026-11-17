@@ -6,15 +6,15 @@ use std::collections::HashSet;
 #[serde(rename_all = "snake_case")]
 pub enum PolicyMode {
     #[default]
+    Immediate,
     Wait,
-    Stop,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyStrategy {
-    #[default]
     Priority,
+    #[default]
     #[serde(alias = "round-robin")]
     RoundRobin,
 }
@@ -40,8 +40,8 @@ impl Default for SwitchPolicy {
             schema_version: STORE_SCHEMA_VERSION,
             revision: 0,
             enabled: false,
-            mode: PolicyMode::Wait,
-            strategy: PolicyStrategy::Priority,
+            mode: PolicyMode::Immediate,
+            strategy: PolicyStrategy::RoundRobin,
             reserve_percentage: 10,
             candidate_min_percentage: 30,
             monitored_model: "all".to_string(),
@@ -156,5 +156,18 @@ mod tests {
         let known = HashSet::from(["acc-1".to_string()]);
         let err = p.validate(Some(&known)).unwrap_err();
         assert!(err.contains("acc-missing"));
+    }
+
+    #[test]
+    fn default_policy_uses_immediate_and_round_robin_and_rejects_removed_stop_mode() {
+        let def = SwitchPolicy::default();
+        assert_eq!(def.mode, PolicyMode::Immediate);
+        assert_eq!(def.strategy, PolicyStrategy::RoundRobin);
+
+        let imm: PolicyMode = serde_json::from_str("\"immediate\"").unwrap();
+        assert_eq!(imm, PolicyMode::Immediate);
+        let wait: PolicyMode = serde_json::from_str("\"wait\"").unwrap();
+        assert_eq!(wait, PolicyMode::Wait);
+        assert!(serde_json::from_str::<PolicyMode>("\"stop\"").is_err());
     }
 }

@@ -9,6 +9,9 @@ use crate::domain::quota::{
 /// - Detects conflicting duplicate window buckets and marks `percentage_known = Some(false)`.
 pub fn fuse_model_quotas(models: &mut [ModelQuota], groups: &[QuotaGroup]) {
     for model in models {
+        if model.name.to_ascii_lowercase().ends_with("-disabled") {
+            continue;
+        }
         let Some(pool) = model_quota_pool(&model.name, model.display_name.as_deref()) else {
             continue;
         };
@@ -156,5 +159,35 @@ mod tests {
         fuse_model_quotas(&mut models, &groups);
         assert_eq!(models[1].percentage_known, Some(false));
         assert_eq!(models[1].observed_remaining_fraction, None);
+    }
+
+    #[test]
+    fn disabled_and_unpooled_models_never_borrow_shared_gemini() {
+        let fixture = |id: &str, fraction: f64| {
+            json!({
+                "bucket_id": id,
+                "window": if id.ends_with("5h") { "5h" } else { "weekly" },
+                "remaining_fraction": fraction,
+                "remaining_fraction_known": true,
+                "reset_time": "2030-01-01T00:00:00Z"
+            })
+        };
+        let groups: Vec<QuotaGroup> = serde_json::from_value(json!([
+            {"display_name":"Gemini Models","buckets":[fixture("gemini-weekly", 0.9), fixture("gemini-5h", 0.8)]}
+        ]))
+        .unwrap();
+        let mut models: Vec<ModelQuota> = serde_json::from_value(json!([
+            {"name":"gemini-4-carbon-high","percentage":100,"reset_time":""},
+            {"name":"gemini-3.8-flash","percentage":100,"reset_time":""},
+            {"name":"gemini-4-hydrogen-disabled","percentage":0,"percentage_known":false,"reset_time":""}
+        ]))
+        .unwrap();
+
+        fuse_model_quotas(&mut models, &groups);
+        assert!(models[0].quota_bucket_id.is_none());
+        assert_eq!(models[0].percentage, 100);
+        assert_eq!(models[1].percentage, 80);
+        assert_eq!(models[2].percentage_known, Some(false));
+        assert_eq!(models[2].observed_remaining_fraction, None);
     }
 }

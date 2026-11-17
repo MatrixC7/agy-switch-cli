@@ -14,7 +14,7 @@ use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-/// 1. `agy-switch-cli` own package version (`1.0.0`), strictly for `--version` and diagnostics.
+/// 1. `agy-switch-cli` own package version (`CARGO_PKG_VERSION`), strictly for `--version` and diagnostics.
 pub const CLI_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Verified official `agy` version range from Phase 0 empirical probe (`1.5.7`).
@@ -64,8 +64,23 @@ pub fn select_ua_version(floor_version: &str, cached_remote_version: Option<&str
     }
 }
 
+pub fn format_hub_user_agent_for_target(ua_version: &str, os: &str, arch: &str) -> String {
+    let os_type = match os {
+        "macos" => "macos",
+        "windows" => "windows",
+        "linux" => "linux",
+        _ => "linux",
+    };
+    let arch_type = match arch {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    };
+    format!("antigravity/hub/{ua_version} (os_type={os_type}; arch={arch_type})")
+}
+
 pub fn format_native_oauth_user_agent(ua_version: &str) -> String {
-    format!("vscode/1.X.X (Antigravity/{ua_version})")
+    format_hub_user_agent_for_target(ua_version, std::env::consts::OS, std::env::consts::ARCH)
 }
 
 pub const SHORT_FALLBACK_USER_AGENT: &str = "antigravity";
@@ -223,8 +238,20 @@ mod tests {
         // Remote newer than floor upgrades UA!
         assert_eq!(select_ua_version("4.3.0", Some("4.10.2")), "4.10.2");
         assert_eq!(
-            format_native_oauth_user_agent(&select_ua_version("4.3.0", Some("4.10.2"))),
-            "vscode/1.X.X (Antigravity/4.10.2)"
+            format_hub_user_agent_for_target(
+                &select_ua_version("4.3.0", Some("4.10.2")),
+                "linux",
+                "x86_64"
+            ),
+            "antigravity/hub/4.10.2 (os_type=linux; arch=amd64)"
         );
+        assert_eq!(
+            format_hub_user_agent_for_target("4.3.0", "linux", "aarch64"),
+            "antigravity/hub/4.3.0 (os_type=linux; arch=arm64)"
+        );
+        let native_ua = format_native_oauth_user_agent("4.3.0");
+        assert!(native_ua.starts_with("antigravity/hub/4.3.0 (os_type="));
+        assert!(native_ua.contains("; arch="));
+        assert!(native_ua.ends_with(')'));
     }
 }

@@ -19,12 +19,10 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// Unified Production-first CloudCode environments per Blueprint §5.1.
+/// Live Daily-first CloudCode environments matching the Antigravity client (`agy`).
+/// Queries `daily-cloudcode-pa.googleapis.com` first so shared Gemini and Gemini 4 pools
+/// match real client consumption, falling back to `Sandbox` and `Production` without cross-env merging.
 pub const DEFAULT_CLOUDCODE_ENVIRONMENTS: [(QuotaSourceEnv, &str); 3] = [
-    (
-        QuotaSourceEnv::Production,
-        "https://cloudcode-pa.googleapis.com/v1internal",
-    ),
     (
         QuotaSourceEnv::Daily,
         "https://daily-cloudcode-pa.googleapis.com/v1internal",
@@ -32,6 +30,10 @@ pub const DEFAULT_CLOUDCODE_ENVIRONMENTS: [(QuotaSourceEnv, &str); 3] = [
     (
         QuotaSourceEnv::Sandbox,
         "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+    ),
+    (
+        QuotaSourceEnv::Production,
+        "https://cloudcode-pa.googleapis.com/v1internal",
     ),
 ];
 
@@ -354,9 +356,20 @@ pub enum SummaryFetchOutcome {
     Unavailable,
 }
 
+fn summary_has_gemini_group(groups: &[QuotaGroup]) -> bool {
+    groups.iter().any(|group| {
+        group.buckets.iter().any(|bucket| {
+            crate::domain::quota::quota_pool(&bucket.bucket_id, &group.display_name)
+                == Some(crate::domain::quota::QuotaPool::Gemini)
+        })
+    })
+}
+
 /// Step 3: `:retrieveUserQuotaSummary` on a SINGLE environment (strictly no cross-env merging!).
 /// Account-level `InsufficientScope`, `401 Unauthorized`, and `403 VALIDATION_REQUIRED` are classified
 /// immediately BEFORE UA/project fallbacks so they are NEVER retried pointlessly or swallowed into `None`!
+/// If an attempt returns HTTP 200 with only 3p buckets (omitting Gemini), it is held only as a partial
+/// fallback while remaining attempts/environments are checked.
 pub async fn fetch_quota_summary_from_environments(
     transport: &dyn HttpTransport,
     environments: &[(QuotaSourceEnv, String)],
@@ -369,6 +382,7 @@ pub async fn fetch_quota_summary_from_environments(
         .filter(|s| !s.is_empty())
         .unwrap_or("aicode-consumers");
     let primary_payload = json!({ "project": default_project });
+    let mut partial_fallback: Option<(QuotaSourceEnv, Vec<QuotaGroup>)> = None;
 
     for (env, base_url) in environments {
         let url = format!("{base_url}:retrieveUserQuotaSummary");
@@ -393,6 +407,9 @@ pub async fn fetch_quota_summary_from_environments(
                     }
                     if resp.status == 403 {
                         if let Some((reason, vurl)) = detect_403_validation_block(&resp.body) {
+                            if let Some((f_env, f_groups)) = partial_fallback {
+                                return Ok(SummaryFetchOutcome::Groups(f_env, f_groups));
+                            }
                             return Ok(SummaryFetchOutcome::ValidationBlocked(reason, vurl));
                         }
                         if attempt_idx + 1 < attempts.len() {
@@ -433,11 +450,24 @@ pub async fn fetch_quota_summary_from_environments(
                     if groups.is_empty() || groups.iter().all(|g| g.buckets.is_empty()) {
                         break;
                     }
-                    return Ok(SummaryFetchOutcome::Groups(*env, groups));
+                    if summary_has_gemini_group(&groups) {
+                        return Ok(SummaryFetchOutcome::Groups(*env, groups));
+                    }
+                    if partial_fallback.is_none() {
+                        partial_fallback = Some((*env, groups));
+                    }
+                    // Bare "antigravity" UA can drop Gemini on daily; retry remaining attempts if any.
+                    if *ua == SHORT_FALLBACK_USER_AGENT && attempt_idx + 1 < attempts.len() {
+                        continue;
+                    }
+                    break;
                 }
                 Err(_) => break,
             }
         }
+    }
+    if let Some((f_env, f_groups)) = partial_fallback {
+        return Ok(SummaryFetchOutcome::Groups(f_env, f_groups));
     }
     Ok(SummaryFetchOutcome::Unavailable)
 }
@@ -461,7 +491,7 @@ pub struct QuotaFetchOutcome {
     pub discovered_project_id: Option<String>,
     /// Internal-only `(reason, optional_validation_url)` when HTTP 403 indicates `VALIDATION_REQUIRED`.
     pub validation_block: Option<(String, Option<String>)>,
-    /// True ONLY when an authoritative primary-environment (`Production`) check succeeded cleanly.
+    /// True ONLY when the configured primary environment (`ep_idx == 0`) succeeded cleanly.
     pub allow_clear_validation_block: bool,
 }
 
@@ -518,9 +548,13 @@ fn find_validation_url_in_json(val: &serde_json::Value) -> Option<String> {
 }
 
 /// Execute one complete single-environment-isolated 3-step CloudCode quota observation pass:
-/// - Each environment (`Production`, then `Daily`, then `Sandbox`) queries its OWN `:loadCodeAssist`,
+/// - Each environment (`Daily`, then `Sandbox`, then `Production`) queries its OWN `:loadCodeAssist`,
 ///   `:fetchAvailableModels`, and `:retrieveUserQuotaSummary` without cross-environment `tier` or `groups` stitching;
-/// - Explicit `VALIDATION_REQUIRED` stops immediately without falling back to `Daily` (preserving block evidence);
+/// - If an environment returns a 3p-only HTTP 200 summary (missing Gemini), its single-env observation is held only
+///   as a partial fallback while all remaining environments are checked (continuing past intermediate non-account-level
+///   404/403/429/5xx/parse failures, while still propagating account-level `401` / `InsufficientScope`);
+/// - Explicit `VALIDATION_REQUIRED` stops immediately (returning an already-captured valid partial observation if
+///   present, or preserving block evidence otherwise);
 /// - Generic `is_forbidden` is ONLY recorded when ALL attempted environments returned HTTP 403 (never on `[503, 503, 403]`).
 pub async fn fetch_quota_once(
     transport: &dyn HttpTransport,
@@ -540,11 +574,11 @@ pub async fn fetch_quota_once(
     let mut saw_transient_failure = false;
     let mut forbidden_env_count = 0usize;
     let mut last_forbidden_ctx: Option<(QuotaSourceEnv, Option<String>, Option<String>)> = None;
+    let mut partial_env_outcome: Option<QuotaFetchOutcome> = None;
 
     for (ep_idx, (source_env, base_url)) in endpoints.environments.iter().enumerate() {
         let has_next = ep_idx + 1 < endpoints.environments.len();
-        let is_authoritative_primary = ep_idx == 0
-            && (*source_env == QuotaSourceEnv::Production || endpoints.environments.len() == 1);
+        let is_authoritative_primary = ep_idx == 0 && *source_env != QuotaSourceEnv::LegacyUnknown;
 
         let (env_project, env_tier) =
             match fetch_load_code_assist_for_env(transport, base_url, user_agent, access_token)
@@ -558,6 +592,9 @@ pub async fn fetch_quota_once(
                     reason,
                     validation_url,
                 } => {
+                    if let Some(partial) = partial_env_outcome {
+                        return Ok(partial);
+                    }
                     let obs_now = clock.now_unix();
                     let mut forbidden_obs = QuotaObservation::new(obs_now, *source_env);
                     forbidden_obs.is_forbidden = true;
@@ -599,8 +636,11 @@ pub async fn fetch_quota_once(
                         return Err(QuotaApiError::Unauthorized);
                     }
                     if resp.status == 403 {
-                        // Account-level `VALIDATION_REQUIRED` MUST NOT be masked by stripping `project` or falling back to `Daily`!
+                        // Account-level `VALIDATION_REQUIRED` MUST NOT be masked by stripping `project` or falling back!
                         if let Some((reason, vurl)) = detect_403_validation_block(&resp.body) {
+                            if let Some(partial) = partial_env_outcome {
+                                return Ok(partial);
+                            }
                             let obs_now = clock.now_unix();
                             let mut forbidden_obs = QuotaObservation::new(obs_now, *source_env);
                             forbidden_obs.is_forbidden = true;
@@ -642,22 +682,47 @@ pub async fn fetch_quota_once(
                             sleep_with_jitter(endpoints.fallback_delay, retry_after).await;
                             break;
                         }
+                        if let Some(partial) = partial_env_outcome {
+                            return Ok(partial);
+                        }
                         return Err(last_error.unwrap());
                     }
                     if !(200..300).contains(&resp.status) {
-                        return Err(QuotaApiError::Protocol(format!(
+                        let proto_err = QuotaApiError::Protocol(format!(
                             "CloudCode fetchAvailableModels returned unexpected HTTP {}.",
                             resp.status
-                        )));
+                        ));
+                        if last_error.is_none() {
+                            last_error = Some(proto_err.clone());
+                        }
+                        if has_next {
+                            break;
+                        }
+                        if let Some(partial) = partial_env_outcome {
+                            return Ok(partial);
+                        }
+                        return Err(last_error.unwrap_or(proto_err));
                     }
 
-                    let catalog: CatalogResponse =
-                        serde_json::from_slice(&resp.body).map_err(|e| {
-                            QuotaApiError::Protocol(format_safe_json_error(
+                    let catalog: CatalogResponse = match serde_json::from_slice(&resp.body) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let proto_err = QuotaApiError::Protocol(format_safe_json_error(
                                 "CloudCode fetchAvailableModels response",
                                 &e,
-                            ))
-                        })?;
+                            ));
+                            if last_error.is_none() {
+                                last_error = Some(proto_err.clone());
+                            }
+                            if has_next {
+                                break;
+                            }
+                            if let Some(partial) = partial_env_outcome {
+                                return Ok(partial);
+                            }
+                            return Err(last_error.unwrap_or(proto_err));
+                        }
+                    };
 
                     let obs_now = clock.now_unix();
                     let mut obs = QuotaObservation::new(obs_now, *source_env);
@@ -681,6 +746,8 @@ pub async fn fetch_quota_once(
 
                     // Strictly query `:retrieveUserQuotaSummary` ONLY on the SAME `source_env`!
                     let same_env_slice = [(*source_env, base_url.clone())];
+                    let mut has_full_gemini_summary = false;
+                    let mut is_partial_3p_only = false;
                     match fetch_quota_summary_from_environments(
                         transport,
                         &same_env_slice,
@@ -691,12 +758,17 @@ pub async fn fetch_quota_once(
                     .await?
                     {
                         SummaryFetchOutcome::Groups(sum_env, groups) => {
+                            has_full_gemini_summary = summary_has_gemini_group(&groups);
+                            is_partial_3p_only = !has_full_gemini_summary;
                             fuse_model_quotas(&mut obs.models, &groups);
                             obs.summary_source_env = Some(sum_env);
                             obs.quota_groups = Some(groups);
                             obs.last_updated = clock.now_unix();
                         }
                         SummaryFetchOutcome::ValidationBlocked(reason, vurl) => {
+                            if let Some(partial) = partial_env_outcome {
+                                return Ok(partial);
+                            }
                             obs.is_forbidden = true;
                             obs.last_updated = clock.now_unix();
                             return Ok(QuotaFetchOutcome {
@@ -711,12 +783,30 @@ pub async fn fetch_quota_once(
                         }
                     }
 
-                    return Ok(QuotaFetchOutcome {
+                    let candidate = QuotaFetchOutcome {
                         observation: obs,
                         discovered_project_id: effective_project,
                         validation_block: None,
                         allow_clear_validation_block: is_authoritative_primary,
-                    });
+                    };
+
+                    if has_full_gemini_summary {
+                        return Ok(candidate);
+                    }
+
+                    if partial_env_outcome.is_some() && has_next {
+                        break;
+                    }
+                    if let Some(first_partial) = partial_env_outcome {
+                        return Ok(first_partial);
+                    }
+
+                    if is_partial_3p_only && has_next {
+                        partial_env_outcome = Some(candidate);
+                        break;
+                    }
+
+                    return Ok(candidate);
                 }
                 Err(terr) => {
                     saw_transient_failure = true;
@@ -730,6 +820,10 @@ pub async fn fetch_quota_once(
                 }
             }
         }
+    }
+
+    if let Some(partial) = partial_env_outcome {
+        return Ok(partial);
     }
 
     // Only mark `is_forbidden = true` when EVERY configured environment genuinely returned HTTP 403

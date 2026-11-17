@@ -2,7 +2,7 @@ use crate::domain::account::AccountRecord;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub const DEFAULT_QUOTA_MAX_AGE_SECS: i64 = 180;
+pub const DEFAULT_QUOTA_MAX_AGE_SECS: i64 = 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +32,9 @@ pub fn quota_pool(bucket_id: &str, group_name: &str) -> Option<QuotaPool> {
         "gemini-argon-wtu-weekly" => return Some(QuotaPool::Argon),
         _ => {}
     }
+    if id.starts_with("gemini-argon-") {
+        return Some(QuotaPool::Argon);
+    }
     if id.starts_with("gemini-") || id.starts_with("3p-") {
         return None;
     }
@@ -50,16 +53,32 @@ pub fn quota_pool(bucket_id: &str, group_name: &str) -> Option<QuotaPool> {
 pub fn model_quota_pool(name: &str, display_name: Option<&str>) -> Option<QuotaPool> {
     let lower = name.to_ascii_lowercase();
     if lower.starts_with("gemini") {
-        let argon = [name, display_name.unwrap_or("")].iter().any(|value| {
+        let words = |value: &str| {
             value
                 .split(|c: char| !c.is_ascii_alphanumeric())
-                .any(|word| word.eq_ignore_ascii_case("argon"))
-        });
-        Some(if argon {
-            QuotaPool::Argon
+                .filter(|w| !w.is_empty())
+                .map(|w| w.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        };
+        let labels: Vec<_> = [name, display_name.unwrap_or("")]
+            .iter()
+            .flat_map(|value| words(value))
+            .collect();
+        let has = |word: &str| labels.iter().any(|value| value == word);
+        if lower.starts_with("gemini-pro-orchestrator") {
+            return if has("argon") || lower.contains("g1-pro") {
+                Some(QuotaPool::Argon)
+            } else {
+                None
+            };
+        }
+        if has("carbon") || lower.starts_with("gemini-4-carbon") {
+            None
+        } else if has("argon") || lower.starts_with("gemini-4-argon") {
+            Some(QuotaPool::Argon)
         } else {
-            QuotaPool::Gemini
-        })
+            Some(QuotaPool::Gemini)
+        }
     } else if lower.starts_with("claude") || lower.starts_with("gpt") {
         Some(QuotaPool::ThirdParty)
     } else {
@@ -327,6 +346,12 @@ pub fn evaluate_single_model(q: &QuotaObservation, model: &str, now_unix: i64) -
         }
     }
 
+    if resolved.to_ascii_lowercase().ends_with("-disabled") {
+        return QuotaEval::Unknown {
+            reason: "model_disabled".into(),
+        };
+    }
+
     let Some(m) = q.models.iter().find(|m| m.name == resolved) else {
         return QuotaEval::Unknown {
             reason: "model_not_found".into(),
@@ -530,6 +555,20 @@ mod tests {
         assert_eq!(quota_group_label("Gemini 4 Argon"), "Gemini 4 Argon");
         assert_eq!(
             model_quota_pool("gemini-4-argon-high", None),
+            Some(QuotaPool::Argon)
+        );
+        assert_eq!(model_quota_pool("gemini-4-carbon-high", None), None);
+        assert_eq!(
+            model_quota_pool("gemini-4-hydrogen-xhigh", None),
+            Some(QuotaPool::Gemini)
+        );
+        assert_eq!(model_quota_pool("gemini-pro-orchestrator", None), None);
+        assert_eq!(
+            model_quota_pool("gemini-pro-orchestrator-argon", None),
+            Some(QuotaPool::Argon)
+        );
+        assert_eq!(
+            model_quota_pool("gemini-pro-orchestrator-g1-pro", None),
             Some(QuotaPool::Argon)
         );
         assert_eq!(

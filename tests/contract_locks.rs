@@ -264,7 +264,7 @@ fn readonly_commands_have_zero_filesystem_side_effects_and_zero_secret_or_ansi_l
     let absent_cache = env._tmp.path().join("absent_cache");
     for args in [
         vec!["accounts", "list", "--json"],
-        vec!["status", "--json"],
+        vec!["current", "--json"],
         vec!["quota", "--all", "--json"],
         vec!["policy", "show", "--json"],
         vec!["policy", "eval", "--json"],
@@ -330,8 +330,6 @@ fn readonly_commands_have_zero_filesystem_side_effects_and_zero_secret_or_ansi_l
         vec!["accounts", "list", "--json"],
         vec!["current"],
         vec!["current", "--json"],
-        vec!["status"],
-        vec!["status", "--json"],
         vec!["quota"],
         vec!["quota", "--json"],
         vec!["policy", "show"],
@@ -788,8 +786,8 @@ fn real_pty_tui_dashboard_renders_switches_slot_and_exits_cleanly_on_ctrl_c() {
         "TUI did not render dashboard frame"
     );
 
-    // Send '2' (row shortcut -> acc-2), 's' (switch to acc-2), then Ctrl+C (`\x03`) to quit!
-    master.write_all(b"2").unwrap();
+    // Send 'j' (move cursor down -> acc-2), 's' (switch to acc-2), then Ctrl+C (`\x03`) to quit!
+    master.write_all(b"j").unwrap();
     master.flush().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
     master.write_all(b"s").unwrap();
@@ -848,7 +846,7 @@ fn secret_service_backend_fails_cleanly_with_exit_8_in_isolated_dbus_free_env() 
     // Read-only `status` and `doctor` with `--backend secret-service` must succeed (exit code 0)
     // reporting `unverified` session identity without unlocking/mutating keyring or creating files!
     for ro_args in [
-        vec!["--backend", "secret-service", "--json", "status"],
+        vec!["--backend", "secret-service", "--json", "current"],
         vec!["--backend", "secret-service", "--json", "doctor"],
     ] {
         let ro_out = env.cli_cmd().args(&ro_args).output().unwrap();
@@ -1297,7 +1295,7 @@ GLib.MainLoop().run()
 
     // 1. Locked collection (`login_locked: true`): read-only `status` & `doctor` report `unverified`
     //    AND `unlock_calls` MUST remain strictly ZERO!
-    for ro_sub in ["status", "doctor"] {
+    for ro_sub in ["current", "doctor"] {
         let out = ss_cli().args(["--json", ro_sub]).output().unwrap();
         assert_eq!(out.status.code(), Some(0));
         let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -1336,8 +1334,8 @@ GLib.MainLoop().run()
         .unwrap()
         .contains("SECRET_REFRESH_TOKEN_acc-kr1"));
 
-    // Unlocked `status` now reports `matched` with ZERO additional `Unlock` calls!
-    let st_ok = ss_cli().args(["--json", "status"]).output().unwrap();
+    // Unlocked `current` now reports `matched` with ZERO additional `Unlock` calls!
+    let st_ok = ss_cli().args(["--json", "current"]).output().unwrap();
     assert_eq!(st_ok.status.code(), Some(0));
     let st_ok_j: serde_json::Value = serde_json::from_slice(&st_ok.stdout).unwrap();
     assert_eq!(st_ok_j["session_identity"]["state"], "matched");
@@ -1392,7 +1390,7 @@ GLib.MainLoop().run()
         r#"{"login_locked": false, "item_locked": true, "fail_create_from_call": -1}"#,
     )
     .unwrap();
-    let st_item_locked = ss_cli().args(["--json", "status"]).output().unwrap();
+    let st_item_locked = ss_cli().args(["--json", "current"]).output().unwrap();
     assert_eq!(st_item_locked.status.code(), Some(0));
     let st_il_j: serde_json::Value = serde_json::from_slice(&st_item_locked.stdout).unwrap();
     assert_eq!(st_il_j["session_identity"]["state"], "unverified");
@@ -1470,4 +1468,522 @@ GLib.MainLoop().run()
     );
     let rb_err_j: serde_json::Value = serde_json::from_slice(&sw_rb_fail.stderr).unwrap();
     assert_eq!(rb_err_j["error_code"], "recovery_incomplete");
+}
+
+#[test]
+fn synthetic_human_timestamps_session_id_strip_and_pty_tui_batch_shortcuts_work_end_to_end() {
+    use agy_switch_cli::cli::dto::{format_rfc3339_local_minute, format_unix_local_minute};
+    use agy_switch_cli::domain::account::{PendingAuthFlow, PendingAuthRecord};
+
+    let env = IsolatedEnv::new();
+    env.init_agy_slot_dir();
+    let now = chrono::Utc::now().timestamp();
+    let repo = StoreRepository::new(env.paths());
+
+    let mut acc1 = sample_account("acc-ts-1", "alice@example.invalid", now);
+    acc1.quota.as_mut().unwrap().quota_groups = Some(vec![
+        QuotaGroup {
+            display_name: "Gemini Models".into(),
+            description: None,
+            buckets: vec![
+                QuotaBucket {
+                    bucket_id: "gemini-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: 1.0,
+                    remaining_fraction_known: Some(true),
+                    reset_time: "2099-11-17T08:30:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+                QuotaBucket {
+                    bucket_id: "gemini-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: 0.75,
+                    remaining_fraction_known: Some(true),
+                    reset_time: "2099-11-23T14:45:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        },
+        QuotaGroup {
+            display_name: "Claude and GPT models".into(),
+            description: None,
+            buckets: vec![
+                QuotaBucket {
+                    bucket_id: "3p-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: 0.95,
+                    remaining_fraction_known: Some(true),
+                    reset_time: "2099-11-17T08:30:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+                QuotaBucket {
+                    bucket_id: "3p-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: 0.40,
+                    remaining_fraction_known: Some(true),
+                    reset_time: "2099-11-23T14:45:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        },
+    ]);
+    let mut acc2 = sample_account("acc-ts-2", "bob@example.invalid", now);
+    acc2.quota.as_mut().unwrap().subscription_tier = Some("Free Tier".into());
+
+    let pending_created_at = 1_794_882_360i64;
+    let pending_rec = PendingAuthRecord {
+        schema_version: 1,
+        id: "pend-ts-1".into(),
+        flow: PendingAuthFlow::Login,
+        token: acc2.token.clone(),
+        auth_seq: 2,
+        email_mismatch: false,
+        input_rt_digest: None,
+        custom_label: None,
+        created_at: pending_created_at,
+    };
+
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc1.clone(), true, now)?;
+        tx.upsert_account(acc2.clone(), false, now)?;
+        tx.save_pending_auth(&pending_rec)?;
+        Ok(())
+    })
+    .unwrap();
+
+    let payload_str = serialize_session_payload(&acc1.token).unwrap();
+    FileSessionBackend
+        .write_slot(&env.paths(), &payload_str)
+        .unwrap();
+
+    // Official `agy` slot file keeps exact RFC3339 microsecond UTC string!
+    let slot_json: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
+    let raw_expiry = slot_json["token"]["expiry"].as_str().unwrap();
+    assert!(raw_expiry.ends_with('Z') && raw_expiry.contains('T'));
+    let expected_exp_local = format_rfc3339_local_minute(raw_expiry);
+
+    // 1. `current` human vs `--json`: human removes internal ID and shows `YYYY-MM-DD HH:MM`, `--json` keeps both!
+    let cur_human = env.cli_cmd().arg("current").output().unwrap();
+    assert_eq!(cur_human.status.code(), Some(0));
+    let cur_txt = String::from_utf8_lossy(&cur_human.stdout);
+    let slot_line = cur_txt
+        .lines()
+        .find(|l| l.starts_with("Active agy slot"))
+        .unwrap();
+    assert_eq!(
+        slot_line,
+        format!("Active agy slot  : matched (alice@example.invalid, expires {expected_exp_local})")
+    );
+    assert!(!slot_line.contains("acc-ts-1"));
+
+    let cur_json_out = env.cli_cmd().args(["--json", "current"]).output().unwrap();
+    let cur_json: serde_json::Value = serde_json::from_slice(&cur_json_out.stdout).unwrap();
+    assert_eq!(cur_json["session_identity"]["account_id"], "acc-ts-1");
+    assert_eq!(cur_json["session_identity"]["expiry"], raw_expiry);
+
+    // 2. `doctor` human output similarly omits internal ID on `Session identity:` and formats `YYYY-MM-DD HH:MM`.
+    let doc_human = env.cli_cmd().arg("doctor").output().unwrap();
+    assert_eq!(doc_human.status.code(), Some(0));
+    let doc_txt = String::from_utf8_lossy(&doc_human.stdout);
+    assert!(doc_txt.contains(&format!(
+        "Session identity:  matched (alice@example.invalid, expires {expected_exp_local})"
+    )));
+
+    // 3. `quota` human output formats `Resets (Local)` with 4-digit year `YYYY-MM-DD HH:MM` while `--json` keeps RFC3339.
+    let q_human = env.cli_cmd().arg("quota").output().unwrap();
+    assert_eq!(q_human.status.code(), Some(0));
+    let q_txt = String::from_utf8_lossy(&q_human.stdout);
+    let expected_reset = format_rfc3339_local_minute("2099-11-23T14:45:00Z");
+    assert!(
+        q_txt.contains(&expected_reset),
+        "Expected {expected_reset} in quota output:\n{q_txt}"
+    );
+    let q_json_out = env.cli_cmd().args(["--json", "quota"]).output().unwrap();
+    let q_json: serde_json::Value = serde_json::from_slice(&q_json_out.stdout).unwrap();
+    assert_eq!(
+        q_json["quota"]["quota_groups"][0]["buckets"][1]["reset_time"],
+        "2099-11-23T14:45:00Z"
+    );
+
+    // 4. `auth pending` human list formats `created_at=YYYY-MM-DD HH:MM` while `--json` preserves integer `created_at`.
+    let pend_human = env.cli_cmd().args(["auth", "pending"]).output().unwrap();
+    assert_eq!(pend_human.status.code(), Some(0));
+    let pend_txt = String::from_utf8_lossy(&pend_human.stdout);
+    let expected_created = format_unix_local_minute(pending_created_at);
+    assert!(
+        pend_txt.contains(&format!("created_at={expected_created}")),
+        "Expected formatted created_at={expected_created}, got: {pend_txt}"
+    );
+    let pend_json_out = env
+        .cli_cmd()
+        .args(["--json", "auth", "pending"])
+        .output()
+        .unwrap();
+    let pend_json: serde_json::Value = serde_json::from_slice(&pend_json_out.stdout).unwrap();
+    assert_eq!(
+        pend_json["pending_auth"][0]["created_at"],
+        pending_created_at
+    );
+
+    // 5. Real PTY TUI end-to-end verification (`C` add all / clear+disable, `cand #2 (skip)`, `5h / W`, `Plan` short, `R` + `SIGTERM`)!
+    #[cfg(feature = "tui")]
+    {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::process::CommandExt;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+
+        let win = libc::winsize {
+            ws_row: 24,
+            ws_col: 136,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let mut master_fd: libc::c_int = -1;
+        let mut slave_fd: libc::c_int = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &win,
+                )
+            },
+            0
+        );
+        let slave_out_fd = unsafe { libc::dup(slave_fd) };
+        let inspect_fd = unsafe { libc::dup(slave_fd) };
+        let slave_in = unsafe { fs::File::from_raw_fd(slave_fd) };
+        let slave_out = unsafe { fs::File::from_raw_fd(slave_out_fd) };
+        let inspect_slave = unsafe { fs::File::from_raw_fd(inspect_fd) };
+        let mut master = unsafe { fs::File::from_raw_fd(master_fd) };
+
+        let mut cmd1 = env.cli_cmd();
+        cmd1.arg("tui")
+            .stdin(Stdio::from(slave_in))
+            .stdout(Stdio::from(slave_out))
+            .stderr(Stdio::piped());
+        unsafe {
+            cmd1.pre_exec(|| {
+                libc::setsid();
+                let _ = libc::ioctl(0, libc::TIOCSCTTY, 0);
+                Ok(())
+            });
+        }
+        let mut child = cmd1.spawn().unwrap();
+
+        unsafe {
+            let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
+            let _ = libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        let drain = |m: &mut fs::File, buf: &mut Vec<u8>| {
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = m.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        };
+
+        let mut screen = Vec::new();
+        for _ in 0..50 {
+            drain(&mut master, &mut screen);
+            if String::from_utf8_lossy(&screen).contains("Gemini (5h / W)") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let initial_txt = String::from_utf8_lossy(&screen).into_owned();
+        assert!(initial_txt.contains("Gemini (5h / W)"));
+        assert!(initial_txt.contains("Claude/GPT (5h / W)"));
+        assert!(initial_txt.contains(&format!(
+            "matched (alice@example.invalid, expires {expected_exp_local})"
+        )));
+        assert!(!initial_txt.contains("Google AI"));
+        assert!(initial_txt.contains("r/R refresh | c/C cand"));
+
+        // Press 'C' -> adds both enabled accounts (`acc-ts-1`, `acc-ts-2`) in list order; then 'p' -> enables policy!
+        master.write_all(b"Cp").unwrap();
+        master.flush().unwrap();
+        for _ in 0..40 {
+            if repo.read_policy().unwrap().enabled {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pol_after_cp = repo.read_policy().unwrap();
+        assert!(pol_after_cp.enabled);
+        assert_eq!(
+            pol_after_cp.candidate_account_ids,
+            vec!["acc-ts-1".to_string(), "acc-ts-2".to_string()]
+        );
+
+        // Press 'j' then 'd' to disable `acc-ts-2` -> TUI renders `cand #2 (skip)`!
+        screen.clear();
+        master.write_all(b"jd").unwrap();
+        master.flush().unwrap();
+        for _ in 0..50 {
+            drain(&mut master, &mut screen);
+            if String::from_utf8_lossy(&screen).contains("cand #2 (skip)") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            String::from_utf8_lossy(&screen).contains("cand #2 (skip)"),
+            "Expected `cand #2 (skip)` after disabling candidate #2"
+        );
+
+        // Re-enable `acc-ts-2` ('e'), then press 'C' when all enabled accounts are already in pool -> clears pool & disables policy!
+        master.write_all(b"eC").unwrap();
+        master.flush().unwrap();
+        for _ in 0..50 {
+            let p = repo.read_policy().unwrap();
+            if p.candidate_account_ids.is_empty() && !p.enabled {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pol_cleared = repo.read_policy().unwrap();
+        assert!(pol_cleared.candidate_account_ids.is_empty());
+        assert!(!pol_cleared.enabled);
+
+        // Boundary check: disable BOTH accounts ('dkd'), then press 'R' and 'C' -> clean status notices with 0 network calls!
+        screen.clear();
+        master.write_all(b"dkdR").unwrap();
+        master.flush().unwrap();
+        for _ in 0..50 {
+            drain(&mut master, &mut screen);
+            if String::from_utf8_lossy(&screen).contains("No enabled accounts to refresh.") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(String::from_utf8_lossy(&screen).contains("No enabled accounts to refresh."));
+
+        screen.clear();
+        master.write_all(b"C").unwrap();
+        master.flush().unwrap();
+        for _ in 0..50 {
+            drain(&mut master, &mut screen);
+            if String::from_utf8_lossy(&screen)
+                .contains("No enabled accounts available to add as policy candidates.")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(String::from_utf8_lossy(&screen)
+            .contains("No enabled accounts available to add as policy candidates."));
+
+        // Re-enable both accounts ('eje') and quit cleanly with 'q'
+        master.write_all(b"ejeq").unwrap();
+        master.flush().unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(0));
+        let mut post_q: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(inspect_slave.as_raw_fd(), &mut post_q) },
+            0
+        );
+        assert_ne!(post_q.c_lflag & libc::ECHO, 0);
+
+        // 6. Launch TUI pointed at a local hanging proxy, press 'R' (batch refresh), verify bottom-bar progress
+        //    AND verify `SIGTERM` interrupts batch refresh cleanly and restores PTY `ECHO`!
+        let hold_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = hold_listener.local_addr().unwrap().port();
+        let proxy_hit = Arc::new(AtomicBool::new(false));
+        let proxy_hit_bg = proxy_hit.clone();
+        let _proxy_thread = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = hold_listener.accept() {
+                proxy_hit_bg.store(true, Ordering::SeqCst);
+                held.push(sock);
+            }
+        });
+
+        let mut master2_fd: libc::c_int = -1;
+        let mut slave2_fd: libc::c_int = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master2_fd,
+                    &mut slave2_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &win,
+                )
+            },
+            0
+        );
+        let slave2_out_fd = unsafe { libc::dup(slave2_fd) };
+        let inspect2_fd = unsafe { libc::dup(slave2_fd) };
+        let slave2_in = unsafe { fs::File::from_raw_fd(slave2_fd) };
+        let slave2_out = unsafe { fs::File::from_raw_fd(slave2_out_fd) };
+        let inspect2_slave = unsafe { fs::File::from_raw_fd(inspect2_fd) };
+        let mut master2 = unsafe { fs::File::from_raw_fd(master2_fd) };
+
+        let mut cmd2 = env.cli_cmd();
+        cmd2.env_remove("NO_PROXY")
+            .env_remove("AGY_SWITCH_CLI_PROXY")
+            .args(["--proxy", &format!("http://127.0.0.1:{proxy_port}"), "tui"])
+            .stdin(Stdio::from(slave2_in))
+            .stdout(Stdio::from(slave2_out))
+            .stderr(Stdio::piped());
+        unsafe {
+            cmd2.pre_exec(|| {
+                libc::setsid();
+                let _ = libc::ioctl(0, libc::TIOCSCTTY, 0);
+                Ok(())
+            });
+        }
+        let mut child2 = cmd2.spawn().unwrap();
+        unsafe {
+            let flags = libc::fcntl(master2.as_raw_fd(), libc::F_GETFL);
+            let _ = libc::fcntl(master2.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        let mut screen2 = Vec::new();
+        for _ in 0..50 {
+            drain(&mut master2, &mut screen2);
+            if String::from_utf8_lossy(&screen2).contains("Headless SSH Dashboard") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        screen2.clear();
+        master2.write_all(b"R").unwrap();
+        master2.flush().unwrap();
+        for _ in 0..60 {
+            drain(&mut master2, &mut screen2);
+            if proxy_hit.load(Ordering::SeqCst)
+                && String::from_utf8_lossy(&screen2).contains("Refreshing 2 enabled account(s)")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            String::from_utf8_lossy(&screen2).contains("Refreshing 2 enabled account(s)"),
+            "Expected real-time bottom-bar batch refresh status on 'R'"
+        );
+        assert!(
+            proxy_hit.load(Ordering::SeqCst),
+            "Expected 'R' to initiate bounded network refresh against local mock proxy"
+        );
+
+        unsafe {
+            libc::kill(child2.id() as i32, libc::SIGTERM);
+        }
+        let st2 = child2.wait().unwrap();
+        assert_eq!(st2.code(), Some(0));
+
+        let mut post2: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(inspect2_slave.as_raw_fd(), &mut post2) },
+            0
+        );
+        assert_ne!(
+            post2.c_lflag & libc::ECHO,
+            0,
+            "SIGTERM during 'R' batch refresh MUST restore PTY ECHO!"
+        );
+
+        // 7. Also verify raw-mode keyboard Ctrl+C (`\x03` on PTY master, where `ISIG` is disabled)
+        //    immediately aborts in-flight 'R' batch refresh, exits 0, and restores PTY `ECHO`!
+        proxy_hit.store(false, Ordering::SeqCst);
+        let mut master3_fd: libc::c_int = -1;
+        let mut slave3_fd: libc::c_int = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master3_fd,
+                    &mut slave3_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &win,
+                )
+            },
+            0
+        );
+        let slave3_out_fd = unsafe { libc::dup(slave3_fd) };
+        let inspect3_fd = unsafe { libc::dup(slave3_fd) };
+        let slave3_in = unsafe { fs::File::from_raw_fd(slave3_fd) };
+        let slave3_out = unsafe { fs::File::from_raw_fd(slave3_out_fd) };
+        let inspect3_slave = unsafe { fs::File::from_raw_fd(inspect3_fd) };
+        let mut master3 = unsafe { fs::File::from_raw_fd(master3_fd) };
+
+        let mut cmd3 = env.cli_cmd();
+        cmd3.env_remove("NO_PROXY")
+            .env_remove("AGY_SWITCH_CLI_PROXY")
+            .args(["--proxy", &format!("http://127.0.0.1:{proxy_port}"), "tui"])
+            .stdin(Stdio::from(slave3_in))
+            .stdout(Stdio::from(slave3_out))
+            .stderr(Stdio::piped());
+        unsafe {
+            cmd3.pre_exec(|| {
+                libc::setsid();
+                let _ = libc::ioctl(0, libc::TIOCSCTTY, 0);
+                Ok(())
+            });
+        }
+        let mut child3 = cmd3.spawn().unwrap();
+        unsafe {
+            let flags = libc::fcntl(master3.as_raw_fd(), libc::F_GETFL);
+            let _ = libc::fcntl(master3.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        let mut screen3 = Vec::new();
+        for _ in 0..50 {
+            drain(&mut master3, &mut screen3);
+            if String::from_utf8_lossy(&screen3).contains("Headless SSH Dashboard") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        screen3.clear();
+        master3.write_all(b"R").unwrap();
+        master3.flush().unwrap();
+        for _ in 0..60 {
+            drain(&mut master3, &mut screen3);
+            if proxy_hit.load(Ordering::SeqCst)
+                && String::from_utf8_lossy(&screen3).contains("Refreshing 2 enabled account(s)")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(proxy_hit.load(Ordering::SeqCst));
+
+        // Send raw `\x03` (`Ctrl+C`) over PTY master (no external `kill` signal!)
+        master3.write_all(b"\x03").unwrap();
+        master3.flush().unwrap();
+        let st3 = child3.wait().unwrap();
+        assert_eq!(st3.code(), Some(0));
+
+        let mut post3: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(inspect3_slave.as_raw_fd(), &mut post3) },
+            0
+        );
+        assert_ne!(
+            post3.c_lflag & libc::ECHO,
+            0,
+            "Raw-mode Ctrl+C (`\\x03`) during 'R' batch refresh MUST restore PTY ECHO!"
+        );
+    }
 }

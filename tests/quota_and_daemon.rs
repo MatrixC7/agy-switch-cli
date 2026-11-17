@@ -1429,7 +1429,7 @@ async fn quota_and_quota_all_respect_policy_monitored_model_and_render_four_stat
         now,
     );
     acc_stale.quota = Some(build_quota(
-        now - 1000,
+        now - DEFAULT_QUOTA_MAX_AGE_SECS - 120,
         Some("Google AI Pro"),
         0.50,
         0.50,
@@ -1469,17 +1469,21 @@ async fn quota_and_quota_all_respect_policy_monitored_model_and_render_four_stat
     let out_argon = cli().arg("quota").output().unwrap();
     assert_eq!(out_argon.status.code(), Some(4));
 
-    // `quota --all` human text output MUST show four-state `Status: unknown (..., model=argon)` and `Status: stale (..., model=argon)`!
+    // `quota --all` human text output MUST show four-state `Status  : unknown (..., model=argon)` and `Status  : stale (..., model=argon)`!
     let out_all_argon = cli().args(["quota", "--all"]).output().unwrap();
     assert_eq!(out_all_argon.status.code(), Some(0));
     let txt_all = String::from_utf8_lossy(&out_all_argon.stdout);
     assert!(
-        txt_all.contains("Status: unknown (unknown_pool, model=argon)"),
+        txt_all.contains("Status  : unknown (unknown_pool, model=argon)"),
         "Missing unknown status in quota --all output: {txt_all}"
     );
     assert!(
-        txt_all.contains("Status: stale (stale_quota, model=argon)"),
+        txt_all.contains("Status  : stale (stale_quota, model=argon)"),
         "Missing stale status in quota --all output: {txt_all}"
+    );
+    assert!(
+        !txt_all.contains("gemini-3.8-flash"),
+        "Default quota output must suppress per-model dump: {txt_all}"
     );
 
     // 2. Switch `policy.monitored_model` to `"gemini"` -> `quota` now evaluates Gemini -> Known (80%) -> exit code 0!
@@ -1492,7 +1496,120 @@ async fn quota_and_quota_all_respect_policy_monitored_model_and_render_four_stat
     let out_gem = cli().arg("quota").output().unwrap();
     assert_eq!(out_gem.status.code(), Some(0));
     let txt_gem = String::from_utf8_lossy(&out_gem.stdout);
-    assert!(txt_gem.contains("Status: known (80.0% effective on gemini)"));
+    assert!(txt_gem.contains("Status  : known (80.0% effective on gemini)"));
+    assert!(!txt_gem.contains("gemini-3.8-flash"));
+
+    // 3. Stale cached quota in human mode STILL displays the cached quota table cleanly (with `-r` hint),
+    //    while `--json` preserves strict exit code 4 for machine callers!
+    let out_stale_human = cli()
+        .args(["quota", "stale@example.invalid"])
+        .output()
+        .unwrap();
+    assert_eq!(out_stale_human.status.code(), Some(0));
+    let txt_stale_human = String::from_utf8_lossy(&out_stale_human.stdout);
+    assert!(txt_stale_human.contains("Account : stale@example.invalid"));
+    assert!(txt_stale_human.contains("add -r to refresh"));
+
+    let out_stale_json = cli()
+        .args(["--json", "quota", "stale@example.invalid"])
+        .output()
+        .unwrap();
+    assert_eq!(out_stale_json.status.code(), Some(4));
+
+    // 4. `current` displays supported models, `accounts list --move <EMAIL> --to 1` reorders cleanly,
+    //    and `policy set --all-candidates` selects all enabled accounts in list order!
+    let out_current = cli().arg("current").output().unwrap();
+    assert_eq!(out_current.status.code(), Some(0));
+    let txt_current = String::from_utf8_lossy(&out_current.stdout);
+    assert!(txt_current.contains("Supported models : 1 available (cached)"));
+    assert!(txt_current.contains("gemini-3.8-flash"));
+
+    let out_move = cli()
+        .args([
+            "accounts",
+            "list",
+            "--move",
+            "stale@example.invalid",
+            "--to",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out_move.status.code(), Some(0));
+    let out_list = cli().args(["accounts", "list"]).output().unwrap();
+    let txt_list = String::from_utf8_lossy(&out_list.stdout);
+    assert!(txt_list
+        .lines()
+        .next()
+        .unwrap()
+        .contains("stale@example.invalid"));
+
+    let out_all_cands = cli()
+        .args(["policy", "set", "--all-candidates", "--enabled", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(out_all_cands.status.code(), Some(0));
+    let pol_after = repo.read_policy().unwrap();
+    assert!(pol_after.enabled);
+    assert_eq!(
+        pol_after.candidate_account_ids,
+        vec!["acc-stale".to_string(), "acc-gem".to_string()]
+    );
+
+    // 5. CLI account selectors strictly require `<ID|EMAIL>` (rejecting positional indices like `1` or `2` with exit code 3).
+    let out_q_email = cli()
+        .args(["quota", "gem@example.invalid"])
+        .output()
+        .unwrap();
+    assert_eq!(out_q_email.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out_q_email.stdout).contains("gem@example.invalid"));
+
+    let out_q_idx_rejected = cli().args(["quota", "2"]).output().unwrap();
+    assert_eq!(out_q_idx_rejected.status.code(), Some(3));
+
+    fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+    fs::create_dir_all(proc_dir.join("1")).unwrap();
+    fs::write(
+        proc_dir.join("1/stat"),
+        "1 (systemd) S 0 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 100 1000 10\n",
+    )
+    .unwrap();
+    repo.with_write_lock(|tx| {
+        for id in ["acc-stale", "acc-gem"] {
+            let mut a = repo.read_account_unchecked(id).unwrap();
+            a.token.oauth_client_key = None;
+            tx.save_account(&a)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    let out_sw_idx_rejected = cli().args(["switch", "1", "--dry-run"]).output().unwrap();
+    assert_eq!(out_sw_idx_rejected.status.code(), Some(3));
+
+    let out_sw_live = cli()
+        .args(["switch", "stale@example.invalid"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out_sw_live.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out_sw_live.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out_sw_live.stdout).contains("stale@example.invalid"));
+
+    let out_sw_dry = cli()
+        .args(["switch", "acc-gem", "--dry-run"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out_sw_dry.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out_sw_dry.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out_sw_dry.stdout).contains("gem@example.invalid"));
 }
 
 #[tokio::test]
@@ -1718,4 +1835,312 @@ async fn managed_run_rejects_disabled_or_unscoped_synced_slot_and_daemon_stage5_
             .unwrap()
             .paused_on_failure
     );
+}
+
+#[tokio::test]
+async fn synthetic_immediate_mode_overwrites_slot_with_running_agy_fails_closed_on_unverified_proc_and_rejects_stop(
+) {
+    let _guard = PROC_ENV_MUTEX.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    let cache = tmp.path().join("cache");
+    let run_dir = tmp.path().join("run");
+    let fake_proc = tmp.path().join("proc_imm");
+    fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::create_dir_all(&fake_proc).unwrap();
+    let _proc_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc);
+
+    let now = 1_800_100_000i64;
+    let paths = HeadlessPaths::with_explicit(home.clone(), data.clone(), cache.clone());
+    let repo = StoreRepository::new(paths.clone());
+    let backend = FileSessionBackend;
+
+    // 1. Default policy is `Immediate` + `RoundRobin`.
+    let default_pol = SwitchPolicy::default();
+    assert_eq!(default_pol.mode, PolicyMode::Immediate);
+    assert_eq!(default_pol.strategy, PolicyStrategy::RoundRobin);
+
+    let make_acc = |id: &str, pct: f64| -> AccountRecord {
+        let mut a = AccountRecord::new(
+            id.into(),
+            format!("{id}@example.invalid"),
+            TokenRecord {
+                access_token: format!("ya29.{id}"),
+                refresh_token: format!("1//RT_{id}"),
+                expires_in: 7200,
+                expiry_timestamp: now + 7200,
+                token_type: "Bearer".into(),
+                id_token: None,
+                oauth_client_key: Some("antigravity_enterprise".into()),
+                granted_scopes: None,
+                project_id: None,
+                is_gcp_tos: true,
+            },
+            now,
+        );
+        a.quota = Some(build_quota(
+            now,
+            Some("Google AI Pro"),
+            pct,
+            pct,
+            Some(pct),
+            "2099-01-01T00:00:00Z",
+        ));
+        a
+    };
+
+    let acc1 = make_acc("acc-imm-1", 0.05);
+    let acc2 = make_acc("acc-imm-2", 0.80);
+    let acc3 = make_acc("acc-imm-3", 0.90);
+
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc1.clone(), true, now)?;
+        tx.upsert_account(acc2.clone(), false, now)?;
+        tx.upsert_account(acc3.clone(), false, now)?;
+        let mut pol = SwitchPolicy {
+            enabled: true,
+            monitored_model: "gemini".into(),
+            candidate_account_ids: vec!["acc-imm-1".into(), "acc-imm-2".into(), "acc-imm-3".into()],
+            ..SwitchPolicy::default()
+        };
+        tx.save_policy(&mut pol, None, now)?;
+        Ok(())
+    })
+    .unwrap();
+    backend
+        .write_slot(&paths, &serialize_session_payload(&acc1.token).unwrap())
+        .unwrap();
+
+    // 2. Simulate an active `agy` process in `/proc`: under default `PolicyMode::Immediate`,
+    //    daemon does NOT kill the process and IMMEDIATELY updates the credential slot to `acc-imm-2`!
+    let my_uid = unsafe { libc::geteuid() };
+    let _ = my_uid; // fake_proc dir entry created by current test process already has current UID!
+    fs::create_dir_all(fake_proc.join("6101")).unwrap();
+    fs::write(
+        fake_proc.join("6101/stat"),
+        "6101 (agy) S 1 6101 6101 0 -1 0 0 0 0 0 1 1 0 0 20 0 1 0 888111 1000 10",
+    )
+    .unwrap();
+    fs::write(fake_proc.join("6101/comm"), "agy\n").unwrap();
+
+    let mut engine = DaemonEngine::new();
+    let overrides = DaemonConfigOverrides {
+        cooldown_secs: 10,
+        ..DaemonConfigOverrides::default()
+    };
+    let reg = OAuthClientRegistry::parse_from_raw(None, None);
+
+    let t1 = engine
+        .run_single_tick(
+            &repo,
+            &backend,
+            &MockTransport::default(),
+            &OAuthEndpoints::default(),
+            &CloudCodeEndpoints::default(),
+            &reg,
+            "antigravity/hub/1.5.7 (os_type=linux; arch=amd64)",
+            &overrides,
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        t1,
+        TickStageOutcome::CommittedSwitch {
+            source_id: "acc-imm-1".into(),
+            target_id: "acc-imm-2".into(),
+        }
+    );
+    let slot_after_t1 = fs::read_to_string(&paths.active_slot_file).unwrap();
+    assert!(slot_after_t1.contains("1//RT_acc-imm-2"));
+
+    // 3. Default `RoundRobin` strategy: after cooldown, if `acc-imm-2` drops to 5% and `acc-imm-1` recovers to 95%,
+    //    next tick rotates forward to `acc-imm-3` rather than jumping back to #1 (`acc-imm-1`)!
+    repo.with_write_lock(|tx| {
+        let mut a1 = tx.load_account_opt("acc-imm-1")?.unwrap();
+        a1.quota = Some(build_quota(
+            now + 20,
+            Some("Google AI Pro"),
+            0.95,
+            0.95,
+            Some(0.95),
+            "2099-01-01T00:00:00Z",
+        ));
+        tx.save_account(&a1)?;
+        let mut a2 = tx.load_account_opt("acc-imm-2")?.unwrap();
+        a2.quota = Some(build_quota(
+            now + 20,
+            Some("Google AI Pro"),
+            0.05,
+            0.05,
+            Some(0.05),
+            "2099-01-01T00:00:00Z",
+        ));
+        tx.save_account(&a2)
+    })
+    .unwrap();
+
+    let t2 = engine
+        .run_single_tick(
+            &repo,
+            &backend,
+            &MockTransport::default(),
+            &OAuthEndpoints::default(),
+            &CloudCodeEndpoints::default(),
+            &reg,
+            "antigravity/hub/1.5.7 (os_type=linux; arch=amd64)",
+            &overrides,
+            now + 20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        t2,
+        TickStageOutcome::CommittedSwitch {
+            source_id: "acc-imm-2".into(),
+            target_id: "acc-imm-3".into(),
+        }
+    );
+
+    // 4. Fail-closed on `RuntimeState::Unverified` even in `PolicyMode::Immediate` (both Stage 4 AND Stage 5)!
+    repo.with_write_lock(|tx| {
+        let mut a3 = tx.load_account_opt("acc-imm-3")?.unwrap();
+        a3.quota = Some(build_quota(
+            now + 40,
+            Some("Google AI Pro"),
+            0.05,
+            0.05,
+            Some(0.05),
+            "2099-01-01T00:00:00Z",
+        ));
+        tx.save_account(&a3)
+    })
+    .unwrap();
+
+    // 4a: Stage 4 `/proc` missing -> `UncertainHold` without blind-writing slot!
+    let missing_proc = tmp.path().join("nonexistent_proc_dir");
+    {
+        let _unver_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &missing_proc);
+        let t_unver_s4 = engine
+            .run_single_tick(
+                &repo,
+                &backend,
+                &MockTransport::default(),
+                &OAuthEndpoints::default(),
+                &CloudCodeEndpoints::default(),
+                &reg,
+                "antigravity/hub/1.5.7 (os_type=linux; arch=amd64)",
+                &overrides,
+                now + 40,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(t_unver_s4, TickStageOutcome::UncertainHold { ref reason } if reason.contains("process_state_unverified")),
+            "Immediate mode must fail closed on Stage 4 Unverified /proc, got {t_unver_s4:?}"
+        );
+    }
+    assert!(fs::read_to_string(&paths.active_slot_file)
+        .unwrap()
+        .contains("1//RT_acc-imm-3"));
+
+    // 4b: Stage 4 sees readable `/proc`, then `/proc` becomes unreadable right before Stage 5 `Revalidate`!
+    let proc_s5 = tmp.path().join("proc_stage5_race");
+    fs::create_dir_all(&proc_s5).unwrap();
+    {
+        let _s5_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &proc_s5);
+        let proc_s5_hook = proc_s5.clone();
+        engine.before_revalidate_hook = Some(Arc::new(move || {
+            fs::remove_dir_all(&proc_s5_hook).unwrap();
+        }));
+        let t_unver_s5 = engine
+            .run_single_tick(
+                &repo,
+                &backend,
+                &MockTransport::default(),
+                &OAuthEndpoints::default(),
+                &CloudCodeEndpoints::default(),
+                &reg,
+                "antigravity/hub/1.5.7 (os_type=linux; arch=amd64)",
+                &overrides,
+                now + 41,
+            )
+            .await
+            .unwrap();
+        engine.before_revalidate_hook = None;
+        assert!(
+            matches!(t_unver_s5, TickStageOutcome::UncertainHold { ref reason } if reason.contains("process_state_unverified")),
+            "Immediate mode must fail closed on Stage 5 Unverified /proc, got {t_unver_s5:?}"
+        );
+    }
+    assert_eq!(
+        read_daemon_state_readonly(&paths)
+            .unwrap()
+            .consecutive_commit_failures,
+        0
+    );
+    assert!(fs::read_to_string(&paths.active_slot_file)
+        .unwrap()
+        .contains("1//RT_acc-imm-3"));
+
+    // 5. CLI & env & JSON completely reject removed `stop` mode!
+    let cli = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"));
+        c.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_RUNTIME_DIR", &run_dir)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}/no-dbus", run_dir.display()),
+            )
+            .env("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc)
+            .args(["--data-dir", data.to_str().unwrap(), "--no-remote-version"]);
+        c
+    };
+
+    let bad_cli_mode = cli()
+        .args(["policy", "set", "--mode", "stop"])
+        .output()
+        .unwrap();
+    assert_eq!(bad_cli_mode.status.code(), Some(2));
+    let bad_stderr = String::from_utf8_lossy(&bad_cli_mode.stderr);
+    assert!(bad_stderr.contains("immediate") && bad_stderr.contains("wait"));
+    assert!(!bad_stderr.contains("possible values: stop"));
+
+    let bad_daemon_flag = cli()
+        .args(["daemon", "--once", "--mode", "stop"])
+        .output()
+        .unwrap();
+    assert_eq!(bad_daemon_flag.status.code(), Some(2));
+
+    let bad_daemon_env = cli()
+        .env("AGY_SWITCH_CLI_MODE", "stop")
+        .args(["daemon", "--once"])
+        .output()
+        .unwrap();
+    assert_eq!(bad_daemon_env.status.code(), Some(2));
+
+    let ok_set_wait = cli()
+        .args(["policy", "set", "--mode", "wait"])
+        .output()
+        .unwrap();
+    assert_eq!(ok_set_wait.status.code(), Some(0));
+    let ok_set_imm = cli()
+        .args(["policy", "set", "--mode", "immediate"])
+        .output()
+        .unwrap();
+    assert_eq!(ok_set_imm.status.code(), Some(0));
+
+    // Hand-written `policy.json` with `"mode": "stop"` fails closed with exit 1!
+    fs::write(
+        paths.policy_file(),
+        r#"{"schema_version":1,"revision":9,"enabled":false,"mode":"stop","strategy":"round_robin","reserve_percentage":10,"candidate_min_percentage":30,"monitored_model":"all","candidate_account_ids":[],"updated_at":100}"#,
+    )
+    .unwrap();
+    let bad_disk_pol = cli().args(["policy", "show"]).output().unwrap();
+    assert_eq!(bad_disk_pol.status.code(), Some(1));
 }

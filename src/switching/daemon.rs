@@ -19,7 +19,7 @@ use crate::store::fs_atomic::{
 };
 use crate::store::locks::{ActiveSlotLock, DaemonInstanceLock};
 use crate::store::repository::StoreRepository;
-use crate::switching::executor::execute_switch_with_slot_lock;
+use crate::switching::executor::{execute_switch_with_slot_lock_and_guard, RunningGuardMode};
 use crate::switching::runner::ordered_candidate_ids;
 use crate::transport::client::{BoxFuture, HttpTransport};
 use rand::Rng;
@@ -30,8 +30,8 @@ use std::task::Poll;
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
 
-pub const DEFAULT_DAEMON_INTERVAL_SECS: u64 = 60;
-pub const DEFAULT_DAEMON_COOLDOWN_SECS: i64 = 300;
+pub const DEFAULT_DAEMON_INTERVAL_SECS: u64 = 3600;
+pub const DEFAULT_DAEMON_COOLDOWN_SECS: i64 = 3600;
 pub const DEFAULT_TICK_HARD_TIMEOUT: Duration = Duration::from_secs(45);
 pub const MAX_CONSECUTIVE_COMMIT_FAILURES: u32 = 3;
 pub const CANDIDATE_REFRESH_BACKOFF_SECS: i64 = 300;
@@ -221,11 +221,11 @@ pub fn resolve_effective_daemon_policy(
     // 1. Environment variable layer (`AGY_SWITCH_CLI_*`) — never echo raw env values on error!
     if let Some(raw_mode) = non_empty_env("AGY_SWITCH_CLI_MODE") {
         policy.mode = match raw_mode.to_ascii_lowercase().as_str() {
+            "immediate" => PolicyMode::Immediate,
             "wait" => PolicyMode::Wait,
-            "stop" => PolicyMode::Stop,
             _ => {
                 return Err(CliError::usage(
-                    "Invalid AGY_SWITCH_CLI_MODE value (expected `wait` or `stop`).",
+                    "Invalid AGY_SWITCH_CLI_MODE value (expected `immediate` or `wait`).",
                 ))
             }
         };
@@ -727,10 +727,73 @@ impl DaemonEngine {
 
         // ================= STAGE 4: PROCESS GUARD =================
         let guard_now = active_clock.now_unix();
-        match observe_runtime_state(paths) {
+        let guard_runtime = observe_runtime_state(paths);
+        if let RuntimeState::Unverified { detail } = guard_runtime {
+            self.persist_status(
+                repo,
+                &mut pstate,
+                "hold",
+                Some("process_state_unverified"),
+                guard_now,
+            )?;
+            return Ok(TickStageOutcome::UncertainHold {
+                reason: format!("process_state_unverified: {detail}"),
+            });
+        }
+
+        // Re-check store/policy/slot revisions BEFORE `PolicyMode::Wait` holds on an active process
+        // (and use the latest effective policy mode in case policy changed during Stage 3 `Prepare` or between ticks).
+        let (guard_policy, guard_policy_rev) =
+            resolve_effective_daemon_policy(repo, &overrides.policy_overlay)?;
+        let guard_snap = repo.read_snapshot()?;
+        if guard_snap.index.revision != plan.index_revision {
+            self.pending = None;
+            self.persist_status(
+                repo,
+                &mut pstate,
+                "cancelled",
+                Some("store_index_revision_changed"),
+                guard_now,
+            )?;
+            return Ok(TickStageOutcome::CancelledStalePlan {
+                reason: "store_index_revision_changed".into(),
+            });
+        }
+        if guard_policy_rev != plan.policy_revision || !guard_policy.enabled {
+            self.pending = None;
+            self.persist_status(
+                repo,
+                &mut pstate,
+                "cancelled",
+                Some("policy_revision_changed_or_disabled"),
+                guard_now,
+            )?;
+            return Ok(TickStageOutcome::CancelledStalePlan {
+                reason: "policy_revision_changed_or_disabled".into(),
+            });
+        }
+        if backend.inspect_slot(paths).raw_digest() != Some(plan.source_slot_digest.as_str()) {
+            self.pending = None;
+            self.persist_status(
+                repo,
+                &mut pstate,
+                "cancelled",
+                Some("active_slot_digest_changed"),
+                guard_now,
+            )?;
+            return Ok(TickStageOutcome::CancelledStalePlan {
+                reason: "active_slot_digest_changed".into(),
+            });
+        }
+
+        match guard_runtime {
             RuntimeState::Idle => {}
             RuntimeState::ManagedRunning { .. } | RuntimeState::UnmanagedRunning { .. } => {
-                match policy.mode {
+                match guard_policy.mode {
+                    PolicyMode::Immediate => {
+                        // Never kill running `agy` processes; proceed to Stage 5 & Stage 6 to
+                        // update the credential slot immediately for subsequent `agy` terminals.
+                    }
                     PolicyMode::Wait => {
                         self.persist_status(
                             repo,
@@ -743,34 +806,9 @@ impl DaemonEngine {
                             target_id: plan.target_account_id,
                         });
                     }
-                    PolicyMode::Stop => {
-                        // v1 headless contract never kills running `agy` processes; hold without committing
-                        self.pending = None;
-                        self.persist_status(
-                            repo,
-                            &mut pstate,
-                            "blocked_by_active_process",
-                            Some("active_agy_process_stop_mode"),
-                            guard_now,
-                        )?;
-                        return Ok(TickStageOutcome::BlockedByActiveProcess {
-                            target_id: plan.target_account_id,
-                        });
-                    }
                 }
             }
-            RuntimeState::Unverified { detail } => {
-                self.persist_status(
-                    repo,
-                    &mut pstate,
-                    "hold",
-                    Some("process_state_unverified"),
-                    guard_now,
-                )?;
-                return Ok(TickStageOutcome::UncertainHold {
-                    reason: format!("process_state_unverified: {detail}"),
-                });
-            }
+            RuntimeState::Unverified { .. } => unreachable!("handled above"),
         }
 
         if let Some(ref hook) = self.before_revalidate_hook {
@@ -824,29 +862,49 @@ impl DaemonEngine {
             return Err(err);
         }
 
-        if let Some(cancel_reason) = revalidate_pending_under_l1(
+        let commit_mode = match revalidate_pending_under_l1(
             repo,
             backend,
             &plan,
             &overrides.policy_overlay,
             commit_now,
         )? {
-            drop(slot_lock);
-            self.pending = None;
-            self.persist_status(
-                repo,
-                &mut pstate,
-                "cancelled",
-                Some(&cancel_reason),
-                commit_now,
-            )?;
-            return Ok(TickStageOutcome::CancelledStalePlan {
-                reason: cancel_reason,
-            });
-        }
+            RevalidateVerdict::Proceed(mode) => mode,
+            RevalidateVerdict::HoldUnverified(detail) => {
+                drop(slot_lock);
+                self.persist_status(
+                    repo,
+                    &mut pstate,
+                    "hold",
+                    Some("process_state_unverified"),
+                    commit_now,
+                )?;
+                return Ok(TickStageOutcome::UncertainHold {
+                    reason: format!("process_state_unverified: {detail}"),
+                });
+            }
+            RevalidateVerdict::Cancel(cancel_reason) => {
+                drop(slot_lock);
+                self.pending = None;
+                self.persist_status(
+                    repo,
+                    &mut pstate,
+                    "cancelled",
+                    Some(&cancel_reason),
+                    commit_now,
+                )?;
+                return Ok(TickStageOutcome::CancelledStalePlan {
+                    reason: cancel_reason,
+                });
+            }
+        };
 
         // ================= STAGE 6: COMMIT & RECONCILE =================
-        let commit_res = execute_switch_with_slot_lock(
+        let guard_mode = match commit_mode {
+            PolicyMode::Immediate => RunningGuardMode::AllowVerifiedRunning,
+            PolicyMode::Wait => RunningGuardMode::RequireIdle,
+        };
+        let commit_res = execute_switch_with_slot_lock_and_guard(
             &slot_lock,
             repo,
             backend,
@@ -855,7 +913,7 @@ impl DaemonEngine {
             registry,
             user_agent,
             &plan.target_account_id,
-            false,
+            guard_mode,
             commit_now,
         )
         .await;
@@ -882,6 +940,18 @@ impl DaemonEngine {
                 Ok(TickStageOutcome::CommittedSwitch {
                     source_id: plan.source_account_id,
                     target_id: plan.target_account_id,
+                })
+            }
+            Err(err) if err.error_code == "runtime_state_unverified" => {
+                self.persist_status(
+                    repo,
+                    &mut pstate,
+                    "hold",
+                    Some("process_state_unverified"),
+                    post_commit_now,
+                )?;
+                Ok(TickStageOutcome::UncertainHold {
+                    reason: format!("process_state_unverified: {}", err.message),
                 })
             }
             Err(err) => {
@@ -1115,45 +1185,73 @@ impl DaemonEngine {
     }
 }
 
+enum RevalidateVerdict {
+    Proceed(PolicyMode),
+    HoldUnverified(String),
+    Cancel(String),
+}
+
 fn revalidate_pending_under_l1(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
     plan: &PendingSwitchPlan,
     overlay: &DaemonPolicyOverlay,
     commit_now: i64,
-) -> CliResult<Option<String>> {
+) -> CliResult<RevalidateVerdict> {
     let paths = repo.paths();
+    let (policy, disk_policy_revision) = resolve_effective_daemon_policy(repo, overlay)?;
 
-    // 1. Re-verify no `agy` process started right before L1 acquisition (and process table is verified!)
-    if observe_runtime_state(paths) != RuntimeState::Idle {
-        return Ok(Some("active_process_started_before_commit".into()));
+    // 1. Re-verify runtime state right under L1 lock:
+    //    - `Unverified` ALWAYS fails closed (`HoldUnverified`) even in `Immediate` mode;
+    //    - Active `agy` processes cancel only in `Wait` mode (`Immediate` updates slot for new terminals).
+    match observe_runtime_state(paths) {
+        RuntimeState::Idle => {}
+        RuntimeState::Unverified { detail } => {
+            return Ok(RevalidateVerdict::HoldUnverified(detail));
+        }
+        RuntimeState::ManagedRunning { .. } | RuntimeState::UnmanagedRunning { .. } => {
+            if policy.mode == PolicyMode::Wait {
+                return Ok(RevalidateVerdict::Cancel(
+                    "active_process_started_before_commit".into(),
+                ));
+            }
+        }
     }
 
     // 2. Re-read index & policy revisions against ORIGINAL decision snapshot (detects changes during Prepare too!)
     let snapshot = repo.read_snapshot()?;
     if snapshot.index.revision != plan.index_revision {
-        return Ok(Some("store_index_revision_changed".into()));
+        return Ok(RevalidateVerdict::Cancel(
+            "store_index_revision_changed".into(),
+        ));
     }
     if snapshot.index.selected_account_id.as_deref() != Some(plan.source_account_id.as_str()) {
-        return Ok(Some("selected_account_changed_manually".into()));
+        return Ok(RevalidateVerdict::Cancel(
+            "selected_account_changed_manually".into(),
+        ));
     }
 
-    let (policy, disk_policy_revision) = resolve_effective_daemon_policy(repo, overlay)?;
     if disk_policy_revision != plan.policy_revision || !policy.enabled {
-        return Ok(Some("policy_revision_changed_or_disabled".into()));
+        return Ok(RevalidateVerdict::Cancel(
+            "policy_revision_changed_or_disabled".into(),
+        ));
     }
     if !policy
         .candidate_account_ids
         .contains(&plan.target_account_id)
     {
-        return Ok(Some("target_removed_from_candidates".into()));
+        return Ok(RevalidateVerdict::Cancel(
+            "target_removed_from_candidates".into(),
+        ));
     }
 
     // Check if any higher-priority candidate was re-enabled OR became qualified while `plan` was pending/waiting!
     for (higher_id, was_disabled) in &plan.higher_priority_candidate_states {
         if let Some(higher_acc) = snapshot.accounts.iter().find(|a| a.id == *higher_id) {
             if *was_disabled && !higher_acc.disabled {
-                return Ok(Some("higher_priority_candidate_enabled".into()));
+                return Ok(RevalidateVerdict::Cancel(
+                    "higher_priority_candidate_enabled".into(),
+                ));
             }
             if higher_acc.is_usable_at(commit_now) {
                 let h_eval = evaluate_account_quota(
@@ -1166,7 +1264,9 @@ fn revalidate_pending_under_l1(
                     h_eval,
                     QuotaEval::Known { remaining_percentage } if remaining_percentage >= policy.candidate_min_percentage as f64
                 ) {
-                    return Ok(Some("higher_priority_candidate_qualified".into()));
+                    return Ok(RevalidateVerdict::Cancel(
+                        "higher_priority_candidate_qualified".into(),
+                    ));
                 }
             }
         }
@@ -1175,7 +1275,9 @@ fn revalidate_pending_under_l1(
     // 3. Re-verify active slot digest matches pre-prepare source slot
     let slot_state = backend.inspect_slot(paths);
     if slot_state.raw_digest() != Some(plan.source_slot_digest.as_str()) {
-        return Ok(Some("active_slot_digest_changed".into()));
+        return Ok(RevalidateVerdict::Cancel(
+            "active_slot_digest_changed".into(),
+        ));
     }
 
     // 4. Re-verify both source and target accounts at REAL `commit_now` (usability, token expiry, reset_time <= commit_now, age)
@@ -1184,23 +1286,27 @@ fn revalidate_pending_under_l1(
         .iter()
         .find(|a| a.id == plan.source_account_id)
     else {
-        return Ok(Some("source_account_deleted".into()));
+        return Ok(RevalidateVerdict::Cancel("source_account_deleted".into()));
     };
     let Some(target_acc) = snapshot
         .accounts
         .iter()
         .find(|a| a.id == plan.target_account_id)
     else {
-        return Ok(Some("target_account_deleted".into()));
+        return Ok(RevalidateVerdict::Cancel("target_account_deleted".into()));
     };
     if !target_acc.is_usable_at(commit_now) {
-        return Ok(Some("target_account_became_unusable".into()));
+        return Ok(RevalidateVerdict::Cancel(
+            "target_account_became_unusable".into(),
+        ));
     }
     if target_acc
         .token
         .is_expiring_within(commit_now, TOKEN_REFRESH_SKEW_SECONDS)
     {
-        return Ok(Some("target_token_expired_before_commit".into()));
+        return Ok(RevalidateVerdict::Cancel(
+            "target_token_expired_before_commit".into(),
+        ));
     }
 
     let source_eval = evaluate_account_quota(
@@ -1213,7 +1319,11 @@ fn revalidate_pending_under_l1(
         QuotaEval::Known {
             remaining_percentage,
         } if remaining_percentage <= policy.reserve_percentage as f64 => {}
-        _ => return Ok(Some("source_quota_no_longer_below_reserve".into())),
+        _ => {
+            return Ok(RevalidateVerdict::Cancel(
+                "source_quota_no_longer_below_reserve".into(),
+            ))
+        }
     }
 
     let target_eval = evaluate_account_quota(
@@ -1226,10 +1336,14 @@ fn revalidate_pending_under_l1(
         QuotaEval::Known {
             remaining_percentage,
         } if remaining_percentage >= policy.candidate_min_percentage as f64 => {}
-        _ => return Ok(Some("target_quota_no_longer_meets_minimum".into())),
+        _ => {
+            return Ok(RevalidateVerdict::Cancel(
+                "target_quota_no_longer_meets_minimum".into(),
+            ))
+        }
     }
 
-    Ok(None)
+    Ok(RevalidateVerdict::Proceed(policy.mode))
 }
 
 /// Apply deterministic basis-point jitter (`-1000..=1000` => `[0.90, 1.10] * base_interval`) per Blueprint §7.2 Rule 1.

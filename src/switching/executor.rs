@@ -25,6 +25,23 @@ pub struct SwitchOptions {
     pub allow_running: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunningGuardMode {
+    RequireIdle,
+    AllowVerifiedRunning,
+    ForceAllowRunningAndUnverified,
+}
+
+impl RunningGuardMode {
+    fn from_allow_running(allow_running: bool) -> Self {
+        if allow_running {
+            Self::ForceAllowRunningAndUnverified
+        } else {
+            Self::RequireIdle
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SwitchOutcome {
     pub dry_run: bool,
@@ -98,7 +115,10 @@ pub async fn execute_switch(
         }
 
         let runtime = observe_runtime_state(paths);
-        let runtime_warning = check_running_guard(&runtime, options.allow_running)?;
+        let runtime_warning = check_running_guard(
+            &runtime,
+            RunningGuardMode::from_allow_running(options.allow_running),
+        )?;
         let effective_prev = match journal_diag {
             JournalDiagnosis::CommittedIndexPending { target_account_id } => {
                 Some(target_account_id)
@@ -135,7 +155,7 @@ pub async fn execute_switch(
     .await
 }
 
-/// Core switch execution when the caller ALREADY holds L1 `ActiveSlotLock` (used by `execute_switch` and `daemon` Stage 6).
+/// Core switch execution when the caller ALREADY holds L1 `ActiveSlotLock`.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_switch_with_slot_lock(
     slot_lock: &ActiveSlotLock,
@@ -147,6 +167,34 @@ pub async fn execute_switch_with_slot_lock(
     user_agent: &str,
     selector: &str,
     allow_running: bool,
+    now_unix: i64,
+) -> CliResult<SwitchOutcome> {
+    execute_switch_with_slot_lock_and_guard(
+        slot_lock,
+        repo,
+        backend,
+        transport,
+        oauth_endpoints,
+        registry,
+        user_agent,
+        selector,
+        RunningGuardMode::from_allow_running(allow_running),
+        now_unix,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_switch_with_slot_lock_and_guard(
+    slot_lock: &ActiveSlotLock,
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    transport: &dyn HttpTransport,
+    oauth_endpoints: &OAuthEndpoints,
+    registry: &OAuthClientRegistry,
+    user_agent: &str,
+    selector: &str,
+    guard_mode: RunningGuardMode,
     now_unix: i64,
 ) -> CliResult<SwitchOutcome> {
     let paths = repo.paths();
@@ -163,7 +211,7 @@ pub async fn execute_switch_with_slot_lock(
     })?;
 
     let runtime = observe_runtime_state(paths);
-    let runtime_warning = check_running_guard(&runtime, allow_running)?;
+    let runtime_warning = check_running_guard(&runtime, guard_mode)?;
 
     let snapshot = repo.read_snapshot()?;
     let target_initial = snapshot.select(selector)?.clone();
@@ -363,11 +411,18 @@ pub(crate) fn validate_target_usable(
     Ok(())
 }
 
-fn check_running_guard(runtime: &RuntimeState, allow_running: bool) -> CliResult<Option<String>> {
+fn check_running_guard(
+    runtime: &RuntimeState,
+    guard_mode: RunningGuardMode,
+) -> CliResult<Option<String>> {
     match runtime {
         RuntimeState::Idle => Ok(None),
         RuntimeState::ManagedRunning { pids, .. } | RuntimeState::UnmanagedRunning { pids, .. } => {
-            if allow_running {
+            if matches!(
+                guard_mode,
+                RunningGuardMode::AllowVerifiedRunning
+                    | RunningGuardMode::ForceAllowRunningAndUnverified
+            ) {
                 Ok(Some(format!(
                     "Warning: active `agy` process(es) {:?} detected; running processes keep their startup login and only new `agy` invocations will use the switched account.",
                     pids
@@ -383,7 +438,7 @@ fn check_running_guard(runtime: &RuntimeState, allow_running: bool) -> CliResult
             }
         }
         RuntimeState::Unverified { detail } => {
-            if allow_running {
+            if guard_mode == RunningGuardMode::ForceAllowRunningAndUnverified {
                 Ok(Some(format!(
                     "Warning: process state unverified ({detail})."
                 )))

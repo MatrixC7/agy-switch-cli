@@ -1,6 +1,6 @@
 [package]
 name = "agy-switch-cli"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.89"
 license = "CC-BY-NC-SA-4.0"
@@ -8,7 +8,7 @@ description = "Headless multi-account manager and credential switcher for Antigr
 
 [features]
 default = ["tui"]
-tui = ["dep:crossterm", "dep:comfy-table"]
+tui = ["dep:crossterm", "dep:comfy-table", "dep:unicode-width", "dep:unicode-segmentation"]
 # Optional backend gated behind explicit Cargo feature per Phase 0 Gate
 # Note: rquest 5.1.0 / 5.2.0 are yanked on crates.io as verified in Phase 0;
 # reqwest + rustls-tls-native-roots is the sole non-yanked TLS HTTP backend.
@@ -37,6 +37,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 
 crossterm = { version = "0.29", optional = true }
 comfy-table = { version = "7.1", optional = true }
+unicode-width = { version = "0.2", optional = true }
+unicode-segmentation = { version = "1.12", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"

@@ -452,11 +452,11 @@ async fn quota_401_triggers_single_forced_token_refresh_persists_rotation_and_us
     let mock = MockTransport::from_handler(move |req| {
         let step = seq.fetch_add(1, Ordering::SeqCst);
         match step {
-            // Step 0: loadCodeAssist MUST hit Production first (`cloudcode-pa.googleapis.com`) -> returns 401!
+            // Step 0: loadCodeAssist MUST hit Daily first (`daily-cloudcode-pa.googleapis.com`) -> returns 401!
             0 => {
                 assert_eq!(
                     req.url,
-                    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+                    "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
                 );
                 Ok(MockTransport::json_response(
                     401,
@@ -481,11 +481,11 @@ async fn quota_401_triggers_single_forced_token_refresh_persists_rotation_and_us
                 200,
                 json!({"email": "q@example.invalid", "name": "Quota User"}),
             )),
-            // Replay loadCodeAssist on Production
+            // Replay loadCodeAssist on Daily
             2 | 3 if req.url.ends_with(":loadCodeAssist") => {
                 assert_eq!(
                     req.url,
-                    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+                    "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
                 );
                 Ok(MockTransport::json_response(
                     200,
@@ -499,7 +499,7 @@ async fn quota_401_triggers_single_forced_token_refresh_persists_rotation_and_us
             n if req.url.ends_with(":fetchAvailableModels") => {
                 assert_eq!(
                     req.url,
-                    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+                    "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
                 );
                 if let RequestBody::Json(ref val) = req.body {
                     if val.get("project").is_some() {
@@ -519,11 +519,11 @@ async fn quota_401_triggers_single_forced_token_refresh_persists_rotation_and_us
                     }),
                 ))
             }
-            // retrieveUserQuotaSummary on Production: first 403 retries with short UA `"antigravity"` -> 200!
+            // retrieveUserQuotaSummary on Daily: first 403 retries with short UA `"antigravity"` -> 200!
             _ if req.url.ends_with(":retrieveUserQuotaSummary") => {
                 assert_eq!(
                     req.url,
-                    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+                    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
                 );
                 let ua = req
                     .headers
@@ -558,7 +558,7 @@ async fn quota_401_triggers_single_forced_token_refresh_persists_rotation_and_us
         &fast_oauth_endpoints(),
         &fast_quota_endpoints(),
         &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
+        "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
         "acc-q",
         now,
     )
@@ -569,8 +569,8 @@ async fn quota_401_triggers_single_forced_token_refresh_persists_rotation_and_us
     assert_eq!(updated.token.refresh_token, "1//rotated_after_401");
     assert_eq!(updated.token.access_token, "ya29.fresh_after_401");
     let q = updated.quota.unwrap();
-    assert_eq!(q.source_env, QuotaSourceEnv::Production);
-    assert_eq!(q.summary_source_env, Some(QuotaSourceEnv::Production));
+    assert_eq!(q.source_env, QuotaSourceEnv::Daily);
+    assert_eq!(q.summary_source_env, Some(QuotaSourceEnv::Daily));
     assert_eq!(q.subscription_tier.as_deref(), Some("Google AI Pro"));
     // Primary model fraction (42%) is lower than summary (60%/80%), so primary limit 42% is preserved!
     assert_eq!(q.models[0].percentage, 42);

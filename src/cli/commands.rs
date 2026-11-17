@@ -1,8 +1,8 @@
 use crate::cli::args::*;
 use crate::cli::dto::*;
 use crate::cli::secret_input::{
-    read_bounded_line, read_secret_from_private_file, read_secret_from_stdin,
-    read_secret_from_tty_with_mode, write_interactive_prompt, MAX_SECRET_BYTES,
+    read_bounded_line, read_secret_from_tty_with_mode, read_secrets_from_private_file,
+    read_secrets_from_stdin, write_interactive_prompt, MAX_SECRET_BYTES,
 };
 use crate::domain::account::{
     validate_account_id, AccountRecord, DisableReasonCode, PendingAuthRecord, SessionIdentity,
@@ -54,7 +54,8 @@ use crate::switching::runner::{ordered_candidate_ids, run_managed_agy};
 use crate::transport::client::{HttpTransport, ReqwestTransport};
 use crate::transport::proxy::ProxyMode;
 use crate::transport::user_agent::{
-    probe_local_agy_version_isolated, resolve_native_oauth_user_agent, CLI_PKG_VERSION,
+    format_native_oauth_user_agent, probe_local_agy_version_isolated,
+    resolve_native_oauth_user_agent, CLI_PKG_VERSION, KNOWN_COMPAT_FLOOR_UA_VERSION,
     VERIFIED_AGY_VERSIONS,
 };
 use serde::Serialize;
@@ -230,7 +231,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                         terminal_text(&r.id),
                         r.flow,
                         r.auth_seq,
-                        r.created_at
+                        format_unix_local_minute(r.created_at)
                     );
                 }
             }
@@ -238,40 +239,104 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
         }
 
         // ==================== 3. ACCOUNTS ====================
-        Commands::Accounts(AccountsCommand::List) => {
-            // Strictly read-only
+        Commands::Accounts(AccountsCommand::List(args)) => {
+            if args.move_target.is_none() && args.order.is_none() {
+                // Strictly read-only
+                let snap = repo.read_snapshot()?;
+                let selected_id = snap.index.selected_account_id.as_deref();
+                let views: Vec<AccountViewDto> = snap
+                    .accounts
+                    .iter()
+                    .map(|a| {
+                        AccountViewDto::from_record_at(
+                            a,
+                            selected_id == Some(a.id.as_str()),
+                            now_unix,
+                        )
+                    })
+                    .collect();
+                if cli.json {
+                    print_json(&serde_json::json!({
+                        "selected_account_id": snap.index.selected_account_id,
+                        "account_order": snap.index.account_order,
+                        "accounts": views,
+                    }))?;
+                } else {
+                    print_numbered_accounts_human(&snap, now_unix);
+                }
+                return Ok(ExitCode::Ok.as_i32());
+            }
+
+            reconcile_pending_journal_before_write(&repo, backend, now_unix)?;
             let snap = repo.read_snapshot()?;
-            let selected_id = snap.index.selected_account_id.as_deref();
-            let views: Vec<AccountViewDto> = snap
+            let resolved_ids = if let Some(ref move_sel) = args.move_target {
+                let total = snap.accounts.len();
+                if total == 0 {
+                    return Err(CliError::not_found("No accounts saved to reorder."));
+                }
+                let pos = args.to.unwrap_or(0);
+                if pos == 0 || pos > total {
+                    return Err(CliError::usage(format!(
+                        "`--to` position must be between 1 and {total} (got {pos})."
+                    )));
+                }
+                let target_id = snap.select(move_sel)?.id.clone();
+                let mut ids: Vec<String> = snap.accounts.iter().map(|a| a.id.clone()).collect();
+                let cur_idx = ids
+                    .iter()
+                    .position(|id| id == &target_id)
+                    .ok_or_else(|| CliError::not_found("Target account not found in order."))?;
+                let moved = ids.remove(cur_idx);
+                ids.insert(pos - 1, moved);
+                ids
+            } else if let Some(ref raw_order) = args.order {
+                let mut ids = Vec::with_capacity(raw_order.len());
+                for sel in raw_order {
+                    ids.push(snap.select(sel)?.id.clone());
+                }
+                ids
+            } else {
+                unreachable!()
+            };
+
+            let updated = repo.with_write_lock(|tx| tx.reorder_accounts(resolved_ids, now_unix))?;
+            let fresh_snap = repo.read_snapshot()?;
+            let selected_id = fresh_snap.index.selected_account_id.as_deref();
+            let views: Vec<AccountViewDto> = fresh_snap
                 .accounts
                 .iter()
-                .map(|a| AccountViewDto::from_record(a, selected_id == Some(a.id.as_str())))
+                .map(|a| {
+                    AccountViewDto::from_record_at(a, selected_id == Some(a.id.as_str()), now_unix)
+                })
                 .collect();
             if cli.json {
                 print_json(&serde_json::json!({
-                    "selected_account_id": snap.index.selected_account_id,
+                    "revision": updated.revision,
+                    "selected_account_id": fresh_snap.index.selected_account_id,
+                    "account_order": updated.account_order,
                     "accounts": views,
                 }))?;
-            } else if views.is_empty() {
-                println!("No accounts saved.");
             } else {
-                for v in &views {
-                    println!("{}", v.human_line());
-                }
+                println!(
+                    "Updated account order ({} accounts):",
+                    updated.account_order.len()
+                );
+                print_numbered_accounts_human(&fresh_snap, now_unix);
             }
             Ok(ExitCode::Ok.as_i32())
         }
         Commands::Accounts(AccountsCommand::Add(args)) => {
             reconcile_pending_journal_before_write(&repo, backend, SystemClock.now_unix())?;
-            let secret = if args.stdin {
-                read_secret_from_stdin()?
+            let token_entries: Vec<(String, Option<String>)> = if args.stdin {
+                read_secrets_from_stdin()?
             } else if let Some(ref file_path) = args.token_file {
-                read_secret_from_private_file(file_path)?
+                read_secrets_from_private_file(file_path)?
             } else {
-                read_secret_from_tty_with_mode(
+                let single = read_secret_from_tty_with_mode(
                     "Enter Google OAuth refresh_token (echo hidden): ",
                     cli.json,
-                )?
+                )?;
+                vec![(single, None)]
             };
 
             let transport = build_network_transport(&repo, cli.proxy.as_deref())?;
@@ -285,36 +350,131 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             let registry = OAuthClientRegistry::load(&paths)?;
             let endpoints = OAuthEndpoints::default();
 
-            reconcile_pending_journal_before_write(&repo, backend, SystemClock.now_unix())?;
-            let (saved, created) = bootstrap_and_persist_refresh_token(
-                &repo,
-                &transport,
-                &endpoints,
-                &registry,
-                &ua,
-                &secret,
-                args.client.as_deref(),
-                args.label.as_deref(),
-                SystemClock.now_unix(),
-            )
-            .await?;
+            if token_entries.len() == 1 {
+                let (secret, inline_label) = &token_entries[0];
+                let effective_label = inline_label.as_deref().or(args.label.as_deref());
+                reconcile_pending_journal_before_write(&repo, backend, SystemClock.now_unix())?;
+                let (saved, created) = bootstrap_and_persist_refresh_token(
+                    &repo,
+                    &transport,
+                    &endpoints,
+                    &registry,
+                    &ua,
+                    secret,
+                    args.client.as_deref(),
+                    effective_label,
+                    SystemClock.now_unix(),
+                )
+                .await?;
+
+                let snap = repo.read_snapshot()?;
+                let is_sel = snap.index.selected_account_id.as_deref() == Some(saved.id.as_str());
+                let dto = AccountViewDto::from_record(&saved, is_sel);
+
+                if cli.json {
+                    print_json(&serde_json::json!({
+                        "created": created,
+                        "account": dto,
+                    }))?;
+                } else {
+                    println!(
+                        "{} account {} ({})",
+                        if created { "Added" } else { "Updated" },
+                        terminal_text(&dto.id),
+                        terminal_text(&dto.email)
+                    );
+                }
+                return Ok(ExitCode::Ok.as_i32());
+            }
+
+            let total = token_entries.len();
+            let mut added_count = 0usize;
+            let mut updated_count = 0usize;
+            let mut saved_ids_and_flags: Vec<(String, bool)> = Vec::new();
+            let mut failures: Vec<(usize, String)> = Vec::new();
+
+            for (idx, (secret, inline_label)) in token_entries.iter().enumerate() {
+                let effective_label = inline_label.as_deref().or(args.label.as_deref());
+                reconcile_pending_journal_before_write(&repo, backend, SystemClock.now_unix())?;
+                match bootstrap_and_persist_refresh_token(
+                    &repo,
+                    &transport,
+                    &endpoints,
+                    &registry,
+                    &ua,
+                    secret,
+                    args.client.as_deref(),
+                    effective_label,
+                    SystemClock.now_unix(),
+                )
+                .await
+                {
+                    Ok((saved, created)) => {
+                        if created {
+                            added_count += 1;
+                        } else {
+                            updated_count += 1;
+                        }
+                        if !cli.json {
+                            println!(
+                                "[{}/{}] {} {} ({})",
+                                idx + 1,
+                                total,
+                                if created { "Added" } else { "Updated" },
+                                terminal_text(&saved.id),
+                                terminal_text(&saved.email)
+                            );
+                        }
+                        saved_ids_and_flags.push((saved.id, created));
+                    }
+                    Err(err) => {
+                        if !cli.json {
+                            eprintln!(
+                                "[{}/{}] Failed: {}",
+                                idx + 1,
+                                total,
+                                terminal_text(&err.message)
+                            );
+                        }
+                        failures.push((idx + 1, err.message));
+                    }
+                }
+            }
 
             let snap = repo.read_snapshot()?;
-            let is_sel = snap.index.selected_account_id.as_deref() == Some(saved.id.as_str());
-            let dto = AccountViewDto::from_record(&saved, is_sel);
+            let selected_id = snap.index.selected_account_id.as_deref();
+            let accounts_out: Vec<AccountViewDto> = saved_ids_and_flags
+                .iter()
+                .filter_map(|(sid, _)| {
+                    snap.accounts
+                        .iter()
+                        .find(|a| &a.id == sid)
+                        .map(|a| AccountViewDto::from_record(a, selected_id == Some(a.id.as_str())))
+                })
+                .collect();
 
             if cli.json {
+                let fail_json: Vec<serde_json::Value> = failures
+                    .iter()
+                    .map(|(line_no, msg)| serde_json::json!({"item": line_no, "reason": msg}))
+                    .collect();
                 print_json(&serde_json::json!({
-                    "created": created,
-                    "account": dto,
+                    "total": total,
+                    "added_count": added_count,
+                    "updated_count": updated_count,
+                    "failed_count": failures.len(),
+                    "accounts": accounts_out,
+                    "failures": fail_json,
                 }))?;
             } else {
                 println!(
-                    "{} account {} ({})",
-                    if created { "Added" } else { "Updated" },
-                    terminal_text(&dto.id),
-                    terminal_text(&dto.email)
+                    "Batch add complete: {added_count} added, {updated_count} updated, {} failed.",
+                    failures.len()
                 );
+            }
+
+            if !failures.is_empty() {
+                return Ok(ExitCode::GeneralOrDataError.as_i32());
             }
             Ok(ExitCode::Ok.as_i32())
         }
@@ -383,40 +543,6 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 println!(
                     "Exported {exported_count} account(s) privately (0600) to {}",
                     terminal_text(&out_file.to_string_lossy())
-                );
-            }
-            Ok(ExitCode::Ok.as_i32())
-        }
-        Commands::Accounts(AccountsCommand::Order(args)) => {
-            if args.selectors.is_empty() {
-                let snap = repo.read_snapshot()?;
-                if cli.json {
-                    print_json(&serde_json::json!({
-                        "account_order": snap.index.account_order,
-                    }))?;
-                } else {
-                    for id in &snap.index.account_order {
-                        println!("{}", terminal_text(id));
-                    }
-                }
-                return Ok(ExitCode::Ok.as_i32());
-            }
-            reconcile_pending_journal_before_write(&repo, backend, now_unix)?;
-            let snap = repo.read_snapshot()?;
-            let mut resolved_ids = Vec::with_capacity(args.selectors.len());
-            for sel in &args.selectors {
-                resolved_ids.push(snap.select(sel)?.id.clone());
-            }
-            let updated = repo.with_write_lock(|tx| tx.reorder_accounts(resolved_ids, now_unix))?;
-            if cli.json {
-                print_json(&serde_json::json!({
-                    "revision": updated.revision,
-                    "account_order": updated.account_order,
-                }))?;
-            } else {
-                println!(
-                    "Updated account order ({} accounts).",
-                    updated.account_order.len()
                 );
             }
             Ok(ExitCode::Ok.as_i32())
@@ -513,8 +639,8 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             Ok(ExitCode::Ok.as_i32())
         }
 
-        // ==================== 4. STATUS / CURRENT / SWITCH / RUN ====================
-        Commands::Status => {
+        // ==================== 4. CURRENT / SWITCH / RUN ====================
+        Commands::Current => {
             // Strictly read-only
             let snap = repo.read_snapshot()?;
             let slot_state = backend.inspect_slot(&paths);
@@ -523,10 +649,23 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             let journal = read_journal_readonly(&paths)?;
             let journal_diag = diagnose_journal(journal.as_ref(), &slot_state);
 
+            let model_source_acc = match &session_identity {
+                SessionIdentity::Matched { account_id, .. }
+                | SessionIdentity::DriftedKnown { account_id, .. } => snap
+                    .accounts
+                    .iter()
+                    .find(|a| &a.id == account_id)
+                    .or_else(|| snap.selected_account()),
+                _ => snap.selected_account(),
+            };
+            let supported_models = model_source_acc
+                .and_then(|a| a.quota.as_ref())
+                .map(extract_supported_models);
+
             let view = StatusViewDto {
                 selected_account: snap
                     .selected_account()
-                    .map(SelectedAccountBriefDto::from_record),
+                    .map(|acc| SelectedAccountBriefDto::from_record_at(acc, now_unix)),
                 session_identity,
                 runtime_state,
             };
@@ -537,41 +676,56 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                     "session_identity": view.session_identity,
                     "runtime_state": view.runtime_state,
                     "journal_status": journal_diag,
+                    "supported_models": supported_models,
                 }))?;
             } else {
                 match &view.selected_account {
-                    Some(sel) => println!(
-                        "Selected account (index.json): {} ({})",
-                        terminal_text(&sel.id),
-                        terminal_text(&sel.email)
-                    ),
-                    None => println!("Selected account (index.json): none"),
+                    Some(sel) => {
+                        let plan_part = sel
+                            .subscription_tier
+                            .as_deref()
+                            .map(|t| format!("  [{}]", terminal_text(t)))
+                            .unwrap_or_default();
+                        let label_part = sel
+                            .custom_label
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(|l| format!("  ({})", terminal_text(l)))
+                            .unwrap_or_default();
+                        let flag_part = if sel.disabled {
+                            "  [disabled]"
+                        } else if sel.validation_blocked {
+                            "  [verification required]"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "Selected account : {}{}{}{}  ({})",
+                            terminal_text(&sel.email),
+                            plan_part,
+                            label_part,
+                            flag_part,
+                            terminal_text(&sel.id)
+                        );
+                    }
+                    None => println!("Selected account : none"),
                 }
                 println!(
-                    "Active slot session_identity:  {}",
+                    "Active agy slot  : {}",
                     format_session_identity_human(&view.session_identity)
                 );
                 println!(
-                    "Live agy runtime_state:        {}",
+                    "Live agy runtime : {}",
                     format_runtime_state_human(&view.runtime_state)
                 );
                 if journal_diag != JournalDiagnosis::Clean {
-                    println!("Pending switch journal:        {:?}", journal_diag);
+                    println!("Pending journal  : {:?}", journal_diag);
                 }
-            }
-            Ok(ExitCode::Ok.as_i32())
-        }
-        Commands::Current => {
-            // Strictly read-only
-            let snap = repo.read_snapshot()?;
-            let selected = snap.selected_account().ok_or_else(|| {
-                CliError::not_found("No selected account recorded in index.json.")
-            })?;
-            let dto = AccountViewDto::from_record_at(selected, true, now_unix);
-            if cli.json {
-                print_json(&serde_json::json!({ "selected_account": dto }))?;
-            } else {
-                println!("{}", dto.human_line());
+                if model_source_acc.is_some() {
+                    for line in format_supported_models_human(supported_models.as_deref()) {
+                        println!("{line}");
+                    }
+                }
             }
             Ok(ExitCode::Ok.as_i32())
         }
@@ -579,13 +733,14 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             let registry = OAuthClientRegistry::load(&paths)?;
             if args.dry_run {
                 let dummy = crate::transport::client::MockTransport::default();
+                let floor_ua = format_native_oauth_user_agent(KNOWN_COMPAT_FLOOR_UA_VERSION);
                 let outcome = execute_switch(
                     &repo,
                     backend,
                     &dummy,
                     &OAuthEndpoints::default(),
                     &registry,
-                    "vscode/1.X.X (Antigravity/4.3.0)",
+                    &floor_ua,
                     &args.selector,
                     &SwitchOptions {
                         dry_run: true,
@@ -671,9 +826,27 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             Ok(code)
         }
 
-        // ==================== 5. QUOTA (READ-ONLY) & REFRESH (NETWORK) ====================
+        // ==================== 5. QUOTA (READ-ONLY OR `-r` REFRESH) & REFRESH ====================
         Commands::Quota(args) => {
-            // Strictly read-only: zero network, zero disk writes
+            let mut effective_now = now_unix;
+            let mut refresh_failures: Vec<(String, CliError)> = Vec::new();
+            if args.refresh {
+                let (_, fails) = execute_quota_refresh_batch(
+                    &repo,
+                    backend,
+                    cli.proxy.as_deref(),
+                    !cli.no_remote_version,
+                    args.selector.as_deref(),
+                    args.all,
+                    args.concurrency,
+                    now_unix,
+                )
+                .await?;
+                refresh_failures = fails;
+                effective_now = SystemClock.now_unix();
+            }
+
+            // Read snapshot (strictly zero network & zero disk writes when `args.refresh == false`)
             let snap = repo.read_snapshot()?;
             let policy = repo.read_policy()?;
             let monitored_model = policy.monitored_model.as_str();
@@ -685,7 +858,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                         let eval = evaluate_account_quota(
                             acc,
                             monitored_model,
-                            now_unix,
+                            effective_now,
                             DEFAULT_QUOTA_MAX_AGE_SECS,
                         );
                         serde_json::json!({
@@ -698,27 +871,51 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                     })
                     .collect();
                 if cli.json {
-                    print_json(&serde_json::json!({
+                    let fail_json: Vec<serde_json::Value> = refresh_failures
+                        .iter()
+                        .map(|(id, e)| {
+                            serde_json::json!({
+                                "account_id": id,
+                                "error_code": e.error_code,
+                                "message": e.message,
+                            })
+                        })
+                        .collect();
+                    let mut payload = serde_json::json!({
                         "monitored_model": monitored_model,
                         "accounts": items,
-                    }))?;
+                    });
+                    if args.refresh {
+                        payload["refresh_failures"] = serde_json::Value::Array(fail_json);
+                    }
+                    print_json(&payload)?;
                 } else if snap.accounts.is_empty() {
                     println!("No accounts saved.");
                 } else {
-                    for acc in &snap.accounts {
+                    for (id, e) in &refresh_failures {
+                        eprintln!(
+                            "Refresh failed for {}: {}",
+                            terminal_text(id),
+                            terminal_text(&e.message)
+                        );
+                    }
+                    for (idx, acc) in snap.accounts.iter().enumerate() {
+                        if idx > 0 {
+                            println!();
+                        }
                         let eval = evaluate_account_quota(
                             acc,
                             monitored_model,
-                            now_unix,
+                            effective_now,
                             DEFAULT_QUOTA_MAX_AGE_SECS,
                         );
                         match &acc.quota {
                             Some(q) => println!(
                                 "{}",
-                                QuotaViewDto::from_observation(q).human_multiline_with_eval(
+                                QuotaViewDto::from_observation(q).human_multiline_at(
                                     &acc.email,
-                                    &eval,
-                                    monitored_model,
+                                    Some((&eval, monitored_model)),
+                                    effective_now,
                                 )
                             ),
                             None => println!(
@@ -728,6 +925,9 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                             ),
                         }
                     }
+                }
+                if !refresh_failures.is_empty() {
+                    return Ok(ExitCode::GeneralOrDataError.as_i32());
                 }
                 return Ok(ExitCode::Ok.as_i32());
             }
@@ -744,25 +944,29 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             let eval = evaluate_account_quota(
                 target,
                 monitored_model,
-                now_unix,
+                effective_now,
                 DEFAULT_QUOTA_MAX_AGE_SECS,
             );
             let Some(ref q_obs) = target.quota else {
                 return Err(CliError::quota_unavailable(
                     "no_cached_quota",
                     format!(
-                        "Account '{}' ({}) has no cached quota. Run `agy-switch-cli refresh {}` first.",
+                        "Account '{}' ({}) has no cached quota. Run `agy-switch-cli quota -r {}` first.",
                         target.id, target.email, target.id
                     ),
                 ));
             };
             let q_dto = QuotaViewDto::from_observation(q_obs);
 
-            if !matches!(eval, QuotaEval::Known { .. }) {
+            // In `--json` mode (or when quota is `Unknown` / `Unavailable`), enforce strict exit code 4.
+            // In interactive human mode, if cached quota is merely `Stale` (> 1 hour old), still render
+            // the cached quota table cleanly with an inline `-r` hint instead of hiding it behind an error!
+            let is_human_stale_viewable = !cli.json && matches!(eval, QuotaEval::Stale { .. });
+            if !matches!(eval, QuotaEval::Known { .. }) && !is_human_stale_viewable {
                 return Err(CliError::quota_unavailable(
                     "quota_stale_or_unknown",
                     format!(
-                        "Cached quota for '{}' ({}) on model '{}' is {:?}. Run `agy-switch-cli refresh {}` for fresh observation.",
+                        "Cached quota for '{}' ({}) on model '{}' is {:?}. Run `agy-switch-cli quota -r {}` for fresh observation.",
                         target.id, target.email, monitored_model, eval, target.id
                     ),
                 )
@@ -786,101 +990,35 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             } else {
                 println!(
                     "{}",
-                    q_dto.human_multiline_with_eval(&target.email, &eval, monitored_model)
+                    q_dto.human_multiline_at(
+                        &target.email,
+                        Some((&eval, monitored_model)),
+                        effective_now,
+                    )
                 );
             }
             Ok(ExitCode::Ok.as_i32())
         }
         Commands::Refresh(args) => {
-            reconcile_pending_journal_before_write(&repo, backend, now_unix)?;
-            let snap = repo.read_snapshot()?;
-            let target_ids: Vec<String> = if args.all || args.selector.is_none() {
-                if let Some(ref sel) = args.selector {
-                    vec![snap.select(sel)?.id.clone()]
-                } else if args.all {
-                    snap.accounts
-                        .iter()
-                        .filter(|a| !a.disabled)
-                        .map(|a| a.id.clone())
-                        .collect()
-                } else {
-                    let cur = snap.selected_account().ok_or_else(|| {
-                        CliError::not_found(
-                            "No selected account to refresh. Pass `<ID|EMAIL>` or `--all`.",
-                        )
-                    })?;
-                    vec![cur.id.clone()]
-                }
-            } else {
-                vec![snap.select(args.selector.as_deref().unwrap())?.id.clone()]
-            };
+            let (refreshed_views, failures) = execute_quota_refresh_batch(
+                &repo,
+                backend,
+                cli.proxy.as_deref(),
+                !cli.no_remote_version,
+                args.selector.as_deref(),
+                args.all,
+                args.concurrency,
+                now_unix,
+            )
+            .await?;
 
-            if target_ids.is_empty() {
+            if refreshed_views.is_empty() && failures.is_empty() {
                 if cli.json {
                     print_json(&serde_json::json!({ "refreshed": [], "failures": [] }))?;
                 } else {
                     println!("No enabled accounts to refresh.");
                 }
                 return Ok(ExitCode::Ok.as_i32());
-            }
-
-            let transport = Arc::new(build_network_transport(&repo, cli.proxy.as_deref())?);
-            let ua = resolve_native_oauth_user_agent(
-                &paths,
-                transport.as_ref(),
-                !cli.no_remote_version,
-                now_unix,
-            )
-            .await;
-            let registry = Arc::new(OAuthClientRegistry::load(&paths)?);
-            let oauth_ep = Arc::new(OAuthEndpoints::default());
-            let quota_ep = Arc::new(CloudCodeEndpoints::default());
-            let sem = Arc::new(Semaphore::new(args.concurrency as usize));
-
-            let mut handles = Vec::with_capacity(target_ids.len());
-            for id in target_ids {
-                let repo_c = repo.clone();
-                let tr_c = transport.clone();
-                let reg_c = registry.clone();
-                let oe_c = oauth_ep.clone();
-                let qe_c = quota_ep.clone();
-                let ua_c = ua.clone();
-                let sem_c = sem.clone();
-                handles.push(tokio::spawn(async move {
-                    let _permit = sem_c.acquire_owned().await.ok();
-                    let res = refresh_account_quota_locked(
-                        &repo_c,
-                        tr_c.as_ref(),
-                        &oe_c,
-                        &qe_c,
-                        &reg_c,
-                        &ua_c,
-                        &id,
-                        now_unix,
-                    )
-                    .await;
-                    (id, res)
-                }));
-            }
-
-            let mut refreshed_views = Vec::new();
-            let mut failures = Vec::new();
-            let selected_id = repo.read_snapshot()?.index.selected_account_id;
-
-            for h in handles {
-                if let Ok((id, res)) = h.await {
-                    match res {
-                        Ok(acc) => {
-                            let is_sel = selected_id.as_deref() == Some(acc.id.as_str());
-                            refreshed_views.push(AccountViewDto::from_record(&acc, is_sel));
-                        }
-                        Err(err) => failures.push((id, err)),
-                    }
-                }
-            }
-
-            if refreshed_views.is_empty() && failures.len() == 1 {
-                return Err(failures.pop().unwrap().1);
             }
 
             if cli.json {
@@ -928,16 +1066,40 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             if cli.json {
                 print_json(&serde_json::json!({ "policy": policy }))?;
             } else {
+                let snap_opt = repo.read_snapshot().ok();
                 println!(
-                    "enabled={} mode={:?} strategy={:?} reserve={}% minimum={}% model={} candidates={:?}",
-                    policy.enabled,
-                    policy.mode,
-                    policy.strategy,
-                    policy.reserve_percentage,
-                    policy.candidate_min_percentage,
-                    terminal_text(&policy.monitored_model),
-                    policy.candidate_account_ids
+                    "Auto-switch : {}",
+                    if policy.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
                 );
+                println!("Mode        : {:?}", policy.mode);
+                println!("Strategy    : {:?}", policy.strategy);
+                println!(
+                    "Thresholds  : reserve {}%  /  candidate minimum {}%",
+                    policy.reserve_percentage, policy.candidate_min_percentage
+                );
+                println!("Model scope : {}", terminal_text(&policy.monitored_model));
+                if policy.candidate_account_ids.is_empty() {
+                    println!("Candidates  : (none configured)");
+                } else {
+                    println!(
+                        "Candidates  : {} configured",
+                        policy.candidate_account_ids.len()
+                    );
+                    for (idx, cid) in policy.candidate_account_ids.iter().enumerate() {
+                        let email_label = snap_opt
+                            .as_ref()
+                            .and_then(|s| s.accounts.iter().find(|a| &a.id == cid))
+                            .map(|a| {
+                                format!("{}  ({})", terminal_text(&a.email), terminal_text(cid))
+                            })
+                            .unwrap_or_else(|| terminal_text(cid));
+                        println!("  {}. {}", idx + 1, email_label);
+                    }
+                }
             }
             Ok(ExitCode::Ok.as_i32())
         }
@@ -958,8 +1120,8 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             }
             if let Some(m) = args.mode {
                 policy.mode = match m {
+                    CliMode::Immediate => PolicyMode::Immediate,
                     CliMode::Wait => PolicyMode::Wait,
-                    CliMode::Stop => PolicyMode::Stop,
                 };
             }
             if let Some(r) = args.reserve {
@@ -973,6 +1135,19 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             }
             if args.clear_candidates {
                 policy.candidate_account_ids.clear();
+            } else if args.all_candidates {
+                let all_enabled: Vec<String> = snap
+                    .accounts
+                    .iter()
+                    .filter(|a| !a.disabled)
+                    .map(|a| a.id.clone())
+                    .collect();
+                if all_enabled.is_empty() {
+                    return Err(CliError::usage(
+                        "No enabled accounts available for `--all-candidates`.",
+                    ));
+                }
+                policy.candidate_account_ids = all_enabled;
             } else if let Some(ref raw_cands) = args.candidates {
                 let mut resolved = Vec::with_capacity(raw_cands.len());
                 for sel in raw_cands {
@@ -990,7 +1165,11 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             if cli.json {
                 print_json(&serde_json::json!({ "policy": saved }))?;
             } else {
-                println!("Saved policy (revision {}).", saved.revision);
+                println!(
+                    "Saved policy (revision {}, {} candidate(s)).",
+                    saved.revision,
+                    saved.candidate_account_ids.len()
+                );
             }
             Ok(ExitCode::Ok.as_i32())
         }
@@ -1167,8 +1346,8 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             let transport = build_network_transport(&repo, cli.proxy.as_deref())?;
             let policy_overlay = DaemonPolicyOverlay {
                 mode: args.mode.map(|m| match m {
+                    CliMode::Immediate => PolicyMode::Immediate,
                     CliMode::Wait => PolicyMode::Wait,
-                    CliMode::Stop => PolicyMode::Stop,
                 }),
                 strategy: args.strategy.map(|s| match s {
                     CliStrategy::Priority => PolicyStrategy::Priority,
@@ -1232,6 +1411,148 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             }
         }
     }
+}
+
+fn print_numbered_accounts_human(snap: &crate::store::repository::StoreSnapshot, now_unix: i64) {
+    if snap.accounts.is_empty() {
+        println!("No accounts saved.");
+        return;
+    }
+    let selected_id = snap.index.selected_account_id.as_deref();
+    let email_w = snap
+        .accounts
+        .iter()
+        .map(|a| terminal_text(&a.email).chars().count())
+        .max()
+        .unwrap_or(10);
+    for (idx, acc) in snap.accounts.iter().enumerate() {
+        let mark = if selected_id == Some(acc.id.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        let plan = acc
+            .quota
+            .as_ref()
+            .and_then(|q| q.subscription_tier.as_deref())
+            .map(|p| format!("  [{}]", terminal_text(p)))
+            .unwrap_or_default();
+        let label = acc
+            .custom_label
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|l| format!("  ({})", terminal_text(l)))
+            .unwrap_or_default();
+        let status_flag = if acc.disabled {
+            match acc.disabled_code {
+                Some(DisableReasonCode::RevokedOrExpiredGrant) => "  [disabled: reauth required]",
+                Some(DisableReasonCode::ScopeReauthRequired) => "  [disabled: scope update needed]",
+                _ => "  [disabled]",
+            }
+        } else if acc.is_validation_blocked_at(now_unix) {
+            "  [verification required]"
+        } else {
+            ""
+        };
+        let email_clean = terminal_text(&acc.email);
+        let pad = " ".repeat(email_w.saturating_sub(email_clean.chars().count()));
+        println!(
+            "{:>2}. {mark} {email_clean}{pad}{plan}{label}{status_flag}  ({})",
+            idx + 1,
+            terminal_text(&acc.id)
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_quota_refresh_batch(
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    cli_proxy: Option<&str>,
+    allow_remote_version: bool,
+    selector: Option<&str>,
+    all: bool,
+    concurrency: u8,
+    now_unix: i64,
+) -> CliResult<(Vec<AccountViewDto>, Vec<(String, CliError)>)> {
+    reconcile_pending_journal_before_write(repo, backend, now_unix)?;
+    let snap = repo.read_snapshot()?;
+    let target_ids: Vec<String> = if let Some(sel) = selector {
+        vec![snap.select(sel)?.id.clone()]
+    } else if all {
+        snap.accounts
+            .iter()
+            .filter(|a| !a.disabled)
+            .map(|a| a.id.clone())
+            .collect()
+    } else {
+        let cur = snap.selected_account().ok_or_else(|| {
+            CliError::not_found("No selected account to refresh. Pass `<ID|EMAIL>` or `--all`.")
+        })?;
+        vec![cur.id.clone()]
+    };
+
+    if target_ids.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let paths = repo.paths();
+    let transport = Arc::new(build_network_transport(repo, cli_proxy)?);
+    let ua =
+        resolve_native_oauth_user_agent(paths, transport.as_ref(), allow_remote_version, now_unix)
+            .await;
+    let registry = Arc::new(OAuthClientRegistry::load(paths)?);
+    let oauth_ep = Arc::new(OAuthEndpoints::default());
+    let quota_ep = Arc::new(CloudCodeEndpoints::default());
+    let sem = Arc::new(Semaphore::new(concurrency as usize));
+
+    let mut handles = Vec::with_capacity(target_ids.len());
+    for id in target_ids {
+        let repo_c = repo.clone();
+        let tr_c = transport.clone();
+        let reg_c = registry.clone();
+        let oe_c = oauth_ep.clone();
+        let qe_c = quota_ep.clone();
+        let ua_c = ua.clone();
+        let sem_c = sem.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem_c.acquire_owned().await.ok();
+            let res = refresh_account_quota_locked(
+                &repo_c,
+                tr_c.as_ref(),
+                &oe_c,
+                &qe_c,
+                &reg_c,
+                &ua_c,
+                &id,
+                now_unix,
+            )
+            .await;
+            (id, res)
+        }));
+    }
+
+    let mut refreshed_views = Vec::new();
+    let mut failures = Vec::new();
+    let selected_id = repo.read_snapshot()?.index.selected_account_id;
+
+    for h in handles {
+        if let Ok((id, res)) = h.await {
+            match res {
+                Ok(acc) => {
+                    let is_sel = selected_id.as_deref() == Some(acc.id.as_str());
+                    refreshed_views.push(AccountViewDto::from_record(&acc, is_sel));
+                }
+                Err(err) => failures.push((id, err)),
+            }
+        }
+    }
+
+    if refreshed_views.is_empty() && failures.len() == 1 {
+        return Err(failures.pop().unwrap().1);
+    }
+
+    Ok((refreshed_views, failures))
 }
 
 fn build_network_transport(
@@ -1820,10 +2141,11 @@ async fn handle_auth_login(
     let registry = OAuthClientRegistry::load(repo.paths())?;
     let client = registry.select_for_login(args.client.as_deref())?;
 
+    let manual_mode = !args.ssh;
     let (session, code) = execute_interactive_oauth_code_flow(
         client,
         args.port,
-        args.manual,
+        manual_mode,
         args.open_browser,
         json_mode,
     )
@@ -1885,10 +2207,11 @@ async fn handle_auth_reauthorize(
         .or(existing.token.oauth_client_key.as_deref());
     let client = registry.select_for_login(preferred_key)?;
 
+    let manual_mode = !args.ssh;
     let (session, code) = execute_interactive_oauth_code_flow(
         client,
         args.port,
-        args.manual,
+        manual_mode,
         args.open_browser,
         json_mode,
     )

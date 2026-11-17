@@ -835,6 +835,7 @@ async fn a06_lock_hierarchy_invariants_hold_on_current_thread_executor() {
 async fn a07_and_a08_daemon_cancels_on_prepare_policy_reorder_and_clock_reset_expiration() {
     let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
+    let _pg = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir);
     let paths = h.paths();
     let repo = StoreRepository::new(paths.clone());
     let backend = FileSessionBackend;
@@ -955,6 +956,16 @@ async fn a07_and_a08_daemon_cancels_on_prepare_policy_reorder_and_clock_reset_ex
         ))
     });
 
+    // Even when a live `agy` process is running under `PolicyMode::Wait`, an in-`Prepare` policy reorder
+    // MUST immediately cancel the stale plan in Stage 4 rather than getting stuck in `BlockedByActiveProcess`!
+    fs::create_dir_all(h.proc_dir.join("9101")).unwrap();
+    fs::write(
+        h.proc_dir.join("9101/stat"),
+        "9101 (agy) S 1 9101 9101 0 -1 0 0 0 0 0 1 1 0 0 20 0 1 0 777111 1000 10",
+    )
+    .unwrap();
+    fs::write(h.proc_dir.join("9101/comm"), "agy\n").unwrap();
+
     let mut engine = DaemonEngine::new();
     let out_a07 = engine
         .run_single_tick(
@@ -970,6 +981,7 @@ async fn a07_and_a08_daemon_cancels_on_prepare_policy_reorder_and_clock_reset_ex
         )
         .await
         .unwrap();
+    fs::remove_dir_all(h.proc_dir.join("9101")).unwrap();
     assert_eq!(
         out_a07,
         TickStageOutcome::CancelledStalePlan {
@@ -1051,9 +1063,9 @@ async fn a09_and_a10_quota_single_env_missing_primary_and_error_evidence_chains(
     repo.with_write_lock(|tx| tx.upsert_account(acc, true, now))
         .unwrap();
 
-    // 1. A09(A): Production load=503, Daily load=200 Free, Production catalog+summary=200 without 5h -> MUST be Unknown!
+    // 1. A09(A): Primary Daily load=503, fallback load=200 Free, Daily catalog+summary=200 without 5h -> MUST be Unknown!
     let mock_cross_free = MockTransport::from_handler(|req| {
-        if req.url == "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist" {
+        if req.url == "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist" {
             return Ok(MockTransport::json_response(503, json!({})));
         }
         if req.url.ends_with(":loadCodeAssist") {
@@ -1062,13 +1074,15 @@ async fn a09_and_a10_quota_single_env_missing_primary_and_error_evidence_chains(
                 json!({"currentTier": {"id": "free", "name": "Free Tier"}}),
             ));
         }
-        if req.url == "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels" {
+        if req.url == "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels" {
             return Ok(MockTransport::json_response(
                 200,
                 json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.80, "resetTime": "2099-01-01T00:00:00Z"}}}}),
             ));
         }
-        if req.url == "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary" {
+        if req.url
+            == "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+        {
             return Ok(MockTransport::json_response(
                 200,
                 json!({"groups": [{"displayName": "Gemini Models", "buckets": [{"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.80, "resetTime": "2099-01-07T00:00:00Z"}]}]}),
@@ -1082,14 +1096,14 @@ async fn a09_and_a10_quota_single_env_missing_primary_and_error_evidence_chains(
         &fast_oauth(),
         &fast_quota(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
+        "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
         "acc-q",
         now,
     )
     .await
     .unwrap();
     let obs_cross = res_cross.quota.unwrap();
-    assert_eq!(obs_cross.source_env, QuotaSourceEnv::Production);
+    assert_eq!(obs_cross.source_env, QuotaSourceEnv::Daily);
     assert_eq!(obs_cross.subscription_tier, None);
     assert!(matches!(
         evaluate_quota_observation(&obs_cross, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
@@ -1124,7 +1138,7 @@ async fn a09_and_a10_quota_single_env_missing_primary_and_error_evidence_chains(
         &fast_oauth(),
         &fast_quota(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
+        "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
         "acc-q",
         now + 1,
     )
@@ -1140,9 +1154,12 @@ async fn a09_and_a10_quota_single_env_missing_primary_and_error_evidence_chains(
         agy_switch_cli::domain::quota::QuotaEval::Unknown { .. }
     ));
 
-    // 3. A10(2): Production 403 VALIDATION_REQUIRED + Daily 200 -> MUST keep `validation_blocked = true`!
+    // 3. A10(2): Primary Daily 403 VALIDATION_REQUIRED + fallback 200 -> MUST keep `validation_blocked = true`!
     let mock_prod_val = MockTransport::from_handler(|req| {
-        if req.url.starts_with("https://cloudcode-pa.googleapis.com") {
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.googleapis.com")
+        {
             if req.url.ends_with(":loadCodeAssist") {
                 return Ok(MockTransport::json_response(200, json!({})));
             }
@@ -1159,7 +1176,7 @@ async fn a09_and_a10_quota_single_env_missing_primary_and_error_evidence_chains(
         &fast_oauth(),
         &fast_quota(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
+        "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
         "acc-q",
         now + 2,
     )
@@ -1167,9 +1184,12 @@ async fn a09_and_a10_quota_single_env_missing_primary_and_error_evidence_chains(
     .unwrap();
     assert!(blocked_acc.validation_blocked);
 
-    // Even if Production subsequently returns 503 and Daily returns 200, Daily 200 MUST NOT clear `validation_blocked`!
+    // Even if Primary Daily subsequently returns 503 and fallback returns 200, fallback 200 MUST NOT clear `validation_blocked`!
     let mock_prod503_daily200 = MockTransport::from_handler(|req| {
-        if req.url.starts_with("https://cloudcode-pa.googleapis.com") {
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.googleapis.com")
+        {
             return Ok(MockTransport::json_response(503, json!({})));
         }
         if req.url.ends_with(":loadCodeAssist") {
@@ -1824,6 +1844,7 @@ fn real_sigkill_signal_9_after_slot_commit_recovers_cleanly_via_doctor_fix() {
 async fn daemon_candidate_budget_cancels_lower_priority_probe_while_preserving_its_rotated_rt() {
     let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
+    let _pg = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir);
     let paths = h.paths();
     let repo = StoreRepository::new(paths.clone());
     let backend = FileSessionBackend;
@@ -2224,7 +2245,7 @@ async fn review_r2_quota_eval_supports_group_named_pool0_buckets_rejects_untagge
     // Expired `pool-0` 5h bucket MUST mark observation `Stale(reset_deadline_passed)` even on a Free account!
     let mut expired_pool0 = obs.clone();
     expired_pool0.subscription_tier = Some("Free Tier".into());
-    expired_pool0.tier_source_env = Some(QuotaSourceEnv::Production);
+    expired_pool0.tier_source_env = Some(obs.source_env);
     expired_pool0.quota_groups.as_mut().unwrap()[0].buckets[1].reset_time =
         "2020-01-01T00:00:00Z".into();
     assert_eq!(
@@ -2246,9 +2267,12 @@ async fn review_r2_quota_eval_supports_group_named_pool0_buckets_rejects_untagge
         agy_switch_cli::domain::quota::QuotaEval::Unknown { .. }
     ));
 
-    // 3. Fallback `Daily` 200 OK MUST NOT overwrite existing authoritative `prod-proj-1`!
+    // 3. Fallback `Sandbox`/`Production` 200 OK MUST NOT overwrite existing authoritative `prod-proj-1`!
     let mock_daily_fallback = MockTransport::from_handler(|req| {
-        if req.url.starts_with("https://cloudcode-pa.googleapis.com") {
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.googleapis.com")
+        {
             return Ok(MockTransport::json_response(503, json!({})));
         }
         if req.url.ends_with(":loadCodeAssist") {
@@ -6173,4 +6197,758 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
     hold_rel.notify_one();
     pa_holder.await.unwrap();
     assert_eq!(busy_err_rep.failures.len(), 1);
+}
+
+#[tokio::test]
+async fn maint_daily_hub_ua_partial_3p_fallback_and_carbon_disabled_isolation() {
+    let _g = ENV_MUTEX.lock().await;
+    let h = IsolatedHarness::new();
+    let repo = StoreRepository::new(h.paths());
+    let reg = OAuthClientRegistry::parse_from_raw(None, None);
+    let now = 1_800_000_000i64;
+
+    assert_eq!(
+        agy_switch_cli::quota::client::DEFAULT_CLOUDCODE_ENVIRONMENTS[0],
+        (
+            QuotaSourceEnv::Daily,
+            "https://daily-cloudcode-pa.googleapis.com/v1internal"
+        )
+    );
+    let ua = agy_switch_cli::transport::user_agent::resolve_native_oauth_user_agent(
+        &h.paths(),
+        &MockTransport::default(),
+        false,
+        now,
+    )
+    .await;
+    assert!(
+        ua.starts_with("antigravity/hub/4.3.0 (os_type=linux; arch="),
+        "unexpected UA: {ua}"
+    );
+
+    let acc = make_acc(
+        "acc-maint",
+        "maint@example.invalid",
+        "1//RT_MAINT",
+        now + 7200,
+        now,
+    );
+    repo.with_write_lock(|tx| tx.upsert_account(acc, true, now))
+        .unwrap();
+
+    // Case 1: Daily returns 3p-only summary while Sandbox returns complete Gemini + Carbon + Argon summary ->
+    // selects Sandbox cleanly WITHOUT cross-environment merging!
+    let mock_partial_to_full = MockTransport::from_handler(|req| {
+        if req.url.ends_with(":loadCodeAssist") {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
+            ));
+        }
+        if req.url.ends_with(":fetchAvailableModels") {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"models": {
+                    "gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 1.0, "resetTime": "2099-01-01T05:00:00Z"}},
+                    "gemini-4-carbon-high": {"quotaInfo": {"remainingFraction": 1.0, "resetTime": "2099-01-01T05:00:00Z"}},
+                    "gemini-4-hydrogen-disabled": {"displayName": "Gemini 4 Hydrogen"}
+                }}),
+            ));
+        }
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.googleapis.com")
+        {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"groups": [{
+                    "displayName": "Claude and GPT models",
+                    "buckets": [{"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.37, "resetTime": "2099-01-07T00:00:00Z"}]
+                }]}),
+            ));
+        }
+        Ok(MockTransport::json_response(
+            200,
+            json!({"groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.64, "resetTime": "2099-01-07T00:00:00Z"},
+                        {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"}
+                    ]
+                },
+                {
+                    "displayName": "Gemini 4 Carbon",
+                    "buckets": [
+                        {"bucketId": "gemini-carbon-wtu-weekly", "window": "weekly", "remainingFraction": 0.41, "resetTime": "2099-01-07T00:00:00Z"},
+                        {"bucketId": "gemini-carbon-5h", "window": "5h", "remainingFraction": 0.80, "resetTime": "2099-01-01T05:00:00Z"}
+                    ]
+                }
+            ]}),
+        ))
+    });
+
+    let refreshed = refresh_account_quota_locked(
+        &repo,
+        &mock_partial_to_full,
+        &fast_oauth(),
+        &fast_quota(),
+        &reg,
+        &ua,
+        "acc-maint",
+        now,
+    )
+    .await
+    .unwrap();
+    let q = refreshed.quota.as_ref().unwrap();
+    assert_eq!(q.source_env, QuotaSourceEnv::Sandbox);
+    assert_eq!(q.summary_source_env, Some(QuotaSourceEnv::Sandbox));
+    assert_eq!(DEFAULT_QUOTA_MAX_AGE_SECS, 3600);
+    assert_eq!(
+        agy_switch_cli::switching::daemon::DEFAULT_DAEMON_INTERVAL_SECS,
+        3600
+    );
+    assert_eq!(
+        agy_switch_cli::switching::daemon::DEFAULT_DAEMON_COOLDOWN_SECS,
+        3600
+    );
+    assert_eq!(
+        evaluate_quota_observation(q, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
+        agy_switch_cli::domain::quota::QuotaEval::Known {
+            remaining_percentage: 64.0
+        }
+    );
+    // Unpooled `gemini-4-carbon-high` and `-disabled` models never pollute shared Gemini or evaluate as Known
+    assert!(matches!(
+        evaluate_quota_observation(q, "gemini-4-carbon-high", now, DEFAULT_QUOTA_MAX_AGE_SECS),
+        agy_switch_cli::domain::quota::QuotaEval::Unknown { .. }
+    ));
+    assert!(matches!(
+        evaluate_quota_observation(
+            q,
+            "gemini-4-hydrogen-disabled",
+            now,
+            DEFAULT_QUOTA_MAX_AGE_SECS
+        ),
+        agy_switch_cli::domain::quota::QuotaEval::Unknown { .. }
+    ));
+
+    // Verify multi-line batch refresh_token parser with inline `# label` comments AND literal `#` without space
+    let parsed_batch = agy_switch_cli::cli::secret_input::parse_token_lines_from_text(
+        "\n# comment line\n1//synthetic_tok_a  # Work Account\n1//synthetic#literal_b\n\n",
+        "test",
+    )
+    .unwrap();
+    assert_eq!(
+        parsed_batch,
+        vec![
+            (
+                "1//synthetic_tok_a".to_string(),
+                Some("Work Account".to_string())
+            ),
+            ("1//synthetic#literal_b".to_string(), None),
+        ]
+    );
+
+    // Case 2: Daily returns 3p-only summary while Sandbox returns 200 catalog + 404 summary (`Unavailable`)
+    // and Production returns 403 VALIDATION_REQUIRED -> MUST retain Daily's valid 3p partial observation!
+    let mock_partial_only = MockTransport::from_handler(|req| {
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.sandbox.googleapis.com")
+        {
+            if req.url.ends_with(":loadCodeAssist") {
+                return Ok(MockTransport::json_response(200, json!({})));
+            }
+            if req.url.ends_with(":fetchAvailableModels") {
+                return Ok(MockTransport::json_response(200, json!({"models": {}})));
+            }
+            return Ok(MockTransport::json_response(404, json!({})));
+        }
+        if req.url.starts_with("https://cloudcode-pa.googleapis.com") {
+            return Ok(MockTransport::json_response(
+                403,
+                json!({"error": {"message": "VALIDATION_REQUIRED"}}),
+            ));
+        }
+        if req.url.ends_with(":loadCodeAssist") {
+            return Ok(MockTransport::json_response(200, json!({})));
+        }
+        if req.url.ends_with(":fetchAvailableModels") {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"models": {"claude-sonnet-4": {"quotaInfo": {"remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"}}}}),
+            ));
+        }
+        Ok(MockTransport::json_response(
+            200,
+            json!({"groups": [{
+                "displayName": "Claude and GPT models",
+                "buckets": [
+                    {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.37, "resetTime": "2099-01-07T00:00:00Z"},
+                    {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.95, "resetTime": "2099-01-01T05:00:00Z"}
+                ]
+            }]}),
+        ))
+    });
+
+    let partial_refreshed = refresh_account_quota_locked(
+        &repo,
+        &mock_partial_only,
+        &fast_oauth(),
+        &fast_quota(),
+        &reg,
+        &ua,
+        "acc-maint",
+        now + 1,
+    )
+    .await
+    .unwrap();
+    let qp = partial_refreshed.quota.as_ref().unwrap();
+    assert_eq!(qp.source_env, QuotaSourceEnv::Daily);
+    assert_eq!(
+        evaluate_quota_observation(qp, "claude", now + 1, DEFAULT_QUOTA_MAX_AGE_SECS),
+        agy_switch_cli::domain::quota::QuotaEval::Known {
+            remaining_percentage: 37.0
+        }
+    );
+}
+
+#[tokio::test]
+async fn synthetic_incremental_v110_middle_catalog_404_and_cli_contract_regressions() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let _g = ENV_MUTEX.lock().await;
+    let h = IsolatedHarness::new();
+    let repo = StoreRepository::new(h.paths());
+    let reg = OAuthClientRegistry::parse_from_raw(None, None);
+    let now = 1_800_010_000i64;
+    let ua = "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)";
+
+    let acc1 = make_acc(
+        "acc-inc-1",
+        "inc1@example.invalid",
+        "1//RT_INC_1",
+        now + 7200,
+        now,
+    );
+    let acc2 = make_acc(
+        "acc-inc-2",
+        "inc2@example.invalid",
+        "1//RT_INC_2",
+        now + 7200,
+        now,
+    );
+    let acc3 = make_acc(
+        "acc-inc-3",
+        "inc3@example.invalid",
+        "1//RT_INC_3",
+        now + 7200,
+        now,
+    );
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc1, true, now)?;
+        tx.upsert_account(acc2, false, now)?;
+        tx.upsert_account(acc3, false, now)
+    })
+    .unwrap();
+
+    // 1. Middle environment (`Sandbox`) returning HTTP 404 or malformed JSON on `:fetchAvailableModels`
+    //    MUST NOT stop environment probing early when `Production` can return a full Gemini observation!
+    for sandbox_catalog_mode in ["http_404", "malformed_json"] {
+        let prod_hits = Arc::new(AtomicUsize::new(0));
+        let prod_hits_c = prod_hits.clone();
+        let mode = sandbox_catalog_mode.to_string();
+        let mock = MockTransport::from_handler(move |req| {
+            if req
+                .url
+                .starts_with("https://daily-cloudcode-pa.googleapis.com")
+            {
+                if req.url.ends_with(":loadCodeAssist") {
+                    return Ok(MockTransport::json_response(
+                        200,
+                        json!({
+                            "cloudaicompanionProject": "daily-proj",
+                            "paidTier": {"id": "daily-tier", "name": "Daily Tier"}
+                        }),
+                    ));
+                }
+                if req.url.ends_with(":fetchAvailableModels") {
+                    return Ok(MockTransport::json_response(
+                        200,
+                        json!({"models": {
+                            "claude-sonnet-4": {"quotaInfo": {"remainingFraction": 0.92, "resetTime": "2099-01-01T05:00:00Z"}}
+                        }}),
+                    ));
+                }
+                return Ok(MockTransport::json_response(
+                    200,
+                    json!({"groups": [{
+                        "displayName": "Claude and GPT models",
+                        "buckets": [
+                            {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.37, "resetTime": "2099-01-07T00:00:00Z"},
+                            {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.92, "resetTime": "2099-01-01T05:00:00Z"}
+                        ]
+                    }]}),
+                ));
+            }
+
+            if req
+                .url
+                .starts_with("https://daily-cloudcode-pa.sandbox.googleapis.com")
+            {
+                if req.url.ends_with(":loadCodeAssist") {
+                    return Ok(MockTransport::json_response(200, json!({})));
+                }
+                if req.url.ends_with(":fetchAvailableModels") {
+                    if mode == "http_404" {
+                        return Ok(MockTransport::json_response(404, json!({})));
+                    }
+                    return Ok(agy_switch_cli::transport::client::HttpResponse {
+                        status: 200,
+                        headers: std::collections::HashMap::new(),
+                        body: b"{not-valid-json".to_vec(),
+                    });
+                }
+                return Ok(MockTransport::json_response(404, json!({})));
+            }
+
+            prod_hits_c.fetch_add(1, Ordering::SeqCst);
+            if req.url.ends_with(":loadCodeAssist") {
+                return Ok(MockTransport::json_response(
+                    200,
+                    json!({
+                        "cloudaicompanionProject": "prod-proj",
+                        "paidTier": {"id": "pro", "name": "Google AI Pro"}
+                    }),
+                ));
+            }
+            if req.url.ends_with(":fetchAvailableModels") {
+                return Ok(MockTransport::json_response(
+                    200,
+                    json!({"models": {
+                        "gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"}}
+                    }}),
+                ));
+            }
+            Ok(MockTransport::json_response(
+                200,
+                json!({"groups": [{
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.64, "resetTime": "2099-01-07T00:00:00Z"},
+                        {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"}
+                    ]
+                }]}),
+            ))
+        });
+
+        let out = refresh_account_quota_locked(
+            &repo,
+            &mock,
+            &fast_oauth(),
+            &fast_quota(),
+            &reg,
+            ua,
+            "acc-inc-1",
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(
+            prod_hits.load(Ordering::SeqCst) >= 3,
+            "mode={sandbox_catalog_mode}: expected Production to be queried"
+        );
+        let q = out.quota.as_ref().unwrap();
+        assert_eq!(q.source_env, QuotaSourceEnv::Production);
+        assert_eq!(q.summary_source_env, Some(QuotaSourceEnv::Production));
+        assert_eq!(q.tier_source_env, Some(QuotaSourceEnv::Production));
+        assert_eq!(q.subscription_tier.as_deref(), Some("Google AI Pro"));
+        assert_eq!(out.token.project_id.as_deref(), Some("prod-proj"));
+        // Strict single-env isolation: Daily's `claude-sonnet-4` was NOT stitched into Production!
+        assert!(q.models.iter().all(|m| m.name != "claude-sonnet-4"));
+        assert_eq!(
+            evaluate_quota_observation(q, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
+            agy_switch_cli::domain::quota::QuotaEval::Known {
+                remaining_percentage: 64.0
+            }
+        );
+    }
+
+    // 2. When BOTH Sandbox and Production return catalog 404, Daily's 3p partial observation is retained;
+    //    when Production returns account-level InsufficientScope, the error still propagates immediately.
+    let mock_both_later_404 = MockTransport::from_handler(|req| {
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.googleapis.com")
+        {
+            if req.url.ends_with(":loadCodeAssist") {
+                return Ok(MockTransport::json_response(200, json!({})));
+            }
+            if req.url.ends_with(":fetchAvailableModels") {
+                return Ok(MockTransport::json_response(
+                    200,
+                    json!({"models": {"claude-sonnet-4": {"quotaInfo": {"remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"}}}}),
+                ));
+            }
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"groups": [{
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.37, "resetTime": "2099-01-07T00:00:00Z"},
+                        {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.92, "resetTime": "2099-01-01T05:00:00Z"}
+                    ]
+                }]}),
+            ));
+        }
+        Ok(MockTransport::json_response(404, json!({})))
+    });
+    let retained = refresh_account_quota_locked(
+        &repo,
+        &mock_both_later_404,
+        &fast_oauth(),
+        &fast_quota(),
+        &reg,
+        ua,
+        "acc-inc-1",
+        now + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(retained.quota.unwrap().source_env, QuotaSourceEnv::Daily);
+
+    let mock_later_scope_err = MockTransport::from_handler(|req| {
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.googleapis.com")
+        {
+            if req.url.ends_with(":loadCodeAssist") {
+                return Ok(MockTransport::json_response(200, json!({})));
+            }
+            if req.url.ends_with(":fetchAvailableModels") {
+                return Ok(MockTransport::json_response(200, json!({"models": {}})));
+            }
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"groups": [{
+                    "displayName": "Claude and GPT models",
+                    "buckets": [{"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.37, "resetTime": "2099-01-07T00:00:00Z"}]
+                }]}),
+            ));
+        }
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.sandbox.googleapis.com")
+        {
+            return Ok(MockTransport::json_response(404, json!({})));
+        }
+        Ok(MockTransport::json_response(
+            403,
+            json!({"error": {"message": "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}}),
+        ))
+    });
+    let scope_err = refresh_account_quota_locked(
+        &repo,
+        &mock_later_scope_err,
+        &fast_oauth(),
+        &fast_quota(),
+        &reg,
+        ua,
+        "acc-inc-2",
+        now + 2,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(scope_err.error_code, "scope_reauth_required");
+
+    // 3. Builtin OAuth client key in `config.json` (`antigravity_enterprise`) produces zero warnings,
+    //    and incomplete `accounts list --order` reports the unified `accounts list --order` command name.
+    let cfg_path = h.paths().config_file();
+    fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+    fs::write(
+        &cfg_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "oauth": {
+                "active_client_key": "antigravity_enterprise",
+                "required_scopes": ["openid", "https://www.googleapis.com/auth/cloud-platform"],
+                "clients": []
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cfg_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let loaded_reg = OAuthClientRegistry::load(&h.paths()).unwrap();
+    assert!(
+        loaded_reg.warnings().is_empty(),
+        "expected zero warnings for antigravity_enterprise, got: {:?}",
+        loaded_reg.warnings()
+    );
+
+    let order_err = repo
+        .with_write_lock(|tx| tx.reorder_accounts(vec!["acc-inc-1".to_string()], now + 3))
+        .unwrap_err();
+    assert_eq!(
+        order_err.exit_code,
+        agy_switch_cli::error::ExitCode::InvalidUsageOrAmbiguous
+    );
+    assert!(
+        order_err
+            .message
+            .contains("`accounts list --order` requires every saved account exactly once"),
+        "unexpected error message: {}",
+        order_err.message
+    );
+    assert!(!order_err.message.contains("`accounts order`"));
+
+    // 4. When `Daily` fails transiently (HTTP 503 -> `partial_env_outcome == None`) and `Sandbox` returns
+    //    catalog HTTP 404, probing MUST still continue to `Production` rather than aborting on `Sandbox`!
+    let mock_503_then_404_then_prod = MockTransport::from_handler(|req| {
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.googleapis.com")
+        {
+            return Ok(MockTransport::json_response(503, json!({})));
+        }
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.sandbox.googleapis.com")
+        {
+            return Ok(MockTransport::json_response(404, json!({})));
+        }
+        if req.url.ends_with(":loadCodeAssist") {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({
+                    "cloudaicompanionProject": "prod-after-503-404",
+                    "paidTier": {"id": "pro", "name": "Google AI Pro"}
+                }),
+            ));
+        }
+        if req.url.ends_with(":fetchAvailableModels") {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"models": {
+                    "gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.88, "resetTime": "2099-01-01T05:00:00Z"}}
+                }}),
+            ));
+        }
+        Ok(MockTransport::json_response(
+            200,
+            json!({"groups": [{
+                "displayName": "Gemini Models",
+                "buckets": [
+                    {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.55, "resetTime": "2099-01-07T00:00:00Z"},
+                    {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.88, "resetTime": "2099-01-01T05:00:00Z"}
+                ]
+            }]}),
+        ))
+    });
+    let recovered_prod = refresh_account_quota_locked(
+        &repo,
+        &mock_503_then_404_then_prod,
+        &fast_oauth(),
+        &fast_quota(),
+        &reg,
+        ua,
+        "acc-inc-3",
+        now + 4,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recovered_prod.quota.as_ref().unwrap().source_env,
+        QuotaSourceEnv::Production
+    );
+    assert_eq!(
+        recovered_prod.token.project_id.as_deref(),
+        Some("prod-after-503-404")
+    );
+
+    // And if `Daily` returns 503 while both `Sandbox` and `Production` return catalog 404,
+    // the primary transient `quota_network_error` is preserved rather than misclassified as `data_error`.
+    let mock_503_then_404_404 = MockTransport::from_handler(|req| {
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.googleapis.com")
+        {
+            return Ok(MockTransport::json_response(503, json!({})));
+        }
+        Ok(MockTransport::json_response(404, json!({})))
+    });
+    let net_err = refresh_account_quota_locked(
+        &repo,
+        &mock_503_then_404_404,
+        &fast_oauth(),
+        &fast_quota(),
+        &reg,
+        ua,
+        "acc-inc-3",
+        now + 5,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(net_err.error_code, "quota_network_error");
+
+    // 5. `Daily` (3p partial) -> `Sandbox` (403 strip-project retry -> 404) -> `Production` (401 Unauthorized):
+    //    must trigger the single locked forced OAuth token refresh, persist rotated `refresh_token`, and replay from `Daily`!
+    let token_refresh_hits = Arc::new(AtomicUsize::new(0));
+    let tr_hits_c = token_refresh_hits.clone();
+    let sandbox_catalog_hits = Arc::new(AtomicUsize::new(0));
+    let sb_hits_c = sandbox_catalog_hits.clone();
+    let mock_partial_403_404_401_replay = MockTransport::from_handler(move |req| {
+        if req.url == "https://oauth2.googleapis.com/token" {
+            tr_hits_c.fetch_add(1, Ordering::SeqCst);
+            return Ok(MockTransport::json_response(
+                200,
+                json!({
+                    "access_token": "fresh_replayed_at",
+                    "refresh_token": "1//RT_INC_3_ROTATED",
+                    "expires_in": 3600,
+                    "token_type": "Bearer"
+                }),
+            ));
+        }
+        let is_replayed = req.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("authorization") && v == "Bearer fresh_replayed_at"
+        });
+        if is_replayed {
+            if req.url.ends_with(":loadCodeAssist") {
+                return Ok(MockTransport::json_response(
+                    200,
+                    json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
+                ));
+            }
+            if req.url.ends_with(":fetchAvailableModels") {
+                return Ok(MockTransport::json_response(
+                    200,
+                    json!({"models": {
+                        "gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.91, "resetTime": "2099-01-01T05:00:00Z"}}
+                    }}),
+                ));
+            }
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"groups": [{
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.77, "resetTime": "2099-01-07T00:00:00Z"},
+                        {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.91, "resetTime": "2099-01-01T05:00:00Z"}
+                    ]
+                }]}),
+            ));
+        }
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.googleapis.com")
+        {
+            if req.url.ends_with(":loadCodeAssist") {
+                return Ok(MockTransport::json_response(200, json!({})));
+            }
+            if req.url.ends_with(":fetchAvailableModels") {
+                return Ok(MockTransport::json_response(200, json!({"models": {}})));
+            }
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"groups": [{
+                    "displayName": "Claude and GPT models",
+                    "buckets": [{"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.37, "resetTime": "2099-01-07T00:00:00Z"}]
+                }]}),
+            ));
+        }
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.sandbox.googleapis.com")
+        {
+            if req.url.ends_with(":loadCodeAssist") {
+                return Ok(MockTransport::json_response(
+                    200,
+                    json!({"cloudaicompanionProject": "sb-proj"}),
+                ));
+            }
+            if req.url.ends_with(":fetchAvailableModels") {
+                let hit = sb_hits_c.fetch_add(1, Ordering::SeqCst);
+                if hit == 0 {
+                    return Ok(MockTransport::json_response(403, json!({})));
+                }
+                return Ok(MockTransport::json_response(404, json!({})));
+            }
+            return Ok(MockTransport::json_response(404, json!({})));
+        }
+        Ok(MockTransport::json_response(401, json!({})))
+    });
+    let replayed_acc = refresh_account_quota_locked(
+        &repo,
+        &mock_partial_403_404_401_replay,
+        &fast_oauth(),
+        &fast_quota(),
+        &reg,
+        ua,
+        "acc-inc-3",
+        now + 6,
+    )
+    .await
+    .unwrap();
+    assert_eq!(token_refresh_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(sandbox_catalog_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(replayed_acc.token.refresh_token, "1//RT_INC_3_ROTATED");
+    assert_eq!(
+        replayed_acc.quota.as_ref().unwrap().source_env,
+        QuotaSourceEnv::Daily
+    );
+    assert_eq!(
+        evaluate_quota_observation(
+            replayed_acc.quota.as_ref().unwrap(),
+            "gemini",
+            now + 6,
+            DEFAULT_QUOTA_MAX_AGE_SECS
+        ),
+        agy_switch_cli::domain::quota::QuotaEval::Known {
+            remaining_percentage: 77.0
+        }
+    );
+
+    // 6. Direct `fetch_quota_summary_from_environments` preserves an earlier HTTP 200 3p `partial_fallback`
+    //    when a later environment returns `403 VALIDATION_REQUIRED`.
+    let mock_sum_multi_val = MockTransport::from_handler(|req| {
+        if req
+            .url
+            .starts_with("https://daily-cloudcode-pa.googleapis.com")
+        {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"groups": [{
+                    "displayName": "Claude and GPT models",
+                    "buckets": [{"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.42, "resetTime": "2099-01-07T00:00:00Z"}]
+                }]}),
+            ));
+        }
+        Ok(MockTransport::json_response(
+            403,
+            json!({"error": {"message": "VALIDATION_REQUIRED", "validationUrl": "https://example.invalid/v"}}),
+        ))
+    });
+    let sum_multi = agy_switch_cli::quota::client::fetch_quota_summary_from_environments(
+        &mock_sum_multi_val,
+        &fast_quota().environments,
+        ua,
+        "tok",
+        Some("proj"),
+    )
+    .await
+    .unwrap();
+    match sum_multi {
+        agy_switch_cli::quota::client::SummaryFetchOutcome::Groups(env, groups) => {
+            assert_eq!(env, QuotaSourceEnv::Daily);
+            assert_eq!(groups.len(), 1);
+        }
+        other => panic!("expected Daily partial Groups, got {other:?}"),
+    }
 }
