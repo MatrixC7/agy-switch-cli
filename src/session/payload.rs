@@ -22,14 +22,15 @@ pub fn serialize_session_payload(token: &TokenRecord) -> CliResult<String> {
             token.expiry_timestamp
         )));
     }
-    let expiry_datetime =
-        chrono::DateTime::from_timestamp(token.expiry_timestamp, 0).ok_or_else(|| {
-            CliError::data(format!(
-                "Out-of-range token expiry_timestamp ({}).",
-                token.expiry_timestamp
-            ))
-        })?;
-    let expiry_rfc3339 = expiry_datetime.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let expiry_rfc3339 = crate::domain::clock::format_unix_rfc3339_micros_utc(
+        token.expiry_timestamp,
+    )
+    .ok_or_else(|| {
+        CliError::data(format!(
+            "Out-of-range token expiry_timestamp ({}).",
+            token.expiry_timestamp
+        ))
+    })?;
 
     #[derive(Serialize)]
     struct TokenDetails<'a> {

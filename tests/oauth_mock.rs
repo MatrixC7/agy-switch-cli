@@ -1562,6 +1562,7 @@ async fn synthetic_accounts_add_from_local_reads_agy_slot_and_rejects_symlinks()
     use base64::engine::general_purpose::STANDARD;
     use std::os::unix::fs::PermissionsExt;
 
+    let _env_guard = OAUTH_ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let repo = new_repo(tmp.path());
     let paths = repo.paths().clone();
@@ -1638,4 +1639,1212 @@ async fn synthetic_accounts_add_from_local_reads_agy_slot_and_rejects_symlinks()
     std::fs::remove_file(&paths.active_slot_file).unwrap();
     std::os::unix::fs::symlink(&standalone_path, &paths.active_slot_file).unwrap();
     assert!(read_local_active_refresh_token(&paths, &backend).is_err());
+}
+
+#[tokio::test]
+async fn synthetic_v120_preflight_blocks_token_exchange_on_unwritable_store_and_warns_bad_env_proxy(
+) {
+    use agy_switch_cli::oauth::refresh::bootstrap_and_persist_refresh_token;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let _env_guard = OAUTH_ENV_MUTEX.lock().await;
+    let registry = OAuthClientRegistry::parse_from_raw(None, None);
+
+    // Child subprocess mode for P1-09 (b) (`before_write:pend-:enospc`):
+    if std::env::var_os("AGY_SUBTEST_POST_EXCHANGE_FAULT").is_some() {
+        let tmp2 = tempfile::tempdir().unwrap();
+        let repo2 = new_repo(tmp2.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"access_token":"ya29.SUBPROC_AT_SECRET","refresh_token":"1//ROTATED_NEW_RT_SECRET_888","expires_in":3600,"token_type":"Bearer","scope":"openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let endpoints = agy_switch_cli::oauth::refresh::OAuthEndpoints {
+            token_url: format!("http://{addr}/token"),
+            userinfo_url: format!("http://{addr}/userinfo"),
+            ..fast_oauth_endpoints()
+        };
+        let real_transport = agy_switch_cli::transport::client::ReqwestTransport::build(
+            agy_switch_cli::transport::proxy::ProxyMode::Direct,
+        )
+        .unwrap();
+        let post_err = bootstrap_and_persist_refresh_token(
+            &repo2,
+            &real_transport,
+            &endpoints,
+            &registry,
+            "antigravity/1.5.7 linux/amd64",
+            "1//ORIG_LOCAL_RT_SECRET_777",
+            None,
+            None,
+            1_800_000_000,
+        )
+        .await
+        .unwrap_err();
+        let _ = server.await;
+
+        assert_eq!(post_err.exit_code, ExitCode::PartialCommitOrRecovery);
+        assert_eq!(post_err.error_code, "issued_token_unpersisted");
+        let err_line = post_err.to_json_line();
+        assert!(!err_line.contains("ORIG_LOCAL_RT_SECRET_777"));
+        assert!(!err_line.contains("ROTATED_NEW_RT_SECRET_888"));
+        assert!(!err_line.contains("SUBPROC_AT_SECRET"));
+        let parsed_err: serde_json::Value = serde_json::from_str(&err_line).unwrap();
+        assert_eq!(parsed_err["exit_code"], 7);
+        assert_eq!(parsed_err["details"]["refresh_token_rotated"], true);
+        return;
+    }
+
+    // 1. P1-09 (a): Obstructed `state/pending_auth` (symlink) MUST fail preflight BEFORE calling `/token`!
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = new_repo(tmp.path());
+    let paths = repo.paths().clone();
+    std::fs::create_dir_all(paths.state_dir()).unwrap();
+    std::fs::set_permissions(paths.state_dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let outside_dir = tmp.path().join("outside_pending");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::os::unix::fs::symlink(&outside_dir, paths.pending_auth_dir()).unwrap();
+
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let tc_clone = token_calls.clone();
+    let transport = MockTransport::from_handler(move |_req| {
+        tc_clone.fetch_add(1, Ordering::SeqCst);
+        Ok(MockTransport::json_response(
+            200,
+            json!({
+                "access_token": "ya29.should-never-be-called",
+                "refresh_token": "1//rotated-would-have-been-lost",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            }),
+        ))
+    });
+    let preflight_err = bootstrap_and_persist_refresh_token(
+        &repo,
+        &transport,
+        &fast_oauth_endpoints(),
+        &registry,
+        "antigravity/1.5.7 linux/amd64",
+        "1//synthetic-unbuilt-local-rt",
+        None,
+        None,
+        1_800_000_000,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(preflight_err.exit_code, ExitCode::GeneralOrDataError);
+    assert_eq!(
+        token_calls.load(Ordering::SeqCst),
+        0,
+        "Preflight MUST fail before issuing any `/token` network request!"
+    );
+
+    // 2. P1-09 (b): Post-exchange fault (`before_write:pend-:enospc`) after `/token` rotated the token
+    //    MUST return exit code 7 (`issued_token_unpersisted`) with `refresh_token_rotated: true` and ZERO secret echo!
+    let child_subtest = Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", tmp.path())
+        .env("AGY_SUBTEST_POST_EXCHANGE_FAULT", "1")
+        .env("AGY_SWITCH_CLI_FAULT_SPEC", "before_write:pend-:enospc")
+        .args([
+            "--exact",
+            "synthetic_v120_preflight_blocks_token_exchange_on_unwritable_store_and_warns_bad_env_proxy",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        child_subtest.status.success(),
+        "Post-exchange fault subtest failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&child_subtest.stdout),
+        String::from_utf8_lossy(&child_subtest.stderr)
+    );
+
+    // 3. P2-02: Malformed ambient `HTTPS_PROXY` emits variable-name-only stderr warning in human mode,
+    //    while keeping `--json` stderr a pure single-line JSON error envelope!
+    let tmp3 = tempfile::tempdir().unwrap();
+    let home3 = tmp3.path().join("home");
+    let data3 = tmp3.path().join("data");
+    let cache3 = tmp3.path().join("cache");
+    let run3 = tmp3.path().join("run");
+    std::fs::create_dir_all(&home3).unwrap();
+    std::fs::create_dir_all(&run3).unwrap();
+    let repo3 = StoreRepository::new(agy_switch_cli::paths::HeadlessPaths::with_explicit(
+        home3.clone(),
+        data3.clone(),
+        cache3.join("agy-switch-cli"),
+    ));
+    let seed_acc = AccountRecord::new(
+        "acc-prx".into(),
+        "alice@example.com".into(),
+        TokenRecord {
+            access_token: "ya29.seed".into(),
+            refresh_token: "1//seed".into(),
+            expires_in: 3600,
+            expiry_timestamp: 1_900_000_000,
+            token_type: "Bearer".into(),
+            id_token: None,
+            oauth_client_key: Some("antigravity_enterprise".into()),
+            granted_scopes: Some(vec![
+                "openid".into(),
+                "https://www.googleapis.com/auth/cloud-platform".into(),
+            ]),
+            project_id: None,
+            is_gcp_tos: true,
+        },
+        1_800_000_000,
+    );
+    repo3
+        .with_write_lock(|tx| tx.upsert_account(seed_acc, true, 1_800_000_000))
+        .unwrap();
+
+    // Use `ALL_PROXY` = unreachable `http://127.0.0.1:9` so no external traffic ever leaves localhost,
+    // plus malformed `HTTPS_PROXY="badscheme://PROXY_SECRET_CRED_555@bad"` to trigger fallback warning!
+    let human_out = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home3)
+        .env("XDG_CACHE_HOME", &cache3)
+        .env("XDG_RUNTIME_DIR", &run3)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/no-bus", run3.display()),
+        )
+        .env(
+            "HTTPS_PROXY",
+            "badscheme://PROXY_SECRET_CRED_555@example.invalid:8080",
+        )
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .args([
+            "--data-dir",
+            data3.to_str().unwrap(),
+            "--no-remote-version",
+            "refresh",
+        ])
+        .output()
+        .unwrap();
+    let human_stderr = String::from_utf8_lossy(&human_out.stderr);
+    assert!(
+        human_stderr
+            .contains("warning: Ignored unsupported or malformed proxy URL in `HTTPS_PROXY`"),
+        "Expected variable-name-only proxy warning in human stderr, got: {human_stderr}"
+    );
+    assert!(
+        !human_stderr.contains("PROXY_SECRET_CRED_555"),
+        "Leaked proxy secret in human stderr: {human_stderr}"
+    );
+
+    let json_out = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home3)
+        .env("XDG_CACHE_HOME", &cache3)
+        .env("XDG_RUNTIME_DIR", &run3)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/no-bus", run3.display()),
+        )
+        .env(
+            "HTTPS_PROXY",
+            "badscheme://PROXY_SECRET_CRED_555@example.invalid:8080",
+        )
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .args([
+            "--data-dir",
+            data3.to_str().unwrap(),
+            "--no-remote-version",
+            "--json",
+            "refresh",
+        ])
+        .output()
+        .unwrap();
+    let json_stderr = String::from_utf8_lossy(&json_out.stderr);
+    assert_eq!(
+        json_stderr.trim().lines().count(),
+        1,
+        "`--json` stderr must remain a single structured JSON envelope without mixed warning lines: {json_stderr}"
+    );
+    let _: serde_json::Value = serde_json::from_str(json_stderr.trim()).unwrap();
+    assert!(!json_stderr.contains("PROXY_SECRET_CRED_555"));
+}
+
+#[tokio::test]
+async fn synthetic_v120_signoff_round2_renewal_preflight_lineage_and_unpersisted_exit_7() {
+    use agy_switch_cli::domain::account::{
+        PendingAuthFlow, PendingAuthRecord, STORE_SCHEMA_VERSION,
+    };
+    use agy_switch_cli::error::ExitCode;
+    use agy_switch_cli::oauth::refresh::{
+        bootstrap_and_persist_refresh_token, ensure_account_token_fresh_locked,
+        resume_pending_auth_records,
+    };
+    use agy_switch_cli::store::locks::with_store_write_lock;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let _env_guard = OAUTH_ENV_MUTEX.lock().await;
+
+    // Child subprocess helper 1: normal renewal hits post-`/token` `ENOSPC` -> MUST return exit 7 (`issued_token_unpersisted`)!
+    if std::env::var_os("AGY_SUBTEST_RENEWAL_POST_ENOSPC").is_some() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = new_repo(tmp.path());
+        let now = 1_800_000_000_i64;
+        let expiring = AccountRecord::new(
+            "acc-ren".into(),
+            "alice@example.com".into(),
+            TokenRecord {
+                access_token: "ya29.old-at".into(),
+                refresh_token: "1//OLD_RENEWAL_RT_111".into(),
+                expires_in: 3600,
+                expiry_timestamp: now + 30,
+                token_type: "Bearer".into(),
+                id_token: None,
+                oauth_client_key: Some("antigravity_enterprise".into()),
+                granted_scopes: Some(vec![
+                    "openid".into(),
+                    "https://www.googleapis.com/auth/cloud-platform".into(),
+                    "https://www.googleapis.com/auth/userinfo.email".into(),
+                ]),
+                project_id: None,
+                is_gcp_tos: true,
+            },
+            now - 100,
+        );
+        repo.with_write_lock(|tx| tx.upsert_account(expiring, true, now - 100))
+            .unwrap();
+
+        // Inject `ENOSPC` ONLY on `state/token_lineage` spill OR use $>512$ digests so `save_account` writes `token_lineage`?
+        // Even simpler: `AGY_SWITCH_CLI_FAULT_SPEC` is checked inside `write_atomic_durable`! Because `upsert_account`
+        // ran BEFORE we set fault? No, `AGY_SWITCH_CLI_FAULT_SPEC` was set on `acc-fault-post` only!
+        let acc_fault = AccountRecord::new(
+            "acc-fault-post".into(),
+            "bob@example.com".into(),
+            TokenRecord {
+                access_token: "ya29.old-b".into(),
+                refresh_token: "1//OLD_BOB_RT_222".into(),
+                expires_in: 3600,
+                expiry_timestamp: now + 30,
+                token_type: "Bearer".into(),
+                id_token: None,
+                oauth_client_key: Some("antigravity_enterprise".into()),
+                granted_scopes: Some(vec![
+                    "openid".into(),
+                    "https://www.googleapis.com/auth/cloud-platform".into(),
+                    "https://www.googleapis.com/auth/userinfo.email".into(),
+                ]),
+                project_id: None,
+                is_gcp_tos: true,
+            },
+            now - 100,
+        );
+        // Write `acc-fault-post.json` directly before enabling fault? `AGY_SWITCH_CLI_FAULT_SPEC` is set to
+        // `after_rename:acc-fault-post:corrupt_once` -> `upsert_account` consumes `corrupt_once`? No: use `before_fsync:acc-target-enospc:enospc`
+        // and seed `acc-target-enospc.json` + `index.json` via `std::fs::write`!
+        let paths = repo.paths();
+        let seeded_path = paths.account_file("acc-target-enospc");
+        let mut seeded = acc_fault;
+        seeded.id = "acc-target-enospc".into();
+        std::fs::write(&seeded_path, serde_json::to_vec_pretty(&seeded).unwrap()).unwrap();
+        std::fs::set_permissions(&seeded_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut idx = repo.read_snapshot().unwrap().index;
+        idx.account_order.push("acc-target-enospc".into());
+        std::fs::write(paths.index_file(), serde_json::to_vec_pretty(&idx).unwrap()).unwrap();
+
+        let registry = OAuthClientRegistry::parse_from_raw(None, None);
+        let transport = MockTransport::from_handler(|_req| {
+            Ok(MockTransport::json_response(
+                200,
+                json!({
+                    "access_token": "ya29.NEW_ISSUED_AT_SECRET_999",
+                    "refresh_token": "1//NEW_ROTATED_RT_SECRET_999",
+                    "expires_in": 3600,
+                    "token_type": "Bearer"
+                }),
+            ))
+        });
+        let err = ensure_account_token_fresh_locked(
+            &repo,
+            &transport,
+            &fast_oauth_endpoints(),
+            &registry,
+            "antigravity/1.5.7 linux/amd64",
+            "acc-target-enospc",
+            false,
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit_code, ExitCode::PartialCommitOrRecovery);
+        assert_eq!(err.error_code, "issued_token_unpersisted");
+        let line = err.to_json_line();
+        assert!(!line.contains("NEW_ROTATED_RT_SECRET_999"));
+        assert!(!line.contains("NEW_ISSUED_AT_SECRET_999"));
+        assert!(!line.contains("OLD_BOB_RT_222"));
+        let j: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(j["exit_code"], 7);
+        assert_eq!(j["details"]["refresh_token_rotated"], true);
+
+        // Also verify `auth pending --resume` surfaces `unpersisted_error` (`ExitCode::PartialCommitOrRecovery = 7`,
+        // NOT downgraded to `1`) when an expiring pending record rotates at `/token` and fails `save_pending_auth_cas`!
+        let pend_seeded_path = paths.pending_auth_file("pend-target-enospc");
+        std::fs::create_dir_all(paths.pending_auth_dir()).unwrap();
+        let pend_seeded = PendingAuthRecord {
+            schema_version: STORE_SCHEMA_VERSION,
+            id: "pend-target-enospc".into(),
+            flow: PendingAuthFlow::AddToken,
+            token: TokenRecord {
+                access_token: "ya29.old-pend".into(),
+                refresh_token: "1//OLD_PEND_RT_333".into(),
+                expires_in: 3600,
+                expiry_timestamp: now + 10,
+                token_type: "Bearer".into(),
+                id_token: None,
+                oauth_client_key: Some("antigravity_enterprise".into()),
+                granted_scopes: Some(vec![
+                    "openid".into(),
+                    "https://www.googleapis.com/auth/cloud-platform".into(),
+                    "https://www.googleapis.com/auth/userinfo.email".into(),
+                ]),
+                project_id: None,
+                is_gcp_tos: true,
+            },
+            auth_seq: 5,
+            email_mismatch: false,
+            input_rt_digest: None,
+            custom_label: None,
+            created_at: now - 50,
+        };
+        std::fs::write(
+            &pend_seeded_path,
+            serde_json::to_vec_pretty(&pend_seeded).unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&pend_seeded_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let resume_rep = resume_pending_auth_records(
+            &repo,
+            &transport,
+            &fast_oauth_endpoints(),
+            &registry,
+            "antigravity/1.5.7 linux/amd64",
+            now,
+        )
+        .await
+        .unwrap();
+        let unp = resume_rep
+            .unpersisted_error
+            .expect("Expected unpersisted_error on post-rotation ENOSPC in pending resume");
+        assert_eq!(unp.exit_code, ExitCode::PartialCommitOrRecovery);
+        assert_eq!(unp.error_code, "issued_token_unpersisted");
+        return;
+    }
+
+    // Child subprocess helper 2: holds synchronous `L3 StoreWriteLock` across process boundary so parent's
+    // post-`/token` `with_write_lock` times out with `lock_busy` -> MUST map to exit 7 (`issued_token_unpersisted`), NOT exit 5!
+    if let Ok(lock_data_dir) = std::env::var("AGY_SUBTEST_HOLD_L3_DATA_DIR") {
+        let ready_file = std::env::var("AGY_SUBTEST_HOLD_L3_READY").unwrap();
+        let stop_file = std::env::var("AGY_SUBTEST_HOLD_L3_STOP").unwrap();
+        let stop_path = std::path::Path::new(&stop_file);
+        let paths = agy_switch_cli::paths::HeadlessPaths::with_explicit(
+            std::path::PathBuf::from(&lock_data_dir).join("home"),
+            std::path::PathBuf::from(&lock_data_dir),
+            std::path::PathBuf::from(&lock_data_dir).join("cache"),
+        );
+        with_store_write_lock(&paths, Duration::from_secs(5), |_| {
+            std::fs::write(&ready_file, b"held").unwrap();
+            let hold_deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !stop_path.exists()
+                && stop_path.parent().is_some_and(std::path::Path::exists)
+                && std::time::Instant::now() < hold_deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        })
+        .unwrap();
+        return;
+    }
+
+    // 1. Obstructed `state/token_lineage` (symlink or non-directory) on normal renewal MUST fail preflight
+    //    with ZERO `/token` network calls (never rotating & stranding a refresh token)!
+    let tmp1 = tempfile::tempdir().unwrap();
+    let repo1 = new_repo(tmp1.path());
+    let now = 1_800_000_000_i64;
+    let acc1 = AccountRecord::new(
+        "acc-lin1".into(),
+        "alice@example.com".into(),
+        TokenRecord {
+            access_token: "ya29.expiring".into(),
+            refresh_token: "1//SAFE_UNROTATED_RT_001".into(),
+            expires_in: 3600,
+            expiry_timestamp: now + 10,
+            token_type: "Bearer".into(),
+            id_token: None,
+            oauth_client_key: Some("antigravity_enterprise".into()),
+            granted_scopes: Some(vec![
+                "openid".into(),
+                "https://www.googleapis.com/auth/cloud-platform".into(),
+                "https://www.googleapis.com/auth/userinfo.email".into(),
+            ]),
+            project_id: None,
+            is_gcp_tos: true,
+        },
+        now - 200,
+    );
+    repo1
+        .with_write_lock(|tx| tx.upsert_account(acc1, true, now - 200))
+        .unwrap();
+
+    // Replace `state/token_lineage` with a symlink (rejected by synchronous storage check!)
+    let lin_dir = repo1.paths().token_lineage_dir();
+    if lin_dir.exists() {
+        std::fs::remove_dir_all(&lin_dir).unwrap();
+    }
+    let outside = tmp1.path().join("outside_lineage");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &lin_dir).unwrap();
+
+    let calls1 = Arc::new(AtomicUsize::new(0));
+    let calls1_c = calls1.clone();
+    let transport1 = MockTransport::from_handler(move |_req| {
+        calls1_c.fetch_add(1, Ordering::SeqCst);
+        Ok(MockTransport::json_response(
+            200,
+            json!({
+                "access_token": "ya29.never",
+                "refresh_token": "1//ROTATED_WOULD_STRAND",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            }),
+        ))
+    });
+    let registry = OAuthClientRegistry::parse_from_raw(None, None);
+    let err1 = ensure_account_token_fresh_locked(
+        &repo1,
+        &transport1,
+        &fast_oauth_endpoints(),
+        &registry,
+        "antigravity/1.5.7 linux/amd64",
+        "acc-lin1",
+        false,
+        now,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err1.exit_code, ExitCode::GeneralOrDataError);
+    assert_eq!(
+        calls1.load(Ordering::SeqCst),
+        0,
+        "Normal renewal MUST fail preflight with 0 `/token` calls when `token_lineage` is obstructed!"
+    );
+
+    // 2. Pending auto-renewal (`resume_pending_auth_records`) with obstructed `state/pending_lineage`
+    //    MUST ALSO fail preflight with ZERO `/token` calls!
+    let tmp_pend = tempfile::tempdir().unwrap();
+    let repo_pend = new_repo(tmp_pend.path());
+    repo_pend
+        .with_write_lock(|tx| {
+            let p = PendingAuthRecord {
+                schema_version: STORE_SCHEMA_VERSION,
+                id: "pend-exp1".into(),
+                flow: PendingAuthFlow::AddToken,
+                token: TokenRecord {
+                    access_token: "ya29.p-exp".into(),
+                    refresh_token: "1//PENDING_SAFE_RT".into(),
+                    expires_in: 3600,
+                    expiry_timestamp: now + 5,
+                    token_type: "Bearer".into(),
+                    id_token: None,
+                    oauth_client_key: Some("antigravity_enterprise".into()),
+                    granted_scopes: Some(vec![
+                        "openid".into(),
+                        "https://www.googleapis.com/auth/cloud-platform".into(),
+                        "https://www.googleapis.com/auth/userinfo.email".into(),
+                    ]),
+                    project_id: None,
+                    is_gcp_tos: true,
+                },
+                auth_seq: 2,
+                email_mismatch: false,
+                input_rt_digest: None,
+                custom_label: None,
+                created_at: now - 50,
+            };
+            let _ = tx.save_pending_auth_cas(&p, None)?;
+            Ok(())
+        })
+        .unwrap();
+    let plin_dir = repo_pend.paths().pending_lineage_dir();
+    if plin_dir.exists() {
+        std::fs::remove_dir_all(&plin_dir).unwrap();
+    }
+    std::fs::write(&plin_dir, b"not-a-dir").unwrap();
+
+    let calls_p = Arc::new(AtomicUsize::new(0));
+    let calls_pc = calls_p.clone();
+    let transport_p = MockTransport::from_handler(move |_req| {
+        calls_pc.fetch_add(1, Ordering::SeqCst);
+        Ok(MockTransport::json_response(
+            200,
+            json!({
+                "access_token": "ya29.p-never",
+                "refresh_token": "1//P_ROTATED",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            }),
+        ))
+    });
+    let rep_p = resume_pending_auth_records(
+        &repo_pend,
+        &transport_p,
+        &fast_oauth_endpoints(),
+        &registry,
+        "antigravity/1.5.7 linux/amd64",
+        now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rep_p.resumed_accounts.len(), 0);
+    assert_eq!(rep_p.failures.len(), 1);
+    assert_eq!(
+        calls_p.load(Ordering::SeqCst),
+        0,
+        "Pending auto-renewal MUST fail preflight with 0 `/token` calls when `pending_lineage` is obstructed!"
+    );
+
+    // 3. Run child subprocess helper 1 (`before_fsync:acc-target-enospc:enospc` after `/token` rotation -> exit 7)!
+    let sub1 = Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", tmp1.path())
+        .env("AGY_SUBTEST_RENEWAL_POST_ENOSPC", "1")
+        .env(
+            "AGY_SWITCH_CLI_FAULT_SPEC",
+            "before_fsync:target-enospc:enospc",
+        )
+        .args([
+            "--exact",
+            "synthetic_v120_signoff_round2_renewal_preflight_lineage_and_unpersisted_exit_7",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        sub1.status.success(),
+        "Renewal post-ENOSPC subtest failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&sub1.stdout),
+        String::from_utf8_lossy(&sub1.stderr)
+    );
+
+    // 4. Post-issuance `L3` `lock_busy` timeout (when NO durable backup exists!) MUST return exit 7 (`issued_token_unpersisted`), NOT exit 5!
+    struct KillChildOnDrop(Arc<std::sync::Mutex<Option<std::process::Child>>>);
+    impl Drop for KillChildOnDrop {
+        fn drop(&mut self) {
+            if let Ok(mut g) = self.0.lock() {
+                if let Some(mut p) = g.take() {
+                    let _ = p.kill();
+                    let _ = p.wait();
+                }
+            }
+        }
+    }
+
+    let tmp_l3 = tempfile::tempdir().unwrap();
+    let child_slot: Arc<std::sync::Mutex<Option<std::process::Child>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let _child_guard = KillChildOnDrop(child_slot.clone());
+
+    let l3_data = tmp_l3.path().join("store");
+    let paths_l3 = agy_switch_cli::paths::HeadlessPaths::with_explicit(
+        l3_data.join("home"),
+        l3_data.clone(),
+        l3_data.join("cache"),
+    );
+    let repo_l3 = StoreRepository::new(paths_l3).with_lock_timeout(Duration::from_millis(120));
+    let ready_f = tmp_l3.path().join("l3.ready");
+    let stop_f = tmp_l3.path().join("l3.stop");
+    let ready_c = ready_f.clone();
+    let stop_c = stop_f.clone();
+    let l3_data_c = l3_data.clone();
+    let child_slot_c = child_slot.clone();
+    let tmp_l3_dir = tmp_l3.path().to_path_buf();
+
+    let transport_l3 = MockTransport::from_handler(move |_req| {
+        // Preflight `L3` already succeeded! Now spawn a separate OS process that acquires `L3` BEFORE `/token` returns!
+        let ch = Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", &tmp_l3_dir)
+            .env("AGY_SUBTEST_HOLD_L3_DATA_DIR", &l3_data_c)
+            .env("AGY_SUBTEST_HOLD_L3_READY", &ready_c)
+            .env("AGY_SUBTEST_HOLD_L3_STOP", &stop_c)
+            .args([
+                "--exact",
+                "synthetic_v120_signoff_round2_renewal_preflight_lineage_and_unpersisted_exit_7",
+                "--nocapture",
+            ])
+            .spawn()
+            .unwrap();
+        *child_slot_c.lock().unwrap() = Some(ch);
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !ready_c.exists() {
+            if let Some(status) = child_slot_c
+                .lock()
+                .unwrap()
+                .as_mut()
+                .and_then(|c| c.try_wait().unwrap())
+            {
+                if !ready_c.exists() {
+                    panic!("L3 holder child exited prematurely ({status}) before signaling ready");
+                }
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "Timed out waiting for L3 holder child ready marker"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(MockTransport::json_response(
+            200,
+            json!({
+                "access_token": "ya29.UNPERSISTED_BUSY_AT_777",
+                "refresh_token": "1//UNPERSISTED_BUSY_RT_777",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            }),
+        ))
+    });
+
+    let busy_err = bootstrap_and_persist_refresh_token(
+        &repo_l3,
+        &transport_l3,
+        &fast_oauth_endpoints(),
+        &registry,
+        "antigravity/1.5.7 linux/amd64",
+        "1//INPUT_RT_BEFORE_L3_BUSY",
+        None,
+        None,
+        now,
+    )
+    .await
+    .unwrap_err();
+    std::fs::write(&stop_f, b"release").unwrap();
+    let held_proc = child_slot.lock().unwrap().take();
+    if let Some(mut p) = held_proc {
+        let _ = p.wait();
+    }
+
+    assert_eq!(
+        busy_err.exit_code,
+        ExitCode::PartialCommitOrRecovery,
+        "Post-issuance L3 lock_busy without durable backup MUST return exit 7, got {:?}: {}",
+        busy_err.exit_code,
+        busy_err.message
+    );
+    assert_eq!(busy_err.error_code, "issued_token_unpersisted");
+    let busy_json = busy_err.to_json_line();
+    assert!(!busy_json.contains("UNPERSISTED_BUSY_RT_777"));
+    assert!(!busy_json.contains("UNPERSISTED_BUSY_AT_777"));
+}
+
+#[tokio::test]
+async fn synthetic_v120_round3_r304_pending_resume_short_circuits_on_exit_7_and_preflight_fsync_probe(
+) {
+    use agy_switch_cli::domain::account::{
+        PendingAuthFlow, PendingAuthRecord, STORE_SCHEMA_VERSION,
+    };
+    use agy_switch_cli::error::ExitCode;
+    use agy_switch_cli::oauth::refresh::{
+        bootstrap_and_persist_refresh_token, resume_pending_auth_records,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // Subprocess 1: preflight parent-dir fsync probe failure (`sync_parent_dir:.write-probe:io`) -> 0 `/token` calls!
+    if std::env::var_os("AGY_SUBTEST_R304_PREFLIGHT_FSYNC").is_some() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = new_repo(tmp.path());
+        let registry = OAuthClientRegistry::parse_from_raw(None, None);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let transport = MockTransport::from_handler(move |_req| {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            Ok(MockTransport::json_response(
+                200,
+                json!({
+                    "access_token": "ya29.never",
+                    "refresh_token": "1//never-rotated",
+                    "expires_in": 3600,
+                    "token_type": "Bearer"
+                }),
+            ))
+        });
+        let err = bootstrap_and_persist_refresh_token(
+            &repo,
+            &transport,
+            &fast_oauth_endpoints(),
+            &registry,
+            "antigravity/1.5.7 linux/amd64",
+            "1//safe-input-rt",
+            None,
+            None,
+            1_800_000_000,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit_code, ExitCode::GeneralOrDataError);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "Preflight parent-dir fsync probe failure MUST block `/token` with 0 requests!"
+        );
+        return;
+    }
+
+    // Subprocess 2: `resume_pending_auth_records` with 2 expiring records where 1st hits exit 7
+    // MUST stop immediately without calling `/token` for the 2nd record!
+    if std::env::var_os("AGY_SUBTEST_R304_PENDING_SHORT_CIRCUIT").is_some() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = new_repo(tmp.path());
+        let paths = repo.paths();
+        let now = 1_800_000_000_i64;
+        std::fs::create_dir_all(paths.pending_auth_dir()).unwrap();
+        std::fs::set_permissions(
+            paths.pending_auth_dir(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        let make_pend = |id: &str, rt: &str| PendingAuthRecord {
+            schema_version: STORE_SCHEMA_VERSION,
+            id: id.into(),
+            flow: PendingAuthFlow::AddToken,
+            token: TokenRecord {
+                access_token: format!("ya29.old-{id}"),
+                refresh_token: rt.into(),
+                expires_in: 3600,
+                expiry_timestamp: now + 5,
+                token_type: "Bearer".into(),
+                id_token: None,
+                oauth_client_key: Some("antigravity_enterprise".into()),
+                granted_scopes: Some(vec![
+                    "openid".into(),
+                    "https://www.googleapis.com/auth/cloud-platform".into(),
+                    "https://www.googleapis.com/auth/userinfo.email".into(),
+                ]),
+                project_id: None,
+                is_gcp_tos: true,
+            },
+            auth_seq: 1,
+            email_mismatch: false,
+            input_rt_digest: None,
+            custom_label: None,
+            created_at: now - 50,
+        };
+        for (id, rt) in [
+            ("pend-01-enospc", "1//PEND_01_RT"),
+            ("pend-02-untouched", "1//PEND_02_RT"),
+        ] {
+            let p = paths.pending_auth_file(id);
+            std::fs::write(&p, serde_json::to_vec_pretty(&make_pend(id, rt)).unwrap()).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let transport = MockTransport::from_handler(move |_req| {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            Ok(MockTransport::json_response(
+                200,
+                json!({
+                    "access_token": "ya29.rot-pend",
+                    "refresh_token": "1//ROTATED_PEND_01",
+                    "expires_in": 3600,
+                    "token_type": "Bearer"
+                }),
+            ))
+        });
+        let registry = OAuthClientRegistry::parse_from_raw(None, None);
+        let rep = resume_pending_auth_records(
+            &repo,
+            &transport,
+            &fast_oauth_endpoints(),
+            &registry,
+            "antigravity/1.5.7 linux/amd64",
+            now,
+        )
+        .await
+        .unwrap();
+        let unp = rep
+            .unpersisted_error
+            .expect("Expected unpersisted_error from pend-01-enospc");
+        assert_eq!(unp.exit_code, ExitCode::PartialCommitOrRecovery);
+        assert_eq!(unp.error_code, "issued_token_unpersisted");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "resume_pending_auth_records MUST stop immediately after first exit-7 without touching pend-02!"
+        );
+        // Verify pend-02-untouched still has its original RT on disk!
+        let pend2_raw =
+            std::fs::read_to_string(paths.pending_auth_file("pend-02-untouched")).unwrap();
+        assert!(pend2_raw.contains("1//PEND_02_RT"));
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out1 = Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", tmp.path())
+        .env("AGY_SUBTEST_R304_PREFLIGHT_FSYNC", "1")
+        .env(
+            "AGY_SWITCH_CLI_FAULT_SPEC",
+            "sync_parent_dir:.write-probe:io",
+        )
+        .args([
+            "--exact",
+            "synthetic_v120_round3_r304_pending_resume_short_circuits_on_exit_7_and_preflight_fsync_probe",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out1.status.success(),
+        "Preflight fsync probe subtest failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out1.stdout),
+        String::from_utf8_lossy(&out1.stderr)
+    );
+
+    let out2 = Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", tmp.path())
+        .env("AGY_SUBTEST_R304_PENDING_SHORT_CIRCUIT", "1")
+        .env(
+            "AGY_SWITCH_CLI_FAULT_SPEC",
+            "before_fsync:pend-01-enospc:enospc",
+        )
+        .args([
+            "--exact",
+            "synthetic_v120_round3_r304_pending_resume_short_circuits_on_exit_7_and_preflight_fsync_probe",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out2.status.success(),
+        "Pending resume short-circuit subtest failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+}
+
+#[tokio::test]
+async fn synthetic_v120_a02a_reauthorize_preflight_blocks_unwritable_dirs_and_preserves_staging_exit_7(
+) {
+    use agy_switch_cli::oauth::flow::PreparedAuthSession;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let seed_acc = |repo: &StoreRepository,
+                    now: i64|
+     -> (AccountRecord, PreparedAuthSession, OAuthClientRegistry) {
+        let reg = OAuthClientRegistry::parse_from_raw(None, None);
+        let client = reg.select_for_login(None).unwrap();
+        let session = build_authorization_session(client, 54546, GOOGLE_AUTH_URL).unwrap();
+        let tok = TokenRecord {
+            access_token: "ya29.orig-a02a".into(),
+            refresh_token: "1//ORIG_A02A_RT".into(),
+            expires_in: 3600,
+            expiry_timestamp: now + 3600,
+            token_type: "Bearer".into(),
+            id_token: None,
+            oauth_client_key: Some("antigravity_enterprise".into()),
+            granted_scopes: Some(vec![
+                "openid".into(),
+                "https://www.googleapis.com/auth/cloud-platform".into(),
+                "https://www.googleapis.com/auth/userinfo.email".into(),
+            ]),
+            project_id: Some("proj-synth".into()),
+            is_gcp_tos: true,
+        };
+        let acc = AccountRecord::new(
+            "acc-reauth-a02a".into(),
+            "alice@example.com".into(),
+            tok,
+            now,
+        );
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(acc.clone(), true, now)?;
+            Ok(())
+        })
+        .unwrap();
+        (acc, session, reg)
+    };
+
+    // Subprocess A: `pending_lineage` durability probe fails -> 0 `/token` HTTP requests!
+    // Subprocess B: `token_lineage` durability probe fails -> 0 `/token` HTTP requests!
+    if std::env::var_os("AGY_SUBTEST_A02A_DIR_PROBE").is_some() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = new_repo(tmp.path());
+        let now = 1_900_000_000i64;
+        let (acc, session, reg) = seed_acc(&repo, now);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let transport = MockTransport::from_handler(move |_req| {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            Ok(MockTransport::json_response(
+                200,
+                json!({
+                    "access_token": "ya29.never",
+                    "refresh_token": "1//NEVER_ISSUED",
+                    "expires_in": 3600,
+                    "token_type": "Bearer"
+                }),
+            ))
+        });
+        let err = complete_reauthorize_exchange_locked(
+            &repo,
+            &transport,
+            &fast_oauth_endpoints(),
+            &reg,
+            "antigravity/1.5.9 linux/amd64",
+            &acc,
+            &session,
+            "4/code-probe-fail",
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit_code, ExitCode::GeneralOrDataError);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "Reauthorize preflight durability probe failure MUST block `/token` with 0 HTTP requests!"
+        );
+        return;
+    }
+
+    // Subprocess C: Post-exchange pending staging fails after `/token` -> exit 7 (`issued_token_unpersisted`), zero secret echo!
+    if std::env::var_os("AGY_SUBTEST_A02A_STAGE_ENOSP").is_some() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = new_repo(tmp.path());
+        let now = 1_900_000_000i64;
+        let (acc, session, reg) = seed_acc(&repo, now);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let transport = MockTransport::from_handler(move |req| {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                req.url.contains("token"),
+                "Unexpected non-token request after staging failed: {}",
+                req.url
+            );
+            Ok(MockTransport::json_response(
+                200,
+                json!({
+                    "access_token": "ya29.A02A_SUBPROC_AT",
+                    "refresh_token": "1//A02A_UNPERSISTED_SECRET_RT",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                    "scope": "openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email"
+                }),
+            ))
+        });
+        let err = complete_reauthorize_exchange_locked(
+            &repo,
+            &transport,
+            &fast_oauth_endpoints(),
+            &reg,
+            "antigravity/1.5.9 linux/amd64",
+            &acc,
+            &session,
+            "4/code-enospc",
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(err.exit_code, ExitCode::PartialCommitOrRecovery);
+        assert_eq!(err.error_code, "issued_token_unpersisted");
+        let err_json = err.to_json_line();
+        assert!(!err_json.contains("1//A02A_UNPERSISTED_SECRET_RT"));
+        assert!(!err_json.contains("ya29.A02A_SUBPROC_AT"));
+        return;
+    }
+
+    // 1. In-process symlink obstruction on `state/pending_lineage` blocks `/token` with 0 requests!
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = new_repo(tmp.path());
+        let paths = repo.paths().clone();
+        let now = 1_900_000_000i64;
+        let (acc, session, reg) = seed_acc(&repo, now);
+        let outside_dir = tmp.path().join("outside_pending_lineage");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::remove_dir_all(paths.pending_lineage_dir()).unwrap_or(());
+        std::os::unix::fs::symlink(&outside_dir, paths.pending_lineage_dir()).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let transport = MockTransport::from_handler(move |_req| {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            Ok(MockTransport::json_response(200, json!({})))
+        });
+        let err = complete_reauthorize_exchange_locked(
+            &repo,
+            &transport,
+            &fast_oauth_endpoints(),
+            &reg,
+            "antigravity/1.5.9 linux/amd64",
+            &acc,
+            &session,
+            "4/code-symlink",
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit_code, ExitCode::GeneralOrDataError);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    // 2 & 3. Subprocesses testing both pending-only dir probe (`pending_lineage`) and shared dir probe (`token_lineage`).
+    let tmp = tempfile::tempdir().unwrap();
+    for fault in [
+        "sync_parent_dir:pending_lineage/.write-probe:io",
+        "sync_parent_dir:token_lineage/.write-probe:io",
+    ] {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", tmp.path())
+            .env("AGY_SUBTEST_A02A_DIR_PROBE", "1")
+            .env("AGY_SWITCH_CLI_FAULT_SPEC", fault)
+            .args([
+                "--exact",
+                "synthetic_v120_a02a_reauthorize_preflight_blocks_unwritable_dirs_and_preserves_staging_exit_7",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "Subtest for {fault} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // 4. Happy path: durable `0600` pending file exists BEFORE `userinfo` responds, and final commit rotates RT cleanly.
+    {
+        let tmp_ok = tempfile::tempdir().unwrap();
+        let repo = new_repo(tmp_ok.path());
+        let paths = repo.paths().clone();
+        let now = 1_900_000_000i64;
+        let (acc, session, reg) = seed_acc(&repo, now);
+        let saw_staged_before_userinfo = Arc::new(AtomicUsize::new(0));
+        let saw_c = saw_staged_before_userinfo.clone();
+        let pending_dir = paths.pending_auth_dir();
+
+        let transport = MockTransport::from_handler(move |req| {
+            if req.url.contains("token") {
+                Ok(MockTransport::json_response(
+                    200,
+                    json!({
+                        "access_token": "ya29.a02a-ok-at",
+                        "refresh_token": "1//A02A_ROTATED_RT",
+                        "expires_in": 3600,
+                        "token_type": "Bearer",
+                        "scope": "openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email"
+                    }),
+                ))
+            } else {
+                let staged_0600 = std::fs::read_dir(&pending_dir)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|e| {
+                        let name = e.file_name();
+                        let s = name.to_string_lossy();
+                        s.starts_with("pend-") && s.ends_with(".json")
+                    })
+                    .filter(|e| {
+                        std::fs::symlink_metadata(e.path())
+                            .map(|m| m.is_file() && (m.permissions().mode() & 0o777) == 0o600)
+                            .unwrap_or(false)
+                    })
+                    .count();
+                assert_eq!(
+                    staged_0600, 1,
+                    "Durable 0600 pending_auth file must exist BEFORE fetch_userinfo responds!"
+                );
+                saw_c.fetch_add(1, Ordering::SeqCst);
+                Ok(MockTransport::json_response(
+                    200,
+                    json!({"email": "alice@example.com", "name": "Alice"}),
+                ))
+            }
+        });
+
+        let updated = complete_reauthorize_exchange_locked(
+            &repo,
+            &transport,
+            &fast_oauth_endpoints(),
+            &reg,
+            "antigravity/1.5.9 linux/amd64",
+            &acc,
+            &session,
+            "4/code-ok",
+            now + 10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(saw_staged_before_userinfo.load(Ordering::SeqCst), 1);
+        assert_eq!(updated.token.refresh_token, "1//A02A_ROTATED_RT");
+        assert!(repo.list_pending_auth_readonly().unwrap().is_empty());
+    }
+
+    // 5. Subprocess testing post-exchange staging failure returns exit 7 (`issued_token_unpersisted`).
+    let out_enospc = Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", tmp.path())
+        .env("AGY_SUBTEST_A02A_STAGE_ENOSP", "1")
+        .env("AGY_SWITCH_CLI_FAULT_SPEC", "before_fsync:pend-:enospc")
+        .args([
+            "--exact",
+            "synthetic_v120_a02a_reauthorize_preflight_blocks_unwritable_dirs_and_preserves_staging_exit_7",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out_enospc.status.success(),
+        "Post-exchange staging exit-7 subtest failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out_enospc.stdout),
+        String::from_utf8_lossy(&out_enospc.stderr)
+    );
 }

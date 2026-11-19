@@ -75,6 +75,31 @@ impl Drop for ScopedEnvVar {
     }
 }
 
+struct KillChildOnDrop(Option<std::process::Child>);
+
+impl KillChildOnDrop {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn as_mut(&mut self) -> &mut std::process::Child {
+        self.0.as_mut().expect("child active")
+    }
+
+    fn take(&mut self) -> std::process::Child {
+        self.0.take().expect("child active")
+    }
+}
+
+impl Drop for KillChildOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 struct IsolatedHarness {
     pub tmp: TempDir,
     pub home: PathBuf,
@@ -136,6 +161,10 @@ impl IsolatedHarness {
                 format!("unix:path={}/no-dbus", self.runtime_dir.display()),
             )
             .env("AGY_SWITCH_CLI_PROC_ROOT", &self.proc_dir)
+            .env(
+                "AGY_SWITCH_CLI_AGY_BIN",
+                self.tmp.path().join("no-host-agy"),
+            )
             .env("NO_PROXY", "*")
             .env("AGY_SWITCH_CLI_PROXY", "direct")
             .args([
@@ -771,7 +800,7 @@ async fn a04_a05_mixed_l1_lock_and_external_slot_drift_blocks_stale_reconcile() 
     );
     assert!(read_journal_readonly(&paths_a).unwrap().is_some());
 
-    // 5. Explicit `doctor --fix` on Store A preserves Store B's valid live slot `acc-c`, keeps `acc-a` (not `acc-b`!), and clears journal!
+    // 5. Full repair reconciliation on Store A preserves Store B's valid live slot `acc-c`, keeps `acc-a` (not `acc-b`!), and clears journal!
     reconcile_journal_locked(&l1, &repo_a, &backend, true, now + 6).unwrap();
     drop(l1);
     assert!(fs::read_to_string(&paths_b.active_slot_file)
@@ -794,6 +823,7 @@ async fn a04_a05_mixed_l1_lock_and_external_slot_drift_blocks_stale_reconcile() 
 // ============================================================================
 #[tokio::test(flavor = "current_thread")]
 async fn a06_lock_hierarchy_invariants_hold_on_current_thread_executor() {
+    let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let paths = h.paths();
     let paths_t1 = paths.clone();
@@ -843,9 +873,9 @@ async fn a07_and_a08_daemon_cancels_on_prepare_policy_reorder_and_clock_reset_ex
     let now = 1_800_000_000i64;
 
     let make_q = |pct: f64, reset_unix: i64| -> QuotaObservation {
-        let reset_str = chrono::DateTime::from_timestamp(reset_unix, 0)
+        let reset_str = jiff::Timestamp::from_second(reset_unix)
             .unwrap()
-            .to_rfc3339();
+            .to_string();
         let mut q = QuotaObservation::new(now, QuotaSourceEnv::Production);
         q.subscription_tier = Some("Google AI Pro".into());
         q.tier_source_env = Some(QuotaSourceEnv::Production);
@@ -1449,10 +1479,10 @@ async fn a12_a13_a14_a15_a21_proc_fail_closed_loopback_host_fifo_json_and_delete
     }
     fs::remove_dir_all(h.proc_dir.join("9999")).unwrap();
 
-    // A15: `auth login --manual --json` with 20 KiB stdin -> stderr MUST be a single valid JSON line!
+    // A15: `auth login --json` (default manual paste mode) with 20 KiB stdin -> stderr MUST be a single valid JSON line!
     let mut manual_child = h
         .cli()
-        .args(["auth", "login", "--manual", "--json"])
+        .args(["auth", "login", "--json"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1470,7 +1500,7 @@ async fn a12_a13_a14_a15_a21_proc_fail_closed_loopback_host_fifo_json_and_delete
     assert_eq!(
         stderr_text.trim().lines().count(),
         1,
-        "auth login --manual --json stderr must be single-line JSON, got: {stderr_text}"
+        "auth login --json stderr must be single-line JSON, got: {stderr_text}"
     );
     let err_env: serde_json::Value = serde_json::from_str(stderr_text.trim()).unwrap();
     assert_eq!(err_env["schema_version"], 1);
@@ -1528,7 +1558,7 @@ async fn a12_a13_a14_a15_a21_proc_fail_closed_loopback_host_fifo_json_and_delete
     for (fifo_target, args) in [
         (
             paths.policy_file(),
-            vec!["policy", "set", "--reserve", "20"],
+            vec!["policy", "set", "--reserve", "10"],
         ),
         (
             paths.switch_journal_file(),
@@ -1569,10 +1599,11 @@ async fn a12_a13_a14_a15_a21_proc_fail_closed_loopback_host_fifo_json_and_delete
 // ============================================================================
 #[tokio::test]
 async fn a16_and_a17_sigterm_graceful_daemon_once_and_pty_tui_echo_restore() {
+    let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let paths = h.paths();
     let repo = StoreRepository::new(paths.clone());
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
 
     // Seed low-quota source account + local hanging HTTP server so `daemon --once` awaits network!
     let listener = ::tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1698,7 +1729,8 @@ async fn a16_and_a17_sigterm_graceful_daemon_once_and_pty_tui_echo_restore() {
 // §4.2 #8: Real `libc::SIGKILL` (-9) crash recovery at slot commit boundary
 // ============================================================================
 #[test]
-fn real_sigkill_signal_9_after_slot_commit_recovers_cleanly_via_doctor_fix() {
+fn real_sigkill_signal_9_after_slot_commit_recovers_cleanly_via_status_and_write() {
+    let _g = ENV_MUTEX.blocking_lock();
     if std::env::var("AGY_TEST_SIGKILL_CHILD_MODE").as_deref() == Ok("1") {
         let home = PathBuf::from(std::env::var("AGY_CHILD_HOME").unwrap());
         let data = PathBuf::from(std::env::var("AGY_CHILD_DATA").unwrap());
@@ -1783,26 +1815,35 @@ fn real_sigkill_signal_9_after_slot_commit_recovers_cleanly_via_doctor_fix() {
 
     let marker = h.tmp.path().join("slot_committed_marker");
     let current_test_exe = std::env::current_exe().unwrap();
-    let mut child = Command::new(current_test_exe)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", &h.home)
-        .env("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir)
-        .env("AGY_TEST_SIGKILL_CHILD_MODE", "1")
-        .env("AGY_CHILD_HOME", &paths.home_dir)
-        .env("AGY_CHILD_DATA", &paths.data_dir)
-        .env("AGY_CHILD_CACHE", &paths.cache_dir)
-        .env("AGY_CHILD_READY_MARKER", &marker)
-        .args([
-            "--exact",
-            "real_sigkill_signal_9_after_slot_commit_recovers_cleanly_via_doctor_fix",
-            "--nocapture",
-        ])
-        .spawn()
-        .unwrap();
+    let mut child_guard = KillChildOnDrop::new(
+        Command::new(current_test_exe)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &h.home)
+            .env("TMPDIR", h.tmp.path())
+            .env("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir)
+            .env("AGY_TEST_SIGKILL_CHILD_MODE", "1")
+            .env("AGY_CHILD_HOME", &paths.home_dir)
+            .env("AGY_CHILD_DATA", &paths.data_dir)
+            .env("AGY_CHILD_CACHE", &paths.cache_dir)
+            .env("AGY_CHILD_READY_MARKER", &marker)
+            .args([
+                "--exact",
+                "real_sigkill_signal_9_after_slot_commit_recovers_cleanly_via_status_and_write",
+                "--nocapture",
+            ])
+            .spawn()
+            .unwrap(),
+    );
 
-    for _ in 0..100 {
+    for _ in 0..400 {
         if marker.exists() {
+            break;
+        }
+        if let Some(status) = child_guard.as_mut().try_wait().unwrap() {
+            if !marker.exists() {
+                panic!("Child exited prematurely ({status}) before reaching slot commit point");
+            }
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -1810,19 +1851,20 @@ fn real_sigkill_signal_9_after_slot_commit_recovers_cleanly_via_doctor_fix() {
     assert!(marker.exists(), "Child did not reach slot commit point");
 
     // Deliver genuine kernel SIGKILL (-9)!
+    let mut child = child_guard.take();
     unsafe {
         libc::kill(child.id() as i32, libc::SIGKILL);
     }
     let wait_st = child.wait().unwrap();
     assert_eq!(wait_st.signal(), Some(libc::SIGKILL));
 
-    // `doctor` reports exit code 7 (`CommittedIndexPending`); `doctor --fix` reconciles cleanly to `acc-b`!
-    let doc = h.cli().args(["doctor", "--json"]).output().unwrap();
-    assert_eq!(doc.status.code(), Some(7));
+    // `status` reports exit code 7 (`CommittedIndexPending`); subsequent write command reconciles cleanly to `acc-b`!
+    let st = h.cli().args(["status", "--json"]).output().unwrap();
+    assert_eq!(st.status.code(), Some(7));
 
     let fix = h
         .cli()
-        .args(["doctor", "--fix", "--json"])
+        .args(["policy", "set", "--reserve", "10", "--json"])
         .output()
         .unwrap();
     assert_eq!(fix.status.code(), Some(0));
@@ -2385,6 +2427,7 @@ fn review_r3_pty_json_channel_isolation_for_accounts_add_and_oauth_manual_tty_de
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
 
+    let _g = ENV_MUTEX.blocking_lock();
     let h = IsolatedHarness::new();
 
     // 1. `accounts add --json` on a PTY with empty input MUST emit pure single-line JSON on `stderr`!
@@ -2435,7 +2478,7 @@ fn review_r3_pty_json_channel_isolation_for_accounts_add_and_oauth_manual_tty_de
     assert_eq!(parsed_err["ok"], false);
     assert_eq!(parsed_err["exit_code"], 2);
 
-    // 2. `auth login --manual --json` with a controlling PTY (`/dev/tty`) delivers the authorization URL
+    // 2. `auth login --json` with a controlling PTY (`/dev/tty`) delivers the authorization URL
     //    to `/dev/tty` while keeping `stderr` 100% pure single-line JSON!
     let mut m2_fd: libc::c_int = -1;
     let mut s2_fd: libc::c_int = -1;
@@ -2457,7 +2500,7 @@ fn review_r3_pty_json_channel_isolation_for_accounts_add_and_oauth_manual_tty_de
 
     let mut login_cmd = h.cli();
     login_cmd
-        .args(["--json", "auth", "login", "--manual"])
+        .args(["--json", "auth", "login"])
         .stdin(Stdio::from(slave2_in))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2617,7 +2660,7 @@ async fn review_r4_stale_rt_client_binding_overwrite_disable_recovery_and_pendin
         "`--overwrite` must preserve Manual disablement!"
     );
 
-    // 3. `pending_auth` corrupt file detection (`doctor` exit 1), `doctor --fix` cleanup, and `resume_pending_auth_records`!
+    // 3. `pending_auth` corrupt file detection (`status` exit 1), `0644` warning detection, and `resume_pending_auth_records`!
     let client = reg.select_for_login(None).unwrap();
     let session = build_authorization_session(client, 54545, GOOGLE_AUTH_URL).unwrap();
     let fail_userinfo = MockTransport::from_handler(|req| {
@@ -2662,9 +2705,9 @@ async fn review_r4_stale_rt_client_binding_overwrite_disable_recovery_and_pendin
     fs::write(&corrupt_pend_path, b"{corrupt-json").unwrap();
     fs::set_permissions(&corrupt_pend_path, fs::Permissions::from_mode(0o600)).unwrap();
 
-    // `doctor` MUST report exit 1 (never swallowing corrupt `pending_auth`!)
-    let doc_bad = h.cli().args(["doctor", "--json"]).output().unwrap();
-    assert_eq!(doc_bad.status.code(), Some(1));
+    // `status` MUST report exit 1 (never swallowing corrupt `pending_auth`!)
+    let st_bad = h.cli().args(["status", "--json"]).output().unwrap();
+    assert_eq!(st_bad.status.code(), Some(1));
 
     // Unrelated `accounts add` MUST still work despite `pend-corrupt.json`!
     let ok_unrelated = MockTransport::from_handler(|req| {
@@ -2699,19 +2742,17 @@ async fn review_r4_stale_rt_client_binding_overwrite_disable_recovery_and_pendin
     .await
     .unwrap();
 
-    // `doctor --fix` removes `pend-corrupt.json`, tightens valid `pending_auth` back to `0600`, and keeps live token!
-    let doc_fix = h
-        .cli()
-        .args(["doctor", "--fix", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(doc_fix.status.code(), Some(0));
-    assert!(!corrupt_pend_path.exists());
-    assert!(valid_pend_path.exists());
-    assert_eq!(
-        fs::metadata(&valid_pend_path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
+    // Remove `pend-corrupt.json`; verify `status --json` reports `pending_auth_ok == false` on `0644`, then `true` after `chmod 600`!
+    fs::remove_file(&corrupt_pend_path).unwrap();
+    let st_warn = h.cli().args(["status", "--json"]).output().unwrap();
+    assert_eq!(st_warn.status.code(), Some(0));
+    let st_warn_j: serde_json::Value = serde_json::from_slice(&st_warn.stdout).unwrap();
+    assert_eq!(st_warn_j["pending_auth_ok"], false);
+    fs::set_permissions(&valid_pend_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let st_clean = h.cli().args(["status", "--json"]).output().unwrap();
+    assert_eq!(st_clean.status.code(), Some(0));
+    let st_clean_j: serde_json::Value = serde_json::from_slice(&st_clean.stdout).unwrap();
+    assert_eq!(st_clean_j["pending_auth_ok"], true);
 
     // `auth pending --json` lists metadata without leaking refresh_token!
     let pend_list = h
@@ -2752,11 +2793,11 @@ async fn review_r4_stale_rt_client_binding_overwrite_disable_recovery_and_pendin
 }
 
 // ============================================================================
-// Review R5 (A05 / A07 / §4.2 #4): Uninitialized `doctor --fix`, usable repair priority, Wait-mode qualify, foreground loop
+// Review R5 (A05 / A07 / §4.2 #4): Uninitialized journal reconcile, usable repair priority, Wait-mode qualify, foreground loop
 // ============================================================================
 #[tokio::test]
-async fn review_r5_doctor_fix_uninitialized_slot_usable_priority_wait_qualify_and_foreground_loop()
-{
+async fn review_r5_journal_reconcile_uninitialized_slot_usable_priority_wait_qualify_and_foreground_loop(
+) {
     let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let paths = h.paths();
@@ -2783,7 +2824,7 @@ async fn review_r5_doctor_fix_uninitialized_slot_usable_priority_wait_qualify_an
     .unwrap();
 
     // 1. Stuck `RecoveryIncomplete` journal when `~/.gemini/antigravity-cli` is `Uninitialized` (removed)
-    //    MUST unwedge cleanly via `doctor --fix` (exit 0)!
+    //    MUST unwedge cleanly via pre-write journal reconciliation (exit 0)!
     fs::remove_dir_all(h.home.join(".gemini")).unwrap();
     let stuck_j = agy_switch_cli::session::journal::SwitchJournal {
         schema_version: 1,
@@ -2805,18 +2846,18 @@ async fn review_r5_doctor_fix_uninitialized_slot_usable_priority_wait_qualify_an
 
     let fix_uninit = h
         .cli()
-        .args(["doctor", "--fix", "--json"])
+        .args(["policy", "set", "--reserve", "10", "--json"])
         .output()
         .unwrap();
     assert_eq!(
         fix_uninit.status.code(),
         Some(0),
-        "`doctor --fix` MUST succeed when slot dir is Uninitialized: stderr={}",
+        "Journal reconciliation MUST succeed when slot dir is Uninitialized: stderr={}",
         String::from_utf8_lossy(&fix_uninit.stderr)
     );
     assert!(read_journal_readonly(&paths).unwrap().is_none());
 
-    // 2. When slot dir IS initialized (`AbsentInInitializedDir`), `doctor --fix` prefers usable `acc-ok` over disabled `acc-dis`!
+    // 2. When slot dir IS initialized (`AbsentInInitializedDir`), journal repair prefers usable `acc-ok` over disabled `acc-dis`!
     fs::create_dir_all(&paths.active_slot_dir).unwrap();
     fs::set_permissions(&paths.active_slot_dir, fs::Permissions::from_mode(0o700)).unwrap();
     repo.with_write_lock(|tx| {
@@ -2825,7 +2866,7 @@ async fn review_r5_doctor_fix_uninitialized_slot_usable_priority_wait_qualify_an
     .unwrap();
     let fix_usable = h
         .cli()
-        .args(["doctor", "--fix", "--json"])
+        .args(["policy", "set", "--reserve", "12", "--json"])
         .output()
         .unwrap();
     assert_eq!(fix_usable.status.code(), Some(0));
@@ -3076,6 +3117,7 @@ async fn review_r5_doctor_fix_uninitialized_slot_usable_priority_wait_qualify_an
 // ============================================================================
 #[test]
 fn review_r6_real_sigkill_signal_9_prepared_and_index_committed_boundaries() {
+    let _g = ENV_MUTEX.blocking_lock();
     if let Ok(stage) = std::env::var("AGY_TEST_SIGKILL_STAGE") {
         let home = PathBuf::from(std::env::var("AGY_CHILD_HOME").unwrap());
         let data = PathBuf::from(std::env::var("AGY_CHILD_DATA").unwrap());
@@ -3197,44 +3239,54 @@ fn review_r6_real_sigkill_signal_9_prepared_and_index_committed_boundaries() {
             .unwrap();
 
         let marker = h.tmp.path().join("sigkill_stage_marker");
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", &h.home)
-            .env("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir)
-            .env("AGY_TEST_SIGKILL_STAGE", stage)
-            .env("AGY_CHILD_HOME", &paths.home_dir)
-            .env("AGY_CHILD_DATA", &paths.data_dir)
-            .env("AGY_CHILD_CACHE", &paths.cache_dir)
-            .env("AGY_CHILD_READY_MARKER", &marker)
-            .args([
-                "--exact",
-                "review_r6_real_sigkill_signal_9_prepared_and_index_committed_boundaries",
-                "--nocapture",
-            ])
-            .spawn()
-            .unwrap();
+        let mut child_guard = KillChildOnDrop::new(
+            Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &h.home)
+                .env("TMPDIR", h.tmp.path())
+                .env("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir)
+                .env("AGY_TEST_SIGKILL_STAGE", stage)
+                .env("AGY_CHILD_HOME", &paths.home_dir)
+                .env("AGY_CHILD_DATA", &paths.data_dir)
+                .env("AGY_CHILD_CACHE", &paths.cache_dir)
+                .env("AGY_CHILD_READY_MARKER", &marker)
+                .args([
+                    "--exact",
+                    "review_r6_real_sigkill_signal_9_prepared_and_index_committed_boundaries",
+                    "--nocapture",
+                ])
+                .spawn()
+                .unwrap(),
+        );
 
-        for _ in 0..100 {
+        for _ in 0..400 {
             if marker.exists() {
+                break;
+            }
+            if let Some(status) = child_guard.as_mut().try_wait().unwrap() {
+                if !marker.exists() {
+                    panic!("Child exited prematurely ({status}) before reaching stage {stage}");
+                }
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(marker.exists(), "Child did not reach stage {stage}");
 
+        let mut child = child_guard.take();
         unsafe {
             libc::kill(child.id() as i32, libc::SIGKILL);
         }
         let st = child.wait().unwrap();
         assert_eq!(st.signal(), Some(libc::SIGKILL));
 
-        let doc = h.cli().args(["doctor", "--json"]).output().unwrap();
+        let doc = h.cli().args(["status", "--json"]).output().unwrap();
         assert_eq!(doc.status.code(), Some(expected_doc_rc), "stage={stage}");
 
         let fix = h
             .cli()
-            .args(["doctor", "--fix", "--json"])
+            .args(["policy", "set", "--reserve", "10", "--json"])
             .output()
             .unwrap();
         assert_eq!(fix.status.code(), Some(0), "stage={stage}");
@@ -3253,6 +3305,7 @@ fn review_r6_real_sigkill_signal_9_prepared_and_index_committed_boundaries() {
 
 #[tokio::test]
 async fn review_r7_single_quote_clap_redaction_client_key_policy_and_daemon_startup_sigterm() {
+    let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let paths = h.paths();
     let repo = StoreRepository::new(paths.clone());
@@ -3311,7 +3364,7 @@ async fn review_r7_single_quote_clap_redaction_client_key_policy_and_daemon_star
         );
     }
 
-    // 2. Malformed `ANTIGRAVITY_OAUTH_CLIENTS`, accidental `--client <SECRET>`, `--token-file <SECRET>`,
+    // 2. Malformed `ANTIGRAVITY_OAUTH_CLIENTS`, accidental `--client <SECRET>`, `--from-file <SECRET>`,
     //    `--model <SECRET>`, and corrupted `policy.json` candidate IDs MUST NEVER echo secrets (case-insensitive)!
     let clients_out = h
         .cli()
@@ -3334,13 +3387,7 @@ async fn review_r7_single_quote_clap_redaction_client_key_policy_and_daemon_star
 
     let bad_client_flag = h
         .cli()
-        .args([
-            "auth",
-            "login",
-            "--manual",
-            "--client",
-            "GOCSPX-FlagClientSecret66666",
-        ])
+        .args(["auth", "login", "--client", "GOCSPX-FlagClientSecret66666"])
         .output()
         .unwrap();
     assert_eq!(bad_client_flag.status.code(), Some(6));
@@ -3353,7 +3400,7 @@ async fn review_r7_single_quote_clap_redaction_client_key_policy_and_daemon_star
         .args([
             "accounts",
             "add",
-            "--token-file",
+            "--from-file",
             "1//0gLiteralTokenPassedToTokenFile55555",
         ])
         .output()
@@ -3481,33 +3528,36 @@ async fn review_r7_single_quote_clap_redaction_client_key_policy_and_daemon_star
         }
     });
 
-    let mut daemon_child = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", &h.home)
-        .env("XDG_DATA_HOME", h.tmp.path().join("xdg_data"))
-        .env("XDG_CACHE_HOME", &h.cache_dir)
-        .env("XDG_CONFIG_HOME", h.tmp.path().join("xdg_cfg"))
-        .env("XDG_RUNTIME_DIR", &h.runtime_dir)
-        .env(
-            "DBUS_SESSION_BUS_ADDRESS",
-            format!("unix:path={}/no-dbus", h.runtime_dir.display()),
-        )
-        .env("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir)
-        .args([
-            "--data-dir",
-            h.data_dir.to_str().unwrap(),
-            "--proxy",
-            &format!("http://127.0.0.1:{stall_port}"),
-            "daemon",
-            "--once",
-        ])
-        .spawn()
-        .unwrap();
+    let mut daemon_child_guard = KillChildOnDrop::new(
+        Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &h.home)
+            .env("XDG_DATA_HOME", h.tmp.path().join("xdg_data"))
+            .env("XDG_CACHE_HOME", &h.cache_dir)
+            .env("XDG_CONFIG_HOME", h.tmp.path().join("xdg_cfg"))
+            .env("XDG_RUNTIME_DIR", &h.runtime_dir)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}/no-dbus", h.runtime_dir.display()),
+            )
+            .env("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir)
+            .args([
+                "--data-dir",
+                h.data_dir.to_str().unwrap(),
+                "--proxy",
+                &format!("http://127.0.0.1:{stall_port}"),
+                "daemon",
+                "--once",
+            ])
+            .spawn()
+            .unwrap(),
+    );
 
     accepted_rx
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(Duration::from_secs(10))
         .expect("daemon --once did not initiate remote UA HTTP connection via proxy");
+    let mut daemon_child = daemon_child_guard.take();
     unsafe {
         libc::kill(daemon_child.id() as i32, libc::SIGTERM);
     }
@@ -3529,6 +3579,7 @@ async fn r2_01_pending_resume_and_add_interleaving_serializes_and_enforces_cas()
     };
     use std::collections::HashMap;
 
+    let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let repo = StoreRepository::new(h.paths());
     let now = 2_000_000_000i64;
@@ -3832,6 +3883,7 @@ async fn r2_02_superseded_lineage_beyond_32_and_overflow_archive_prevent_overwri
     use agy_switch_cli::domain::account::MAX_PREVIOUS_RT_DIGESTS;
     use agy_switch_cli::store::repository::TokenLineageArchive;
 
+    let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let paths = h.paths();
     let repo = StoreRepository::new(paths.clone());
@@ -3897,7 +3949,13 @@ async fn r2_02_superseded_lineage_beyond_32_and_overflow_archive_prevent_overwri
     // 1) Default import of oldest backup -> skipped_count = 1
     let def_out = h
         .cli()
-        .args(["accounts", "import", bundle_0.to_str().unwrap(), "--json"])
+        .args([
+            "accounts",
+            "import",
+            "--from-file",
+            bundle_0.to_str().unwrap(),
+            "--json",
+        ])
         .output()
         .unwrap();
     assert_eq!(def_out.status.code(), Some(0));
@@ -3912,6 +3970,7 @@ async fn r2_02_superseded_lineage_beyond_32_and_overflow_archive_prevent_overwri
             .args([
                 "accounts",
                 "import",
+                "--from-file",
                 b.to_str().unwrap(),
                 "--overwrite",
                 "--json",
@@ -4022,6 +4081,7 @@ fn r2_03_deep_ancestor_symlinks_rejected_across_all_read_write_import_export_and
         ensure_private_dir, read_regular_file_bounded, write_atomic_durable, MAX_STORE_FILE_BYTES,
     };
 
+    let _g = ENV_MUTEX.blocking_lock();
     let h = IsolatedHarness::new();
     let real_root = h.tmp.path().join("real");
     let real_deep_data = real_root.join("deep").join("data");
@@ -4057,10 +4117,10 @@ fn r2_03_deep_ancestor_symlinks_rejected_across_all_read_write_import_export_and
     for args in [
         vec!["accounts", "list", "--json"],
         vec!["policy", "show", "--json"],
-        vec!["doctor", "--json"],
+        vec!["status", "--json"],
         vec!["auth", "pending", "--json"],
         vec!["accounts", "disable", "acc-real", "--json"],
-        vec!["policy", "set", "--reserve", "20", "--json"],
+        vec!["policy", "set", "--reserve", "10", "--json"],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
             .env_clear()
@@ -4090,7 +4150,7 @@ fn r2_03_deep_ancestor_symlinks_rejected_across_all_read_write_import_export_and
         orig_acc_bytes
     );
 
-    // 2. Import, legacy import, export, and `--token-file` through `alias/deep/...` MUST ALSO reject!
+    // 2. Import, legacy import, export, and `--from-file` through `alias/deep/...` MUST ALSO reject!
     let real_io_dir = real_root.join("deep").join("io");
     fs::create_dir_all(&real_io_dir).unwrap();
     let real_bundle = real_io_dir.join("bundle.json");
@@ -4109,6 +4169,7 @@ fn r2_03_deep_ancestor_symlinks_rejected_across_all_read_write_import_export_and
         .args([
             "accounts",
             "import",
+            "--from-file",
             alias_io_dir.join("bundle.json").to_str().unwrap(),
             "--json",
         ])
@@ -4137,7 +4198,7 @@ fn r2_03_deep_ancestor_symlinks_rejected_across_all_read_write_import_export_and
         .args([
             "accounts",
             "add",
-            "--token-file",
+            "--from-file",
             alias_io_dir.join("tok.txt").to_str().unwrap(),
             "--json",
         ])
@@ -4159,8 +4220,9 @@ fn r2_03_deep_ancestor_symlinks_rejected_across_all_read_write_import_export_and
 }
 
 #[test]
-fn r2_04_doctor_surfaces_daemon_state_fifo_and_corrupt_errors_honestly() {
+fn r2_04_status_surfaces_daemon_state_fifo_and_corrupt_errors_honestly() {
     use std::os::unix::fs::FileTypeExt;
+    let _g = ENV_MUTEX.blocking_lock();
     let h = IsolatedHarness::new();
     let paths = h.paths();
     fs::create_dir_all(paths.state_dir()).unwrap();
@@ -4168,59 +4230,62 @@ fn r2_04_doctor_surfaces_daemon_state_fifo_and_corrupt_errors_honestly() {
     fs::set_permissions(paths.state_dir(), fs::Permissions::from_mode(0o700)).unwrap();
 
     // 1. Replace `state/daemon_state.json` with a zero-writer `0600` FIFO:
-    //    `doctor --json` MUST NOT block, MUST exit `1`, and MUST report `daemon_state_ok: false` + `daemon_paused_on_failure: null`!
+    //    `status --json` MUST NOT block, MUST exit `1`, and MUST report `daemon_state_ok: false` + `daemon_paused_on_failure: null`!
     let ds_path = paths.daemon_state_file();
     let c_fifo = CString::new(ds_path.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
 
     let t0 = Instant::now();
-    let doc_fifo = h.cli().args(["doctor", "--json"]).output().unwrap();
+    let st_fifo = h.cli().args(["status", "--json"]).output().unwrap();
     assert!(t0.elapsed() < Duration::from_secs(2));
-    assert_eq!(doc_fifo.status.code(), Some(1));
-    assert!(doc_fifo.stdout.is_empty());
-    let err_json: serde_json::Value = serde_json::from_slice(&doc_fifo.stderr).unwrap();
+    assert_eq!(st_fifo.status.code(), Some(1));
+    assert!(st_fifo.stdout.is_empty());
+    let err_json: serde_json::Value = serde_json::from_slice(&st_fifo.stderr).unwrap();
     assert_eq!(err_json["ok"], false);
     assert_eq!(err_json["details"]["daemon_state_ok"], false);
     assert!(err_json["details"]["daemon_state_error"].is_string());
     assert!(err_json["details"]["daemon_paused_on_failure"].is_null());
 
-    // `doctor --fix` preserves non-regular FIFO without unlinking it and still exits `1` honestly!
-    let fix_fifo = h
+    // `policy set` (`repair_or_clear_daemon_state_in_tx`) preserves non-regular FIFO without unlinking it!
+    let pol_fifo = h
         .cli()
-        .args(["doctor", "--fix", "--json"])
+        .args(["policy", "set", "--reserve", "10", "--json"])
         .output()
         .unwrap();
-    assert_eq!(fix_fifo.status.code(), Some(1));
+    assert_eq!(pol_fifo.status.code(), Some(0));
     assert!(fs::symlink_metadata(&ds_path)
         .unwrap()
         .file_type()
         .is_fifo());
     fs::remove_file(&ds_path).unwrap();
 
-    // 2. Corrupt regular `daemon_state.json` -> `doctor` exits `1`, `doctor --fix` resets it and exits `0`!
+    // 2. Corrupt regular `daemon_state.json` -> `status` exits `1`, `policy set` resets it so `status` exits `0`!
     fs::write(&ds_path, b"{corrupt-daemon-state").unwrap();
     fs::set_permissions(&ds_path, fs::Permissions::from_mode(0o600)).unwrap();
-    let doc_corrupt = h.cli().args(["doctor", "--json"]).output().unwrap();
-    assert_eq!(doc_corrupt.status.code(), Some(1));
+    let st_corrupt = h.cli().args(["status", "--json"]).output().unwrap();
+    assert_eq!(st_corrupt.status.code(), Some(1));
 
-    let fix_corrupt = h
+    let heal_corrupt = h
         .cli()
-        .args(["doctor", "--fix", "--json"])
+        .args(["policy", "set", "--reserve", "12", "--json"])
         .output()
         .unwrap();
+    assert_eq!(heal_corrupt.status.code(), Some(0));
+    let st_healed = h.cli().args(["status", "--json"]).output().unwrap();
     assert_eq!(
-        fix_corrupt.status.code(),
+        st_healed.status.code(),
         Some(0),
         "stderr={}",
-        String::from_utf8_lossy(&fix_corrupt.stderr)
+        String::from_utf8_lossy(&st_healed.stderr)
     );
-    let fixed_json: serde_json::Value = serde_json::from_slice(&fix_corrupt.stdout).unwrap();
+    let fixed_json: serde_json::Value = serde_json::from_slice(&st_healed.stdout).unwrap();
     assert_eq!(fixed_json["daemon_state_ok"], true);
     assert_eq!(fixed_json["daemon_paused_on_failure"], false);
 }
 
 #[test]
 fn r2_05_explicit_help_never_echoes_misconfigured_env_values() {
+    let _g = ENV_MUTEX.blocking_lock();
     let h = IsolatedHarness::new();
     let synthetic_interval = "1//synthetic_secret_fixture'equals=tail\nnext_line_0123456789";
     let synthetic_cooldown = "GOCSPX-CooldownHelpSecret987654";
@@ -4267,6 +4332,7 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
     use agy_switch_cli::store::locks::is_pending_auth_lock_busy;
     use std::io::BufRead;
 
+    let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let paths = h.paths();
     let repo = StoreRepository::new(paths.clone());
@@ -4514,23 +4580,28 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
     let pk_lock_path = paths.pending_auth_lock_file(&pk_id);
 
     // Spawn a real child process holding `flock(LOCK_EX)` on `pending-<id>.lock`, verify `resume` sees busy, then `SIGKILL -9` child!
-    let mut holder = Command::new("python3")
-        .args([
-            "-c",
-            "import fcntl, os, sys, time\nfd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\nfcntl.flock(fd, fcntl.LOCK_EX)\nsys.stdout.write('LOCKED\\n')\nsys.stdout.flush()\ntime.sleep(30)\n",
-            pk_lock_path.to_str().unwrap(),
-        ])
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut holder_guard = KillChildOnDrop::new(
+        Command::new("python3")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .args([
+                "-c",
+                "import fcntl, os, sys, time\nfd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\nfcntl.flock(fd, fcntl.LOCK_EX)\nsys.stdout.write('LOCKED\\n')\nsys.stdout.flush()\ntime.sleep(30)\n",
+                pk_lock_path.to_str().unwrap(),
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let mut ready_line = String::new();
-    std::io::BufReader::new(holder.stdout.take().unwrap())
+    std::io::BufReader::new(holder_guard.as_mut().stdout.take().unwrap())
         .read_line(&mut ready_line)
         .unwrap();
     assert_eq!(ready_line.trim(), "LOCKED");
     assert!(is_pending_auth_lock_busy(&paths, &pk_id).unwrap());
 
     // Kill holder with real SIGKILL (-9) -> kernel closes fd & releases `flock` -> `resume` immediately recovers `1//pk-surviving`!
+    let mut holder = holder_guard.take();
     unsafe {
         libc::kill(holder.id() as i32, libc::SIGKILL);
     }
@@ -4612,7 +4683,7 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
             .truncated
     );
 
-    // 5. Corrupt / FIFO / symlink `state/token_lineage/<id>.json` fails closed without blocking on `import`, `add`, and `doctor [--fix]`!
+    // 5. Corrupt / FIFO / symlink `state/token_lineage/<id>.json` fails closed without blocking on `import`, `add`, and `status`!
     let lin_file = paths.token_lineage_file("acc-cap");
     fs::remove_file(&lin_file).unwrap();
     let c_lin_fifo = CString::new(lin_file.as_os_str().as_bytes()).unwrap();
@@ -4642,15 +4713,11 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
     assert_eq!(imp_fifo.updated_count, 0);
     assert_eq!(imp_fifo.failed_count, 1);
 
-    let doc_lin_fifo = h
-        .cli()
-        .args(["doctor", "--fix", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(doc_lin_fifo.status.code(), Some(1));
+    let st_lin_fifo = h.cli().args(["status", "--json"]).output().unwrap();
+    assert_eq!(st_lin_fifo.status.code(), Some(1));
     fs::remove_file(&lin_file).unwrap();
 
-    // 6. `--data-dir alias_sym/../store` and symlinked `config.json` in `doctor --fix` are rejected without chmodding external targets!
+    // 6. `--data-dir alias_sym/../store` and symlinked `config.json` in `status` & write commands are rejected without chmodding external targets!
     let ext_dir = h.tmp.path().join("ext_victim");
     fs::create_dir_all(ext_dir.join("nested")).unwrap();
     fs::set_permissions(&ext_dir, fs::Permissions::from_mode(0o755)).unwrap();
@@ -4667,12 +4734,8 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
         .is_err());
 
     std::os::unix::fs::symlink(&ext_file, paths.config_file()).unwrap();
-    let doc_sym_cfg = h
-        .cli()
-        .args(["doctor", "--fix", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(doc_sym_cfg.status.code(), Some(1));
+    let st_sym_cfg = h.cli().args(["status", "--json"]).output().unwrap();
+    assert_eq!(st_sym_cfg.status.code(), Some(1));
     assert_eq!(
         fs::metadata(&ext_file).unwrap().permissions().mode() & 0o777,
         0o644
@@ -4691,6 +4754,7 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
     use std::collections::HashMap;
     use std::os::unix::fs::FileTypeExt;
 
+    let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let paths = h.paths();
     let repo = StoreRepository::new(paths.clone());
@@ -5734,15 +5798,16 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
     let _ = agy_switch_cli::oauth::refresh::purge_all_pending_auth_records(&repo).unwrap();
 
     // =========================================================================
-    // 6. `state/auth_sequence.json` corrupt / 0000 / 0644 / FIFO diagnostics in `doctor` and `doctor --fix`
+    // 6. `state/auth_sequence.json` corrupt / 0644 / FIFO diagnostics in `status`
     // =========================================================================
     let seq_path = paths.auth_sequence_file();
     assert!(seq_path.exists());
+    let orig_seq_bytes = fs::read(&seq_path).unwrap();
     fs::write(&seq_path, b"{corrupt-auth-seq").unwrap();
     fs::set_permissions(&seq_path, fs::Permissions::from_mode(0o644)).unwrap();
 
-    let doc_bad_seq = h.cli().args(["doctor", "--json"]).output().unwrap();
-    assert_eq!(doc_bad_seq.status.code(), Some(1));
+    let st_bad_seq = h.cli().args(["status", "--json"]).output().unwrap();
+    assert_eq!(st_bad_seq.status.code(), Some(1));
 
     // Pre-`/token` preflight: corrupt `auth_sequence.json` aborts BEFORE sending `/token` POST (`token_posts == 0`)!
     let preflight_posts = Arc::new(AtomicUsize::new(0));
@@ -5767,38 +5832,16 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
     assert_eq!(preflight_err.error_code, "data_error");
     assert_eq!(preflight_posts.load(Ordering::SeqCst), 0);
 
-    let fix_bad_seq = h
-        .cli()
-        .args(["doctor", "--fix", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        fix_bad_seq.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&fix_bad_seq.stderr)
-    );
-    assert_eq!(
-        fs::symlink_metadata(&seq_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-    let rebuilt_seq = repo.read_auth_sequence_readonly().unwrap().unwrap();
-    assert!(rebuilt_seq.last_auth_seq >= post_live_ok.auth_generation);
-
-    // `0000` permissions on valid `auth_sequence.json` (`last_auth_seq = 900`) MUST preserve `900` upon `doctor --fix`!
+    // Restore valid `auth_sequence.json` with `0644` -> `status` flags `pending_auth_ok: false` + warning!
+    fs::write(&seq_path, &orig_seq_bytes).unwrap();
     repo.with_write_lock(|tx| tx.write_auth_sequence_state(900))
         .unwrap();
-    fs::set_permissions(&seq_path, fs::Permissions::from_mode(0o000)).unwrap();
-    let fix_0000_seq = h
-        .cli()
-        .args(["doctor", "--fix", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(fix_0000_seq.status.code(), Some(0));
+    fs::set_permissions(&seq_path, fs::Permissions::from_mode(0o644)).unwrap();
+    let st_perm_warn = h.cli().args(["status", "--json"]).output().unwrap();
+    assert_eq!(st_perm_warn.status.code(), Some(0));
+    let st_pw_j: serde_json::Value = serde_json::from_slice(&st_perm_warn.stdout).unwrap();
+    assert_eq!(st_pw_j["pending_auth_ok"], false);
+    fs::set_permissions(&seq_path, fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(
         repo.read_auth_sequence_readonly()
             .unwrap()
@@ -5807,19 +5850,15 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         900
     );
 
-    // Zero-writer named pipe at `auth_sequence.json` never blocks and is preserved by `doctor --fix` (exit 1)
+    // Zero-writer named pipe at `auth_sequence.json` never blocks and is preserved by `status` (exit 1)
     let saved_seq_bytes = fs::read(&seq_path).unwrap();
     fs::remove_file(&seq_path).unwrap();
     let c_seq_pipe = CString::new(seq_path.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c_seq_pipe.as_ptr(), 0o600) }, 0);
     let t0 = Instant::now();
-    let fix_pipe = h
-        .cli()
-        .args(["doctor", "--fix", "--json"])
-        .output()
-        .unwrap();
+    let st_pipe = h.cli().args(["status", "--json"]).output().unwrap();
     assert!(t0.elapsed() < Duration::from_secs(2));
-    assert_eq!(fix_pipe.status.code(), Some(1));
+    assert_eq!(st_pipe.status.code(), Some(1));
     assert!(fs::symlink_metadata(&seq_path)
         .unwrap()
         .file_type()

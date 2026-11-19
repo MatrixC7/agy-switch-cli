@@ -371,13 +371,14 @@ pub fn evaluate_single_model(q: &QuotaObservation, model: &str, now_unix: i64) -
         match pq.remaining_fraction {
             Some(frac) if fraction_is_known(Some(frac)) => {
                 if !pq.reset_time.trim().is_empty() {
-                    let Ok(parsed_pq_reset) = chrono::DateTime::parse_from_rfc3339(&pq.reset_time)
+                    let Some(parsed_pq_reset_unix) =
+                        crate::domain::clock::parse_rfc3339_unix_seconds(&pq.reset_time)
                     else {
                         return QuotaEval::Unknown {
                             reason: "invalid_primary_reset_time".into(),
                         };
                     };
-                    if parsed_pq_reset.timestamp() <= now_unix {
+                    if parsed_pq_reset_unix <= now_unix {
                         return QuotaEval::Stale {
                             reason: "reset_deadline_passed".into(),
                         };
@@ -398,12 +399,14 @@ pub fn evaluate_single_model(q: &QuotaObservation, model: &str, now_unix: i64) -
         }
     } else {
         if !m.reset_time.trim().is_empty() {
-            let Ok(parsed_m_reset) = chrono::DateTime::parse_from_rfc3339(&m.reset_time) else {
+            let Some(parsed_m_reset_unix) =
+                crate::domain::clock::parse_rfc3339_unix_seconds(&m.reset_time)
+            else {
                 return QuotaEval::Unknown {
                     reason: "invalid_reset_time".into(),
                 };
             };
-            if parsed_m_reset.timestamp() <= now_unix {
+            if parsed_m_reset_unix <= now_unix {
                 return QuotaEval::Stale {
                     reason: "reset_deadline_passed".into(),
                 };
@@ -444,12 +447,14 @@ pub fn evaluate_single_model(q: &QuotaObservation, model: &str, now_unix: i64) -
                 };
             }
 
-            let Ok(parsed_reset) = chrono::DateTime::parse_from_rfc3339(&bucket.reset_time) else {
+            let Some(parsed_reset_unix) =
+                crate::domain::clock::parse_rfc3339_unix_seconds(&bucket.reset_time)
+            else {
                 return QuotaEval::Unknown {
                     reason: "invalid_reset_time".into(),
                 };
             };
-            if parsed_reset.timestamp() <= now_unix {
+            if parsed_reset_unix <= now_unix {
                 return QuotaEval::Stale {
                     reason: "reset_deadline_passed".into(),
                 };
@@ -512,12 +517,12 @@ pub fn evaluate_single_model(q: &QuotaObservation, model: &str, now_unix: i64) -
 
     let same_env_tier =
         q.source_env != QuotaSourceEnv::LegacyUnknown && q.tier_source_env == Some(q.source_env);
-    let is_free = same_env_tier
-        && q.subscription_tier
-            .as_deref()
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .contains("free");
+    let tier_lower = q
+        .subscription_tier
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_free = same_env_tier && (tier_lower.contains("free") || tier_lower.contains("starter"));
 
     let short_pct = match short_5h {
         Some(v) => v,

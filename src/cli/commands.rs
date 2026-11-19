@@ -4,10 +4,7 @@ use crate::cli::secret_input::{
     read_bounded_line, read_secret_from_tty_with_mode, read_secrets_from_private_file,
     read_secrets_from_stdin, write_interactive_prompt, MAX_SECRET_BYTES,
 };
-use crate::domain::account::{
-    validate_account_id, AccountRecord, DisableReasonCode, PendingAuthRecord, SessionIdentity,
-    StoreIndex, STORE_SCHEMA_VERSION,
-};
+use crate::domain::account::{DisableReasonCode, SessionIdentity};
 use crate::domain::clock::{Clock, SystemClock};
 use crate::domain::policy::{PolicyMode, PolicyStrategy};
 use crate::domain::quota::{evaluate_account_quota, QuotaEval, DEFAULT_QUOTA_MAX_AGE_SECS};
@@ -26,48 +23,46 @@ use crate::paths::HeadlessPaths;
 use crate::quota::client::{refresh_account_quota_locked, CloudCodeEndpoints};
 use crate::session::backend::{
     detect_dbus_session_socket_warning, read_local_active_refresh_token,
-    resolve_credential_backend_with_config, validate_backend_choice, CredentialBackend,
-    FileSessionBackend, SlotInspectState,
+    resolve_credential_backend_with_config, validate_backend_choice, BackendChoice,
+    CredentialBackend, FileSessionBackend, SlotInspectState,
 };
 use crate::session::journal::{
-    diagnose_journal, read_journal_readonly, reconcile_journal_locked,
+    diagnose_journal_replicas_with_intent, read_journal_full_readonly,
     reconcile_pending_journal_before_write, JournalDiagnosis,
 };
 use crate::session::payload::resolve_session_identity;
-use crate::session::process::{cleanup_stale_leases_under_write_lock, observe_runtime_state};
-use crate::store::fs_atomic::{
-    cleanup_orphan_temp_files, read_regular_file_opt_bounded, MAX_STORE_FILE_BYTES,
-};
-use crate::store::locks::{
-    try_acquire_pending_auth_lock_nonblocking, ActiveSlotLock, DaemonInstanceLock,
-};
+use crate::session::process::observe_runtime_state;
+use crate::store::locks::DaemonInstanceLock;
 use crate::store::repository::StoreRepository;
 use crate::store::transfer::{
     export_transfer_bundle_file, import_from_legacy_dir, import_transfer_bundle_file,
 };
 use crate::switching::daemon::{
-    clear_daemon_pause_in_tx, read_daemon_state_readonly, repair_or_clear_daemon_state_in_tx,
+    read_daemon_state_readonly, repair_or_clear_daemon_state_in_tx,
     run_foreground_daemon_with_shutdown, spawn_shutdown_signal_watcher, DaemonConfigOverrides,
-    DaemonPolicyOverlay,
+    DaemonPolicyOverlay, DEFAULT_DAEMON_COOLDOWN_SECS, DEFAULT_DAEMON_INTERVAL_SECS,
 };
-use crate::switching::executor::{execute_switch, SwitchOptions};
+use crate::switching::executor::{
+    execute_account_delete, execute_switch_with_idle_policy, SwitchOptions,
+};
 use crate::switching::runner::{ordered_candidate_ids, run_managed_agy};
+use crate::switching::systemd::{
+    install_systemd_user_service, uninstall_systemd_user_service, DaemonServiceInstallOptions,
+};
 use crate::transport::client::{HttpTransport, ReqwestTransport};
 use crate::transport::proxy::ProxyMode;
 use crate::transport::user_agent::{
-    format_native_oauth_user_agent, probe_local_agy_version_isolated,
-    resolve_native_oauth_user_agent, CLI_PKG_VERSION, KNOWN_COMPAT_FLOOR_UA_VERSION,
-    VERIFIED_AGY_VERSIONS,
+    format_native_oauth_user_agent, probe_local_agy_for_status, resolve_native_oauth_user_agent,
+    LocalAgyProbeOutcome, CLI_PKG_VERSION, KNOWN_COMPAT_FLOOR_UA_VERSION,
 };
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
 
 fn command_uses_backend(cmd: &Commands) -> bool {
     match cmd {
@@ -79,31 +74,54 @@ fn command_uses_backend(cmd: &Commands) -> bool {
         Commands::Accounts(AccountsCommand::Export(_)) => false,
         Commands::Quota(args) => args.refresh,
         Commands::Policy(PolicyCommand::Show | PolicyCommand::Eval) => false,
+        Commands::Daemon(args) => !(args.install || args.uninstall),
+        Commands::Stats(_) => false,
         _ => true,
     }
 }
 
 pub async fn dispatch(cli: Cli) -> CliResult<i32> {
     let paths = HeadlessPaths::resolve(cli.data_dir.as_deref())?;
+    if cli.backend.is_some() || std::env::var_os("AGY_SWITCH_CLI_BACKEND").is_some() {
+        validate_backend_choice(cli.backend.as_deref(), None)?;
+    }
     let repo = StoreRepository::new(paths.clone());
-    let backend_box: Box<dyn CredentialBackend> = if matches!(cli.command, Commands::Doctor(_)) {
+    let mut explicit_file_backend = false;
+    let backend_box: Box<dyn CredentialBackend> = if matches!(cli.command, Commands::Status) {
         let cfg_backend = repo.read_config().ok().and_then(|c| c.backend);
         resolve_credential_backend_with_config(cli.backend.as_deref(), cfg_backend.as_deref())?
     } else if command_uses_backend(&cli.command) {
         let cfg = repo.read_config()?;
+        let choice = validate_backend_choice(cli.backend.as_deref(), cfg.backend.as_deref())?;
+        explicit_file_backend = choice == BackendChoice::File;
         resolve_credential_backend_with_config(cli.backend.as_deref(), cfg.backend.as_deref())?
+    } else if matches!(cli.command, Commands::Stats(_)) {
+        match repo.read_config() {
+            Ok(cfg) => {
+                validate_backend_choice(cli.backend.as_deref(), cfg.backend.as_deref())?;
+            }
+            Err(e) if e.message.contains("Unsupported `backend` setting") => {
+                return Err(CliError::data(
+                    "Unsupported `backend` setting in `config.json`. Supported values: `auto`, `dual`, `file`, `keyring`.",
+                ));
+            }
+            Err(_) => {
+                validate_backend_choice(cli.backend.as_deref(), None)?;
+            }
+        }
+        Box::new(FileSessionBackend)
     } else {
-        let cfg_backend = repo.read_config().ok().and_then(|c| c.backend);
-        validate_backend_choice(cli.backend.as_deref(), cfg_backend.as_deref())?;
+        let cfg = repo.read_config()?;
+        validate_backend_choice(cli.backend.as_deref(), cfg.backend.as_deref())?;
         Box::new(FileSessionBackend)
     };
     let backend: &dyn CredentialBackend = backend_box.as_ref();
-    let now_unix = chrono::Utc::now().timestamp();
+    let now_unix = crate::domain::clock::current_unix_seconds();
 
     match &cli.command {
-        // ==================== 1. DOCTOR ====================
-        Commands::Doctor(args) => {
-            handle_doctor(&repo, backend, args, cli.json, now_unix).await?;
+        // ==================== 1. STATUS ====================
+        Commands::Status => {
+            handle_status(&repo, backend, cli.json).await?;
             Ok(ExitCode::Ok.as_i32())
         }
 
@@ -135,7 +153,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
         }
         Commands::Auth(AuthCommand::Login(args)) => {
             reconcile_pending_journal_before_write(&repo, backend, now_unix)?;
-            let transport = build_network_transport(&repo, cli.proxy.as_deref())?;
+            let transport = build_network_transport(&repo, cli.proxy.as_deref(), cli.json)?;
             let ua = resolve_native_oauth_user_agent(
                 &paths,
                 &transport,
@@ -148,7 +166,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
         }
         Commands::Auth(AuthCommand::Reauthorize(args)) => {
             reconcile_pending_journal_before_write(&repo, backend, now_unix)?;
-            let transport = build_network_transport(&repo, cli.proxy.as_deref())?;
+            let transport = build_network_transport(&repo, cli.proxy.as_deref(), cli.json)?;
             let ua = resolve_native_oauth_user_agent(
                 &paths,
                 &transport,
@@ -175,7 +193,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             if args.resume {
                 let resume_now = SystemClock.now_unix();
                 reconcile_pending_journal_before_write(&repo, backend, resume_now)?;
-                let transport = build_network_transport(&repo, cli.proxy.as_deref())?;
+                let transport = build_network_transport(&repo, cli.proxy.as_deref(), cli.json)?;
                 let ua = resolve_native_oauth_user_agent(
                     &paths,
                     &transport,
@@ -193,6 +211,9 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                     SystemClock.now_unix(),
                 )
                 .await?;
+                if let Some(unpersisted_err) = report.unpersisted_error {
+                    return Err(unpersisted_err);
+                }
                 let selected_id = repo.read_snapshot()?.index.selected_account_id;
                 let views: Vec<AccountViewDto> = report
                     .resumed_accounts
@@ -351,15 +372,23 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             Ok(ExitCode::Ok.as_i32())
         }
         Commands::Accounts(AccountsCommand::Add(args)) => {
+            // Validate explicit path arguments BEFORE any pre-write journal reconciliation!
+            if let Some(ref file_path) = args.from_file {
+                if crate::error::path_looks_like_accidental_secret(file_path) {
+                    return Err(CliError::usage(
+                        "`--from-file` expects a filesystem path to a private `0600` file, not a literal credential value (redacted).",
+                    ));
+                }
+            }
             reconcile_pending_journal_before_write(&repo, backend, SystemClock.now_unix())?;
             let mut local_source_tag: Option<&'static str> = None;
             let token_entries: Vec<(String, Option<String>)> = if args.from_local {
                 let (secret, src_tag) = read_local_active_refresh_token(&paths, backend)?;
                 local_source_tag = Some(src_tag);
                 vec![(secret, None)]
-            } else if args.stdin {
+            } else if args.from_stdin {
                 read_secrets_from_stdin()?
-            } else if let Some(ref file_path) = args.token_file {
+            } else if let Some(ref file_path) = args.from_file {
                 read_secrets_from_private_file(file_path)?
             } else {
                 let single = read_secret_from_tty_with_mode(
@@ -369,7 +398,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 vec![(single, None)]
             };
 
-            let transport = build_network_transport(&repo, cli.proxy.as_deref())?;
+            let transport = build_network_transport(&repo, cli.proxy.as_deref(), cli.json)?;
             let ua = resolve_native_oauth_user_agent(
                 &paths,
                 &transport,
@@ -469,6 +498,9 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                         saved_ids_and_flags.push((saved.id, created));
                     }
                     Err(err) => {
+                        if err.exit_code == ExitCode::PartialCommitOrRecovery {
+                            return Err(err);
+                        }
                         if !cli.json {
                             eprintln!(
                                 "[{}/{}] Failed: {}",
@@ -520,10 +552,29 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             Ok(ExitCode::Ok.as_i32())
         }
         Commands::Accounts(AccountsCommand::Import(args)) => {
-            if args.from_legacy.is_none() && args.file.is_none() {
+            if args.from_legacy.is_none() && args.from_file.is_none() {
                 return Err(CliError::usage(
-                    "Specify either `<FILE>` or `--from-legacy [<LEGACY_DIR>]`.",
+                    "Specify either `--from-file <FILE>` or `--from-legacy [<LEGACY_DIR>]`.",
                 ));
+            }
+            // Validate explicit path arguments BEFORE any pre-write journal reconciliation!
+            if let Some(ref bundle_file) = args.from_file {
+                if crate::error::path_looks_like_accidental_secret(bundle_file) {
+                    return Err(CliError::usage(
+                        "`--from-file` expects a filesystem path to a transfer bundle JSON file, not a literal credential value (redacted).",
+                    ));
+                }
+            }
+            if let Some(ref legacy_arg) = args.from_legacy {
+                if !legacy_arg.trim().is_empty()
+                    && crate::error::path_looks_like_accidental_secret(std::path::Path::new(
+                        legacy_arg,
+                    ))
+                {
+                    return Err(CliError::usage(
+                        "`--from-legacy` expects a filesystem directory path, not a literal credential value (redacted).",
+                    ));
+                }
             }
             let import_now = SystemClock.now_unix();
             reconcile_pending_journal_before_write(&repo, backend, import_now)?;
@@ -534,7 +585,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                     PathBuf::from(legacy_arg)
                 };
                 import_from_legacy_dir(&repo, &legacy_dir, args.overwrite, import_now).await?
-            } else if let Some(ref bundle_file) = args.file {
+            } else if let Some(ref bundle_file) = args.from_file {
                 import_transfer_bundle_file(&repo, bundle_file, args.overwrite, import_now).await?
             } else {
                 unreachable!()
@@ -572,8 +623,8 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 &repo,
                 out_file,
                 args.include_secrets,
-                args.force,
-                &args.ids,
+                args.overwrite,
+                &args.accounts,
             )?;
             if cli.json {
                 print_json(&serde_json::json!({
@@ -632,33 +683,14 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             Ok(ExitCode::Ok.as_i32())
         }
         Commands::Accounts(AccountsCommand::Delete(args)) => {
-            let mut cleared_slot = false;
-            let target = if args.clear_active_slot {
-                // Acquire L1 -> reconcile any pending journal -> re-read fresh snapshot -> L3 delete!
-                let slot_lock = ActiveSlotLock::try_acquire(&paths, backend.uses_keyring())?;
-                reconcile_journal_locked(&slot_lock, &repo, backend, false, now_unix)?;
-                let snap = repo.read_snapshot()?;
-                let t = snap.select(&args.selector)?.clone();
-                let slot_state = backend.inspect_slot(&paths);
-                let should_remove = match &slot_state {
-                    SlotInspectState::Present(parsed) => {
-                        parsed.refresh_token_digest == t.token.refresh_token_fingerprint()
-                    }
-                    _ => false,
-                };
-                repo.with_write_lock(|tx| tx.delete_account(&t.id, args.force, now_unix))?;
-                if should_remove {
-                    backend.remove_slot(&paths)?;
-                    cleared_slot = true;
-                }
-                t
-            } else {
-                reconcile_pending_journal_before_write(&repo, backend, now_unix)?;
-                let snap = repo.read_snapshot()?;
-                let t = snap.select(&args.selector)?.clone();
-                repo.with_write_lock(|tx| tx.delete_account(&t.id, args.force, now_unix))?;
-                t
-            };
+            let (target, cleared_slot) = execute_account_delete(
+                &repo,
+                backend,
+                &args.selector,
+                args.force,
+                args.clear_active_slot,
+                now_unix,
+            )?;
 
             if cli.json {
                 print_json(&serde_json::json!({
@@ -682,92 +714,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
 
         // ==================== 4. CURRENT / SWITCH / RUN ====================
         Commands::Current => {
-            // Strictly read-only
-            let snap = repo.read_snapshot()?;
-            let slot_state = backend.inspect_slot(&paths);
-            let session_identity = resolve_session_identity(&slot_state, &snap);
-            let runtime_state = observe_runtime_state(&paths);
-            let journal = read_journal_readonly(&paths)?;
-            let journal_diag = diagnose_journal(journal.as_ref(), &slot_state);
-
-            let model_source_acc = match &session_identity {
-                SessionIdentity::Matched { account_id, .. }
-                | SessionIdentity::DriftedKnown { account_id, .. } => snap
-                    .accounts
-                    .iter()
-                    .find(|a| &a.id == account_id)
-                    .or_else(|| snap.selected_account()),
-                _ => snap.selected_account(),
-            };
-            let supported_models = model_source_acc
-                .and_then(|a| a.quota.as_ref())
-                .map(extract_supported_models);
-
-            let view = StatusViewDto {
-                selected_account: snap
-                    .selected_account()
-                    .map(|acc| SelectedAccountBriefDto::from_record_at(acc, now_unix)),
-                session_identity,
-                runtime_state,
-            };
-
-            if cli.json {
-                print_json(&serde_json::json!({
-                    "selected_account": view.selected_account,
-                    "session_identity": view.session_identity,
-                    "runtime_state": view.runtime_state,
-                    "journal_status": journal_diag,
-                    "supported_models": supported_models,
-                }))?;
-            } else {
-                match &view.selected_account {
-                    Some(sel) => {
-                        let plan_part = sel
-                            .subscription_tier
-                            .as_deref()
-                            .map(|t| format!("  [{}]", terminal_text(t)))
-                            .unwrap_or_default();
-                        let label_part = sel
-                            .custom_label
-                            .as_deref()
-                            .filter(|s| !s.is_empty())
-                            .map(|l| format!("  ({})", terminal_text(l)))
-                            .unwrap_or_default();
-                        let flag_part = if sel.disabled {
-                            "  [disabled]"
-                        } else if sel.validation_blocked {
-                            "  [verification required]"
-                        } else {
-                            ""
-                        };
-                        println!(
-                            "Selected account : {}{}{}{}  ({})",
-                            terminal_text(&sel.email),
-                            plan_part,
-                            label_part,
-                            flag_part,
-                            terminal_text(&sel.id)
-                        );
-                    }
-                    None => println!("Selected account : none"),
-                }
-                println!(
-                    "Active agy slot  : {}",
-                    format_session_identity_human(&view.session_identity)
-                );
-                println!(
-                    "Live agy runtime : {}",
-                    format_runtime_state_human(&view.runtime_state)
-                );
-                if journal_diag != JournalDiagnosis::Clean {
-                    println!("Pending journal  : {:?}", journal_diag);
-                }
-                if model_source_acc.is_some() {
-                    for line in format_supported_models_human(supported_models.as_deref()) {
-                        println!("{line}");
-                    }
-                }
-            }
+            handle_current(&repo, backend, cli.json, now_unix)?;
             Ok(ExitCode::Ok.as_i32())
         }
         Commands::Switch(args) => {
@@ -775,7 +722,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             if args.dry_run {
                 let dummy = crate::transport::client::MockTransport::default();
                 let floor_ua = format_native_oauth_user_agent(KNOWN_COMPAT_FLOOR_UA_VERSION);
-                let outcome = execute_switch(
+                let outcome = execute_switch_with_idle_policy(
                     &repo,
                     backend,
                     &dummy,
@@ -787,12 +734,16 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                         dry_run: true,
                         allow_running: args.allow_running,
                     },
+                    args.require_idle,
                     now_unix,
                 )
                 .await?;
                 if cli.json {
                     print_json(&serde_json::json!({ "switch": outcome }))?;
                 } else {
+                    if let Some(ref warn) = outcome.runtime_warning {
+                        eprintln!("{}", terminal_text(warn));
+                    }
                     println!(
                         "[dry-run] Ready to switch active slot to {} ({}).",
                         terminal_text(&outcome.target_account_id),
@@ -802,7 +753,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 return Ok(ExitCode::Ok.as_i32());
             }
 
-            let transport = build_network_transport(&repo, cli.proxy.as_deref())?;
+            let transport = build_network_transport(&repo, cli.proxy.as_deref(), cli.json)?;
             let ua = resolve_native_oauth_user_agent(
                 &paths,
                 &transport,
@@ -810,7 +761,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 now_unix,
             )
             .await;
-            let outcome = execute_switch(
+            let outcome = execute_switch_with_idle_policy(
                 &repo,
                 backend,
                 &transport,
@@ -822,6 +773,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                     dry_run: false,
                     allow_running: args.allow_running,
                 },
+                args.require_idle,
                 now_unix,
             )
             .await?;
@@ -842,7 +794,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
         }
         Commands::Run(args) => {
             let registry = OAuthClientRegistry::load(&paths)?;
-            let transport = build_network_transport(&repo, cli.proxy.as_deref())?;
+            let transport = build_network_transport(&repo, cli.proxy.as_deref(), cli.json)?;
             let ua = resolve_native_oauth_user_agent(
                 &paths,
                 &transport,
@@ -855,11 +807,10 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 backend,
                 &transport,
                 &OAuthEndpoints::default(),
-                &CloudCodeEndpoints::default(),
                 &registry,
                 &ua,
                 args.account.as_deref(),
-                args.isolate_dbus,
+                explicit_file_backend,
                 &args.command,
                 now_unix,
             )
@@ -867,15 +818,18 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             Ok(code)
         }
 
-        // ==================== 5. QUOTA (READ-ONLY OR `-r` REFRESH) & REFRESH ====================
+        // ==================== 5. QUOTA (READ-ONLY OR `--refresh`) & REFRESH ====================
         Commands::Quota(args) => {
             let mut effective_now = now_unix;
             let mut refresh_failures: Vec<(String, CliError)> = Vec::new();
+            let mut streamed_batch = false;
+            let mut streamed_stdout = false;
             if args.refresh {
-                let (_, fails) = execute_quota_refresh_batch(
+                let (refreshed_ok, fails, streamed) = execute_quota_refresh_batch(
                     &repo,
                     backend,
                     cli.proxy.as_deref(),
+                    cli.json,
                     !cli.no_remote_version,
                     args.selector.as_deref(),
                     args.all,
@@ -883,6 +837,8 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                     now_unix,
                 )
                 .await?;
+                streamed_stdout = streamed && !refreshed_ok.is_empty();
+                streamed_batch = streamed && (!refreshed_ok.is_empty() || !fails.is_empty());
                 refresh_failures = fails;
                 effective_now = SystemClock.now_unix();
             }
@@ -933,12 +889,16 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 } else if snap.accounts.is_empty() {
                     println!("No accounts saved.");
                 } else {
-                    for (id, e) in &refresh_failures {
-                        eprintln!(
-                            "Refresh failed for {}: {}",
-                            terminal_text(id),
-                            terminal_text(&e.message)
-                        );
+                    if streamed_stdout {
+                        println!();
+                    } else if !streamed_batch {
+                        for (id, e) in &refresh_failures {
+                            eprintln!(
+                                "Refresh failed for {}: {}",
+                                terminal_text(id),
+                                terminal_text(&e.message)
+                            );
+                        }
                     }
                     for (idx, acc) in snap.accounts.iter().enumerate() {
                         if idx > 0 {
@@ -992,7 +952,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 return Err(CliError::quota_unavailable(
                     "no_cached_quota",
                     format!(
-                        "Account '{}' ({}) has no cached quota. Run `agy-switch-cli quota -r {}` first.",
+                        "Account '{}' ({}) has no cached quota. Run `agy-switch-cli quota --refresh {}` first.",
                         target.id, target.email, target.id
                     ),
                 ));
@@ -1001,13 +961,13 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
 
             // In `--json` mode (or when quota is `Unknown` / `Unavailable`), enforce strict exit code 4.
             // In interactive human mode, if cached quota is merely `Stale` (> 1 hour old), still render
-            // the cached quota table cleanly with an inline `-r` hint instead of hiding it behind an error!
+            // the cached quota table cleanly with an inline `--refresh` hint instead of hiding it behind an error!
             let is_human_stale_viewable = !cli.json && matches!(eval, QuotaEval::Stale { .. });
             if !matches!(eval, QuotaEval::Known { .. }) && !is_human_stale_viewable {
                 return Err(CliError::quota_unavailable(
                     "quota_stale_or_unknown",
                     format!(
-                        "Cached quota for '{}' ({}) on model '{}' is {:?}. Run `agy-switch-cli quota -r {}` for fresh observation.",
+                        "Cached quota for '{}' ({}) on model '{}' is {:?}. Run `agy-switch-cli quota --refresh {}` for fresh observation.",
                         target.id, target.email, monitored_model, eval, target.id
                     ),
                 )
@@ -1041,10 +1001,11 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             Ok(ExitCode::Ok.as_i32())
         }
         Commands::Refresh(args) => {
-            let (refreshed_views, failures) = execute_quota_refresh_batch(
+            let (refreshed_views, failures, streamed_batch) = execute_quota_refresh_batch(
                 &repo,
                 backend,
                 cli.proxy.as_deref(),
+                cli.json,
                 !cli.no_remote_version,
                 args.selector.as_deref(),
                 args.all,
@@ -1077,6 +1038,14 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                     "refreshed": refreshed_views,
                     "failures": fail_json,
                 }))?;
+            } else if streamed_batch {
+                if refreshed_views.len() + failures.len() >= 2 {
+                    println!(
+                        "Batch refresh complete: {} refreshed, {} failed.",
+                        refreshed_views.len(),
+                        failures.len()
+                    );
+                }
             } else {
                 for v in &refreshed_views {
                     println!(
@@ -1197,11 +1166,23 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 policy.candidate_account_ids = resolved;
             }
 
+            let mut daemon_pause_err: Option<CliError> = None;
             let saved = repo.with_write_lock(|tx| {
                 let out = tx.save_policy(&mut policy, Some(prev_rev), now_unix)?;
-                clear_daemon_pause_in_tx(tx.paths(), now_unix);
+                if let Err(err) = repair_or_clear_daemon_state_in_tx(tx.paths(), now_unix) {
+                    daemon_pause_err = Some(err);
+                }
                 Ok(out)
             })?;
+            if let Some(pause_err) = daemon_pause_err {
+                return Err(CliError::partial_commit(
+                    "daemon_pause_clear_failed",
+                    format!(
+                        "Saved policy (revision {}), but failed to durably clear daemon failure pause in `daemon_state.json` ({}). Daemon remains paused.",
+                        saved.revision, pause_err.message
+                    ),
+                ));
+            }
 
             if cli.json {
                 print_json(&serde_json::json!({ "policy": saved }))?;
@@ -1251,11 +1232,23 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 }
             }
             policy.candidate_account_ids = resolved;
+            let mut daemon_pause_err: Option<CliError> = None;
             let saved = repo.with_write_lock(|tx| {
                 let out = tx.save_policy(&mut policy, Some(prev_rev), now_unix)?;
-                clear_daemon_pause_in_tx(tx.paths(), now_unix);
+                if let Err(err) = repair_or_clear_daemon_state_in_tx(tx.paths(), now_unix) {
+                    daemon_pause_err = Some(err);
+                }
                 Ok(out)
             })?;
+            if let Some(pause_err) = daemon_pause_err {
+                return Err(CliError::partial_commit(
+                    "daemon_pause_clear_failed",
+                    format!(
+                        "Saved policy (revision {}), but failed to durably clear daemon failure pause in `daemon_state.json` ({}). Daemon remains paused.",
+                        saved.revision, pause_err.message
+                    ),
+                ));
+            }
             if cli.json {
                 print_json(&serde_json::json!({ "policy": saved }))?;
             } else {
@@ -1382,9 +1375,101 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             Ok(ExitCode::Ok.as_i32())
         }
         Commands::Daemon(args) => {
+            let has_temp_policy_flags = args.mode.is_some()
+                || args.strategy.is_some()
+                || args.reserve.is_some()
+                || args.minimum.is_some()
+                || args.model.is_some();
+            if args.install {
+                if has_temp_policy_flags {
+                    return Err(CliError::usage(
+                        "Policy flags (`--mode`, `--strategy`, `--reserve`, `--minimum`, `--model`) are single-run in-memory overrides; persist them with `agy-switch-cli policy set ...` first, then run `agy-switch-cli daemon --install`.",
+                    ));
+                }
+                if cli.proxy.is_some() {
+                    return Err(CliError::usage(
+                        "`--proxy` is a single-run override and is not written into the systemd unit file. Persist `network.proxy_url` in `config.json` (0600) first, then run `agy-switch-cli daemon --install`.",
+                    ));
+                }
+                let has_env_backend = std::env::var_os("AGY_SWITCH_CLI_BACKEND").is_some();
+                let explicit_backend = if cli.backend.is_some() || has_env_backend {
+                    Some(validate_backend_choice(cli.backend.as_deref(), None)?)
+                } else {
+                    None
+                };
+                let outcome = install_systemd_user_service(
+                    &paths,
+                    &DaemonServiceInstallOptions {
+                        explicit_interval_secs: args.interval,
+                        explicit_cooldown_secs: args.cooldown,
+                        explicit_backend,
+                    },
+                )
+                .await?;
+                if cli.json {
+                    print_json(&outcome)?;
+                } else {
+                    println!(
+                        "Installed and started user service `{}`.",
+                        outcome.service_name
+                    );
+                    println!(
+                        "  Unit file : {}",
+                        terminal_text(&outcome.unit_path.to_string_lossy())
+                    );
+                    println!("  ExecStart : {}", terminal_text(&outcome.exec_start));
+                    println!(
+                        "  Status    : systemctl --user status {}",
+                        outcome.service_name
+                    );
+                    println!(
+                        "  Logs      : journalctl --user -u {} -f",
+                        outcome.service_name
+                    );
+                    println!(
+                        "  SSH note  : Run `{}` on remote servers so the user service stays running after SSH logout.",
+                        outcome.linger_hint
+                    );
+                }
+                return Ok(ExitCode::Ok.as_i32());
+            }
+            if args.uninstall {
+                if has_temp_policy_flags || cli.proxy.is_some() {
+                    return Err(CliError::usage(
+                        "Policy or `--proxy` flags cannot be combined with `daemon --uninstall`.",
+                    ));
+                }
+                let outcome = uninstall_systemd_user_service(&paths).await?;
+                if cli.json {
+                    print_json(&outcome)?;
+                } else if outcome.removed_unit_file {
+                    println!(
+                        "Stopped, disabled, and removed user service `{}` ({}).",
+                        outcome.service_name,
+                        terminal_text(&outcome.unit_path.to_string_lossy())
+                    );
+                } else {
+                    println!(
+                        "User service `{}` is already uninstalled ({} not present).",
+                        outcome.service_name,
+                        terminal_text(&outcome.unit_path.to_string_lossy())
+                    );
+                }
+                return Ok(ExitCode::Ok.as_i32());
+            }
+
+            let interval_secs = args.interval.unwrap_or(DEFAULT_DAEMON_INTERVAL_SECS);
+            let cooldown_secs = args.cooldown.unwrap_or(DEFAULT_DAEMON_COOLDOWN_SECS);
+            if interval_secs == 0 {
+                return Err(CliError::usage("`--interval` must be at least 1 second."));
+            }
+            if cooldown_secs < 0 {
+                return Err(CliError::usage("`--cooldown` must be >= 0 seconds."));
+            }
+
             let mut shutdown_rx = spawn_shutdown_signal_watcher();
             let registry = OAuthClientRegistry::load(&paths)?;
-            let transport = build_network_transport(&repo, cli.proxy.as_deref())?;
+            let transport = build_network_transport(&repo, cli.proxy.as_deref(), cli.json)?;
             let policy_overlay = DaemonPolicyOverlay {
                 mode: args.mode.map(|m| match m {
                     CliMode::Immediate => PolicyMode::Immediate,
@@ -1425,8 +1510,8 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 &registry,
                 &ua,
                 DaemonConfigOverrides {
-                    interval_secs: args.interval,
-                    cooldown_secs: args.cooldown,
+                    interval_secs,
+                    cooldown_secs,
                     once: args.once,
                     policy_overlay,
                     ..DaemonConfigOverrides::default()
@@ -1437,8 +1522,46 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             Ok(ExitCode::Ok.as_i32())
         }
 
-        // ==================== 7. OPTIONAL TUI ====================
+        // ==================== 7. READ-ONLY LOCAL STATS ====================
+        Commands::Stats(sub) => {
+            #[cfg(feature = "stats")]
+            {
+                match sub {
+                    StatsCommand::Summary(args) => {
+                        let view = crate::stats::collect_token_stats(&paths, args)?;
+                        if cli.json {
+                            print_json(&view)?;
+                        } else {
+                            println!("{}", view.render_human());
+                        }
+                    }
+                    StatsCommand::List(args) => {
+                        let view = crate::stats::collect_token_stats_list(&paths, args)?;
+                        if cli.json {
+                            print_json(&view)?;
+                        } else {
+                            println!("{}", view.render_human());
+                        }
+                    }
+                }
+                Ok(ExitCode::Ok.as_i32())
+            }
+            #[cfg(not(feature = "stats"))]
+            {
+                let _ = sub;
+                Err(CliError::usage(
+                    "This `agy-switch-cli` binary was compiled with `--no-default-features` (without `stats`). Rebuild with `--features stats` to inspect local SQLite token usage.",
+                ))
+            }
+        }
+
+        // ==================== 8. OPTIONAL TUI ====================
         Commands::Tui => {
+            if cli.json {
+                return Err(CliError::usage(
+                    "`tui` is an interactive terminal dashboard and cannot be combined with `--json`.",
+                ));
+            }
             #[cfg(feature = "tui")]
             {
                 crate::tui::run_interactive_tui(&repo, backend, cli.proxy.as_deref()).await?;
@@ -1510,98 +1633,218 @@ async fn execute_quota_refresh_batch(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
     cli_proxy: Option<&str>,
+    json_mode: bool,
     allow_remote_version: bool,
     selector: Option<&str>,
     all: bool,
     concurrency: u8,
     now_unix: i64,
-) -> CliResult<(Vec<AccountViewDto>, Vec<(String, CliError)>)> {
+) -> CliResult<(Vec<AccountViewDto>, Vec<(String, CliError)>, bool)> {
     reconcile_pending_journal_before_write(repo, backend, now_unix)?;
     let snap = repo.read_snapshot()?;
-    let target_ids: Vec<String> = if let Some(sel) = selector {
-        vec![snap.select(sel)?.id.clone()]
+    let targets: Vec<(usize, String, String)> = if let Some(sel) = selector {
+        let acc = snap.select(sel)?;
+        vec![(0, acc.id.clone(), acc.email.clone())]
     } else if all {
         snap.accounts
             .iter()
             .filter(|a| !a.disabled)
-            .map(|a| a.id.clone())
+            .enumerate()
+            .map(|(i, a)| (i, a.id.clone(), a.email.clone()))
             .collect()
     } else {
         let cur = snap.selected_account().ok_or_else(|| {
             CliError::not_found("No selected account to refresh. Pass `<ID|EMAIL>` or `--all`.")
         })?;
-        vec![cur.id.clone()]
+        vec![(0, cur.id.clone(), cur.email.clone())]
     };
 
-    if target_ids.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+    if targets.is_empty() {
+        return Ok((Vec::new(), Vec::new(), false));
     }
 
     let paths = repo.paths();
-    let transport = Arc::new(build_network_transport(repo, cli_proxy)?);
+    let transport: Arc<dyn HttpTransport> =
+        Arc::new(build_network_transport(repo, cli_proxy, json_mode)?);
     let ua =
         resolve_native_oauth_user_agent(paths, transport.as_ref(), allow_remote_version, now_unix)
             .await;
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    execute_quota_refresh_batch_inner(
+        repo,
+        snap,
+        targets,
+        all,
+        json_mode,
+        concurrency,
+        now_unix,
+        transport,
+        ua,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_quota_refresh_batch_inner(
+    repo: &StoreRepository,
+    snap: crate::store::repository::StoreSnapshot,
+    targets: Vec<(usize, String, String)>,
+    all: bool,
+    json_mode: bool,
+    concurrency: u8,
+    now_unix: i64,
+    transport: Arc<dyn HttpTransport>,
+    ua: String,
+    human_out: &mut dyn Write,
+    human_err: &mut dyn Write,
+) -> CliResult<(Vec<AccountViewDto>, Vec<(String, CliError)>, bool)> {
+    let total = targets.len();
+    let stream_human = !json_mode && (all || total > 1);
+    let paths = repo.paths();
     let registry = Arc::new(OAuthClientRegistry::load(paths)?);
     let oauth_ep = Arc::new(OAuthEndpoints::default());
     let quota_ep = Arc::new(CloudCodeEndpoints::default());
-    let sem = Arc::new(Semaphore::new(concurrency as usize));
+    let max_in_flight = (concurrency as usize).max(1);
+    let (tx, mut rx) = mpsc::unbounded_channel::<(
+        usize,
+        String,
+        String,
+        CliResult<crate::domain::account::AccountRecord>,
+    )>();
 
-    let mut handles = Vec::with_capacity(target_ids.len());
-    for id in target_ids {
-        let repo_c = repo.clone();
-        let tr_c = transport.clone();
-        let reg_c = registry.clone();
-        let oe_c = oauth_ep.clone();
-        let qe_c = quota_ep.clone();
-        let ua_c = ua.clone();
-        let sem_c = sem.clone();
-        handles.push(tokio::spawn(async move {
-            let _permit = sem_c.acquire_owned().await.ok();
-            let res = refresh_account_quota_locked(
-                &repo_c,
-                tr_c.as_ref(),
-                &oe_c,
-                &qe_c,
-                &reg_c,
-                &ua_c,
-                &id,
-                now_unix,
-            )
-            .await;
-            (id, res)
-        }));
+    let mut queue: VecDeque<(usize, String, String)> = targets.into_iter().collect();
+    let mut handles = Vec::with_capacity(total);
+    let mut in_flight = 0usize;
+    let mut first_recovery_err: Option<CliError> = None;
+
+    let selected_id = snap.index.selected_account_id;
+    let mut refreshed_indexed: Vec<(usize, AccountViewDto)> = Vec::with_capacity(total);
+    let mut failures_indexed: Vec<(usize, String, CliError)> = Vec::new();
+    let mut completed = 0usize;
+
+    let spawn_next = |queue: &mut VecDeque<(usize, String, String)>,
+                      handles: &mut Vec<tokio::task::JoinHandle<()>>,
+                      in_flight: &mut usize| {
+        if let Some((ord, id, email)) = queue.pop_front() {
+            let repo_c = repo.clone();
+            let tr_c = transport.clone();
+            let reg_c = registry.clone();
+            let oe_c = oauth_ep.clone();
+            let qe_c = quota_ep.clone();
+            let ua_c = ua.clone();
+            let tx_c = tx.clone();
+            handles.push(tokio::spawn(async move {
+                let res = refresh_account_quota_locked(
+                    &repo_c,
+                    tr_c.as_ref(),
+                    &oe_c,
+                    &qe_c,
+                    &reg_c,
+                    &ua_c,
+                    &id,
+                    now_unix,
+                )
+                .await;
+                let _ = tx_c.send((ord, id, email, res));
+            }));
+            *in_flight += 1;
+        }
+    };
+
+    // Dispatch ONLY up to `max_in_flight` tasks initially; queued items are held back until a slot
+    // finishes cleanly so any `PartialCommitOrRecovery` (`7`) immediately halts all further dispatch
+    // while allowing already-in-flight tasks to safely finish persisting their responses!
+    while in_flight < max_in_flight && !queue.is_empty() {
+        spawn_next(&mut queue, &mut handles, &mut in_flight);
     }
 
-    let mut refreshed_views = Vec::new();
-    let mut failures = Vec::new();
-    let selected_id = repo.read_snapshot()?.index.selected_account_id;
-
-    for h in handles {
-        if let Ok((id, res)) = h.await {
-            match res {
-                Ok(acc) => {
-                    let is_sel = selected_id.as_deref() == Some(acc.id.as_str());
-                    refreshed_views.push(AccountViewDto::from_record(&acc, is_sel));
+    while in_flight > 0 {
+        let Some((ord, id, email, res)) = rx.recv().await else {
+            break;
+        };
+        in_flight = in_flight.saturating_sub(1);
+        completed += 1;
+        match res {
+            Ok(acc) => {
+                if stream_human && first_recovery_err.is_none() {
+                    let _ = writeln!(
+                        human_out,
+                        "[{completed}/{total}] Refreshed {} ({})",
+                        terminal_text(&acc.id),
+                        terminal_text(&acc.email)
+                    );
+                    let _ = human_out.flush();
                 }
-                Err(err) => failures.push((id, err)),
+                let is_sel = selected_id.as_deref() == Some(acc.id.as_str());
+                refreshed_indexed.push((ord, AccountViewDto::from_record(&acc, is_sel)));
+            }
+            Err(err) => {
+                if err.exit_code == ExitCode::PartialCommitOrRecovery {
+                    if first_recovery_err.is_none() {
+                        first_recovery_err = Some(err.clone());
+                    }
+                    // Immediately stop dispatching remaining queued targets!
+                    queue.clear();
+                } else if stream_human && total >= 2 && first_recovery_err.is_none() {
+                    let _ = writeln!(
+                        human_err,
+                        "[{completed}/{total}] Failed {} ({}): {}",
+                        terminal_text(&id),
+                        terminal_text(&email),
+                        terminal_text(&err.message)
+                    );
+                    let _ = human_err.flush();
+                }
+                failures_indexed.push((ord, id, err));
+            }
+        }
+        if first_recovery_err.is_none() {
+            while in_flight < max_in_flight && !queue.is_empty() {
+                spawn_next(&mut queue, &mut handles, &mut in_flight);
             }
         }
     }
+    drop(tx);
+    for h in handles {
+        let _ = h.await;
+    }
+
+    if let Some(rec_err) = first_recovery_err {
+        return Err(rec_err);
+    }
+
+    refreshed_indexed.sort_by_key(|(ord, _)| *ord);
+    failures_indexed.sort_by_key(|(ord, _, _)| *ord);
+    let refreshed_views: Vec<AccountViewDto> =
+        refreshed_indexed.into_iter().map(|(_, v)| v).collect();
+    let mut failures: Vec<(String, CliError)> = failures_indexed
+        .into_iter()
+        .map(|(_, id, e)| (id, e))
+        .collect();
 
     if refreshed_views.is_empty() && failures.len() == 1 {
         return Err(failures.pop().unwrap().1);
     }
 
-    Ok((refreshed_views, failures))
+    Ok((refreshed_views, failures, stream_human))
 }
 
 fn build_network_transport(
     repo: &StoreRepository,
     cli_proxy: Option<&str>,
+    json_mode: bool,
 ) -> CliResult<ReqwestTransport> {
     let cfg = repo.read_config()?;
-    let proxy_mode = ProxyMode::resolve_with_config(cli_proxy, Some(&cfg.network))?;
+    let (proxy_mode, warnings) =
+        ProxyMode::resolve_with_config_and_warnings(cli_proxy, Some(&cfg.network))?;
+    if !json_mode {
+        for w in &warnings {
+            eprintln!("warning: {}", terminal_text(w));
+        }
+    }
     ReqwestTransport::build(proxy_mode)
 }
 
@@ -1613,304 +1856,135 @@ pub fn print_json<T: Serialize>(payload: &T) -> CliResult<()> {
     Ok(())
 }
 
-async fn handle_doctor(
+struct CurrentDiagnosticView {
+    view: StatusViewDto,
+    journal_diag: JournalDiagnosis,
+    supported_models: Option<Vec<String>>,
+    has_model_source_acc: bool,
+}
+
+fn collect_current_view(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
-    args: &DoctorArgs,
+    now_unix: i64,
+) -> CliResult<CurrentDiagnosticView> {
+    let paths = repo.paths();
+    let snap = repo.read_snapshot()?;
+    let replica_state = backend.inspect_replicas(paths);
+    let slot_state = replica_state.effective_slot_state();
+    let session_identity = resolve_session_identity(slot_state, &snap);
+    let runtime_state = observe_runtime_state(paths);
+    let journal_full = read_journal_full_readonly(paths)?;
+    let journal_diag = diagnose_journal_replicas_with_intent(
+        journal_full.as_ref().map(|(j, _, _)| j),
+        journal_full.as_ref().and_then(|(_, m, _)| m.as_ref()),
+        journal_full.as_ref().is_some_and(|(_, _, c)| *c),
+        &replica_state,
+    );
+
+    let model_source_acc = match &session_identity {
+        SessionIdentity::Matched { account_id, .. }
+        | SessionIdentity::DriftedKnown { account_id, .. } => snap
+            .accounts
+            .iter()
+            .find(|a| &a.id == account_id)
+            .or_else(|| snap.selected_account()),
+        _ => snap.selected_account(),
+    };
+    let supported_models = model_source_acc
+        .and_then(|a| a.quota.as_ref())
+        .map(extract_supported_models);
+    let has_model_source_acc = model_source_acc.is_some();
+
+    let view = StatusViewDto {
+        selected_account: snap
+            .selected_account()
+            .map(|acc| SelectedAccountBriefDto::from_record_at(acc, now_unix)),
+        session_identity,
+        runtime_state,
+    };
+
+    Ok(CurrentDiagnosticView {
+        view,
+        journal_diag,
+        supported_models,
+        has_model_source_acc,
+    })
+}
+
+fn handle_current(
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
     json_mode: bool,
     now_unix: i64,
 ) -> CliResult<()> {
-    let paths = repo.paths();
-    let mut repairs_applied: Vec<String> = Vec::new();
-
-    if args.fix {
-        let slot_lock = ActiveSlotLock::try_acquire(paths, backend.uses_keyring())?;
-        let diag = reconcile_journal_locked(&slot_lock, repo, backend, true, now_unix)?;
-        if diag != JournalDiagnosis::Clean {
-            repairs_applied.push(format!("Reconciled switch_journal: {diag:?}"));
-        }
-        // Clean orphan `*.tmp.*` files in `~/.gemini/antigravity-cli` while holding exclusive L1 `ActiveSlotLock`!
-        let cleaned_slot_tmp = cleanup_orphan_temp_files(&paths.active_slot_dir, Duration::ZERO);
-        if cleaned_slot_tmp > 0 {
-            repairs_applied.push(format!(
-                "Removed {cleaned_slot_tmp} orphan temporary file(s) from active slot directory."
-            ));
-        }
-
-        // Rebuild missing index.json from orphan valid accounts/*.json if needed, fix permissions, clear pause
-        repo.with_write_lock(|tx| {
-            let _ = fs::set_permissions(&tx.paths().data_dir, fs::Permissions::from_mode(0o700));
-            let _ =
-                fs::set_permissions(tx.paths().accounts_dir(), fs::Permissions::from_mode(0o700));
-            if fs::symlink_metadata(tx.paths().config_file()).is_ok_and(|m| m.file_type().is_file())
-            {
-                let _ = fs::set_permissions(
-                    tx.paths().config_file(),
-                    fs::Permissions::from_mode(0o600),
+    let current = collect_current_view(repo, backend, now_unix)?;
+    if json_mode {
+        print_json(&serde_json::json!({
+            "selected_account": current.view.selected_account,
+            "session_identity": current.view.session_identity,
+            "runtime_state": current.view.runtime_state,
+            "journal_status": current.journal_diag,
+            "supported_models": current.supported_models,
+        }))?;
+    } else {
+        match &current.view.selected_account {
+            Some(sel) => {
+                let plan_part = sel
+                    .subscription_tier
+                    .as_deref()
+                    .map(|t| format!("  [{}]", terminal_text(t)))
+                    .unwrap_or_default();
+                let label_part = sel
+                    .custom_label
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|l| format!("  ({})", terminal_text(l)))
+                    .unwrap_or_default();
+                let flag_part = if sel.disabled {
+                    "  [disabled]"
+                } else if sel.validation_blocked {
+                    "  [verification required]"
+                } else {
+                    ""
+                };
+                println!(
+                    "Selected account : {}{}{}{}  ({})",
+                    terminal_text(&sel.email),
+                    plan_part,
+                    label_part,
+                    flag_part,
+                    terminal_text(&sel.id)
                 );
             }
-            let is_real_dir = |p: &std::path::Path| {
-                fs::symlink_metadata(p)
-                    .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
-            };
-            let cleaned_store_tmp = cleanup_orphan_temp_files(&tx.paths().data_dir, Duration::ZERO)
-                + cleanup_orphan_temp_files(&tx.paths().accounts_dir(), Duration::ZERO)
-                + cleanup_orphan_temp_files(&tx.paths().state_dir(), Duration::ZERO)
-                + cleanup_orphan_temp_files(&tx.paths().pending_auth_dir(), Duration::ZERO)
-                + if is_real_dir(&tx.paths().token_lineage_dir()) {
-                    cleanup_orphan_temp_files(&tx.paths().token_lineage_dir(), Duration::ZERO)
-                } else {
-                    0
-                }
-                + if is_real_dir(&tx.paths().pending_lineage_dir()) {
-                    cleanup_orphan_temp_files(&tx.paths().pending_lineage_dir(), Duration::ZERO)
-                } else {
-                    0
-                };
-            if cleaned_store_tmp > 0 {
-                repairs_applied.push(format!(
-                    "Removed {cleaned_store_tmp} orphan temporary file(s) from store directories."
-                ));
+            None => println!("Selected account : none"),
+        }
+        println!(
+            "Active agy slot  : {}",
+            format_session_identity_human(&current.view.session_identity)
+        );
+        println!(
+            "Live agy runtime : {}",
+            format_runtime_state_human(&current.view.runtime_state)
+        );
+        if current.journal_diag != JournalDiagnosis::Clean {
+            println!("Pending journal  : {:?}", current.journal_diag);
+        }
+        if current.has_model_source_acc {
+            for line in format_supported_models_human(current.supported_models.as_deref()) {
+                println!("{line}");
             }
-            cleanup_stale_leases_under_write_lock(tx.paths());
-            if let Some(ds_msg) = repair_or_clear_daemon_state_in_tx(tx.paths(), now_unix) {
-                repairs_applied.push(ds_msg);
-            }
-
-            for l_dir in [tx.paths().token_lineage_dir(), tx.paths().pending_lineage_dir()] {
-                if is_real_dir(&l_dir) {
-                    let _ = fs::set_permissions(&l_dir, fs::Permissions::from_mode(0o700));
-                    if let Ok(entries) = fs::read_dir(&l_dir) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if let Ok(m) = fs::symlink_metadata(&p) {
-                                if m.file_type().is_file() && (m.permissions().mode() & 0o077) != 0
-                                {
-                                    let _ =
-                                        fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Repair permissions on `state/pending_auth/*.json` and remove corrupt/unparseable files
-            // (NEVER deleting valid `PendingAuthRecord` files holding live tokens or actively locked in-flight records!)
-            let pa_dir = tx.paths().pending_auth_dir();
-            if is_real_dir(&pa_dir) {
-                let _ = fs::set_permissions(&pa_dir, fs::Permissions::from_mode(0o700));
-                if let Ok(entries) = fs::read_dir(&pa_dir) {
-                    let mut fixed_pa_perms = 0usize;
-                    let mut removed_corrupt_pa = 0usize;
-                    for entry in entries.flatten() {
-                        let p = entry.path();
-                        let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
-                            continue;
-                        };
-                        if !fname.ends_with(".json") || fname.contains(".tmp.") {
-                            continue;
-                        };
-                        let id_opt = fname.strip_suffix(".json");
-                        let _held_pa_lock = match id_opt {
-                            Some(id_part) if validate_account_id(id_part).is_ok() => {
-                                match try_acquire_pending_auth_lock_nonblocking(tx.paths(), id_part)
-                                {
-                                    Ok(Some(guard)) => Some(guard),
-                                    _ => continue,
-                                }
-                            }
-                            _ => None,
-                        };
-                        let is_valid = read_regular_file_opt_bounded(
-                            &p,
-                            MAX_STORE_FILE_BYTES,
-                            "Pending auth file",
-                        )
-                        .ok()
-                        .flatten()
-                        .and_then(|b| serde_json::from_slice::<PendingAuthRecord>(&b).ok())
-                        .is_some_and(|rec| {
-                            rec.schema_version == STORE_SCHEMA_VERSION
-                                && validate_account_id(&rec.id).is_ok()
-                                && fname == format!("{}.json", rec.id)
-                        });
-                        if is_valid {
-                            if let Ok(m) = fs::symlink_metadata(&p) {
-                                if m.file_type().is_file() && (m.permissions().mode() & 0o077) != 0
-                                {
-                                    let _ =
-                                        fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
-                                    fixed_pa_perms += 1;
-                                }
-                            }
-                        } else if fs::symlink_metadata(&p)
-                            .map(|m| m.file_type().is_file())
-                            .unwrap_or(false)
-                            && fs::remove_file(&p).is_ok()
-                        {
-                            removed_corrupt_pa += 1;
-                            if let Some(id_part) = id_opt {
-                                let _ = tx.remove_pending_lineage(id_part);
-                            }
-                        }
-                    }
-                    if fixed_pa_perms > 0 {
-                        repairs_applied.push(format!(
-                            "Tightened permissions to 0600 on {fixed_pa_perms} pending_auth file(s)."
-                        ));
-                    }
-                    if removed_corrupt_pa > 0 {
-                        repairs_applied.push(format!(
-                            "Removed {removed_corrupt_pa} corrupt pending_auth file(s)."
-                        ));
-                    }
-                }
-            }
-
-            if fs::symlink_metadata(tx.paths().index_file())
-                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-            {
-                if let Ok(entries) = fs::read_dir(tx.paths().accounts_dir()) {
-                    let mut recovered_ids = Vec::new();
-                    for entry in entries.flatten() {
-                        let p = entry.path();
-                        if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                            if let Ok(Some(bytes)) =
-                                read_regular_file_opt_bounded(&p, MAX_STORE_FILE_BYTES, "Account")
-                            {
-                                if let Ok(acc) = serde_json::from_slice::<AccountRecord>(&bytes) {
-                                    let _ =
-                                        fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
-                                    recovered_ids.push(acc.id);
-                                }
-                            }
-                        }
-                    }
-                    recovered_ids.sort();
-                    if !recovered_ids.is_empty() {
-                        let mut idx = StoreIndex::new(now_unix);
-                        idx.selected_account_id = recovered_ids.first().cloned();
-                        idx.account_order = recovered_ids;
-                        tx.save_index(&mut idx, now_unix)?;
-                        repairs_applied
-                            .push("Rebuilt missing index.json from account files.".into());
-                    }
-                }
-            }
-
-            let seq_path = tx.paths().auth_sequence_file();
-            if let Ok(m) = fs::symlink_metadata(&seq_path) {
-                if m.file_type().is_file() {
-                    let orig_mode = m.permissions().mode() & 0o777;
-                    if orig_mode != 0o600 {
-                        let _ = fs::set_permissions(&seq_path, fs::Permissions::from_mode(0o600));
-                    }
-                    if let Ok(Some(cur_seq)) = repo.read_auth_sequence_readonly() {
-                        if orig_mode != 0o600 {
-                            repairs_applied.push(
-                                "Repaired permissions to 0600 on auth_sequence.json.".into(),
-                            );
-                        }
-                        let max_obs = repo
-                            .max_valid_account_auth_generation_lossy()
-                            .unwrap_or(0)
-                            .max(
-                                repo.list_valid_pending_auth_lossy()
-                                    .into_iter()
-                                    .map(|p| p.auth_seq)
-                                    .max()
-                                    .unwrap_or(0),
-                            );
-                        if cur_seq.last_auth_seq < max_obs
-                            && tx.ensure_auth_sequence_at_least(max_obs).is_ok()
-                        {
-                            repairs_applied.push(
-                                "Advanced auth_sequence.json to match live account and pending generations."
-                                    .into(),
-                            );
-                        }
-                    } else if let Ok(snap) = repo.read_snapshot() {
-                        let pa_dir_clean = match fs::read_dir(tx.paths().pending_auth_dir()) {
-                            Ok(entries) => entries.flatten().all(|ent| {
-                                let p = ent.path();
-                                let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
-                                    return true;
-                                };
-                                if !fname.ends_with(".json") || fname.contains(".tmp.") {
-                                    return true;
-                                }
-                                read_regular_file_opt_bounded(
-                                    &p,
-                                    MAX_STORE_FILE_BYTES,
-                                    "Pending auth file",
-                                )
-                                .ok()
-                                .flatten()
-                                .and_then(|b| serde_json::from_slice::<PendingAuthRecord>(&b).ok())
-                                .is_some_and(|rec| {
-                                    rec.schema_version == STORE_SCHEMA_VERSION
-                                        && validate_account_id(&rec.id).is_ok()
-                                        && fname == format!("{}.json", rec.id)
-                                })
-                            }),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-                            Err(_) => false,
-                        };
-                        if pa_dir_clean {
-                            let max_obs = snap
-                                .accounts
-                                .iter()
-                                .map(|a| a.auth_generation)
-                                .chain(std::iter::once(
-                                    repo.max_valid_account_auth_generation_lossy().unwrap_or(0),
-                                ))
-                                .chain(
-                                    repo.list_valid_pending_auth_lossy()
-                                        .into_iter()
-                                        .map(|p| p.auth_seq),
-                                )
-                                .max()
-                                .unwrap_or(0);
-                            if tx.write_auth_sequence_state(max_obs).is_ok() {
-                                repairs_applied.push(
-                                    "Rebuilt corrupt auth_sequence.json from live account and pending generations."
-                                        .into(),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Reconcile dangling candidate_account_ids in policy.json if any exist
-            if fs::symlink_metadata(tx.paths().policy_file())
-                .is_ok_and(|m| m.file_type().is_file())
-            {
-                if let Ok(mut pol) = repo.read_policy() {
-                    let idx = tx.load_index_or_init(now_unix)?;
-                    let known: HashSet<&str> =
-                        idx.account_order.iter().map(String::as_str).collect();
-                    let before_len = pol.candidate_account_ids.len();
-                    pol.candidate_account_ids
-                        .retain(|cid| known.contains(cid.as_str()));
-                    let pruned = before_len - pol.candidate_account_ids.len();
-                    if pruned > 0 {
-                        if pol.candidate_account_ids.is_empty() {
-                            pol.enabled = false;
-                        }
-                        tx.save_policy(&mut pol, None, now_unix)?;
-                        repairs_applied.push(format!(
-                            "Pruned {pruned} dangling candidate account ID(s) from policy.json."
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        })?;
+        }
     }
+    Ok(())
+}
 
-    // Pure read-only checks after any requested `--fix`
+async fn handle_status(
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    json_mode: bool,
+) -> CliResult<()> {
+    let paths = repo.paths();
     let snap_res = repo.read_snapshot();
     let policy_res = repo.read_policy();
     let pending_auth_res = repo.list_pending_auth_readonly();
@@ -1927,7 +2001,7 @@ async fn handle_doctor(
                     let mode = m.permissions().mode() & 0o777;
                     if (mode & 0o077) != 0 {
                         pending_auth_warnings.push(format!(
-                            "Pending auth file '{}' has insecure permissions ({mode:04o}); run `agy-switch-cli doctor --fix`.",
+                            "Pending auth file '{}' has insecure permissions ({mode:04o}); tighten with `chmod 600`.",
                             p.display()
                         ));
                     }
@@ -1940,7 +2014,7 @@ async fn handle_doctor(
             let mode = m.permissions().mode() & 0o777;
             if (mode & 0o077) != 0 {
                 pending_auth_warnings.push(format!(
-                    "Auth sequence file '{}' has insecure permissions ({mode:04o}); run `agy-switch-cli doctor --fix`.",
+                    "Auth sequence file '{}' has insecure permissions ({mode:04o}); tighten with `chmod 600`.",
                     paths.auth_sequence_file().display()
                 ));
             }
@@ -1948,63 +2022,56 @@ async fn handle_doctor(
     }
     let cfg_res = repo.read_config_with_warnings();
     let lineage_res = repo.validate_all_token_lineage_readonly();
-    let slot_state = backend.inspect_slot(paths);
-    let journal = read_journal_readonly(paths)?;
-    let journal_diag = diagnose_journal(journal.as_ref(), &slot_state);
+    let replica_state = backend.inspect_replicas(paths);
+    let slot_state = replica_state.effective_slot_state();
+    let journal_diag = match read_journal_full_readonly(paths) {
+        Ok(journal_full) => diagnose_journal_replicas_with_intent(
+            journal_full.as_ref().map(|(j, _, _)| j),
+            journal_full.as_ref().and_then(|(_, m, _)| m.as_ref()),
+            journal_full.as_ref().is_some_and(|(_, _, c)| *c),
+            &replica_state,
+        ),
+        Err(err) if err.exit_code == ExitCode::PartialCommitOrRecovery => {
+            JournalDiagnosis::RecoveryIncomplete {
+                target_account_id: String::new(),
+                reason: err.message,
+            }
+        }
+        Err(err) => return Err(err),
+    };
     let dbus_warning = (!backend.uses_keyring())
         .then(detect_dbus_session_socket_warning)
         .flatten();
-    let runtime_state = observe_runtime_state(paths);
     let dstate_res = read_daemon_state_readonly(paths);
-
-    let agy_probe = if args.verify_agy {
-        Some(probe_local_agy_version_isolated().await)
-    } else {
-        None
-    };
-
-    // Check active slot directory cleanliness (must contain ONLY `antigravity-oauth-token`)
-    let mut stray_slot_files = Vec::new();
-    if let Ok(entries) = fs::read_dir(&paths.active_slot_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name != "antigravity-oauth-token" {
-                    stray_slot_files.push(name.to_string());
-                }
-            }
-        }
-    }
-    stray_slot_files.sort();
+    let agy_probe = probe_local_agy_for_status().await;
 
     let agy_json = match &agy_probe {
-        Some(Ok((bin, ver, verified))) => serde_json::json!({
+        LocalAgyProbeOutcome::Detected {
+            executable,
+            version,
+        } => serde_json::json!({
             "checked": true,
-            "executable": bin,
-            "version": ver,
-            "is_verified_version": verified,
-            "verified_versions": VERIFIED_AGY_VERSIONS,
+            "found": true,
+            "executable": executable,
+            "version": version,
         }),
-        Some(Err(err)) => serde_json::json!({
+        LocalAgyProbeOutcome::NotFound => serde_json::json!({
             "checked": true,
-            "error": err,
-            "verified_versions": VERIFIED_AGY_VERSIONS,
+            "found": false,
+            "error": "Official `agy` executable not found in PATH.",
         }),
-        None => serde_json::json!({
-            "checked": false,
-            "verified_versions": VERIFIED_AGY_VERSIONS,
+        LocalAgyProbeOutcome::Failed { executable, error } => serde_json::json!({
+            "checked": true,
+            "found": true,
+            "executable": executable,
+            "error": error,
         }),
     };
 
     let store_ok = snap_res.is_ok();
     let slot_initialized = !matches!(slot_state, SlotInspectState::Uninitialized);
-    let slot_corrupt = matches!(slot_state, SlotInspectState::Corrupt(_));
-    let session_identity = snap_res
-        .as_ref()
-        .ok()
-        .map(|snap| resolve_session_identity(&slot_state, snap))
-        .unwrap_or(SessionIdentity::Unverified {
-            detail: "Store snapshot unreadable.".into(),
-        });
+    let slot_corrupt = matches!(slot_state, SlotInspectState::Corrupt(_))
+        || (replica_state.uses_file && matches!(replica_state.file, SlotInspectState::Corrupt(_)));
 
     let config_warnings = cfg_res
         .as_ref()
@@ -2048,18 +2115,13 @@ async fn handle_doctor(
         "journal_status": journal_diag,
         "slot_initialized": slot_initialized,
         "slot_corrupt": slot_corrupt,
-        "stray_slot_files": stray_slot_files,
-        "session_identity": session_identity,
-        "runtime_state": runtime_state,
         "daemon_state_ok": dstate_res.is_ok(),
         "daemon_state_error": dstate_res.as_ref().err().map(|e| &e.message),
         "daemon_paused_on_failure": dstate_res.as_ref().ok().map(|d| d.paused_on_failure),
         "dbus_keyring_warning": dbus_warning,
         "agy_probe": agy_json,
-        "repairs_applied": repairs_applied,
     });
 
-    // Determine if doctor must exit with a non-zero diagnostic code (7, 1, or 8)
     if matches!(
         journal_diag,
         JournalDiagnosis::CommittedIndexPending { .. }
@@ -2067,7 +2129,9 @@ async fn handle_doctor(
     ) {
         return Err(CliError::partial_commit(
             "pending_journal_reconciliation",
-            format!("Switch journal requires reconciliation ({journal_diag:?}). Run `agy-switch-cli doctor --fix`."),
+            format!(
+                "Switch journal requires reconciliation ({journal_diag:?}). Run `agy-switch-cli switch <ID|EMAIL>` to reconcile."
+            ),
         )
         .with_details(report));
     }
@@ -2082,7 +2146,7 @@ async fn handle_doctor(
 
     if !dangling_policy_candidates.is_empty() {
         return Err(CliError::data(format!(
-            "Policy references non-existent candidate account ID(s): {:?}. Run `agy-switch-cli doctor --fix`.",
+            "Policy references non-existent candidate account ID(s): {:?}. Update candidates via `agy-switch-cli policy set`.",
             dangling_policy_candidates
         ))
         .with_details(report));
@@ -2111,60 +2175,57 @@ async fn handle_doctor(
         );
     }
 
-    if let Some(Err(ref probe_err)) = agy_probe {
-        return Err(
-            CliError::env_not_ready("agy_probe_failed", probe_err.clone()).with_details(report),
-        );
+    if replica_state.uses_file {
+        if let SlotInspectState::Corrupt(ref detail) = replica_state.file {
+            return Err(CliError::data(format!(
+                "Active agy credential file replica is corrupt: {detail}"
+            ))
+            .with_details(report));
+        }
+    }
+
+    if let LocalAgyProbeOutcome::Failed { ref error, .. } = agy_probe {
+        return Err(CliError::env_not_ready("agy_probe_failed", error.clone()).with_details(report));
     }
 
     if json_mode {
         print_json(&report)?;
     } else {
-        println!("agy-switch-cli doctor (v{CLI_PKG_VERSION})");
+        println!("agy-switch-cli status (v{CLI_PKG_VERSION})");
+        println!("  Backend:           {}", backend.name());
         println!("  Store status:      OK");
         println!("  Journal status:    {:?}", journal_diag);
         println!("  Slot initialized:  {}", slot_initialized);
-        println!(
-            "  Session identity:  {}",
-            format_session_identity_human(&session_identity)
-        );
-        println!(
-            "  Runtime state:     {}",
-            format_runtime_state_human(&runtime_state)
-        );
         if let Ok(ref ds) = dstate_res {
             println!(
                 "  Daemon state:      OK (paused_on_failure={})",
                 ds.paused_on_failure
             );
         }
-        if !stray_slot_files.is_empty() {
-            let safe_stray: Vec<String> =
-                stray_slot_files.iter().map(|s| terminal_text(s)).collect();
-            println!(
-                "  Stray slot files:  WARNING — unexpected files in active slot dir: {safe_stray:?} (run `doctor --fix` to clean orphan .tmp. files)"
-            );
+        match &agy_probe {
+            LocalAgyProbeOutcome::Detected {
+                executable,
+                version,
+            } => {
+                println!(
+                    "  Official agy:      {} v{}",
+                    terminal_text(&executable.to_string_lossy()),
+                    terminal_text(version)
+                );
+            }
+            LocalAgyProbeOutcome::NotFound => {
+                println!("  Official agy:      not found in PATH");
+            }
+            LocalAgyProbeOutcome::Failed { .. } => unreachable!(),
         }
         for cw in &config_warnings {
             println!("  Config warning:    {}", terminal_text(cw));
         }
+        for pw in &pending_auth_warnings {
+            println!("  Security warning:  {}", terminal_text(pw));
+        }
         if let Some(ref w) = dbus_warning {
             println!("  D-Bus note:        {}", terminal_text(w));
-        }
-        if let Some(Ok((ref bin, ref ver, verified))) = agy_probe {
-            println!(
-                "  Official agy:      {} v{} ({})",
-                bin.display(),
-                ver,
-                if verified {
-                    "verified"
-                } else {
-                    "unverified version — consumer contract not yet certified for this release"
-                }
-            );
-        }
-        for r in &repairs_applied {
-            println!("  Applied fix:       {}", terminal_text(r));
         }
     }
 
@@ -2351,4 +2412,796 @@ async fn execute_interactive_oauth_code_flow(
 
     let code = wait_for_loopback_callback(listener, &session.state, OAUTH_FLOW_TIMEOUT).await?;
     Ok((session, code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::account::AccountRecord;
+    use crate::domain::token::TokenRecord;
+    use crate::transport::client::{
+        BoxFuture, HttpRequest, HttpResponse, MockTransport, TransportError,
+    };
+    use std::time::Duration;
+
+    struct StaggeredQuotaTransport;
+
+    impl HttpTransport for StaggeredQuotaTransport {
+        fn execute<'a>(
+            &'a self,
+            req: HttpRequest,
+        ) -> BoxFuture<'a, Result<HttpResponse, TransportError>> {
+            Box::pin(async move {
+                let auth = req
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("");
+                if auth.contains("ya29.acc-1") && req.url.contains(":fetchAvailableModels") {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                }
+                let body = if req.url.contains(":loadCodeAssist") {
+                    serde_json::json!({
+                        "cloudaicompanionProject": "proj-synth",
+                        "currentTier": { "name": "Antigravity Starter Quota" }
+                    })
+                } else if req.url.contains(":fetchAvailableModels") {
+                    serde_json::json!({ "models": {} })
+                } else {
+                    serde_json::json!({ "quotaGroups": [] })
+                };
+                Ok(MockTransport::json_response(200, body))
+            })
+        }
+    }
+
+    fn make_fresh_acc(id: &str, email: &str, now: i64) -> AccountRecord {
+        let tok = TokenRecord {
+            access_token: format!("ya29.{id}"),
+            refresh_token: format!("1//rt-{id}"),
+            expires_in: 7200,
+            expiry_timestamp: now + 7200,
+            token_type: "Bearer".into(),
+            id_token: None,
+            oauth_client_key: Some("antigravity_enterprise".into()),
+            granted_scopes: Some(vec![
+                "openid".into(),
+                "https://www.googleapis.com/auth/cloud-platform".into(),
+            ]),
+            project_id: Some("proj-synth".into()),
+            is_gcp_tos: true,
+        };
+        AccountRecord::new(id.into(), email.into(), tok, now)
+    }
+
+    #[tokio::test]
+    async fn refresh_batch_streams_completion_order_in_human_mode_and_sorts_json_views() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = HeadlessPaths::with_explicit(
+            tmp.path().join("home"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+        );
+        let repo = StoreRepository::new(paths);
+        let now = 1_900_000_000i64;
+        let acc1 = make_fresh_acc("acc-1", "alice@example.com", now);
+        let acc2 = make_fresh_acc("acc-2", "bob@example.com", now);
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(acc1, true, now)?;
+            tx.upsert_account(acc2, false, now)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let snap = repo.read_snapshot().unwrap();
+        let targets: Vec<(usize, String, String)> = snap
+            .accounts
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (i, a.id.clone(), a.email.clone()))
+            .collect();
+
+        let mut human_out = Vec::new();
+        let mut human_err = Vec::new();
+        let (views, failures, streamed) = execute_quota_refresh_batch_inner(
+            &repo,
+            snap.clone(),
+            targets.clone(),
+            true,
+            false,
+            2,
+            now,
+            Arc::new(StaggeredQuotaTransport),
+            "antigravity/1.5.9 linux/amd64".into(),
+            &mut human_out,
+            &mut human_err,
+        )
+        .await
+        .unwrap();
+
+        assert!(streamed);
+        assert!(failures.is_empty());
+        let streamed_lines: Vec<String> = String::from_utf8(human_out)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            streamed_lines,
+            vec![
+                "[1/2] Refreshed acc-2 (bob@example.com)".to_string(),
+                "[2/2] Refreshed acc-1 (alice@example.com)".to_string(),
+            ]
+        );
+        assert!(human_err.is_empty());
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].id, "acc-1");
+        assert_eq!(views[1].id, "acc-2");
+        assert_eq!(
+            views[0]
+                .quota
+                .as_ref()
+                .and_then(|q| q.subscription_tier.as_deref()),
+            Some("Antigravity Starter Quota")
+        );
+
+        let mut json_out = Vec::new();
+        let mut json_err = Vec::new();
+        let (json_views, _, json_streamed) = execute_quota_refresh_batch_inner(
+            &repo,
+            snap,
+            targets,
+            true,
+            true,
+            2,
+            now,
+            Arc::new(StaggeredQuotaTransport),
+            "antigravity/1.5.9 linux/amd64".into(),
+            &mut json_out,
+            &mut json_err,
+        )
+        .await
+        .unwrap();
+        assert!(!json_streamed);
+        assert!(json_out.is_empty());
+        assert!(json_err.is_empty());
+        assert_eq!(json_views[0].id, "acc-1");
+        assert_eq!(json_views[1].id, "acc-2");
+    }
+
+    #[tokio::test]
+    async fn r3_04_batch_refresh_stops_dispatching_after_exit_7_for_serial_and_concurrent() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        if std::env::var_os("AGY_SUBTEST_R304_BATCH").is_some() {
+            struct BatchTokenTransport {
+                token_calls: Arc<AtomicUsize>,
+                delay_acc2_ms: u64,
+            }
+            impl HttpTransport for BatchTokenTransport {
+                fn execute<'a>(
+                    &'a self,
+                    req: HttpRequest,
+                ) -> BoxFuture<'a, Result<HttpResponse, TransportError>> {
+                    let calls = self.token_calls.clone();
+                    let delay_ms = self.delay_acc2_ms;
+                    Box::pin(async move {
+                        if req.url.contains("/token") {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let rt_val = match &req.body {
+                                crate::transport::client::RequestBody::Form(pairs) => pairs
+                                    .iter()
+                                    .find(|(k, _)| k == "refresh_token")
+                                    .map(|(_, v)| v.as_str())
+                                    .unwrap_or(""),
+                                _ => "",
+                            };
+                            let is_acc2 = rt_val.contains("acc-2-ok");
+                            if is_acc2 && delay_ms > 0 {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            }
+                            let tag = if is_acc2 {
+                                "acc-2-ok"
+                            } else if rt_val.contains("acc-1-enospc") {
+                                "acc-1-enospc"
+                            } else {
+                                "acc-3-never"
+                            };
+                            return Ok(MockTransport::json_response(
+                                200,
+                                serde_json::json!({
+                                    "access_token": format!("ya29.new-{tag}"),
+                                    "refresh_token": format!("1//rotated-{tag}"),
+                                    "expires_in": 3600,
+                                    "token_type": "Bearer"
+                                }),
+                            ));
+                        }
+                        let body = if req.url.contains(":loadCodeAssist") {
+                            serde_json::json!({
+                                "cloudaicompanionProject": "proj-synth",
+                                "currentTier": { "name": "Antigravity Starter Quota" }
+                            })
+                        } else if req.url.contains(":fetchAvailableModels") {
+                            serde_json::json!({ "models": {} })
+                        } else {
+                            serde_json::json!({ "quotaGroups": [] })
+                        };
+                        Ok(MockTransport::json_response(200, body))
+                    })
+                }
+            }
+
+            let now = 1_900_000_000i64;
+            let make_expiring = |id: &str, email: &str| {
+                let mut acc = make_fresh_acc(id, email, now);
+                acc.token.expiry_timestamp = now + 10;
+                acc
+            };
+
+            let seed_three = |base: &std::path::Path| -> StoreRepository {
+                let paths = HeadlessPaths::with_explicit(
+                    base.join("home"),
+                    base.join("data"),
+                    base.join("cache"),
+                );
+                let repo = StoreRepository::new(paths);
+                let a2 = make_expiring("acc-2-ok", "bob@example.com");
+                let a3 = make_expiring("acc-3-never", "charlie@example.com");
+                repo.with_write_lock(|tx| {
+                    tx.upsert_account(a2, false, now)?;
+                    tx.upsert_account(a3, false, now)?;
+                    Ok(())
+                })
+                .unwrap();
+                // Seed `acc-1-enospc` directly on disk so the fault spec only triggers during batch renewal!
+                let a1 = make_expiring("acc-1-enospc", "alice@example.com");
+                let a1_path = repo.paths().account_file("acc-1-enospc");
+                std::fs::write(&a1_path, serde_json::to_vec_pretty(&a1).unwrap()).unwrap();
+                std::fs::set_permissions(&a1_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let mut idx = repo.read_snapshot().unwrap().index;
+                idx.account_order.insert(0, "acc-1-enospc".into());
+                std::fs::write(
+                    repo.paths().index_file(),
+                    serde_json::to_vec_pretty(&idx).unwrap(),
+                )
+                .unwrap();
+                repo
+            };
+
+            // Case 1: Serial (`concurrency = 1`) -> ONLY `acc-1-enospc` calls `/token` (`1` call total), returns exit `7`!
+            let tmp1 = tempfile::tempdir().unwrap();
+            let repo1 = seed_three(tmp1.path());
+            let snap1 = repo1.read_snapshot().unwrap();
+            let targets1: Vec<(usize, String, String)> = snap1
+                .accounts
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (i, a.id.clone(), a.email.clone()))
+                .collect();
+            let calls1 = Arc::new(AtomicUsize::new(0));
+            let mut out1 = Vec::new();
+            let mut err1 = Vec::new();
+            let res1 = execute_quota_refresh_batch_inner(
+                &repo1,
+                snap1,
+                targets1,
+                true,
+                true,
+                1,
+                now,
+                Arc::new(BatchTokenTransport {
+                    token_calls: calls1.clone(),
+                    delay_acc2_ms: 0,
+                }),
+                "antigravity/1.5.9 linux/amd64".into(),
+                &mut out1,
+                &mut err1,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                res1.exit_code,
+                crate::error::ExitCode::PartialCommitOrRecovery
+            );
+            assert_eq!(res1.error_code, "issued_token_unpersisted");
+            assert_eq!(
+                calls1.load(Ordering::SeqCst),
+                1,
+                "Serial batch refresh must stop after first exit-7 without refreshing remaining accounts"
+            );
+
+            // Case 2: Concurrent (`concurrency = 2`) -> `acc-1` hits exit 7 while `acc-2` is in-flight;
+            // `acc-2` finishes persisting its rotated token cleanly, `acc-3` is NEVER dispatched (`2` calls total)!
+            let tmp2 = tempfile::tempdir().unwrap();
+            let repo2 = seed_three(tmp2.path());
+            let snap2 = repo2.read_snapshot().unwrap();
+            let targets2: Vec<(usize, String, String)> = snap2
+                .accounts
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (i, a.id.clone(), a.email.clone()))
+                .collect();
+            let calls2 = Arc::new(AtomicUsize::new(0));
+            let mut out2 = Vec::new();
+            let mut err2 = Vec::new();
+            let res2 = execute_quota_refresh_batch_inner(
+                &repo2,
+                snap2,
+                targets2,
+                true,
+                true,
+                2,
+                now,
+                Arc::new(BatchTokenTransport {
+                    token_calls: calls2.clone(),
+                    delay_acc2_ms: 60,
+                }),
+                "antigravity/1.5.9 linux/amd64".into(),
+                &mut out2,
+                &mut err2,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                res2.exit_code,
+                crate::error::ExitCode::PartialCommitOrRecovery
+            );
+            assert_eq!(res2.error_code, "issued_token_unpersisted");
+            assert_eq!(
+                calls2.load(Ordering::SeqCst),
+                2,
+                "Concurrent batch refresh must drain in-flight acc-2 but NEVER dispatch acc-3!"
+            );
+            let post2 = repo2.read_snapshot().unwrap();
+            let acc2_after = post2.accounts.iter().find(|a| a.id == "acc-2-ok").unwrap();
+            assert_eq!(
+                acc2_after.token.refresh_token, "1//rotated-acc-2-ok",
+                "In-flight acc-2 must finish persisting its rotated refresh token cleanly!"
+            );
+            let acc3_after = post2
+                .accounts
+                .iter()
+                .find(|a| a.id == "acc-3-never")
+                .unwrap();
+            assert_eq!(
+                acc3_after.token.refresh_token, "1//rt-acc-3-never",
+                "Undispatched acc-3 must remain untouched!"
+            );
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", tmp.path())
+            .env("AGY_SUBTEST_R304_BATCH", "1")
+            .env(
+                "AGY_SWITCH_CLI_FAULT_SPEC",
+                "before_fsync:acc-1-enospc:enospc",
+            )
+            .args([
+                "--exact",
+                "cli::commands::tests::r3_04_batch_refresh_stops_dispatching_after_exit_7_for_serial_and_concurrent",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "R3-04 batch refresh subtest failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn synthetic_a01_readonly_diagnostics_probe_replicas_once_and_preserve_precedence() {
+        use crate::session::backend::BackendReplicaInspection;
+        use crate::session::payload::{parse_session_payload_bytes, serialize_session_payload};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingBackend {
+            backend_name: &'static str,
+            uses_keyring_flag: bool,
+            uses_file_flag: bool,
+            keyring_state: Option<SlotInspectState>,
+            inspect_slot_calls: AtomicUsize,
+            inspect_replicas_calls: AtomicUsize,
+            file_probe_calls: AtomicUsize,
+        }
+
+        impl CountingBackend {
+            fn file_mode() -> Self {
+                Self {
+                    backend_name: "file",
+                    uses_keyring_flag: false,
+                    uses_file_flag: true,
+                    keyring_state: None,
+                    inspect_slot_calls: AtomicUsize::new(0),
+                    inspect_replicas_calls: AtomicUsize::new(0),
+                    file_probe_calls: AtomicUsize::new(0),
+                }
+            }
+
+            fn dual(kr: SlotInspectState) -> Self {
+                Self {
+                    backend_name: "dual",
+                    uses_keyring_flag: true,
+                    uses_file_flag: true,
+                    keyring_state: Some(kr),
+                    inspect_slot_calls: AtomicUsize::new(0),
+                    inspect_replicas_calls: AtomicUsize::new(0),
+                    file_probe_calls: AtomicUsize::new(0),
+                }
+            }
+
+            fn keyring_only(kr: SlotInspectState) -> Self {
+                Self {
+                    backend_name: "keyring",
+                    uses_keyring_flag: true,
+                    uses_file_flag: false,
+                    keyring_state: Some(kr),
+                    inspect_slot_calls: AtomicUsize::new(0),
+                    inspect_replicas_calls: AtomicUsize::new(0),
+                    file_probe_calls: AtomicUsize::new(0),
+                }
+            }
+
+            fn reset_counts(&self) {
+                self.inspect_slot_calls.store(0, Ordering::SeqCst);
+                self.inspect_replicas_calls.store(0, Ordering::SeqCst);
+                self.file_probe_calls.store(0, Ordering::SeqCst);
+            }
+
+            fn counts(&self) -> (usize, usize, usize) {
+                (
+                    self.inspect_slot_calls.load(Ordering::SeqCst),
+                    self.inspect_replicas_calls.load(Ordering::SeqCst),
+                    self.file_probe_calls.load(Ordering::SeqCst),
+                )
+            }
+        }
+
+        impl CredentialBackend for CountingBackend {
+            fn name(&self) -> &'static str {
+                self.backend_name
+            }
+
+            fn uses_keyring(&self) -> bool {
+                self.uses_keyring_flag
+            }
+
+            fn uses_file(&self) -> bool {
+                self.uses_file_flag
+            }
+
+            fn inspect_slot(&self, paths: &HeadlessPaths) -> SlotInspectState {
+                self.inspect_slot_calls.fetch_add(1, Ordering::SeqCst);
+                if self.uses_keyring_flag {
+                    if let Some(ref kr) = self.keyring_state {
+                        if !self.uses_file_flag {
+                            return kr.clone();
+                        }
+                        match kr {
+                            SlotInspectState::AbsentInInitializedDir
+                            | SlotInspectState::Uninitialized => {
+                                self.file_probe_calls.fetch_add(1, Ordering::SeqCst);
+                                return FileSessionBackend.inspect_slot(paths);
+                            }
+                            other => return other.clone(),
+                        }
+                    }
+                }
+                self.file_probe_calls.fetch_add(1, Ordering::SeqCst);
+                FileSessionBackend.inspect_slot(paths)
+            }
+
+            fn inspect_replicas(&self, paths: &HeadlessPaths) -> BackendReplicaInspection {
+                self.inspect_replicas_calls.fetch_add(1, Ordering::SeqCst);
+                let file = if self.uses_file_flag {
+                    self.file_probe_calls.fetch_add(1, Ordering::SeqCst);
+                    FileSessionBackend.inspect_slot(paths)
+                } else {
+                    SlotInspectState::AbsentInInitializedDir
+                };
+                BackendReplicaInspection {
+                    backend_name: self.backend_name,
+                    uses_keyring: self.uses_keyring_flag,
+                    uses_file: self.uses_file_flag,
+                    keyring: self.keyring_state.clone(),
+                    keyring_all_collections_uniform: true,
+                    keyring_collections: Vec::new(),
+                    file,
+                }
+            }
+
+            fn snapshot_before_write(&self, _paths: &HeadlessPaths) -> CliResult<Option<Vec<u8>>> {
+                Err(CliError::data("Unexpected write probe in read-only test"))
+            }
+
+            fn write_slot(&self, _paths: &HeadlessPaths, _payload: &str) -> CliResult<()> {
+                Err(CliError::data("Unexpected write_slot in read-only test"))
+            }
+
+            fn remove_slot(&self, _paths: &HeadlessPaths) -> CliResult<()> {
+                Err(CliError::data("Unexpected remove_slot in read-only test"))
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = HeadlessPaths::with_explicit(
+            tmp.path().join("home"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+        );
+        let repo = StoreRepository::new(paths.clone());
+        let now = 1_900_000_000i64;
+        let acc1 = make_fresh_acc("acc-0001", "alice@example.com", now);
+        let acc2 = make_fresh_acc("acc-0002", "bob@example.com", now);
+        let acc1_payload = serialize_session_payload(&acc1.token).unwrap();
+        let acc1_parsed = parse_session_payload_bytes(acc1_payload.as_bytes()).unwrap();
+        let acc2_payload = serialize_session_payload(&acc2.token).unwrap();
+        let acc2_parsed = parse_session_payload_bytes(acc2_payload.as_bytes()).unwrap();
+
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(acc1.clone(), true, now)?;
+            tx.upsert_account(acc2.clone(), false, now)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let registry = OAuthClientRegistry::load(&paths).unwrap();
+        let transport = MockTransport::default();
+        let endpoints = OAuthEndpoints::default();
+        let dry_opts = SwitchOptions {
+            dry_run: true,
+            allow_running: true,
+        };
+        let floor_ua = format_native_oauth_user_agent(KNOWN_COMPAT_FLOOR_UA_VERSION);
+
+        // 1. `file` backend before slot dir exists: single probe per command and strictly zero slot dir creation.
+        assert!(!paths.active_slot_dir.exists());
+        let file_backend = CountingBackend::file_mode();
+
+        let view = collect_current_view(&repo, &file_backend, now).unwrap();
+        assert_eq!(file_backend.counts(), (0, 1, 1));
+        assert!(matches!(
+            view.view.session_identity,
+            SessionIdentity::Uninitialized
+        ));
+        file_backend.reset_counts();
+
+        handle_current(&repo, &file_backend, true, now).unwrap();
+        assert_eq!(file_backend.counts(), (0, 1, 1));
+        file_backend.reset_counts();
+
+        handle_status(&repo, &file_backend, true).await.unwrap();
+        assert_eq!(file_backend.counts(), (0, 1, 1));
+        file_backend.reset_counts();
+
+        let uninit_dry_err = execute_switch_with_idle_policy(
+            &repo,
+            &file_backend,
+            &transport,
+            &endpoints,
+            &registry,
+            &floor_ua,
+            "acc-0002",
+            &dry_opts,
+            false,
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(uninit_dry_err.error_code, "agy_uninitialized");
+        assert_eq!(file_backend.counts(), (0, 1, 1));
+        assert!(
+            !paths.active_slot_dir.exists(),
+            "Read-only diagnostics must not create active_slot_dir"
+        );
+
+        // Materialize valid `active_slot_file` for `acc-0001`.
+        fs::create_dir_all(&paths.active_slot_dir).unwrap();
+        fs::write(&paths.active_slot_file, &acc1_payload).unwrap();
+        file_backend.reset_counts();
+
+        let view_ok = collect_current_view(&repo, &file_backend, now).unwrap();
+        assert_eq!(file_backend.counts(), (0, 1, 1));
+        assert!(matches!(
+            view_ok.view.session_identity,
+            SessionIdentity::Matched { ref account_id, .. } if account_id == "acc-0001"
+        ));
+        file_backend.reset_counts();
+
+        handle_status(&repo, &file_backend, true).await.unwrap();
+        assert_eq!(file_backend.counts(), (0, 1, 1));
+        file_backend.reset_counts();
+
+        let dry_ok = execute_switch_with_idle_policy(
+            &repo,
+            &file_backend,
+            &transport,
+            &endpoints,
+            &registry,
+            &floor_ua,
+            "acc-0002",
+            &dry_opts,
+            false,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(dry_ok.dry_run);
+        assert_eq!(dry_ok.target_account_id, "acc-0002");
+        assert_eq!(file_backend.counts(), (0, 1, 1));
+
+        // 2. `dual` backend:
+        // (a) Cleanly absent keyring falls back to file replica (`acc-0001`).
+        let dual_absent = CountingBackend::dual(SlotInspectState::AbsentInInitializedDir);
+        let view_dual_fb = collect_current_view(&repo, &dual_absent, now).unwrap();
+        assert_eq!(dual_absent.counts(), (0, 1, 1));
+        assert!(matches!(
+            view_dual_fb.view.session_identity,
+            SessionIdentity::Matched { ref account_id, .. } if account_id == "acc-0001"
+        ));
+        dual_absent.reset_counts();
+        let dry_dual_fb = execute_switch_with_idle_policy(
+            &repo,
+            &dual_absent,
+            &transport,
+            &endpoints,
+            &registry,
+            &floor_ua,
+            "acc-0002",
+            &dry_opts,
+            false,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(dry_dual_fb.dry_run);
+        assert_eq!(dual_absent.counts(), (0, 1, 1));
+
+        // (b) Corrupt keyring is NEVER masked by valid file replica.
+        let dual_kr_corrupt = CountingBackend::dual(SlotInspectState::Corrupt("kr-corrupt".into()));
+        let view_kr_bad = collect_current_view(&repo, &dual_kr_corrupt, now).unwrap();
+        assert_eq!(dual_kr_corrupt.counts(), (0, 1, 1));
+        assert!(matches!(
+            view_kr_bad.view.session_identity,
+            SessionIdentity::Corrupt { ref detail } if detail == "kr-corrupt"
+        ));
+        dual_kr_corrupt.reset_counts();
+        let st_kr_bad = handle_status(&repo, &dual_kr_corrupt, true)
+            .await
+            .unwrap_err();
+        assert_eq!(st_kr_bad.exit_code, ExitCode::GeneralOrDataError);
+        assert_eq!(st_kr_bad.details.as_ref().unwrap()["slot_corrupt"], true);
+        assert_eq!(dual_kr_corrupt.counts(), (0, 1, 1));
+        dual_kr_corrupt.reset_counts();
+        let dry_kr_bad = execute_switch_with_idle_policy(
+            &repo,
+            &dual_kr_corrupt,
+            &transport,
+            &endpoints,
+            &registry,
+            &floor_ua,
+            "acc-0002",
+            &dry_opts,
+            false,
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(dry_kr_bad.exit_code, ExitCode::GeneralOrDataError);
+        assert_eq!(dual_kr_corrupt.counts(), (0, 1, 1));
+
+        // (c) Unverified keyring fails `switch --dry-run` with `secret_service_unavailable` and shows `Unverified` in `current`.
+        let dual_kr_unv = CountingBackend::dual(SlotInspectState::Unverified("kr-locked".into()));
+        let view_kr_unv = collect_current_view(&repo, &dual_kr_unv, now).unwrap();
+        assert_eq!(dual_kr_unv.counts(), (0, 1, 1));
+        assert!(matches!(
+            view_kr_unv.view.session_identity,
+            SessionIdentity::Unverified { ref detail } if detail == "kr-locked"
+        ));
+        dual_kr_unv.reset_counts();
+        let dry_kr_unv = execute_switch_with_idle_policy(
+            &repo,
+            &dual_kr_unv,
+            &transport,
+            &endpoints,
+            &registry,
+            &floor_ua,
+            "acc-0002",
+            &dry_opts,
+            false,
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(dry_kr_unv.error_code, "secret_service_unavailable");
+        assert_eq!(dual_kr_unv.counts(), (0, 1, 1));
+
+        // (d) Valid keyring (`acc-0002`) + corrupt disk file: `status` & `switch --dry-run` still report corrupt disk!
+        fs::write(&paths.active_slot_file, b"{corrupt-disk-replica").unwrap();
+        let dual_disk_bad = CountingBackend::dual(SlotInspectState::Present(acc2_parsed.clone()));
+        let view_disk_bad = collect_current_view(&repo, &dual_disk_bad, now).unwrap();
+        assert_eq!(dual_disk_bad.counts(), (0, 1, 1));
+        assert!(matches!(
+            view_disk_bad.view.session_identity,
+            SessionIdentity::DriftedKnown { ref account_id, .. } if account_id == "acc-0002"
+        ));
+        dual_disk_bad.reset_counts();
+        let st_disk_bad = handle_status(&repo, &dual_disk_bad, true)
+            .await
+            .unwrap_err();
+        assert_eq!(st_disk_bad.exit_code, ExitCode::GeneralOrDataError);
+        assert_eq!(st_disk_bad.details.as_ref().unwrap()["slot_corrupt"], true);
+        assert_eq!(dual_disk_bad.counts(), (0, 1, 1));
+        dual_disk_bad.reset_counts();
+        let dry_disk_bad = execute_switch_with_idle_policy(
+            &repo,
+            &dual_disk_bad,
+            &transport,
+            &endpoints,
+            &registry,
+            &floor_ua,
+            "acc-0002",
+            &dry_opts,
+            false,
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(dry_disk_bad.exit_code, ExitCode::GeneralOrDataError);
+        assert_eq!(dual_disk_bad.counts(), (0, 1, 1));
+
+        // 3. `keyring` backend: zero disk probes even when disk file is corrupt (`status`, `current`, `switch --dry-run` all succeed).
+        let kr_present = CountingBackend::keyring_only(SlotInspectState::Present(acc1_parsed));
+        let view_kr_only = collect_current_view(&repo, &kr_present, now).unwrap();
+        assert_eq!(kr_present.counts(), (0, 1, 0));
+        assert!(matches!(
+            view_kr_only.view.session_identity,
+            SessionIdentity::Matched { ref account_id, .. } if account_id == "acc-0001"
+        ));
+        kr_present.reset_counts();
+        handle_current(&repo, &kr_present, true, now).unwrap();
+        assert_eq!(kr_present.counts(), (0, 1, 0));
+        kr_present.reset_counts();
+        handle_status(&repo, &kr_present, true).await.unwrap();
+        assert_eq!(kr_present.counts(), (0, 1, 0));
+        kr_present.reset_counts();
+        let dry_kr_only = execute_switch_with_idle_policy(
+            &repo,
+            &kr_present,
+            &transport,
+            &endpoints,
+            &registry,
+            &floor_ua,
+            "acc-0002",
+            &dry_opts,
+            false,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(dry_kr_only.dry_run);
+        assert_eq!(kr_present.counts(), (0, 1, 0));
+
+        // Keyring absent with valid file on disk MUST NOT fall back to file and makes zero disk probes.
+        fs::write(&paths.active_slot_file, &acc1_payload).unwrap();
+        let kr_absent = CountingBackend::keyring_only(SlotInspectState::AbsentInInitializedDir);
+        let view_kr_absent = collect_current_view(&repo, &kr_absent, now).unwrap();
+        assert_eq!(kr_absent.counts(), (0, 1, 0));
+        assert!(matches!(
+            view_kr_absent.view.session_identity,
+            SessionIdentity::Uninitialized
+        ));
+        kr_absent.reset_counts();
+        handle_status(&repo, &kr_absent, true).await.unwrap();
+        assert_eq!(kr_absent.counts(), (0, 1, 0));
+    }
 }

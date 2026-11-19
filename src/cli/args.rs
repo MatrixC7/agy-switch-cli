@@ -12,11 +12,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
 
-    /// Explicit proxy URL (http://, https://, socks5://, socks5h://, host:port, or `direct`)
+    /// Explicit proxy URL (http://, https://, socks5://, socks5h://, host:port, or `direct`; overrides AGY_SWITCH_CLI_PROXY)
     #[arg(long, global = true, value_name = "URL")]
     pub proxy: Option<String>,
 
-    /// Credential backend (`auto` [default], `file`, or `secret-service` [requires `secret-service-backend` feature])
+    /// Credential backend (`auto` [default], `dual`, `file`, or `keyring`; overrides AGY_SWITCH_CLI_BACKEND)
     #[arg(long, global = true, value_name = "BACKEND")]
     pub backend: Option<String>,
 
@@ -34,8 +34,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Environment diagnostics and journal reconciliation
-    Doctor(DoctorArgs),
+    /// Read-only environment, store, journal, daemon, and official `agy` status
+    Status,
 
     /// OAuth 2.0 authorization management (manual callback URL paste by default, or `--ssh` local listener)
     #[command(subcommand)]
@@ -51,10 +51,10 @@ pub enum Commands {
     /// Switch active `agy` credential slot to the selected account (applies to new `agy` invocations)
     Switch(SwitchArgs),
 
-    /// Pre-invocation managed wrapper (`agy-switch-cli run -- agy ...`)
+    /// Optional managed launcher for official `agy` (`--account` / `--backend` credential wrapper)
     Run(RunArgs),
 
-    /// View pool quota table (pure local read by default; pass `-r/--refresh` to fetch live quota first)
+    /// View pool quota table (pure local read by default; pass `--refresh` to fetch live quota first)
     Quota(QuotaArgs),
 
     /// Refresh OAuth tokens and CloudCode quotas over the network
@@ -67,19 +67,12 @@ pub enum Commands {
     /// Foreground 7-stage auto-switch daemon (managed by systemd --user or container init)
     Daemon(DaemonArgs),
 
+    /// Read-only local SQLite token usage statistics (`summary` and `list`)
+    #[command(subcommand)]
+    Stats(StatsCommand),
+
     /// Optional interactive SSH terminal dashboard
     Tui,
-}
-
-#[derive(Debug, Args)]
-pub struct DoctorArgs {
-    /// Probe installed `agy --version` in an isolated temporary HOME
-    #[arg(long)]
-    pub verify_agy: bool,
-
-    /// Reconcile pending `switch_journal.json`, repair permissions, and clear daemon failure pause
-    #[arg(long)]
-    pub fix: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -119,10 +112,6 @@ pub struct AuthLoginArgs {
     #[arg(long, value_name = "PORT")]
     pub port: Option<u16>,
 
-    /// Compatibility alias (manual URL paste mode is now the default when `--ssh` is omitted)
-    #[arg(long, hide = true, conflicts_with = "ssh")]
-    pub manual: bool,
-
     /// Attempt to launch local browser via `xdg-open` (disabled by default in headless mode)
     #[arg(long)]
     pub open_browser: bool,
@@ -148,10 +137,6 @@ pub struct AuthReauthorizeArgs {
     #[arg(long, value_name = "PORT")]
     pub port: Option<u16>,
 
-    /// Compatibility alias (manual URL paste mode is now the default when `--ssh` is omitted)
-    #[arg(long, hide = true, conflicts_with = "ssh")]
-    pub manual: bool,
-
     #[arg(long)]
     pub open_browser: bool,
 }
@@ -160,9 +145,9 @@ pub struct AuthReauthorizeArgs {
 pub enum AccountsCommand {
     /// List saved accounts with plan/status details, or reorder accounts (`--move` / `--order`)
     List(AccountsListArgs),
-    /// Add accounts via masked TTY prompt, `--from-local`, `--stdin`, or `0600` `--token-file` (no positional token!)
+    /// Add accounts via masked TTY prompt, `--from-local`, `--from-stdin`, or `0600` `--from-file` (no positional token!)
     Add(AccountsAddArgs),
-    /// Import accounts from a v1/v2 JSON bundle or `--from-legacy` desktop directory
+    /// Import accounts from `--from-file` v1/v2 JSON bundle or `--from-legacy` desktop directory
     Import(AccountsImportArgs),
     /// Export accounts to a `0600` private file (requires `--include-secrets`)
     Export(AccountsExportArgs),
@@ -210,16 +195,16 @@ pub struct AccountsListArgs {
 #[derive(Debug, Args)]
 pub struct AccountsAddArgs {
     /// Import the currently signed-in local Antigravity account (from desktop keyring or `~/.gemini/antigravity-cli/antigravity-oauth-token`)
-    #[arg(long, conflicts_with_all = ["stdin", "token_file"])]
+    #[arg(long, conflicts_with_all = ["from_stdin", "from_file"])]
     pub from_local: bool,
 
     /// Read one or more refresh tokens (one per line) from standard input pipe
-    #[arg(long, conflicts_with_all = ["token_file", "from_local"])]
-    pub stdin: bool,
+    #[arg(long, conflicts_with_all = ["from_file", "from_local"])]
+    pub from_stdin: bool,
 
     /// Read one or more refresh tokens (one per line; `# label` comments supported) from a `0600` regular file
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["stdin", "from_local"])]
-    pub token_file: Option<PathBuf>,
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["from_stdin", "from_local"])]
+    pub from_file: Option<PathBuf>,
 
     /// Optional default custom label
     #[arg(long, value_name = "TEXT")]
@@ -233,15 +218,15 @@ pub struct AccountsAddArgs {
 #[derive(Debug, Args)]
 pub struct AccountsImportArgs {
     /// Path to v1/v2 transfer bundle JSON file
-    #[arg(value_name = "FILE", conflicts_with = "from_legacy")]
-    pub file: Option<PathBuf>,
+    #[arg(long, value_name = "FILE", conflicts_with = "from_legacy")]
+    pub from_file: Option<PathBuf>,
 
     /// Read-only migration from legacy desktop directory (defaults to `~/.antigravity_tools` if flag given without path)
-    #[arg(long, value_name = "LEGACY_DIR", num_args = 0..=1, default_missing_value = "")]
+    #[arg(long, value_name = "LEGACY_DIR", num_args = 0..=1, default_missing_value = "", conflicts_with = "from_file")]
     pub from_legacy: Option<String>,
 
     /// Explicitly update existing accounts' tokens (still refuses to roll back known rotated refresh tokens)
-    #[arg(long, alias = "force")]
+    #[arg(long)]
     pub overwrite: bool,
 }
 
@@ -257,11 +242,11 @@ pub struct AccountsExportArgs {
 
     /// Optional subset of account IDs or emails to export
     #[arg(long, num_args = 1.., value_name = "ID|EMAIL")]
-    pub ids: Vec<String>,
+    pub accounts: Vec<String>,
 
     /// Overwrite `--output` if it already exists
     #[arg(long)]
-    pub force: bool,
+    pub overwrite: bool,
 }
 
 #[derive(Debug, Args)]
@@ -288,9 +273,13 @@ pub struct SwitchArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Allow updating credential file even when running `agy` processes are detected
-    #[arg(long)]
+    /// Override fail-closed process check even when `/proc` runtime state is unverified
+    #[arg(long, conflicts_with = "require_idle")]
     pub allow_running: bool,
+
+    /// Refuse to switch if any running `agy` process is currently active (exit code 8)
+    #[arg(long, conflicts_with = "allow_running")]
+    pub require_idle: bool,
 }
 
 #[derive(Debug, Args)]
@@ -298,10 +287,6 @@ pub struct RunArgs {
     /// Explicitly switch to this account before launching `agy`
     #[arg(long, value_name = "ID|EMAIL")]
     pub account: Option<String>,
-
-    /// Sanitize `DBUS_SESSION_BUS_ADDRESS` for the spawned `agy` child so desktop keyrings cannot shadow file credentials
-    #[arg(long)]
-    pub isolate_dbus: bool,
 
     /// Official `agy` command and arguments (`-- agy ...`)
     #[arg(last = true, required = true, value_name = "AGY_ARGS")]
@@ -318,7 +303,7 @@ pub struct QuotaArgs {
     pub all: bool,
 
     /// Refresh CloudCode quota over the network first before displaying the quota table
-    #[arg(short = 'r', long)]
+    #[arg(long)]
     pub refresh: bool,
 
     /// Bounded concurrency when refreshing multiple accounts with `--refresh --all` (`1..=5`, default `2`)
@@ -358,7 +343,7 @@ pub enum PolicyCommand {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CliStrategy {
     Priority,
-    #[value(name = "round-robin", alias = "round_robin")]
+    #[value(name = "round-robin")]
     RoundRobin,
 }
 
@@ -406,45 +391,164 @@ pub struct PolicySetArgs {
 
 #[derive(Debug, Args)]
 pub struct DaemonArgs {
-    /// Poll interval in seconds (default: 3600 / 1 hour)
+    /// Poll interval in seconds (default: 3600 / 1 hour; in-memory unless persisted via `--install` or `AGY_SWITCH_CLI_INTERVAL`)
     #[arg(
         long,
         env = "AGY_SWITCH_CLI_INTERVAL",
         hide_env_values = true,
-        default_value_t = 3600
+        value_name = "INTERVAL"
     )]
-    pub interval: u64,
+    pub interval: Option<u64>,
 
-    /// Post-switch cooldown in seconds (default: 3600 / 1 hour)
+    /// Post-switch cooldown in seconds (default: 3600 / 1 hour; in-memory unless persisted via `--install` or `AGY_SWITCH_CLI_COOLDOWN`)
     #[arg(
         long,
         env = "AGY_SWITCH_CLI_COOLDOWN",
         hide_env_values = true,
-        default_value_t = 3600
+        value_name = "COOLDOWN"
     )]
-    pub cooldown: i64,
+    pub cooldown: Option<i64>,
 
     /// Run a single 7-stage evaluation/commit tick and exit
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["install", "uninstall"])]
     pub once: bool,
 
-    /// In-memory override for active-process guard mode (`immediate` or `wait`; does not modify `policy.json`)
+    /// Install and start `~/.config/systemd/user/agy-switch-cli.service` via `systemctl --user`
+    #[arg(long, conflicts_with_all = ["once", "uninstall"])]
+    pub install: bool,
+
+    /// Stop, disable, and remove `~/.config/systemd/user/agy-switch-cli.service` via `systemctl --user`
+    #[arg(long, conflicts_with_all = ["once", "install"])]
+    pub uninstall: bool,
+
+    /// In-memory override for active-process guard mode (`immediate` or `wait`; overrides AGY_SWITCH_CLI_MODE and `policy.json`)
     #[arg(long, value_enum)]
     pub mode: Option<CliMode>,
 
-    /// In-memory override for candidate selection strategy (`priority` or `round-robin`; does not modify `policy.json`)
+    /// In-memory override for candidate selection strategy (`priority` or `round-robin`; overrides AGY_SWITCH_CLI_STRATEGY and `policy.json`)
     #[arg(long, value_enum)]
     pub strategy: Option<CliStrategy>,
 
-    /// In-memory override for reserve threshold (`1..=98`; does not modify `policy.json`)
+    /// In-memory override for reserve threshold (`1..=98`; overrides AGY_SWITCH_CLI_RESERVE and `policy.json`)
     #[arg(long)]
     pub reserve: Option<u8>,
 
-    /// In-memory override for candidate minimum threshold (`2..=100`; does not modify `policy.json`)
+    /// In-memory override for candidate minimum threshold (`2..=100`; overrides AGY_SWITCH_CLI_MINIMUM and `policy.json`)
     #[arg(long)]
     pub minimum: Option<u8>,
 
-    /// In-memory override for monitored model/pool (`all`, `gemini`, `claude`, `argon`, or `<MODEL_ID>`)
+    /// In-memory override for monitored model/pool (`all`, `gemini`, `claude`, `argon`, or `<MODEL_ID>`; overrides AGY_SWITCH_CLI_MODEL and `policy.json`)
     #[arg(long, value_name = "MODEL")]
     pub model: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum CliStatsSource {
+    #[default]
+    All,
+    Cli,
+    App,
+}
+
+pub const MAX_STATS_RANGE_DAYS: u32 = 36_500;
+pub const MAX_STATS_RECENT_LIMIT: u32 = 500;
+pub const DEFAULT_STATS_LIST_RECENT: usize = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliStatsRange {
+    Today,
+    Yesterday,
+    All,
+    Days(u32),
+}
+
+pub fn parse_cli_stats_range(raw: &str) -> Result<CliStatsRange, String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "today" => Ok(CliStatsRange::Today),
+        "yesterday" => Ok(CliStatsRange::Yesterday),
+        "all" => Ok(CliStatsRange::All),
+        _ => {
+            if let Some(num_str) = lower.strip_suffix('d') {
+                if !num_str.is_empty()
+                    && !num_str.starts_with('0')
+                    && num_str.bytes().all(|b| b.is_ascii_digit())
+                {
+                    if let Ok(days) = num_str.parse::<u32>() {
+                        if (1..=MAX_STATS_RANGE_DAYS).contains(&days) {
+                            return Ok(CliStatsRange::Days(days));
+                        }
+                    }
+                }
+            }
+            Err(format!(
+                "expected `today`, `yesterday`, `all`, or `<N>d` (1 <= N <= {MAX_STATS_RANGE_DAYS})"
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StatsCommand {
+    /// Aggregate token usage summary, cache hit rate, P10/P50/P90 timings, and per-model breakdown (defaults to `--range today`)
+    Summary(StatsWindowArgs),
+    /// List individual model call records newest-first (defaults to `--recent 10`)
+    List(StatsWindowArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct StatsWindowArgs {
+    /// Conversation database source (`all` [default], `cli`, or `app`)
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CliStatsSource::All,
+        value_name = "SOURCE"
+    )]
+    pub source: CliStatsSource,
+
+    /// Preset local-date range (`today`, `yesterday`, `all`, or `<N>d` such as `1d`, `3d`, `7d`, `30d`)
+    #[arg(
+        long,
+        value_parser = parse_cli_stats_range,
+        value_name = "RANGE",
+        conflicts_with_all = ["date", "from", "to", "recent"]
+    )]
+    pub range: Option<CliStatsRange>,
+
+    /// Exact local calendar date (`YYYY-MM-DD`, `00:00:00..=23:59:59`)
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        conflicts_with_all = ["range", "from", "to", "recent"]
+    )]
+    pub date: Option<String>,
+
+    /// Start date of closed local-date interval (`YYYY-MM-DD`; defaults `--to` to `today` if omitted)
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        conflicts_with_all = ["range", "date", "recent"]
+    )]
+    pub from: Option<String>,
+
+    /// End date of closed local-date interval (`YYYY-MM-DD`; requires `--from`)
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        requires = "from",
+        conflicts_with_all = ["range", "date", "recent"]
+    )]
+    pub to: Option<String>,
+
+    /// Select the latest `<N>` call records (`1 <= N <= 500`)
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_STATS_RECENT_LIMIT)),
+        conflicts_with_all = ["range", "date", "from", "to"]
+    )]
+    pub recent: Option<u32>,
+}
+
+pub type StatsArgs = StatsWindowArgs;

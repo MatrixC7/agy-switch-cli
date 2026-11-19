@@ -156,7 +156,7 @@ pub fn read_secret_from_tty_with_mode(prompt: &str, json_mode: bool) -> CliResul
     let stdin_fd: RawFd = libc::STDIN_FILENO;
     if unsafe { libc::isatty(stdin_fd) } != 1 {
         return Err(CliError::usage(
-            "Interactive token entry requires a TTY with echo suppression. In non-interactive scripts/pipes, pass `--from-local`, `--stdin`, or `--token-file <PATH>` explicitly.",
+            "Interactive token entry requires a TTY with echo suppression. In non-interactive scripts/pipes, pass `--from-local`, `--from-stdin`, or `--from-file <PATH>` explicitly.",
         ));
     }
 
@@ -215,7 +215,7 @@ fn split_whitespace_comment(trimmed: &str) -> (&str, Option<&str>) {
     (trimmed, None)
 }
 
-/// Parse one or more `refresh_token` lines from text (`--stdin` or `--token-file`),
+/// Parse one or more `refresh_token` lines from text (`--from-stdin` or `--from-file`),
 /// skipping blank lines and `#` comment lines, and supporting optional inline `token # custom_label`.
 pub fn parse_token_lines_from_text(
     raw: &str,
@@ -257,17 +257,17 @@ pub fn read_secrets_from_stdin() -> CliResult<Vec<(String, Option<String>)>> {
         .map_err(|e| {
             CliError::io(
                 "secret_read_error",
-                format!("Failed reading `--stdin`: {e}"),
+                format!("Failed reading `--from-stdin`: {e}"),
             )
         })?;
     if buf.len() > MAX_SECRET_BYTES {
         return Err(CliError::usage(format!(
-            "`--stdin` input exceeds maximum allowed size ({MAX_SECRET_BYTES} bytes)."
+            "`--from-stdin` input exceeds maximum allowed size ({MAX_SECRET_BYTES} bytes)."
         )));
     }
     let content = String::from_utf8(buf)
-        .map_err(|_| CliError::usage("`--stdin` input is not valid UTF-8."))?;
-    parse_token_lines_from_text(&content, "`--stdin`")
+        .map_err(|_| CliError::usage("`--from-stdin` input is not valid UTF-8."))?;
+    parse_token_lines_from_text(&content, "`--from-stdin`")
 }
 
 pub fn read_secret_from_stdin() -> CliResult<String> {
@@ -278,9 +278,9 @@ pub fn read_secret_from_stdin() -> CliResult<String> {
 /// Read raw UTF-8 text from a private (`0600`) regular file up to `max_bytes`, rejecting symlinks,
 /// FIFOs, directories, and group/world-accessible files (`mode & 0o077 != 0`) per Blueprint §8.2 rule 1.
 fn read_private_file_content(path: &Path, max_bytes: usize) -> CliResult<String> {
-    if crate::error::looks_like_secret_value(&path.to_string_lossy()) {
+    if crate::error::path_looks_like_accidental_secret(path) {
         return Err(CliError::usage(
-            "`--token-file` expects a filesystem path to a private `0600` file, not a literal credential value (redacted).",
+            "`--from-file` expects a filesystem path to a private `0600` file, not a literal credential value (redacted).",
         ));
     }
 
@@ -428,13 +428,32 @@ mod tests {
             "1//synthetic-token"
         );
 
-        // Accidental credential value passed to `--token-file` MUST NOT be echoed!
+        // Accidental credential value passed to `--from-file` MUST NOT be echoed!
         let accidental_err =
             read_secret_from_private_file(Path::new("1//0gAccidentalTokenPassedAsPath"))
                 .unwrap_err();
         assert!(!accidental_err
             .message
             .contains("AccidentalTokenPassedAsPath"));
+
+        // Legitimate multi-segment relative paths >= 28 chars MUST succeed (never falsely flagged as secrets)!
+        let rel_base = tmp.path().join("backups/2026-11-19");
+        fs::create_dir_all(&rel_base).unwrap();
+        let long_rel_leaf = rel_base.join("my-private-refresh-tokens-batch.txt");
+        fs::write(&long_rel_leaf, "1//rel-path-ok\n").unwrap();
+        fs::set_permissions(&long_rel_leaf, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!crate::error::path_looks_like_accidental_secret(Path::new(
+            "backups/2026-11-19/my-private-refresh-tokens-batch.txt"
+        )));
+        assert!(!crate::error::path_looks_like_accidental_secret(Path::new(
+            "backups/2026-11-19/agy-accounts-export.json"
+        )));
+        assert!(crate::error::path_looks_like_accidental_secret(Path::new(
+            "http://127.0.0.1:54545/oauth-callback?code=4/0AbcSecret&state=xyz"
+        )));
+        assert!(crate::error::path_looks_like_accidental_secret(Path::new(
+            "OpaqueCustomRefreshTokenWithoutSlashes123456"
+        )));
 
         // Grandparent directory symlink MUST also be rejected!
         let real_gp = tmp.path().join("real_gp");

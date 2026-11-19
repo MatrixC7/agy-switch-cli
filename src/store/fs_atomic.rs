@@ -1,121 +1,199 @@
 use crate::error::{CliError, CliResult};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub const MAX_STORE_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// Exact ownership marker embedded in temporary files created by `agy-switch-cli`.
+pub const OWNED_TMP_MARKER: &str = ".tmp.agy-switch-cli.";
 
-/// Verify every existing ancestor component of `dir_path` from `/` (or `.` for relative paths) downward
-/// is a real directory (`!is_symlink() && is_dir()`), and open the final directory handle with
-/// `O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`:
-/// - Deterministically rejects ANY symlink or non-directory component at ANY depth in the ancestor chain;
-/// - Uses prefix `symlink_metadata` (`lstat`) rather than `open("/")` + relative `openat` from `/` so user-mode
+#[cfg(feature = "stats")]
+#[derive(Debug)]
+pub(crate) enum ChildDirOpen {
+    Opened(OwnedFd),
+    Absent,
+    Unsafe,
+    IoError,
+}
+
+pub(crate) fn is_single_normal_filename(name: &[u8]) -> bool {
+    !name.is_empty() && name != b"." && name != b".." && !name.contains(&b'/') && !name.contains(&0)
+}
+
+/// Open a single child directory inside an already-verified `parent_fd` strictly via
+/// `openat(..., (O_RDONLY | O_PATH) | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`.
+#[cfg(feature = "stats")]
+pub(crate) fn open_child_dir_nofollow(
+    parent_fd: &OwnedFd,
+    child_name: &str,
+    readable: bool,
+) -> ChildDirOpen {
+    if !is_single_normal_filename(child_name.as_bytes()) {
+        return ChildDirOpen::Unsafe;
+    }
+    let Ok(c_name) = CString::new(child_name.as_bytes()) else {
+        return ChildDirOpen::Unsafe;
+    };
+    let access_mode = if readable {
+        libc::O_RDONLY
+    } else {
+        libc::O_PATH
+    };
+    let raw_fd = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            c_name.as_ptr(),
+            access_mode | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(code) if code == libc::ENOENT => ChildDirOpen::Absent,
+            Some(code) if code == libc::ELOOP || code == libc::ENOTDIR => ChildDirOpen::Unsafe,
+            _ => ChildDirOpen::IoError,
+        };
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return ChildDirOpen::IoError;
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return ChildDirOpen::Unsafe;
+    }
+    ChildDirOpen::Opened(fd)
+}
+
+/// Walk every existing ancestor component of `dir_path` top-down using chained `openat` handles
+/// (`O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`), returning the verified handle to `dir_path`:
+/// - Eliminates TOCTOU between ancestor verification and directory opening;
+/// - Opens the first top-level component `/<first>` directly rather than literal `"/"` so user-mode
 ///   QEMU `-L <sysroot>` emulation never redirects `"/"` to `/usr/aarch64-linux-gnu`;
-/// - Returns `Ok(Some(dir_fd))` when `dir_path` exists and every component is a real directory;
-/// - Returns `Ok(None)` when a component does not exist yet (`NotFound`), AFTER proving all existing higher ancestors are real directories.
-fn open_existing_dir_nofollow(dir_path: &Path) -> CliResult<Option<OwnedFd>> {
+/// - Deterministically rejects ANY symlink or non-directory component at ANY depth;
+/// - Returns `Ok(None)` when a component does not exist yet (`ENOENT`), AFTER proving all existing higher ancestors are real directories.
+pub(crate) fn open_existing_dir_nofollow(dir_path: &Path) -> CliResult<Option<OwnedFd>> {
     let effective = if dir_path.as_os_str().is_empty() {
         Path::new(".")
     } else {
         dir_path
     };
 
+    let resolved = if effective.is_absolute() {
+        crate::paths::normalize_components(effective)
+    } else {
+        let cwd = std::env::current_dir()
+            .map_err(|e| map_io_error(e, "Cannot resolve current working directory"))?;
+        crate::paths::normalize_components(&cwd.join(effective))
+    };
+
     let mut walked = PathBuf::new();
-    for comp in effective.components() {
+    let mut cur_fd: Option<OwnedFd> = None;
+
+    for comp in resolved.components() {
         match comp {
             Component::RootDir => {
                 walked.push("/");
                 continue;
             }
-            Component::CurDir => {
-                if walked.as_os_str().is_empty() {
-                    walked.push(".");
-                }
-                continue;
-            }
-            Component::ParentDir => {
-                walked.push("..");
-            }
-            Component::Normal(part) => {
-                walked.push(part);
-            }
+            Component::CurDir => continue,
             Component::Prefix(p) => {
                 walked.push(p.as_os_str());
                 continue;
             }
-        }
+            Component::ParentDir => {
+                walked.push("..");
+                return Err(CliError::data(format!(
+                    "Directory path '{}' must not traverse '..' or symlinked ancestors.",
+                    walked.display()
+                )));
+            }
+            Component::Normal(part) => {
+                if !is_single_normal_filename(part.as_bytes()) {
+                    return Err(CliError::data(format!(
+                        "Directory path '{}' contains an invalid component.",
+                        resolved.display()
+                    )));
+                }
+                walked.push(part);
+                let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+                let raw_fd = if let Some(ref parent) = cur_fd {
+                    let c_part = CString::new(part.as_bytes()).map_err(|_| {
+                        CliError::data(format!(
+                            "Path '{}' contains an invalid NUL byte.",
+                            walked.display()
+                        ))
+                    })?;
+                    unsafe { libc::openat(parent.as_raw_fd(), c_part.as_ptr(), flags) }
+                } else {
+                    let c_first = CString::new(walked.as_os_str().as_bytes()).map_err(|_| {
+                        CliError::data(format!(
+                            "Path '{}' contains an invalid NUL byte.",
+                            walked.display()
+                        ))
+                    })?;
+                    unsafe { libc::open(c_first.as_ptr(), flags) }
+                };
 
-        match fs::symlink_metadata(&walked) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                if raw_fd < 0 {
+                    let err = std::io::Error::last_os_error();
+                    return match err.raw_os_error() {
+                        Some(code) if code == libc::ENOENT => Ok(None),
+                        Some(code) if code == libc::ENOTDIR || code == libc::ELOOP => {
+                            Err(CliError::data(format!(
+                                "Directory path '{}' must be a real directory, not a symlink or file.",
+                                walked.display()
+                            )))
+                        }
+                        _ => Err(map_io_error(
+                            err,
+                            &format!("Cannot open directory component '{}'", walked.display()),
+                        )),
+                    };
+                }
+
+                let next_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(next_fd.as_raw_fd(), &mut st) } != 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(map_io_error(
+                        err,
+                        &format!("Cannot stat directory '{}'", walked.display()),
+                    ));
+                }
+                if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
                     return Err(CliError::data(format!(
                         "Directory path '{}' must be a real directory, not a symlink or file.",
                         walked.display()
                     )));
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(map_io_error(
-                    e,
-                    &format!("Cannot inspect directory component '{}'", walked.display()),
-                ));
+                cur_fd = Some(next_fd);
             }
         }
     }
 
-    let c_dir = CString::new(effective.as_os_str().as_bytes()).map_err(|_| {
-        CliError::data(format!(
-            "Path '{}' contains an invalid NUL byte.",
-            effective.display()
-        ))
-    })?;
-    let raw_fd = unsafe {
+    if let Some(fd) = cur_fd {
+        return Ok(Some(fd));
+    }
+
+    let c_root = CString::new("/").unwrap();
+    let root_raw = unsafe {
         libc::open(
-            c_dir.as_ptr(),
+            c_root.as_ptr(),
             libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
-    if raw_fd < 0 {
+    if root_raw < 0 {
         let err = std::io::Error::last_os_error();
-        return match err.raw_os_error() {
-            Some(code) if code == libc::ENOENT => Ok(None),
-            Some(code) if code == libc::ENOTDIR || code == libc::ELOOP => {
-                Err(CliError::data(format!(
-                    "Directory path '{}' must be a real directory, not a symlink or file.",
-                    effective.display()
-                )))
-            }
-            _ => Err(map_io_error(
-                err,
-                &format!("Cannot open directory '{}'", effective.display()),
-            )),
-        };
+        return Err(map_io_error(err, "Cannot open root directory '/'"));
     }
-
-    let dir_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(dir_fd.as_raw_fd(), &mut st) } != 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(map_io_error(
-            err,
-            &format!("Cannot stat directory '{}'", effective.display()),
-        ));
-    }
-    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
-        return Err(CliError::data(format!(
-            "Directory path '{}' must be a real directory, not a symlink or file.",
-            effective.display()
-        )));
-    }
-
-    Ok(Some(dir_fd))
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(root_raw) }))
 }
 
 /// Verify that every existing directory component of `dir_path` from `/` (or `.`) down is a real directory
@@ -369,33 +447,36 @@ pub fn read_regular_file_opt_bounded(
         ))
     })?;
 
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+    let raw_file_fd = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            c_leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    let file = if raw_file_fd >= 0 {
+        unsafe { fs::File::from_raw_fd(raw_file_fd) }
+    } else {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        if e.raw_os_error() == Some(libc::ELOOP) {
             return Err(CliError::data(format!(
                 "{label} '{}' must be a regular file, not a symlink.",
                 path.display()
             )));
         }
-        Err(e)
-            if e.raw_os_error() == Some(libc::ENXIO) || e.raw_os_error() == Some(libc::EISDIR) =>
-        {
+        if e.raw_os_error() == Some(libc::ENXIO) || e.raw_os_error() == Some(libc::EISDIR) {
             return Err(CliError::data(format!(
                 "{label} '{}' must be a regular file, not a special file or directory.",
                 path.display()
             )));
         }
-        Err(e) => {
-            return Err(map_io_error(
-                e,
-                &format!("Cannot open {label} '{}'", path.display()),
-            ));
-        }
+        return Err(map_io_error(
+            e,
+            &format!("Cannot open {label} '{}'", path.display()),
+        ));
     };
 
     let meta = file.metadata().map_err(|e| {
@@ -520,6 +601,13 @@ pub fn check_fault_injection(stage: &str, target: &Path) -> CliResult<()> {
                 "corrupt_after_rename" if stage == "after_rename" => {
                     let _ = fs::write(target, b"corrupted-by-fault-injector");
                 }
+                "corrupt_once" if stage == "after_rename" => {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static FIRED_ONCE: AtomicBool = AtomicBool::new(false);
+                    if !FIRED_ONCE.swap(true, Ordering::SeqCst) {
+                        let _ = fs::write(target, b"corrupted-once-by-fault-injector");
+                    }
+                }
                 "abort" => {
                     std::process::exit(137);
                 }
@@ -605,7 +693,8 @@ pub fn write_atomic_durable(target: &Path, content: &[u8]) -> CliResult<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| CliError::data("Invalid target file name."))?;
-    let temp_path: PathBuf = parent_dir.join(format!("{file_name}.tmp.{}", Uuid::new_v4()));
+    let temp_path: PathBuf =
+        parent_dir.join(format!("{file_name}{OWNED_TMP_MARKER}{}", Uuid::new_v4()));
 
     let mut options = OpenOptions::new();
     options
@@ -656,6 +745,8 @@ pub fn write_atomic_durable(target: &Path, content: &[u8]) -> CliResult<()> {
             &format!("Failed to atomically replace '{}'", target.display()),
         ));
     }
+
+    check_fault_injection("sync_parent_dir", target)?;
 
     // Parent directory fsync (`O_DIRECTORY | O_NOFOLLOW`) to guarantee directory entry durability.
     let dir_file = OpenOptions::new()
@@ -716,52 +807,992 @@ pub fn write_atomic_durable(target: &Path, content: &[u8]) -> CliResult<()> {
     Ok(())
 }
 
-/// Clean orphan `*.tmp.*` files older than `max_age` (use `Duration::ZERO` under exclusive `doctor --fix` L1/L3 lock).
-/// MUST ONLY be called while holding the corresponding write lock (`ActiveSlotLock` or `StoreWriteLock`).
-pub fn cleanup_orphan_temp_files(dir: &Path, max_age: Duration) -> usize {
-    if ensure_no_symlink_ancestors(dir).is_err() || check_not_symlink_dir_if_exists(dir).is_err() {
-        return 0;
+pub(crate) fn stat_dir_fd(dir_fd: &OwnedFd, dir_path: &Path) -> CliResult<(u64, u64)> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(dir_fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(map_io_error(
+            std::io::Error::last_os_error(),
+            &format!("Cannot stat directory '{}'", dir_path.display()),
+        ));
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(CliError::data(format!(
+            "Directory path '{}' must be a real directory.",
+            dir_path.display()
+        )));
+    }
+    #[allow(clippy::unnecessary_cast)]
+    Ok((st.st_dev as u64, st.st_ino as u64))
+}
+
+pub(crate) fn fsync_pinned_dir_fd(dir_fd: &OwnedFd, dir_path: &Path) -> CliResult<()> {
+    let raw_rd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
     };
+    if raw_rd < 0 {
+        return Err(map_io_error(
+            std::io::Error::last_os_error(),
+            &format!(
+                "Failed to open directory '{}' for fsync",
+                dir_path.display()
+            ),
+        ));
+    }
+    let rd_file = unsafe { fs::File::from_raw_fd(raw_rd) };
+    rd_file.sync_all().map_err(|e| {
+        map_io_error(
+            e,
+            &format!("Failed to fsync directory '{}'", dir_path.display()),
+        )
+    })
+}
+
+pub(crate) fn verify_dir_still_pinned(
+    dir_path: &Path,
+    expected_dev: u64,
+    expected_ino: u64,
+) -> CliResult<()> {
+    let Some(reopened) = open_existing_dir_nofollow(dir_path)? else {
+        return Err(CliError::data(format!(
+            "Directory '{}' disappeared during operation.",
+            dir_path.display()
+        )));
+    };
+    let (cur_dev, cur_ino) = stat_dir_fd(&reopened, dir_path)?;
+    if (cur_dev, cur_ino) != (expected_dev, expected_ino) {
+        return Err(CliError::data(format!(
+            "Directory '{}' changed inode or resolved through a replaced ancestor.",
+            dir_path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Remove a regular file strictly through an `openat`-pinned parent directory handle,
+/// propagating parent directory `fsync` errors (even when the target was already unlinked in dcache!)
+/// so post-removal absence is durably confirmed on stable storage.
+pub fn remove_regular_file_durable_under(
+    base_dir: &Path,
+    target: &Path,
+    label: &str,
+) -> CliResult<bool> {
+    ensure_no_symlink_components_under(base_dir, target)?;
+    let raw_parent = target.parent().ok_or_else(|| {
+        CliError::data(format!(
+            "{label} '{}' has no parent directory.",
+            target.display()
+        ))
+    })?;
+    let parent_dir = if raw_parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        raw_parent
+    };
+    let leaf = target.file_name().ok_or_else(|| {
+        CliError::data(format!("{label} '{}' has no file name.", target.display()))
+    })?;
+    if !is_single_normal_filename(leaf.as_bytes()) {
+        return Err(CliError::data(format!(
+            "{label} '{}' has an invalid file name.",
+            target.display()
+        )));
+    }
+    let c_leaf = CString::new(leaf.as_bytes()).map_err(|_| {
+        CliError::data(format!(
+            "{label} '{}' contains an invalid NUL byte.",
+            target.display()
+        ))
+    })?;
+
+    let Some(parent_fd) = open_existing_dir_nofollow(parent_dir)? else {
+        return Ok(false);
+    };
+    let (dir_dev, dir_ino) = stat_dir_fd(&parent_fd, parent_dir)?;
+
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let stat_rc = unsafe {
+        libc::fstatat(
+            parent_fd.as_raw_fd(),
+            c_leaf.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    let mut removed = false;
+    if stat_rc == 0 {
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(CliError::data(format!(
+                "Refusing to remove non-regular {label} '{}'.",
+                target.display()
+            )));
+        }
+        verify_dir_still_pinned(parent_dir, dir_dev, dir_ino)?;
+        let unlink_rc = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), c_leaf.as_ptr(), 0) };
+        if unlink_rc == 0 {
+            removed = true;
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ENOENT) {
+                return Err(map_io_error(
+                    err,
+                    &format!("Failed to remove {label} '{}'", target.display()),
+                ));
+            }
+        }
+    } else {
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(c) if c == libc::ENOENT => {}
+            Some(c) if c == libc::ELOOP || c == libc::ENOTDIR => {
+                return Err(CliError::data(format!(
+                    "Refusing to remove non-regular {label} '{}'.",
+                    target.display()
+                )));
+            }
+            _ => {
+                return Err(map_io_error(
+                    err,
+                    &format!("Cannot inspect {label} '{}'", target.display()),
+                ));
+            }
+        }
+    }
+
+    verify_dir_still_pinned(parent_dir, dir_dev, dir_ino)?;
+    check_fault_injection("sync_parent_dir", target)?;
+    fsync_pinned_dir_fd(&parent_fd, parent_dir)?;
+
+    let mut post_st: libc::stat = unsafe { std::mem::zeroed() };
+    let post_rc = unsafe {
+        libc::fstatat(
+            parent_fd.as_raw_fd(),
+            c_leaf.as_ptr(),
+            &mut post_st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if post_rc == 0 {
+        return Err(CliError::io(
+            "remove_readback_present",
+            format!("{label} '{}' still exists after removal.", target.display()),
+        ));
+    }
+    let post_err = std::io::Error::last_os_error();
+    if post_err.raw_os_error() != Some(libc::ENOENT) {
+        return Err(map_io_error(
+            post_err,
+            &format!("Cannot verify removal of {label} '{}'", target.display()),
+        ));
+    }
+
+    Ok(removed)
+}
+
+/// Confirm that already-updated entries inside `parent_dir` (and each target path) pass symlink
+/// safety checks and `sync_parent_dir` durability confirmation via a pinned directory handle.
+pub fn confirm_dir_entries_durable_under(
+    base_dir: &Path,
+    parent_dir: &Path,
+    targets: &[&Path],
+) -> CliResult<()> {
+    ensure_no_symlink_components_under(base_dir, parent_dir)?;
+    for target in targets {
+        ensure_no_symlink_components_under(base_dir, target)?;
+    }
+    let Some(parent_fd) = open_existing_dir_nofollow(parent_dir)? else {
+        return Err(CliError::io(
+            "io_error",
+            format!(
+                "Parent directory '{}' does not exist while confirming durability.",
+                parent_dir.display()
+            ),
+        ));
+    };
+    let (dir_dev, dir_ino) = stat_dir_fd(&parent_fd, parent_dir)?;
+    for target in targets {
+        check_fault_injection("sync_parent_dir", target)?;
+    }
+    verify_dir_still_pinned(parent_dir, dir_dev, dir_ino)?;
+    fsync_pinned_dir_fd(&parent_fd, parent_dir)?;
+    Ok(())
+}
+
+/// Confirm via pinned `openat`/`fstatat(AT_SYMLINK_NOFOLLOW)` and parent directory `fsync` that
+/// `target` is absent without unlinking any newly appeared file.
+pub fn confirm_file_absent_and_parent_durable_under(
+    base_dir: &Path,
+    target: &Path,
+    label: &str,
+) -> CliResult<()> {
+    ensure_no_symlink_components_under(base_dir, target)?;
+    let raw_parent = target.parent().ok_or_else(|| {
+        CliError::data(format!(
+            "{label} '{}' has no parent directory.",
+            target.display()
+        ))
+    })?;
+    let parent_dir = if raw_parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        raw_parent
+    };
+    let leaf = target.file_name().ok_or_else(|| {
+        CliError::data(format!("{label} '{}' has no file name.", target.display()))
+    })?;
+    if !is_single_normal_filename(leaf.as_bytes()) {
+        return Err(CliError::data(format!(
+            "{label} '{}' has an invalid file name.",
+            target.display()
+        )));
+    }
+    let c_leaf = CString::new(leaf.as_bytes()).map_err(|_| {
+        CliError::data(format!(
+            "{label} '{}' contains an invalid NUL byte.",
+            target.display()
+        ))
+    })?;
+
+    let Some(parent_fd) = open_existing_dir_nofollow(parent_dir)? else {
+        return Ok(());
+    };
+    let (dir_dev, dir_ino) = stat_dir_fd(&parent_fd, parent_dir)?;
+
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let stat_rc = unsafe {
+        libc::fstatat(
+            parent_fd.as_raw_fd(),
+            c_leaf.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if stat_rc == 0 {
+        return Err(CliError::partial_commit(
+            "recovery_incomplete",
+            format!(
+                "{label} '{}' is present on disk while confirming absence durability; journal preserved.",
+                target.display()
+            ),
+        ));
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(c) if c == libc::ENOENT => {}
+        Some(c) if c == libc::ELOOP || c == libc::ENOTDIR => {
+            return Err(CliError::data(format!(
+                "Refusing to traverse non-regular {label} '{}'.",
+                target.display()
+            )));
+        }
+        _ => {
+            return Err(map_io_error(
+                err,
+                &format!("Cannot inspect {label} '{}'", target.display()),
+            ));
+        }
+    }
+
+    verify_dir_still_pinned(parent_dir, dir_dev, dir_ino)?;
+    check_fault_injection("sync_parent_dir", target)?;
+    fsync_pinned_dir_fd(&parent_fd, parent_dir)?;
+
+    let mut post_st: libc::stat = unsafe { std::mem::zeroed() };
+    let post_rc = unsafe {
+        libc::fstatat(
+            parent_fd.as_raw_fd(),
+            c_leaf.as_ptr(),
+            &mut post_st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if post_rc == 0 {
+        return Err(CliError::partial_commit(
+            "recovery_incomplete",
+            format!(
+                "{label} '{}' appeared concurrently during parent directory sync; journal preserved.",
+                target.display()
+            ),
+        ));
+    }
+    let post_err = std::io::Error::last_os_error();
+    if post_err.raw_os_error() != Some(libc::ENOENT) {
+        return Err(map_io_error(
+            post_err,
+            &format!("Cannot verify absence of {label} '{}'", target.display()),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Create/open a real non-symlink directory hierarchy from `/` down to `target_dir` (`0700` on newly
+/// created components under `root_dir`), returning the pinned `OwnedFd` and `(dev, ino)` of `target_dir`.
+pub(crate) fn ensure_dir_chain_pinned_under(
+    root_dir: &Path,
+    target_dir: &Path,
+) -> CliResult<(OwnedFd, u64, u64)> {
+    ensure_no_symlink_ancestors(root_dir)?;
+    if !root_dir.exists() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(root_dir)
+            .map_err(|e| {
+                map_io_error(
+                    e,
+                    &format!("Failed to create directory '{}'", root_dir.display()),
+                )
+            })?;
+    }
+    let Some(mut cur_fd) = open_existing_dir_nofollow(root_dir)? else {
+        return Err(CliError::data(format!(
+            "Directory '{}' could not be opened after creation.",
+            root_dir.display()
+        )));
+    };
+    let rel = target_dir.strip_prefix(root_dir).map_err(|_| {
+        CliError::data(format!(
+            "Target directory '{}' is not inside '{}'.",
+            target_dir.display(),
+            root_dir.display()
+        ))
+    })?;
+    let mut cur_path = root_dir.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::CurDir => continue,
+            Component::Normal(part) => {
+                if !is_single_normal_filename(part.as_bytes()) {
+                    return Err(CliError::data(format!(
+                        "Invalid directory component in '{}'.",
+                        target_dir.display()
+                    )));
+                }
+                cur_path.push(part);
+                let c_part = CString::new(part.as_bytes()).map_err(|_| {
+                    CliError::data(format!(
+                        "Path '{}' contains an invalid NUL byte.",
+                        cur_path.display()
+                    ))
+                })?;
+                let mk_rc = unsafe { libc::mkdirat(cur_fd.as_raw_fd(), c_part.as_ptr(), 0o700) };
+                if mk_rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(map_io_error(
+                            err,
+                            &format!("Failed to create directory '{}'", cur_path.display()),
+                        ));
+                    }
+                }
+                let next_raw = unsafe {
+                    libc::openat(
+                        cur_fd.as_raw_fd(),
+                        c_part.as_ptr(),
+                        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if next_raw < 0 {
+                    let err = std::io::Error::last_os_error();
+                    return if matches!(err.raw_os_error(), Some(c) if c == libc::ELOOP || c == libc::ENOTDIR)
+                    {
+                        Err(CliError::data(format!(
+                            "Refusing to use '{}' because it is a symlink or non-directory.",
+                            cur_path.display()
+                        )))
+                    } else {
+                        Err(map_io_error(
+                            err,
+                            &format!("Cannot open directory '{}'", cur_path.display()),
+                        ))
+                    };
+                }
+                let next_fd = unsafe { OwnedFd::from_raw_fd(next_raw) };
+                let _ = stat_dir_fd(&next_fd, &cur_path)?;
+                cur_fd = next_fd;
+            }
+            _ => {
+                return Err(CliError::data(format!(
+                    "Directory '{}' must not contain '..' components.",
+                    target_dir.display()
+                )));
+            }
+        }
+    }
+
+    let (dev, ino) = stat_dir_fd(&cur_fd, target_dir)?;
+    verify_dir_still_pinned(target_dir, dev, ino)?;
+    Ok((cur_fd, dev, ino))
+}
+
+/// Atomically write and durably replace `leaf_name` strictly inside an `openat`-pinned `dir_fd`,
+/// re-verifying that `dir_path` still resolves to `(dir_dev, dir_ino)` and that `leaf_name` was
+/// not replaced with a symlink before `renameat`, and keeping the readback FD open (`OwnedFd`)
+/// so the kernel cannot reclaim/reuse the inode while the caller verifies follow-up waits!
+pub(crate) fn write_atomic_durable_in_pinned_dir(
+    dir_fd: &OwnedFd,
+    dir_dev: u64,
+    dir_ino: u64,
+    dir_path: &Path,
+    leaf_name: &str,
+    content: &[u8],
+) -> CliResult<(OwnedFd, u64, u64)> {
+    if !is_single_normal_filename(leaf_name.as_bytes()) {
+        return Err(CliError::data("Invalid target file name."));
+    }
+    let c_leaf = CString::new(leaf_name.as_bytes())
+        .map_err(|_| CliError::data("Invalid NUL in target file name."))?;
+    let target_full = dir_path.join(leaf_name);
+
+    verify_dir_still_pinned(dir_path, dir_dev, dir_ino)?;
+
+    let mut pre_st: libc::stat = unsafe { std::mem::zeroed() };
+    let pre_rc = unsafe {
+        libc::fstatat(
+            dir_fd.as_raw_fd(),
+            c_leaf.as_ptr(),
+            &mut pre_st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    let pre_existing_id: Option<(u64, u64)> = if pre_rc == 0 {
+        if (pre_st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(CliError::data(format!(
+                "Refusing to overwrite non-regular service target '{}'.",
+                target_full.display()
+            )));
+        }
+        #[allow(clippy::unnecessary_cast)]
+        Some((pre_st.st_dev as u64, pre_st.st_ino as u64))
+    } else {
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(c) if c == libc::ENOENT => None,
+            Some(c) if c == libc::ELOOP || c == libc::ENOTDIR => {
+                return Err(CliError::data(format!(
+                    "Refusing to overwrite non-regular service target '{}'.",
+                    target_full.display()
+                )));
+            }
+            _ => {
+                return Err(map_io_error(
+                    err,
+                    &format!("Cannot inspect target '{}'", target_full.display()),
+                ));
+            }
+        }
+    };
+
+    check_fault_injection("before_write", &target_full)?;
+
+    let tmp_name = format!("{leaf_name}{OWNED_TMP_MARKER}{}", Uuid::new_v4());
+    let c_tmp = CString::new(tmp_name.as_bytes())
+        .map_err(|_| CliError::data("Invalid temporary file name."))?;
+    let raw_tmp = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            c_tmp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if raw_tmp < 0 {
+        return Err(map_io_error(
+            std::io::Error::last_os_error(),
+            &format!(
+                "Failed to create temporary file in '{}'",
+                dir_path.display()
+            ),
+        ));
+    }
+    let mut tmp_file = unsafe { fs::File::from_raw_fd(raw_tmp) };
+    let cleanup_tmp = || unsafe {
+        let _ = libc::unlinkat(dir_fd.as_raw_fd(), c_tmp.as_ptr(), 0);
+    };
+
+    if let Err(e) = tmp_file.write_all(content) {
+        drop(tmp_file);
+        cleanup_tmp();
+        return Err(map_io_error(
+            e,
+            &format!(
+                "Failed to write temporary file for '{}'",
+                target_full.display()
+            ),
+        ));
+    }
+    if let Err(e) = check_fault_injection("before_fsync", &target_full) {
+        drop(tmp_file);
+        cleanup_tmp();
+        return Err(e);
+    }
+    if let Err(e) = tmp_file.sync_all() {
+        drop(tmp_file);
+        cleanup_tmp();
+        return Err(map_io_error(
+            e,
+            &format!(
+                "Failed to fsync temporary file for '{}'",
+                target_full.display()
+            ),
+        ));
+    }
+    drop(tmp_file);
+
+    if let Err(e) = verify_dir_still_pinned(dir_path, dir_dev, dir_ino) {
+        cleanup_tmp();
+        return Err(e);
+    }
+
+    let mut mid_st: libc::stat = unsafe { std::mem::zeroed() };
+    let mid_rc = unsafe {
+        libc::fstatat(
+            dir_fd.as_raw_fd(),
+            c_leaf.as_ptr(),
+            &mut mid_st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    let still_same_target = match (mid_rc == 0, pre_existing_id) {
+        (true, Some((ed, ei))) => {
+            #[allow(clippy::unnecessary_cast)]
+            {
+                (mid_st.st_mode & libc::S_IFMT) == libc::S_IFREG
+                    && (mid_st.st_dev as u64) == ed
+                    && (mid_st.st_ino as u64) == ei
+            }
+        }
+        (false, None) => std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT),
+        _ => false,
+    };
+    if !still_same_target {
+        cleanup_tmp();
+        return Err(CliError::data(format!(
+            "Refusing to replace '{}' because target changed concurrently during install.",
+            target_full.display()
+        )));
+    }
+
+    if let Err(e) = check_fault_injection("before_rename", &target_full) {
+        cleanup_tmp();
+        return Err(e);
+    }
+
+    let ren_rc = unsafe {
+        libc::renameat(
+            dir_fd.as_raw_fd(),
+            c_tmp.as_ptr(),
+            dir_fd.as_raw_fd(),
+            c_leaf.as_ptr(),
+        )
+    };
+    if ren_rc != 0 {
+        let err = std::io::Error::last_os_error();
+        cleanup_tmp();
+        return Err(map_io_error(
+            err,
+            &format!("Failed to atomically replace '{}'", target_full.display()),
+        ));
+    }
+
+    check_fault_injection("sync_parent_dir", &target_full)?;
+    fsync_pinned_dir_fd(dir_fd, dir_path)?;
+    check_fault_injection("after_rename", &target_full)?;
+
+    let raw_rb = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            c_leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if raw_rb < 0 {
+        return Err(map_io_error(
+            std::io::Error::last_os_error(),
+            &format!("Readback open failed for '{}'", target_full.display()),
+        ));
+    }
+    let mut rb_file = unsafe { fs::File::from_raw_fd(raw_rb) };
+    let rb_meta = rb_file.metadata().map_err(|e| {
+        map_io_error(
+            e,
+            &format!("Readback stat failed for '{}'", target_full.display()),
+        )
+    })?;
+    if !rb_meta.file_type().is_file() {
+        return Err(CliError::io(
+            "readback_not_regular_file",
+            format!(
+                "Readback target '{}' is not a regular file.",
+                target_full.display()
+            ),
+        ));
+    }
+    unsafe {
+        let fl = libc::fcntl(rb_file.as_raw_fd(), libc::F_GETFL);
+        if fl >= 0 && (fl & libc::O_NONBLOCK) != 0 {
+            let _ = libc::fcntl(rb_file.as_raw_fd(), libc::F_SETFL, fl & !libc::O_NONBLOCK);
+        }
+    }
+    let mut actual = Vec::with_capacity(content.len());
+    rb_file.read_to_end(&mut actual).map_err(|e| {
+        map_io_error(
+            e,
+            &format!("Readback failed for '{}'", target_full.display()),
+        )
+    })?;
+    if actual != content {
+        return Err(CliError::io(
+            "readback_mismatch",
+            format!("Readback mismatch for '{}'.", target_full.display()),
+        ));
+    }
+    Ok((OwnedFd::from(rb_file), rb_meta.dev(), rb_meta.ino()))
+}
+
+/// Re-verify after waiting for an external command (`systemctl --user disable --now`) that
+/// `dir_path` still resolves without symlinks to the exact pinned `(dir_dev, dir_ino)` AND
+/// `leaf_name` inside `dir_fd` is still the exact regular-file `(expected_target_dev, expected_target_ino)`,
+/// then unlink via `unlinkat(dir_fd, ...)` and durably `fsync(dir_fd)`.
+pub(crate) fn unlink_pinned_regular_target_after_wait(
+    dir_fd: &OwnedFd,
+    dir_dev: u64,
+    dir_ino: u64,
+    dir_path: &Path,
+    leaf_name: &str,
+    expected_target_dev: u64,
+    expected_target_ino: u64,
+) -> CliResult<bool> {
+    verify_dir_still_pinned(dir_path, dir_dev, dir_ino)?;
+
+    let c_leaf = CString::new(leaf_name.as_bytes())
+        .map_err(|_| CliError::data("Invalid NUL in target file name."))?;
+    let target_full = dir_path.join(leaf_name);
+
+    let mut cur_st: libc::stat = unsafe { std::mem::zeroed() };
+    let st_rc = unsafe {
+        libc::fstatat(
+            dir_fd.as_raw_fd(),
+            c_leaf.as_ptr(),
+            &mut cur_st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if st_rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(c) if c == libc::ENOENT => {
+                fsync_pinned_dir_fd(dir_fd, dir_path)?;
+                Ok(false)
+            }
+            Some(c) if c == libc::ELOOP || c == libc::ENOTDIR => Err(CliError::data(format!(
+                "Refusing to remove non-regular service file '{}' after stop.",
+                target_full.display()
+            ))),
+            _ => Err(map_io_error(
+                err,
+                &format!("Cannot inspect service unit '{}'", target_full.display()),
+            )),
+        };
+    }
+    if (cur_st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Err(CliError::data(format!(
+            "Refusing to remove non-regular service file '{}' (symlink or directory).",
+            target_full.display()
+        )));
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let same_target = (cur_st.st_dev as u64) == expected_target_dev
+        && (cur_st.st_ino as u64) == expected_target_ino;
+    if !same_target {
+        return Err(CliError::data(format!(
+            "Refusing to remove service file '{}' because target inode changed concurrently.",
+            target_full.display()
+        )));
+    }
+
+    let u_rc = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c_leaf.as_ptr(), 0) };
+    if u_rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(map_io_error(
+            err,
+            &format!("Failed to remove service unit '{}'", target_full.display()),
+        ));
+    }
+
+    check_fault_injection("sync_parent_dir", &target_full)?;
+    fsync_pinned_dir_fd(dir_fd, dir_path)?;
+    Ok(true)
+}
+
+/// Returns `true` strictly for temporary filenames owned by `agy-switch-cli`
+/// (`<target_prefix>.tmp.agy-switch-cli.<uuid>`).
+pub fn is_owned_temp_filename(name: &str, allowed_target_prefix: Option<&str>) -> bool {
+    let Some((prefix, uuid_part)) = name.split_once(OWNED_TMP_MARKER) else {
+        return false;
+    };
+    if prefix.is_empty() {
+        return false;
+    }
+    if let Some(expected_prefix) = allowed_target_prefix {
+        if prefix != expected_prefix {
+            return false;
+        }
+    }
+    Uuid::parse_str(uuid_part).is_ok()
+}
+
+/// Full durability preflight for a pinned directory matching the real persistence protocol:
+/// create (`O_CREAT | O_EXCL | O_NOFOLLOW`) -> write -> file `sync_all` -> atomic `renameat`
+/// -> parent dir `fsync` -> `unlinkat` (error-propagating) -> parent dir `fsync`.
+pub(crate) fn verify_dir_writable_and_durable_nofollow(dir: &Path) -> CliResult<()> {
+    let Some(dir_fd) = open_existing_dir_nofollow(dir)? else {
+        return Err(CliError::io(
+            "io_error",
+            format!("Store directory '{}' does not exist.", dir.display()),
+        ));
+    };
+    let (dir_dev, dir_ino) = stat_dir_fd(&dir_fd, dir)?;
+
+    let probe_a_name = format!(".write-probe-a{OWNED_TMP_MARKER}{}", Uuid::new_v4());
+    let probe_b_name = format!(".write-probe-b{OWNED_TMP_MARKER}{}", Uuid::new_v4());
+    let probe_b_path = dir.join(&probe_b_name);
+    let c_a = CString::new(probe_a_name.as_bytes())
+        .map_err(|_| CliError::data("Invalid write probe filename."))?;
+    let c_b = CString::new(probe_b_name.as_bytes())
+        .map_err(|_| CliError::data("Invalid write probe filename."))?;
+
+    let raw_a = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            c_a.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if raw_a < 0 {
+        return Err(map_io_error(
+            std::io::Error::last_os_error(),
+            &format!("Store directory '{}' is not writable", dir.display()),
+        ));
+    }
+    let mut file_a = unsafe { fs::File::from_raw_fd(raw_a) };
+    let write_res = file_a.write_all(b"ok").and_then(|()| file_a.sync_all());
+    drop(file_a);
+    if let Err(e) = write_res {
+        unsafe {
+            let _ = libc::unlinkat(dir_fd.as_raw_fd(), c_a.as_ptr(), 0);
+        }
+        return Err(map_io_error(
+            e,
+            &format!(
+                "Store directory '{}' failed durability probe",
+                dir.display()
+            ),
+        ));
+    }
+
+    verify_dir_still_pinned(dir, dir_dev, dir_ino)?;
+    let ren_rc = unsafe {
+        libc::renameat(
+            dir_fd.as_raw_fd(),
+            c_a.as_ptr(),
+            dir_fd.as_raw_fd(),
+            c_b.as_ptr(),
+        )
+    };
+    if ren_rc != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            let _ = libc::unlinkat(dir_fd.as_raw_fd(), c_a.as_ptr(), 0);
+        }
+        return Err(map_io_error(
+            err,
+            &format!(
+                "Store directory '{}' failed atomic rename probe",
+                dir.display()
+            ),
+        ));
+    }
+
+    let sync_after_rename = check_fault_injection("sync_parent_dir", &probe_b_path)
+        .and_then(|()| fsync_pinned_dir_fd(&dir_fd, dir));
+    let unlink_rc = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c_b.as_ptr(), 0) };
+    let unlink_err = (unlink_rc != 0).then(std::io::Error::last_os_error);
+
+    sync_after_rename?;
+    if let Some(err) = unlink_err {
+        return Err(map_io_error(
+            err,
+            &format!(
+                "Store directory '{}' failed probe cleanup unlink",
+                dir.display()
+            ),
+        ));
+    }
+
+    verify_dir_still_pinned(dir, dir_dev, dir_ino)?;
+    fsync_pinned_dir_fd(&dir_fd, dir)?;
+    Ok(())
+}
+
+/// Clean ONLY expired temporary files demonstrably owned by `agy-switch-cli`
+/// (`<target_prefix>.tmp.agy-switch-cli.<uuid>`) strictly through an `openat`-pinned directory FD,
+/// propagating unlink and parent directory `fsync` errors instead of swallowing them.
+/// MUST ONLY be called while holding the corresponding write lock (`ActiveSlotLock` or `StoreWriteLock`).
+pub fn cleanup_owned_orphan_temp_files_pinned(
+    dir: &Path,
+    allowed_target_prefix: Option<&str>,
+    max_age: Duration,
+) -> CliResult<usize> {
+    let Some(dir_fd) = open_existing_dir_nofollow(dir)? else {
+        return Ok(0);
+    };
+    let (dir_dev, dir_ino) = stat_dir_fd(&dir_fd, dir)?;
+
+    let rd_raw = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if rd_raw < 0 {
+        return Err(map_io_error(
+            std::io::Error::last_os_error(),
+            &format!("Cannot open directory '{}' for reading", dir.display()),
+        ));
+    }
+    let dir_ptr = unsafe { libc::fdopendir(rd_raw) };
+    if dir_ptr.is_null() {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            let _ = libc::close(rd_raw);
+        }
+        return Err(map_io_error(
+            err,
+            &format!("Cannot iterate directory '{}'", dir.display()),
+        ));
+    }
+    struct DirGuard(*mut libc::DIR);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = libc::closedir(self.0);
+            }
+        }
+    }
+    let _dir_guard = DirGuard(dir_ptr);
+
+    let mut owned_names: Vec<CString> = Vec::new();
+    loop {
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let ent = unsafe { libc::readdir(dir_ptr) };
+        if ent.is_null() {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error().unwrap_or(0) != 0 {
+                return Err(map_io_error(
+                    err,
+                    &format!("Failed reading directory '{}'", dir.display()),
+                ));
+            }
+            break;
+        }
+        let raw_name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
+        if raw_name == b"." || raw_name == b".." || !is_single_normal_filename(raw_name) {
+            continue;
+        }
+        let Ok(name_str) = std::str::from_utf8(raw_name) else {
+            continue;
+        };
+        if !is_owned_temp_filename(name_str, allowed_target_prefix) {
+            continue;
+        }
+        if let Ok(cname) = CString::new(raw_name) {
+            owned_names.push(cname);
+        }
+    }
+    drop(_dir_guard);
+
     let now = SystemTime::now();
     let mut removed = 0usize;
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name_str) = file_name.to_str() else {
-            continue;
+    for c_name in owned_names {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let st_rc = unsafe {
+            libc::fstatat(
+                dir_fd.as_raw_fd(),
+                c_name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
         };
-        if !name_str.contains(".tmp.") {
+        if st_rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                continue;
+            }
+            return Err(map_io_error(
+                err,
+                &format!("Cannot inspect temporary file in '{}'", dir.display()),
+            ));
+        }
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
             continue;
         }
-        let path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
+        #[allow(clippy::unnecessary_cast)]
+        let mtime_opt = if st.st_mtime >= 0 {
+            let nanos = (st.st_mtime_nsec as i64).clamp(0, 999_999_999) as u32;
+            UNIX_EPOCH.checked_add(Duration::new(st.st_mtime as u64, nanos))
+        } else {
+            None
         };
-        if !meta.file_type().is_file() {
+        let is_expired = if max_age.is_zero() {
+            true
+        } else {
+            mtime_opt
+                .and_then(|mt| now.duration_since(mt).ok())
+                .is_some_and(|age| age >= max_age)
+        };
+        if !is_expired {
             continue;
         }
-        let is_old = max_age.is_zero()
-            || meta
-                .modified()
-                .ok()
-                .and_then(|mtime| now.duration_since(mtime).ok())
-                .is_some_and(|age| age >= max_age);
-        if is_old && fs::remove_file(&path).is_ok() {
+        verify_dir_still_pinned(dir, dir_dev, dir_ino)?;
+        let unlink_rc = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c_name.as_ptr(), 0) };
+        if unlink_rc == 0 {
             removed += 1;
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ENOENT) {
+                return Err(map_io_error(
+                    err,
+                    &format!(
+                        "Failed to remove orphan temporary file in '{}'",
+                        dir.display()
+                    ),
+                ));
+            }
         }
     }
+
     if removed > 0 {
-        if let Ok(dir_file) = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(dir)
-        {
-            let _ = dir_file.sync_all();
-        }
+        verify_dir_still_pinned(dir, dir_dev, dir_ino)?;
+        check_fault_injection("sync_parent_dir", &dir.join(OWNED_TMP_MARKER))?;
+        fsync_pinned_dir_fd(&dir_fd, dir)?;
     }
-    removed
+
+    Ok(removed)
+}
+
+/// Best-effort wrapper for internal private store maintenance (still restricted strictly to
+/// expired `agy-switch-cli`-owned temporary files via pinned directory FD).
+pub fn cleanup_orphan_temp_files(dir: &Path, max_age: Duration) -> usize {
+    cleanup_owned_orphan_temp_files_pinned(dir, None, max_age).unwrap_or(0)
 }
 
 #[cfg(test)]

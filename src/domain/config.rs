@@ -13,7 +13,7 @@ fn default_config_schema_version() -> u32 {
 pub struct HeadlessConfig {
     #[serde(default = "default_config_schema_version")]
     pub schema_version: u32,
-    /// Optional credential backend preference (`auto`, `file`, or `secret-service`).
+    /// Optional credential backend preference (`auto`, `dual`, `file`, or `keyring`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
     #[serde(default)]
@@ -36,8 +36,9 @@ impl Default for HeadlessConfig {
 fn sanitize_backend_for_debug(raw: &str) -> &'static str {
     match raw.trim().to_ascii_lowercase().as_str() {
         "auto" => "auto",
-        "file" | "file_session" => "file",
-        "secret-service" | "secret_service" => "secret-service",
+        "dual" => "dual",
+        "file" => "file",
+        "keyring" => "keyring",
         _ => "[INVALID_BACKEND]",
     }
 }

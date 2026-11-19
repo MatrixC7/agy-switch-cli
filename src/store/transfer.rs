@@ -127,6 +127,11 @@ pub async fn import_transfer_bundle_file(
     overwrite: bool,
     now_unix: i64,
 ) -> CliResult<ImportReport> {
+    if crate::error::path_looks_like_accidental_secret(bundle_path) {
+        return Err(CliError::usage(
+            "`--from-file` expects a filesystem path to a transfer bundle JSON file, not a literal credential value (redacted).",
+        ));
+    }
     if let Some(parent) = bundle_path.parent() {
         if !parent.as_os_str().is_empty() {
             ensure_no_symlink_ancestors(parent)?;
@@ -331,6 +336,11 @@ pub async fn import_from_legacy_dir(
     overwrite: bool,
     now_unix: i64,
 ) -> CliResult<ImportReport> {
+    if crate::error::path_looks_like_accidental_secret(legacy_dir) {
+        return Err(CliError::usage(
+            "`--from-legacy` expects a filesystem directory path, not a literal credential value (redacted).",
+        ));
+    }
     if legacy_dir == repo.paths().data_dir {
         return Err(CliError::usage(
             "Source `--from-legacy` directory cannot be the same as target `--data-dir`.",
@@ -554,14 +564,19 @@ pub async fn import_from_legacy_dir(
     Ok(report)
 }
 
-/// Private secret export (`0600` file, requires `--include-secrets`, refuses overwrite without `--force`).
+/// Private secret export (`0600` file, requires `--include-secrets`, refuses overwrite without `--overwrite`).
 pub fn export_transfer_bundle_file(
     repo: &StoreRepository,
     output_path: &Path,
     include_secrets: bool,
-    force: bool,
+    overwrite: bool,
     selectors: &[String],
 ) -> CliResult<usize> {
+    if crate::error::path_looks_like_accidental_secret(output_path) {
+        return Err(CliError::usage(
+            "`--output` expects a filesystem file path, not a literal credential value (redacted).",
+        ));
+    }
     if !include_secrets {
         return Err(CliError::usage(
             "Exporting account refresh tokens requires explicit `--include-secrets` confirmation and `--output <FILE>`.",
@@ -581,9 +596,9 @@ pub fn export_transfer_bundle_file(
                     output_path.display()
                 )));
             }
-            if !force {
+            if !overwrite {
                 return Err(CliError::usage(format!(
-                    "Export output '{}' already exists. Pass `--force` to overwrite.",
+                    "Export output '{}' already exists. Pass `--overwrite` to overwrite.",
                     output_path.display()
                 )));
             }

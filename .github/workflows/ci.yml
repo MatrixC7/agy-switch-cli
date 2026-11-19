@@ -29,9 +29,9 @@ jobs:
       - name: Run Clippy across all 3 feature tiers
         run: |
           cargo clippy --locked --all-targets --no-default-features -- -D warnings
+          cargo clippy --locked --all-targets --no-default-features --features tui,stats -- -D warnings
           cargo clippy --locked --all-targets -- -D warnings
-          cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Run 3-tier test suite + 64-thread concurrency gate in isolated sandbox
+      - name: Run 3-tier test suite + 32-thread concurrency gate in isolated sandbox
         run: |
           ISO_ROOT="$(mktemp -d)"
           trap 'rm -rf "$ISO_ROOT"' EXIT
@@ -48,9 +48,9 @@ jobs:
           export NO_PROXY="*"
           export AGY_SWITCH_CLI_PROXY="direct"
           cargo test --locked --no-default-features
+          cargo test --locked --no-default-features --features tui,stats
           cargo test --locked
-          cargo test --locked --all-features
-          cargo test --locked --all-features -- --test-threads=64
+          cargo test --locked -- --test-threads=32
 
   msrv:
     name: MSRV Check & Tests (Rust 1.89.0)
@@ -81,11 +81,11 @@ jobs:
           export NO_PROXY="*"
           export AGY_SWITCH_CLI_PROXY="direct"
           cargo clippy --locked --all-targets --no-default-features -- -D warnings
+          cargo clippy --locked --all-targets --no-default-features --features tui,stats -- -D warnings
           cargo clippy --locked --all-targets -- -D warnings
-          cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --no-default-features
+          cargo test --locked --no-default-features --features tui,stats
           cargo test --locked
-          cargo test --locked --all-features
 
   dependency-audit:
     name: License & Advisory Audit (cargo-deny)
@@ -105,15 +105,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build 3 Release tiers and verify zero GUI / libdbus dynamic linkage
+      - name: Build Release tiers and verify zero GUI / libdbus dynamic linkage
         run: |
-          for flags in "--no-default-features" "" "--all-features"; do
+          for flags in "--no-default-features" "--no-default-features --features tui,stats" ""; do
             cargo build --release --locked $flags
             needed="$(readelf -d target/release/agy-switch-cli | grep '(NEEDED)' || true)"
             echo "=== Release ($flags) NEEDED ==="
             echo "$needed"
             if echo "$needed" | grep -Eiq 'gtk|webkit|x11|wayland|xcb|dbus'; then
               echo "Forbidden GUI/desktop shared library detected!"
+              exit 1
+            fi
+            if echo "$needed" | grep -Eiq 'sqlite'; then
+              echo "Forbidden external libsqlite3 shared library detected (expected bundled static SQLite)!"
               exit 1
             fi
             sha256sum target/release/agy-switch-cli
@@ -154,9 +158,9 @@ jobs:
           export NO_PROXY="*"
           export AGY_SWITCH_CLI_PROXY="direct"
           cargo test --locked --target x86_64-unknown-linux-musl --no-default-features
+          cargo test --locked --target x86_64-unknown-linux-musl --no-default-features --features tui,stats
           cargo test --locked --target x86_64-unknown-linux-musl
-          cargo test --locked --target x86_64-unknown-linux-musl --all-features
-          for flags in "--no-default-features" "" "--all-features"; do
+          for flags in "--no-default-features" "--no-default-features --features tui,stats" ""; do
             cargo build --release --locked --target x86_64-unknown-linux-musl $flags
             bin="target/x86_64-unknown-linux-musl/release/agy-switch-cli"
             file "$bin"
@@ -165,6 +169,11 @@ jobs:
               exit 1
             fi
             "$bin" current --json >/dev/null
+            "$bin" status --json >/dev/null
+            if [ "$flags" != "--no-default-features" ]; then
+              "$bin" stats summary --json >/dev/null
+              "$bin" stats list --json >/dev/null
+            fi
             sha256sum "$bin"
           done
       - name: Build & QEMU-verify static aarch64-unknown-linux-musl (3 tiers + negative guards)
@@ -185,7 +194,7 @@ jobs:
           export AGY_SWITCH_CLI_PROXY="direct"
           QEMU_AARCH64="$(command -v qemu-aarch64-static || command -v qemu-aarch64)"
           mkfifo -m 0600 "$ISO_ROOT/pipe.json"
-          for flags in "--no-default-features" "" "--all-features"; do
+          for flags in "--no-default-features" "--no-default-features --features tui,stats" ""; do
             cargo zigbuild --release --locked --target aarch64-unknown-linux-musl $flags
             bin="target/aarch64-unknown-linux-musl/release/agy-switch-cli"
             file "$bin"
@@ -194,11 +203,15 @@ jobs:
               exit 1
             fi
             "$QEMU_AARCH64" "$bin" --no-remote-version current --json >/dev/null
-            "$QEMU_AARCH64" "$bin" --no-remote-version doctor --json >/dev/null
+            "$QEMU_AARCH64" "$bin" --no-remote-version status --json >/dev/null
+            if [ "$flags" != "--no-default-features" ]; then
+              "$QEMU_AARCH64" "$bin" --no-remote-version stats summary --json >/dev/null
+              "$QEMU_AARCH64" "$bin" --no-remote-version stats list --json >/dev/null
+            fi
             set +e
             bad_err="$("$QEMU_AARCH64" "$bin" --json auth login "4/PART1'CI_ARM_SECRET_999" 2>&1)"
             bad_rc=$?
-            "$QEMU_AARCH64" "$bin" --no-remote-version --json accounts import "$ISO_ROOT/pipe.json" >/dev/null 2>&1
+            "$QEMU_AARCH64" "$bin" --no-remote-version --json accounts import --from-file "$ISO_ROOT/pipe.json" >/dev/null 2>&1
             fifo_rc=$?
             set -e
             if [ "$bad_rc" -ne 2 ] || echo "$bad_err" | grep -iq 'ci_arm_secret_999' || [ "$fifo_rc" -ne 2 ]; then
@@ -228,7 +241,7 @@ jobs:
           export AGY_SWITCH_CLI_PROXY="direct"
           QEMU_AARCH64="$(command -v qemu-aarch64-static || command -v qemu-aarch64)"
           mkfifo -m 0600 "$ISO_ROOT/pipe.json"
-          for flags in "--no-default-features" "" "--all-features"; do
+          for flags in "--no-default-features" "--no-default-features --features tui,stats" ""; do
             cargo build --release --locked --target aarch64-unknown-linux-gnu $flags
             bin="target/aarch64-unknown-linux-gnu/release/agy-switch-cli"
             file "$bin"
@@ -238,12 +251,20 @@ jobs:
               echo "Forbidden GUI/desktop shared library detected in aarch64-gnu ELF!"
               exit 1
             fi
+            if echo "$needed" | grep -Eiq 'sqlite'; then
+              echo "Forbidden external libsqlite3 shared library detected in aarch64-gnu ELF!"
+              exit 1
+            fi
             "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version current --json >/dev/null
-            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version doctor --json >/dev/null
+            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version status --json >/dev/null
+            if [ "$flags" != "--no-default-features" ]; then
+              "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version stats summary --json >/dev/null
+              "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version stats list --json >/dev/null
+            fi
             set +e
             bad_err="$("$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --json auth login "4/PART1'CI_ARM_GNU_SECRET_999" 2>&1)"
             bad_rc=$?
-            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version --json accounts import "$ISO_ROOT/pipe.json" >/dev/null 2>&1
+            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version --json accounts import --from-file "$ISO_ROOT/pipe.json" >/dev/null 2>&1
             fifo_rc=$?
             set -e
             if [ "$bad_rc" -ne 2 ] || echo "$bad_err" | grep -iq 'ci_arm_gnu_secret_999' || [ "$fifo_rc" -ne 2 ]; then

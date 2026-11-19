@@ -1,14 +1,15 @@
 use crate::domain::account::{AccountRecord, DisableReasonCode, RuntimeState};
 use crate::domain::clock::{AnchoredClock, Clock};
-use crate::domain::policy::{PolicyStrategy, SwitchPolicy};
-use crate::domain::quota::{evaluate_account_quota, QuotaEval, DEFAULT_QUOTA_MAX_AGE_SECS};
+use crate::domain::policy::PolicyStrategy;
 use crate::error::{CliError, CliResult};
 use crate::oauth::refresh::{
     persist_disable_or_report_io_error, OAuthEndpoints, TOKEN_REFRESH_SKEW_SECONDS,
 };
 use crate::oauth::registry::OAuthClientRegistry;
-use crate::quota::client::{refresh_account_quota_locked, CloudCodeEndpoints};
-use crate::session::backend::{CredentialBackend, SlotInspectState};
+use crate::session::backend::{
+    should_isolate_child_dbus_for_explicit_file_backend, BackendReplicaInspection,
+    CredentialBackend,
+};
 use crate::session::journal::reconcile_pending_journal_for_slot_consumer;
 use crate::session::payload::{bytes_sha256_hex, serialize_session_payload};
 use crate::session::process::{observe_runtime_state, remove_process_lease, write_process_lease};
@@ -19,18 +20,17 @@ use crate::transport::user_agent::resolve_agy_executable;
 use std::path::PathBuf;
 use std::process::Stdio;
 
-/// Pre-invocation managed wrapper (`agy-switch-cli run [--account <SEL>] [--isolate-dbus] -- agy [<ARGS>...]`) per Blueprint §7.1.
+/// Optional managed credential/backend wrapper (`agy-switch-cli [--backend file] run [--account <SEL>] -- agy [<ARGS>...]`).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_managed_agy(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
     transport: &dyn HttpTransport,
     oauth_endpoints: &OAuthEndpoints,
-    quota_endpoints: &CloudCodeEndpoints,
     registry: &OAuthClientRegistry,
     user_agent: &str,
     explicit_account: Option<&str>,
-    isolate_dbus: bool,
+    explicit_file_backend: bool,
     command_args: &[String],
     now_unix: i64,
 ) -> CliResult<i32> {
@@ -102,7 +102,6 @@ pub async fn run_managed_agy(
         backend,
         transport,
         oauth_endpoints,
-        quota_endpoints,
         registry,
         user_agent,
         explicit_account,
@@ -118,7 +117,7 @@ pub async fn run_managed_agy(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    if isolate_dbus && !backend.uses_keyring() {
+    if explicit_file_backend && should_isolate_child_dbus_for_explicit_file_backend() {
         cmd.env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/dev/null");
     }
     let mut child = cmd.spawn().map_err(|e| {
@@ -190,7 +189,6 @@ async fn prepare_account_before_spawn(
     backend: &dyn CredentialBackend,
     transport: &dyn HttpTransport,
     oauth_endpoints: &OAuthEndpoints,
-    quota_endpoints: &CloudCodeEndpoints,
     registry: &OAuthClientRegistry,
     user_agent: &str,
     explicit_account: Option<&str>,
@@ -200,141 +198,21 @@ async fn prepare_account_before_spawn(
     let paths = repo.paths();
     let snapshot = repo.read_snapshot()?;
 
-    // Case A: Explicit `--account <SEL>`
-    if let Some(sel) = explicit_account {
-        let target = snapshot.select(sel)?;
-        let ts = clock.now_unix();
-        ensure_account_usable_and_scoped(repo, target, registry, ts)?;
-        ensure_no_conflicting_managed_session(runtime, &target.id)?;
-
-        let slot = backend.inspect_slot(paths);
-        if !is_slot_synced_and_fresh(&slot, &snapshot, target, ts) {
-            execute_switch(
-                repo,
-                backend,
-                transport,
-                oauth_endpoints,
-                registry,
-                user_agent,
-                &target.id,
-                &SwitchOptions {
-                    dry_run: false,
-                    allow_running: true, // Same-account managed session (and verified `/proc`) was already confirmed above
-                },
-                clock.now_unix(),
+    let target = match explicit_account {
+        Some(sel) => snapshot.select(sel)?,
+        None => snapshot.selected_account().ok_or_else(|| {
+            CliError::not_found(
+                "No selected account in store. Import/login and `switch` to an account first, or pass `--account <ID|EMAIL>`.",
             )
-            .await?;
-        }
-        return Ok(target.id.clone());
-    }
+        })?,
+    };
+    let target_id = target.id.clone();
+    let ts = clock.now_unix();
+    ensure_account_usable_and_scoped(repo, target, registry, ts)?;
+    ensure_no_conflicting_managed_session(runtime, &target_id)?;
 
-    // Case B: Policy-driven pre-invocation selection
-    let selected = snapshot.selected_account().ok_or_else(|| {
-        CliError::not_found(
-            "No selected account in store. Import/login and `switch` to an account first, or pass `--account <ID|EMAIL>`.",
-        )
-    })?;
-    let selected_id = selected.id.clone();
-
-    let policy = repo.read_policy()?;
-
-    // Step 2: Refresh current account quota if missing or stale when policy is enabled
-    let mut current_acc = selected.clone();
-    let initial_eval = evaluate_account_quota(
-        &current_acc,
-        &policy.monitored_model,
-        clock.now_unix(),
-        DEFAULT_QUOTA_MAX_AGE_SECS,
-    );
-    if policy.enabled
-        && matches!(
-            initial_eval,
-            QuotaEval::Unknown { .. } | QuotaEval::Stale { .. }
-        )
-    {
-        match refresh_account_quota_locked(
-            repo,
-            transport,
-            oauth_endpoints,
-            quota_endpoints,
-            registry,
-            user_agent,
-            &selected_id,
-            clock.now_unix(),
-        )
-        .await
-        {
-            Ok(updated) => current_acc = updated,
-            Err(_) => {
-                if let Ok(reloaded) = repo.read_account_unchecked(&selected_id) {
-                    current_acc = reloaded;
-                }
-            }
-        }
-    }
-
-    let current_eval = evaluate_account_quota(
-        &current_acc,
-        &policy.monitored_model,
-        clock.now_unix(),
-        DEFAULT_QUOTA_MAX_AGE_SECS,
-    );
-
-    // Step 3: Decide if low-quota / unusable switch is warranted
-    let should_try_switch = policy.enabled
-        && (matches!(current_eval, QuotaEval::Unavailable { .. })
-            || matches!(
-                current_eval,
-                QuotaEval::Known { remaining_percentage } if remaining_percentage <= policy.reserve_percentage as f64
-            ));
-
-    if should_try_switch {
-        if let Some(candidate_id) = select_qualified_candidate_lazy(
-            repo,
-            transport,
-            oauth_endpoints,
-            quota_endpoints,
-            registry,
-            user_agent,
-            &policy,
-            &selected_id,
-            None,
-            clock.now_unix(),
-        )
-        .await?
-        {
-            ensure_no_conflicting_managed_session(runtime, &candidate_id)?;
-            execute_switch(
-                repo,
-                backend,
-                transport,
-                oauth_endpoints,
-                registry,
-                user_agent,
-                &candidate_id,
-                &SwitchOptions {
-                    dry_run: false,
-                    allow_running: false,
-                },
-                clock.now_unix(),
-            )
-            .await?;
-            return Ok(candidate_id);
-        }
-    }
-
-    // Keep current selected account; ensure it is usable/scoped and active slot has the exact fresh serialized token payload!
-    ensure_no_conflicting_managed_session(runtime, &selected_id)?;
-    let fresh_snapshot = repo.read_snapshot()?;
-    let fresh_selected = fresh_snapshot.selected_account().ok_or_else(|| {
-        CliError::not_found(format!(
-            "Selected account '{selected_id}' was removed before launching `agy`."
-        ))
-    })?;
-    let sync_now = clock.now_unix();
-    ensure_account_usable_and_scoped(repo, fresh_selected, registry, sync_now)?;
-    let slot = backend.inspect_slot(paths);
-    if !is_slot_synced_and_fresh(&slot, &fresh_snapshot, fresh_selected, sync_now) {
+    let replicas = backend.inspect_replicas(paths);
+    if !is_slot_synced_and_fresh(&replicas, &snapshot, target, ts) {
         execute_switch(
             repo,
             backend,
@@ -342,17 +220,17 @@ async fn prepare_account_before_spawn(
             oauth_endpoints,
             registry,
             user_agent,
-            &selected_id,
+            &target_id,
             &SwitchOptions {
                 dry_run: false,
-                allow_running: true,
+                allow_running: true, // Same-account managed session (and verified `/proc`) was already confirmed above
             },
             clock.now_unix(),
         )
         .await?;
     }
 
-    Ok(selected_id)
+    Ok(target_id)
 }
 
 fn ensure_account_usable_and_scoped(
@@ -391,11 +269,11 @@ fn ensure_account_usable_and_scoped(
     Ok(())
 }
 
-/// Verify that `index.json` selects `target`, `target.token` is not near expiry, AND the active slot file
-/// byte-for-byte matches `serialize_session_payload(&target.token)`.
-/// Prevents spawning `agy` with a stale `access_token` when `refresh_token` remained unchanged across a refresh!
+/// Verify that `index.json` selects `target`, `target.token` is not near expiry, AND ALL replicas
+/// managed by the active backend (`file`, `keyring`, or `dual`) match `serialize_session_payload(&target.token)`.
+/// Prevents spawning `agy` with a stale `access_token` or diverged replica!
 fn is_slot_synced_and_fresh(
-    slot: &SlotInspectState,
+    replicas: &BackendReplicaInspection,
     snapshot: &StoreSnapshot,
     target: &AccountRecord,
     now_unix: i64,
@@ -413,7 +291,13 @@ fn is_slot_synced_and_fresh(
         return false;
     };
     let expected_digest = bytes_sha256_hex(expected_payload.as_bytes());
-    slot.raw_digest() == Some(expected_digest.as_str())
+    let file_ok =
+        !replicas.uses_file || replicas.file.raw_digest() == Some(expected_digest.as_str());
+    let kr_ok = !replicas.uses_keyring
+        || (replicas.keyring_all_collections_uniform
+            && replicas.keyring.as_ref().and_then(|k| k.raw_digest())
+                == Some(expected_digest.as_str()));
+    file_ok && kr_ok
 }
 
 fn ensure_no_conflicting_managed_session(
@@ -435,82 +319,6 @@ fn ensure_no_conflicting_managed_session(
         }
     }
     Ok(())
-}
-
-/// Lazily evaluate/refresh candidate pool according to `policy.strategy` (`Priority` vs `RoundRobin`),
-/// returning the first candidate strictly satisfying `Known(c) && c >= policy.candidate_min_percentage`.
-#[allow(clippy::too_many_arguments)]
-pub async fn select_qualified_candidate_lazy(
-    repo: &StoreRepository,
-    transport: &dyn HttpTransport,
-    oauth_endpoints: &OAuthEndpoints,
-    quota_endpoints: &CloudCodeEndpoints,
-    registry: &OAuthClientRegistry,
-    user_agent: &str,
-    policy: &SwitchPolicy,
-    source_id: &str,
-    last_rotated_cursor: Option<&str>,
-    now_unix: i64,
-) -> CliResult<Option<String>> {
-    if policy.candidate_account_ids.is_empty() {
-        return Ok(None);
-    }
-    let clock = AnchoredClock::new(now_unix);
-
-    let ordered_candidates = ordered_candidate_ids(
-        &policy.candidate_account_ids,
-        source_id,
-        policy.strategy,
-        last_rotated_cursor,
-    );
-
-    for cand_id in ordered_candidates {
-        let Ok(mut cand_acc) = repo.read_account_unchecked(&cand_id) else {
-            continue;
-        };
-        let eval_ts = clock.now_unix();
-        if !cand_acc.is_usable_at(eval_ts) {
-            continue;
-        }
-        let mut eval = evaluate_account_quota(
-            &cand_acc,
-            &policy.monitored_model,
-            eval_ts,
-            DEFAULT_QUOTA_MAX_AGE_SECS,
-        );
-        if matches!(eval, QuotaEval::Unknown { .. } | QuotaEval::Stale { .. }) {
-            if let Ok(refreshed) = refresh_account_quota_locked(
-                repo,
-                transport,
-                oauth_endpoints,
-                quota_endpoints,
-                registry,
-                user_agent,
-                &cand_id,
-                clock.now_unix(),
-            )
-            .await
-            {
-                cand_acc = refreshed;
-                eval = evaluate_account_quota(
-                    &cand_acc,
-                    &policy.monitored_model,
-                    clock.now_unix(),
-                    DEFAULT_QUOTA_MAX_AGE_SECS,
-                );
-            }
-        }
-        if let QuotaEval::Known {
-            remaining_percentage,
-        } = eval
-        {
-            if remaining_percentage >= policy.candidate_min_percentage as f64 {
-                return Ok(Some(cand_id));
-            }
-        }
-    }
-
-    Ok(None)
 }
 
 pub fn ordered_candidate_ids(

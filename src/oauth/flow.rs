@@ -99,7 +99,7 @@ pub fn build_authorization_session(
     })
 }
 
-/// Shared strict validator used by BOTH the Loopback HTTP listener AND `--manual` pasted callback URLs!
+/// Shared strict validator used by BOTH the `--ssh` loopback HTTP listener AND pasted callback URLs!
 /// Never logs raw URL or authorization code.
 pub fn validate_callback_url(raw_url_or_target: &str, expected_state: &str) -> CliResult<String> {
     validate_callback_url_with_port(raw_url_or_target, expected_state, None)

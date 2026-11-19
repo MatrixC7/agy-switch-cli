@@ -7,6 +7,8 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct HeadlessPaths {
     pub home_dir: PathBuf,
+    /// User XDG configuration base (`$XDG_CONFIG_HOME` or `~/.config`) for user service unit installation
+    pub config_dir: PathBuf,
     /// Independent versioned store (`~/.local/share/agy-switch-cli`, 0700)
     pub data_dir: PathBuf,
     /// User-global lock and cache scope (`~/.cache/agy-switch-cli`, 0700), never overridden by `--data-dir`
@@ -20,7 +22,16 @@ pub struct HeadlessPaths {
 impl HeadlessPaths {
     pub fn resolve(explicit_data_dir: Option<&Path>) -> CliResult<Self> {
         let home_dir = resolve_home_dir()?;
+        let config_dir = match non_empty_env_path("XDG_CONFIG_HOME") {
+            Some(xdg_cfg) if xdg_cfg.is_absolute() => normalize_components(&xdg_cfg),
+            _ => home_dir.join(".config"),
+        };
         let data_dir = if let Some(explicit) = explicit_data_dir {
+            if crate::error::path_looks_like_accidental_secret(explicit) {
+                return Err(CliError::usage(
+                    "`--data-dir` expects a filesystem directory path, not a literal credential value (redacted).",
+                ));
+            }
             normalize_lexical(explicit, &home_dir)
         } else if let Some(env_dir) = non_empty_env_path("AGY_SWITCH_CLI_DATA_DIR") {
             normalize_lexical(&env_dir, &home_dir)
@@ -41,6 +52,7 @@ impl HeadlessPaths {
 
         Ok(Self {
             home_dir,
+            config_dir,
             data_dir,
             cache_dir,
             active_slot_dir,
@@ -49,15 +61,25 @@ impl HeadlessPaths {
     }
 
     pub fn with_explicit(home_dir: PathBuf, data_dir: PathBuf, cache_dir: PathBuf) -> Self {
+        let config_dir = home_dir.join(".config");
         let active_slot_dir = home_dir.join(".gemini").join("antigravity-cli");
         let active_slot_file = active_slot_dir.join("antigravity-oauth-token");
         Self {
             home_dir,
+            config_dir,
             data_dir,
             cache_dir,
             active_slot_dir,
             active_slot_file,
         }
+    }
+
+    pub fn systemd_user_dir(&self) -> PathBuf {
+        self.config_dir.join("systemd").join("user")
+    }
+
+    pub fn systemd_user_unit_file(&self) -> PathBuf {
+        self.systemd_user_dir().join("agy-switch-cli.service")
     }
 
     pub fn index_file(&self) -> PathBuf {
@@ -158,7 +180,7 @@ impl HeadlessPaths {
     /// Derive the unified L1 `ActiveSlotLock` path in `~/.cache/agy-switch-cli/locks/slot-<sha256>.lock`.
     /// Canonicalizes the home directory base (without requiring `.gemini/antigravity-cli` to exist yet)
     /// so ALL processes targeting the same `$HOME` active slot — regardless of `--data-dir` OR whether
-    /// `--backend file` vs `--backend secret-service` is chosen — ALWAYS collide on the exact same lock file!
+    /// `--backend file`, `--backend dual`, or `--backend keyring` is chosen — ALWAYS collide on the exact same lock file!
     pub fn active_slot_lock_file(&self) -> PathBuf {
         let canonical_home = std::fs::canonicalize(&self.home_dir)
             .unwrap_or_else(|_| normalize_components(&self.home_dir));
@@ -172,7 +194,7 @@ impl HeadlessPaths {
         self.global_locks_dir().join(format!("slot-{digest}.lock"))
     }
 
-    /// Additional UID-scoped lock acquired SECOND (after `active_slot_lock_file`) when using `secret-service` backend.
+    /// Additional UID-scoped lock acquired SECOND (after `active_slot_lock_file`) when using a keyring backend (`dual` / `keyring`).
     pub fn keyring_lock_file(&self) -> PathBuf {
         let uid = unsafe { libc::geteuid() };
         self.global_locks_dir().join(format!("keyring-{uid}.lock"))
@@ -203,8 +225,13 @@ fn resolve_home_dir() -> CliResult<PathBuf> {
         if home.is_absolute() {
             return Ok(normalize_components(&home));
         }
+        return Err(CliError::env_not_ready(
+            "invalid_home",
+            "User HOME environment variable must be an absolute path.",
+        ));
     }
     dirs::home_dir()
+        .filter(|p| p.is_absolute())
         .map(|p| normalize_components(&p))
         .ok_or_else(|| {
             CliError::env_not_ready("missing_home", "Cannot resolve user HOME directory.")

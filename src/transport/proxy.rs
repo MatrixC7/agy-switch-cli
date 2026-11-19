@@ -70,6 +70,16 @@ impl ProxyMode {
         cli_proxy: Option<&str>,
         network_cfg: Option<&NetworkConfig>,
     ) -> CliResult<Self> {
+        let (mode, _) = Self::resolve_with_config_and_warnings(cli_proxy, network_cfg)?;
+        Ok(mode)
+    }
+
+    /// Resolve proxy mode and collect secret-free warnings (containing ONLY literal environment
+    /// variable names) when malformed ambient proxy variables are ignored.
+    pub fn resolve_with_config_and_warnings(
+        cli_proxy: Option<&str>,
+        network_cfg: Option<&NetworkConfig>,
+    ) -> CliResult<(Self, Vec<String>)> {
         let env_override = std::env::var("AGY_SWITCH_CLI_PROXY")
             .ok()
             .map(|s| strip_matching_quotes(s.trim()).to_string())
@@ -102,30 +112,37 @@ impl ProxyMode {
 
         if let Some((spec, source_name)) = explicit_choice {
             if is_direct_keyword(spec) {
-                return Ok(Self::Direct);
+                return Ok((Self::Direct, Vec::new()));
             }
             let normalized = normalize_proxy_url(spec);
             validate_proxy_url_for_source(&normalized, Some(source_name))?;
-            return Ok(Self::Explicit {
-                proxy_url: normalized,
-                no_proxy: merged_no_proxy,
-            });
+            return Ok((
+                Self::Explicit {
+                    proxy_url: normalized,
+                    no_proxy: merged_no_proxy,
+                },
+                Vec::new(),
+            ));
         }
 
-        let https_proxy = resolve_ambient_proxy_env(&["HTTPS_PROXY", "https_proxy"]);
-        let http_proxy = resolve_ambient_proxy_env(&["HTTP_PROXY", "http_proxy"]);
-        let all_proxy = resolve_ambient_proxy_env(&["ALL_PROXY", "all_proxy"]);
+        let mut warnings = Vec::new();
+        let https_proxy = resolve_ambient_proxy_env(&["HTTPS_PROXY", "https_proxy"], &mut warnings);
+        let http_proxy = resolve_ambient_proxy_env(&["HTTP_PROXY", "http_proxy"], &mut warnings);
+        let all_proxy = resolve_ambient_proxy_env(&["ALL_PROXY", "all_proxy"], &mut warnings);
 
         if https_proxy.is_none() && http_proxy.is_none() && all_proxy.is_none() {
-            return Ok(Self::Direct);
+            return Ok((Self::Direct, warnings));
         }
 
-        Ok(Self::FromEnv {
-            https_proxy,
-            http_proxy,
-            all_proxy,
-            no_proxy: merged_no_proxy,
-        })
+        Ok((
+            Self::FromEnv {
+                https_proxy,
+                http_proxy,
+                all_proxy,
+                no_proxy: merged_no_proxy,
+            },
+            warnings,
+        ))
     }
 
     /// Determine whether `target_url` must bypass external proxies (loopback or matching `NO_PROXY`).
@@ -222,7 +239,7 @@ pub fn normalize_proxy_url(raw: &str) -> String {
     with_scheme
 }
 
-fn resolve_ambient_proxy_env(names: &[&'static str]) -> Option<String> {
+fn resolve_ambient_proxy_env(names: &[&'static str], warnings: &mut Vec<String>) -> Option<String> {
     let (var_name, raw_val) = first_non_empty_env(names)?;
     let unquoted = strip_matching_quotes(&raw_val);
     if unquoted.is_empty() || is_direct_keyword(unquoted) {
@@ -236,6 +253,9 @@ fn resolve_ambient_proxy_env(names: &[&'static str]) -> Option<String> {
                 env_var = var_name,
                 "Ignoring unsupported or malformed proxy URL in ambient environment variable"
             );
+            warnings.push(format!(
+                "Ignored unsupported or malformed proxy URL in `{var_name}` environment variable."
+            ));
             None
         }
     }

@@ -19,14 +19,12 @@ version = 2
 yanked = "deny"
 ignore = [
     # 以下 3 条均为架构合并维护性通告（zbus 6.0 已将独立子包收归主包），并非安全漏洞（CVE / unsound）：
-    # 当前可选特性 `secret-service-backend` 所用 `secret-service 5.2.0` 为 crates.io 最新稳定版（6.0 仍处 rc 阶段），
-    # 其内部锁定 `zbus 5.19.0` 暂无可用升级路径；默认构建与 `--no-default-features` 构建均不引入该依赖链。
+    # 默认全特性构建启用 `secret-service-backend`，其所用 `secret-service 5.2.0` 为 crates.io 最新稳定版（6.0 仍处 rc 阶段），
+    # 内部锁定 `zbus 5.19.0` 暂无可用升级路径（`--no-default-features` 与 `--no-default-features --features tui,stats` 裁剪构建不引入该依赖链）。
     # 待上游 `secret-service 6.0` 正式发布后应升级依赖并移除本豁免项。
-    { id = "RUSTSEC-2026-0370", reason = "Optional secret-service 5.2.0 -> zbus 5.19.0 pulls zvariant 5.15.1 (merged into zbus 6.0, informational unmaintained notice, not a vulnerability; secret-service 6.0 is still RC)" },
-    { id = "RUSTSEC-2026-0371", reason = "Optional secret-service 5.2.0 -> zbus 5.19.0 pulls zbus_names 4.3.5 (merged into zbus 6.0, informational unmaintained notice, not a vulnerability; secret-service 6.0 is still RC)" },
-    { id = "RUSTSEC-2026-0372", reason = "Optional secret-service 5.2.0 -> zbus 5.19.0 pulls zvariant_derive 5.15.1 (merged into zbus 6.0, informational unmaintained notice, not a vulnerability; secret-service 6.0 is still RC)" },
-    # `chrono 0.4.45` 维护状态提示通告（非安全漏洞 CVE / unsound），计划在下一版本（v1.2.0）统一迁移至 `jiff` 或 `time` 并移除本豁免项。
-    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.45 informational unmaintained notice (not a security vulnerability); scheduled for migration to jiff/time in v1.2.0" },
+    { id = "RUSTSEC-2026-0370", reason = "secret-service-backend (enabled by default): secret-service 5.2.0 -> zbus 5.19.0 pulls zvariant 5.15.1 (merged into zbus 6.0, informational unmaintained notice, not a vulnerability; secret-service 6.0 is still RC)" },
+    { id = "RUSTSEC-2026-0371", reason = "secret-service-backend (enabled by default): secret-service 5.2.0 -> zbus 5.19.0 pulls zbus_names 4.3.5 (merged into zbus 6.0, informational unmaintained notice, not a vulnerability; secret-service 6.0 is still RC)" },
+    { id = "RUSTSEC-2026-0372", reason = "secret-service-backend (enabled by default): secret-service 5.2.0 -> zbus 5.19.0 pulls zvariant_derive 5.15.1 (merged into zbus 6.0, informational unmaintained notice, not a vulnerability; secret-service 6.0 is still RC)" },
 ]
 
 [licenses]

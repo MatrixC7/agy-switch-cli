@@ -187,7 +187,7 @@ impl AccountRecord {
     }
 
     pub fn is_usable(&self) -> bool {
-        self.is_usable_at(chrono::Utc::now().timestamp())
+        self.is_usable_at(crate::domain::clock::current_unix_seconds())
     }
 
     /// Record a token update/rotation, tracking superseded `refresh_token` SHA-256 digests so
@@ -459,7 +459,6 @@ pub enum RuntimeState {
     },
     UnmanagedRunning {
         pids: Vec<u32>,
-        identity: String, // Always "unknown"
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         managed_account_ids: Vec<String>,
     },

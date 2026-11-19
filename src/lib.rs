@@ -9,6 +9,9 @@ pub mod store;
 pub mod switching;
 pub mod transport;
 
+#[cfg(feature = "stats")]
+pub mod stats;
+
 #[cfg(feature = "tui")]
 pub mod tui;
 

@@ -11,8 +11,10 @@ use crate::domain::token::{token_digest, TokenRecord};
 use crate::error::{format_safe_json_error, CliError, CliResult};
 use crate::paths::HeadlessPaths;
 use crate::store::fs_atomic::{
-    cleanup_orphan_temp_files, ensure_no_symlink_components_under, ensure_private_dir,
-    map_io_error, read_regular_file_opt_bounded, write_atomic_durable, MAX_STORE_FILE_BYTES,
+    cleanup_orphan_temp_files, confirm_dir_entries_durable_under,
+    ensure_no_symlink_components_under, ensure_private_dir, map_io_error,
+    read_regular_file_opt_bounded, remove_regular_file_durable_under,
+    verify_dir_writable_and_durable_nofollow, write_atomic_durable, MAX_STORE_FILE_BYTES,
 };
 use crate::store::locks::{
     try_acquire_pending_auth_lock_nonblocking, with_store_write_lock, StoreWriteGuard,
@@ -230,7 +232,7 @@ impl StoreRepository {
         Ok(Some(archive))
     }
 
-    /// Pure read-only validation of all `<data_dir>/state/token_lineage/*.json` and `<data_dir>/state/pending_lineage/*.json` files (used by `doctor`).
+    /// Pure read-only validation of all `<data_dir>/state/token_lineage/*.json` and `<data_dir>/state/pending_lineage/*.json` files (used by `status`).
     pub fn validate_all_token_lineage_readonly(&self) -> CliResult<()> {
         for (dir, is_pending) in [
             (self.paths.token_lineage_dir(), false),
@@ -365,7 +367,7 @@ impl StoreRepository {
                             .is_some_and(|n| n.ends_with(".json") && !n.contains(".tmp."))
                     }) {
                         return Err(CliError::data(
-                            "Account index `index.json` is missing while account files exist. Run `agy-switch-cli doctor --fix` to reconcile.",
+                            "Account index `index.json` is missing while account files exist.",
                         ));
                     }
                 }
@@ -396,7 +398,7 @@ impl StoreRepository {
             validate_account_id(sel).map_err(CliError::data)?;
             if !seen.contains(sel.as_str()) {
                 return Err(CliError::data(format!(
-                    "Store index `selected_account_id` ('{sel}') does not exist in `account_order`. Run `agy-switch-cli doctor --fix`."
+                    "Store index `selected_account_id` ('{sel}') does not exist in `account_order`."
                 )));
             }
         }
@@ -534,7 +536,7 @@ impl StoreRepository {
     }
 
     /// Pure read-only strict listing of durable `PendingAuthRecord` files (`<data_dir>/state/pending_auth/*.json`).
-    /// Used by `doctor` and `auth pending` to surface any corrupted, special, or schema-invalid file.
+    /// Used by `status` and `auth pending` to surface any corrupted, special, or schema-invalid file.
     pub fn list_pending_auth_readonly(&self) -> CliResult<Vec<PendingAuthRecord>> {
         let _ = self.read_auth_sequence_readonly()?;
         let dir = self.paths.pending_auth_dir();
@@ -939,6 +941,159 @@ impl<'a> StoreWriteTx<'a> {
             self.write_auth_sequence_state(min_seq)?;
         }
         Ok(())
+    }
+
+    fn verify_dir_writable_nofollow(&self, dir: &Path) -> CliResult<()> {
+        verify_dir_writable_and_durable_nofollow(dir)
+    }
+
+    /// Synchronous `L3` preflight executed BEFORE any `/token` network exchange (releasing `L3` before `.await`)
+    /// so permission/symlink/read-only-FS/`auth_sequence` errors fail BEFORE any `refresh_token` can rotate remotely.
+    pub fn preflight_pending_auth_staging(
+        &self,
+        pending_id: &str,
+        reserve_new_seq: bool,
+    ) -> CliResult<Option<u64>> {
+        self.preflight_pending_auth_staging_with(pending_id, reserve_new_seq, true, |dir| {
+            self.verify_dir_writable_nofollow(dir)
+        })
+    }
+
+    fn preflight_pending_auth_staging_with(
+        &self,
+        pending_id: &str,
+        reserve_new_seq: bool,
+        probe_shared_dirs: bool,
+        mut probe_dir: impl FnMut(&Path) -> CliResult<()>,
+    ) -> CliResult<Option<u64>> {
+        validate_account_id(pending_id).map_err(CliError::data)?;
+        ensure_private_dir(&self.repo.paths.state_dir())?;
+        ensure_private_dir(&self.repo.paths.pending_auth_dir())?;
+        ensure_private_dir(&self.repo.paths.pending_lineage_dir())?;
+        ensure_private_dir(&self.repo.paths.token_lineage_dir())?;
+        let target = self.repo.paths.pending_auth_file(pending_id);
+        let lin_target = self.repo.paths.pending_lineage_file(pending_id);
+        for p in [&target, &lin_target] {
+            ensure_no_symlink_components_under(&self.repo.paths.data_dir, p)?;
+            match fs::symlink_metadata(p) {
+                Ok(m) if !m.file_type().is_file() => {
+                    return Err(CliError::data(format!(
+                        "Refusing to stage pending auth at '{}': non-regular file obstruction.",
+                        p.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(map_io_error(
+                        e,
+                        &format!("Cannot inspect pending auth path '{}'", p.display()),
+                    ));
+                }
+            }
+        }
+        let _ = self.load_pending_auth_opt(pending_id)?;
+        let _ = self.load_pending_lineage_digests(pending_id)?;
+        ensure_private_dir(&self.repo.paths.accounts_dir())?;
+        if probe_shared_dirs {
+            probe_dir(&self.repo.paths.data_dir)?;
+            probe_dir(&self.repo.paths.accounts_dir())?;
+            probe_dir(&self.repo.paths.state_dir())?;
+        }
+        probe_dir(&self.repo.paths.pending_auth_dir())?;
+        probe_dir(&self.repo.paths.pending_lineage_dir())?;
+        if probe_shared_dirs {
+            probe_dir(&self.repo.paths.token_lineage_dir())?;
+        }
+        if reserve_new_seq {
+            let seq = self.allocate_next_auth_seq()?;
+            Ok(Some(seq))
+        } else {
+            let _ = self.repo.read_auth_sequence_readonly()?;
+            Ok(None)
+        }
+    }
+
+    /// Synchronous `L3` preflight executed BEFORE refreshing an existing account over the network.
+    pub fn preflight_account_refresh_staging(&self, account_id: &str) -> CliResult<()> {
+        self.preflight_account_refresh_staging_with(account_id, |dir| {
+            self.verify_dir_writable_nofollow(dir)
+        })
+    }
+
+    fn preflight_account_refresh_staging_with(
+        &self,
+        account_id: &str,
+        mut probe_dir: impl FnMut(&Path) -> CliResult<()>,
+    ) -> CliResult<()> {
+        validate_account_id(account_id).map_err(CliError::data)?;
+        ensure_private_dir(&self.repo.paths.accounts_dir())?;
+        ensure_private_dir(&self.repo.paths.state_dir())?;
+        ensure_private_dir(&self.repo.paths.token_lineage_dir())?;
+        let index = self.load_index_or_init(0)?;
+        if !index.account_order.iter().any(|id| id == account_id) {
+            return Err(CliError::not_found(format!(
+                "Account '{account_id}' does not exist."
+            )));
+        }
+        let acc_path = self.repo.paths.account_file(account_id);
+        let lin_path = self.repo.paths.token_lineage_file(account_id);
+        ensure_no_symlink_components_under(&self.repo.paths.data_dir, &acc_path)?;
+        ensure_no_symlink_components_under(&self.repo.paths.data_dir, &lin_path)?;
+        for target in [&acc_path, &lin_path] {
+            match fs::symlink_metadata(target) {
+                Ok(m) if !m.file_type().is_file() => {
+                    return Err(CliError::data(format!(
+                        "Refusing to persist account state at '{}': non-regular file obstruction.",
+                        target.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(map_io_error(
+                        e,
+                        &format!("Cannot inspect store file '{}'", target.display()),
+                    ));
+                }
+            }
+        }
+        if self.load_account_opt(account_id)?.is_none() {
+            return Err(CliError::not_found(format!(
+                "Account file for '{account_id}' is missing."
+            )));
+        }
+        let _ = self.repo.read_token_lineage_readonly(account_id)?;
+        let _ = self.repo.read_auth_sequence_readonly()?;
+        probe_dir(&self.repo.paths.data_dir)?;
+        probe_dir(&self.repo.paths.state_dir())?;
+        probe_dir(&self.repo.paths.accounts_dir())?;
+        probe_dir(&self.repo.paths.token_lineage_dir())
+    }
+
+    /// Combined synchronous `L3` preflight for account reauthorization: runs all account and pending
+    /// file/format checks while probing the four shared directories (`data`, `state`, `accounts`,
+    /// `token_lineage`) once instead of twice within the same `L3` closure.
+    pub fn preflight_reauthorize_staging(
+        &self,
+        account_id: &str,
+        pending_id: &str,
+        reserve_new_seq: bool,
+    ) -> CliResult<Option<u64>> {
+        self.preflight_reauthorize_staging_with(account_id, pending_id, reserve_new_seq, |dir| {
+            self.verify_dir_writable_nofollow(dir)
+        })
+    }
+
+    fn preflight_reauthorize_staging_with(
+        &self,
+        account_id: &str,
+        pending_id: &str,
+        reserve_new_seq: bool,
+        mut probe_dir: impl FnMut(&Path) -> CliResult<()>,
+    ) -> CliResult<Option<u64>> {
+        self.preflight_account_refresh_staging_with(account_id, &mut probe_dir)?;
+        self.preflight_pending_auth_staging_with(pending_id, reserve_new_seq, false, &mut probe_dir)
     }
 
     /// Atomically verify inside `L3` whether `pending_id` (matching `expected_cas_fp`) is already superseded by
@@ -1915,20 +2070,58 @@ impl<'a> StoreWriteTx<'a> {
     }
 
     /// Delete account with explicit selected-account semantics per Blueprint §8.2 rule 6.
-    /// Propagates policy cleanup persistence failures BEFORE removing the account so `policy.json`
-    /// is never silently left referencing a deleted candidate account!
+    /// Propagates policy cleanup, index save, account removal, lineage removal, AND parent directory
+    /// `fsync` failures so no partial deletion is silently treated as complete!
     pub fn delete_account(&self, account_id: &str, force: bool, now_unix: i64) -> CliResult<bool> {
+        self.delete_account_impl(account_id, force, false, None, None, now_unix)
+    }
+
+    /// Idempotent, transactional-version-bound account deletion replay used after clearing active
+    /// credential replicas (`clear_slot_intent` journal recovery). Completes cleanup across
+    /// `policy.json`, `index.json`, `accounts/<id>.json`, `state/token_lineage/<id>.json`, and parent
+    /// directory `fsync`s even if `index.json` was already updated before a crash, and propagates
+    /// EVERY failure so callers preserve the recovery journal until durable cleanup is verified!
+    pub fn complete_account_deletion_idempotent(
+        &self,
+        account_id: &str,
+        expected_auth_generation: Option<u64>,
+        expected_rt_digest: Option<&str>,
+        now_unix: i64,
+    ) -> CliResult<bool> {
+        self.delete_account_impl(
+            account_id,
+            true,
+            true,
+            expected_auth_generation,
+            expected_rt_digest,
+            now_unix,
+        )
+    }
+
+    fn delete_account_impl(
+        &self,
+        account_id: &str,
+        force: bool,
+        idempotent_replay: bool,
+        expected_auth_generation: Option<u64>,
+        expected_rt_digest: Option<&str>,
+        now_unix: i64,
+    ) -> CliResult<bool> {
+        validate_account_id(account_id).map_err(CliError::data)?;
         let mut index = self.load_index_or_init(now_unix)?;
-        if !index.account_order.iter().any(|id| id == account_id) {
-            return Err(CliError::not_found(format!(
-                "Account '{account_id}' does not exist."
-            )));
-        }
+        let in_index = index.account_order.iter().any(|id| id == account_id);
         let was_selected = index.selected_account_id.as_deref() == Some(account_id);
-        if was_selected && !force {
-            return Err(CliError::usage(format!(
-                "Account '{account_id}' is currently selected. Switch to another account first, or pass `--force` (and `--clear-active-slot` to also remove the active credential file)."
-            )));
+        if !idempotent_replay {
+            if !in_index {
+                return Err(CliError::not_found(format!(
+                    "Account '{account_id}' does not exist."
+                )));
+            }
+            if was_selected && !force {
+                return Err(CliError::usage(format!(
+                    "Account '{account_id}' is currently selected. Switch to another account first, or pass `--force` (and `--clear-active-slot` to also remove the active credential file)."
+                )));
+            }
         }
 
         let acc_path = self.repo.paths.account_file(account_id);
@@ -1954,7 +2147,40 @@ impl<'a> StoreWriteTx<'a> {
             }
         }
 
+        if idempotent_replay && (expected_auth_generation.is_some() || expected_rt_digest.is_some())
+        {
+            if let Some(existing_acc) = self.load_account_opt(account_id)? {
+                if let Some(exp_gen) = expected_auth_generation {
+                    if existing_acc.auth_generation != exp_gen {
+                        return Err(CliError::partial_commit(
+                            "recovery_incomplete",
+                            format!(
+                                "Account '{}' changed auth_generation ({} != expected {}) before clear-slot deletion replay; journal preserved.",
+                                account_id, existing_acc.auth_generation, exp_gen
+                            ),
+                        ));
+                    }
+                }
+                if let Some(exp_rt) = expected_rt_digest {
+                    if existing_acc.token.refresh_token_fingerprint() != exp_rt {
+                        return Err(CliError::partial_commit(
+                            "recovery_incomplete",
+                            format!(
+                                "Account '{}' credential changed before clear-slot deletion replay; journal preserved.",
+                                account_id
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
         // 1. Clean `account_id` (and any already-stale non-indexed IDs) from `policy.json` FIRST and propagate any I/O failure (`?`)!
+        let policy_path = self.repo.paths.policy_file();
+        let index_path = self.repo.paths.index_file();
+        let mut policy_saved = false;
+        let mut index_saved = false;
+
         let mut policy = self.repo.read_policy()?;
         let known_remaining: HashSet<&str> = index
             .account_order
@@ -1971,64 +2197,71 @@ impl<'a> StoreWriteTx<'a> {
                 policy.enabled = false;
             }
             self.save_policy(&mut policy, None, now_unix)?;
+            policy_saved = true;
         }
 
-        // 2. Remove from `index.json`
-        index.account_order.retain(|id| id != account_id);
-        if was_selected {
-            index.selected_account_id = None;
-        }
-        self.save_index(&mut index, now_unix)?;
-
-        // 3. Remove `accounts/<id>.json`
-        let acc_path = self.repo.paths.account_file(account_id);
-        match fs::remove_file(&acc_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(map_io_error(
-                    e,
-                    &format!("Failed to remove account file '{}'", acc_path.display()),
-                ))
+        // 2. Remove from `index.json` (idempotent when already removed during an interrupted replay)
+        if in_index || was_selected {
+            index.account_order.retain(|id| id != account_id);
+            if was_selected {
+                index.selected_account_id = None;
             }
-        }
-        if let Some(parent) = acc_path.parent() {
-            if let Ok(dir_file) = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(parent)
-            {
-                let _ = dir_file.sync_all();
-            }
+            self.save_index(&mut index, now_unix)?;
+            index_saved = true;
         }
 
-        // 4. Clean up any overflow `state/token_lineage/<id>.json` archive for the deleted account
-        let lineage_path = self.repo.paths.token_lineage_file(account_id);
-        if ensure_no_symlink_components_under(&self.repo.paths.data_dir, &lineage_path).is_ok() {
-            match fs::remove_file(&lineage_path) {
-                Ok(()) => {
-                    if let Some(parent) = lineage_path.parent() {
-                        if let Ok(dir_file) = fs::OpenOptions::new()
-                            .read(true)
-                            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                            .open(parent)
-                        {
-                            let _ = dir_file.sync_all();
-                        }
-                    }
+        // During idempotent replay, visible `policy.json` / `index.json` updates after a crash or
+        // `sync_parent_dir` failure cause the branches above to be skipped; explicitly confirm
+        // parent directory durability for any skipped store file before advancing!
+        if idempotent_replay {
+            ensure_no_symlink_components_under(&self.repo.paths.data_dir, &policy_path)?;
+            ensure_no_symlink_components_under(&self.repo.paths.data_dir, &index_path)?;
+            let policy_exists = match fs::symlink_metadata(&policy_path) {
+                Ok(m) if m.file_type().is_file() => true,
+                Ok(_) => {
+                    return Err(CliError::data(format!(
+                        "Policy file '{}' is not a regular file.",
+                        policy_path.display()
+                    )));
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                 Err(e) => {
                     return Err(map_io_error(
                         e,
-                        &format!(
-                            "Failed to remove token lineage archive '{}'",
-                            lineage_path.display()
-                        ),
-                    ))
+                        &format!("Cannot inspect policy file '{}'", policy_path.display()),
+                    ));
                 }
+            };
+            let mut unconfirmed_targets: Vec<&Path> = Vec::new();
+            if policy_exists && !policy_saved {
+                unconfirmed_targets.push(&policy_path);
+            }
+            if !index_saved {
+                unconfirmed_targets.push(&index_path);
+            }
+            if !unconfirmed_targets.is_empty() {
+                confirm_dir_entries_durable_under(
+                    &self.repo.paths.data_dir,
+                    &self.repo.paths.data_dir,
+                    &unconfirmed_targets,
+                )?;
             }
         }
+
+        // 3. Durably remove `accounts/<id>.json` AND fsync `accounts/` parent directory (propagating all errors!)
+        let _ = remove_regular_file_durable_under(
+            &self.repo.paths.data_dir,
+            &acc_path,
+            "account file",
+        )?;
+
+        // 4. Durably remove overflow `state/token_lineage/<id>.json` AND fsync `token_lineage/` parent directory
+        let _ = remove_regular_file_durable_under(
+            &self.repo.paths.data_dir,
+            &lineage_path,
+            "token lineage archive",
+        )?;
+
         Ok(was_selected)
     }
 
@@ -2120,15 +2353,9 @@ pub fn read_headless_config_readonly(
         )));
     }
     if let Some(ref raw_backend) = cfg.backend {
-        let b = raw_backend.trim().to_ascii_lowercase();
-        if !b.is_empty()
-            && !matches!(
-                b.as_str(),
-                "auto" | "file" | "file_session" | "secret-service" | "secret_service"
-            )
-        {
+        if !matches!(raw_backend.as_str(), "auto" | "dual" | "file" | "keyring") {
             return Err(CliError::data(format!(
-                "Unsupported `backend` setting in '{}'. Supported values: `auto`, `file`, `secret-service`.",
+                "Unsupported `backend` setting in '{}'. Supported values: `auto`, `dual`, `file`, `keyring`.",
                 path.display()
             )));
         }
@@ -2143,9 +2370,10 @@ pub fn read_headless_config_readonly(
             .is_some_and(|u| u.contains('@'));
     if has_sensitive_cfg && (mode & 0o077) != 0 {
         warnings.push(format!(
-            "Config file '{}' contains sensitive settings with mode {:04o}; run `chmod 600` or `agy-switch-cli doctor --fix`.",
+            "Config file '{}' contains sensitive settings with mode {:04o}; run `chmod 600 \"{}\"`.",
             path.display(),
-            mode
+            mode,
+            path.display()
         ));
     }
     Ok((cfg, warnings))
@@ -2153,4 +2381,101 @@ pub fn read_headless_config_readonly(
 
 pub fn ensure_no_side_effects_dir_check(dir: &Path) -> bool {
     !dir.exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn synthetic_a02a_reauthorize_preflight_probes_each_dir_once_inside_l3() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = HeadlessPaths::with_explicit(
+            tmp.path().join("home"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+        );
+        let repo = StoreRepository::new(paths.clone());
+        let now = 1_900_000_000i64;
+        let tok = TokenRecord {
+            access_token: "ya29.a02a-test".into(),
+            refresh_token: "1//a02a-test-rt".into(),
+            expires_in: 3600,
+            expiry_timestamp: now + 3600,
+            token_type: "Bearer".into(),
+            id_token: None,
+            oauth_client_key: None,
+            granted_scopes: None,
+            project_id: None,
+            is_gcp_tos: true,
+        };
+        let acc = AccountRecord::new("acc-0001".into(), "alice@example.com".into(), tok, now);
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(acc, true, now)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let (reauth_dirs, refresh_dirs, pending_dirs, seq_ok) = repo
+            .with_write_lock(|tx| {
+                let mut reauth_dirs: Vec<PathBuf> = Vec::new();
+                let seq = tx
+                    .preflight_reauthorize_staging_with("acc-0001", "pend-a02a", true, |dir| {
+                        reauth_dirs.push(dir.to_path_buf());
+                        tx.verify_dir_writable_nofollow(dir)
+                    })?
+                    .unwrap_or(0);
+
+                let mut refresh_dirs: Vec<PathBuf> = Vec::new();
+                tx.preflight_account_refresh_staging_with("acc-0001", |dir| {
+                    refresh_dirs.push(dir.to_path_buf());
+                    tx.verify_dir_writable_nofollow(dir)
+                })?;
+
+                let mut pending_dirs: Vec<PathBuf> = Vec::new();
+                let _ =
+                    tx.preflight_pending_auth_staging_with("pend-a02a", false, true, |dir| {
+                        pending_dirs.push(dir.to_path_buf());
+                        tx.verify_dir_writable_nofollow(dir)
+                    })?;
+
+                Ok((reauth_dirs, refresh_dirs, pending_dirs, seq > 0))
+            })
+            .unwrap();
+
+        assert!(seq_ok);
+        let expected_six = vec![
+            paths.data_dir.clone(),
+            paths.state_dir(),
+            paths.accounts_dir(),
+            paths.token_lineage_dir(),
+            paths.pending_auth_dir(),
+            paths.pending_lineage_dir(),
+        ];
+        assert_eq!(reauth_dirs, expected_six);
+        let unique_reauth: HashSet<PathBuf> = reauth_dirs.iter().cloned().collect();
+        assert_eq!(unique_reauth.len(), 6);
+
+        assert_eq!(
+            refresh_dirs,
+            vec![
+                paths.data_dir.clone(),
+                paths.state_dir(),
+                paths.accounts_dir(),
+                paths.token_lineage_dir(),
+            ]
+        );
+        assert_eq!(
+            pending_dirs,
+            vec![
+                paths.data_dir.clone(),
+                paths.accounts_dir(),
+                paths.state_dir(),
+                paths.pending_auth_dir(),
+                paths.pending_lineage_dir(),
+                paths.token_lineage_dir(),
+            ]
+        );
+    }
 }

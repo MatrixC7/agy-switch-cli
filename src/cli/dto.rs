@@ -67,7 +67,11 @@ pub struct AccountViewDto {
 
 impl AccountViewDto {
     pub fn from_record(rec: &AccountRecord, is_selected: bool) -> Self {
-        Self::from_record_at(rec, is_selected, chrono::Utc::now().timestamp())
+        Self::from_record_at(
+            rec,
+            is_selected,
+            crate::domain::clock::current_unix_seconds(),
+        )
     }
 
     pub fn from_record_at(rec: &AccountRecord, is_selected: bool, now_unix: i64) -> Self {
@@ -198,7 +202,7 @@ impl QuotaViewDto {
     }
 
     pub fn human_multiline(&self, email: &str) -> String {
-        self.human_multiline_at(email, None, chrono::Utc::now().timestamp())
+        self.human_multiline_at(email, None, crate::domain::clock::current_unix_seconds())
     }
 
     pub fn human_multiline_with_eval(
@@ -210,7 +214,7 @@ impl QuotaViewDto {
         self.human_multiline_at(
             email,
             Some((eval, monitored_model)),
-            chrono::Utc::now().timestamp(),
+            crate::domain::clock::current_unix_seconds(),
         )
     }
 
@@ -234,7 +238,7 @@ impl QuotaViewDto {
         )];
         if let Some((eval, monitored_model)) = eval_ctx {
             let refresh_hint = if matches!(eval, QuotaEval::Stale { .. }) {
-                " — add -r to refresh"
+                " — add --refresh to refresh"
             } else {
                 ""
             };
@@ -330,7 +334,7 @@ impl QuotaViewDto {
             }
         } else if !self.is_forbidden {
             lines.push(
-                "  No pool quota observations recorded (run `agy-switch-cli quota -r` to refresh)."
+                "  No pool quota observations recorded (run `agy-switch-cli quota --refresh` to refresh)."
                     .into(),
             );
         }
@@ -434,12 +438,9 @@ pub fn format_rfc3339_local_minute(raw: &str) -> String {
     if trimmed.is_empty() {
         return "?".into();
     }
-    match chrono::DateTime::parse_from_rfc3339(trimmed) {
-        Ok(parsed) => parsed
-            .with_timezone(&chrono::Local)
-            .format("%Y-%m-%d %H:%M")
-            .to_string(),
-        Err(_) => terminal_text(trimmed),
+    match crate::domain::clock::parse_rfc3339_timestamp(trimmed) {
+        Some(parsed) => crate::domain::clock::format_timestamp_local_minute(parsed),
+        None => terminal_text(trimmed),
     }
 }
 
@@ -447,12 +448,9 @@ pub fn format_unix_local_minute(unix_secs: i64) -> String {
     if unix_secs <= 0 {
         return "unknown".into();
     }
-    match chrono::DateTime::from_timestamp(unix_secs, 0) {
-        Some(dt) => dt
-            .with_timezone(&chrono::Local)
-            .format("%Y-%m-%d %H:%M")
-            .to_string(),
-        None => "unknown".into(),
+    match jiff::Timestamp::from_second(unix_secs) {
+        Ok(ts) => crate::domain::clock::format_timestamp_local_minute(ts),
+        Err(_) => "unknown".into(),
     }
 }
 
@@ -461,12 +459,11 @@ fn format_reset_local(reset_rfc3339: &str, now_unix: i64) -> String {
     if trimmed.is_empty() {
         return "—".into();
     }
-    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(trimmed) else {
+    let Some(parsed) = crate::domain::clock::parse_rfc3339_timestamp(trimmed) else {
         return terminal_text(trimmed);
     };
-    let local_dt = parsed.with_timezone(&chrono::Local);
-    let local_str = local_dt.format("%Y-%m-%d %H:%M").to_string();
-    let rem = parsed.timestamp() - now_unix;
+    let local_str = crate::domain::clock::format_timestamp_local_minute(parsed);
+    let rem = crate::domain::clock::timestamp_unix_seconds(parsed) - now_unix;
     if rem <= 0 {
         format!("{local_str}  (expired)")
     } else if rem >= 86_400 {
@@ -571,7 +568,8 @@ pub fn extract_supported_models(obs: &QuotaObservation) -> Vec<String> {
 pub fn format_supported_models_human(models: Option<&[String]>) -> Vec<String> {
     let Some(list) = models else {
         return vec![
-            "Supported models : unknown (run `agy-switch-cli quota -r` to fetch catalog)".into(),
+            "Supported models : unknown (run `agy-switch-cli quota --refresh` to fetch catalog)"
+                .into(),
         ];
     };
     if list.is_empty() {
@@ -685,15 +683,16 @@ pub fn format_runtime_state_human(rt: &RuntimeState) -> String {
         RuntimeState::UnmanagedRunning {
             pids,
             managed_account_ids,
-            ..
         } => {
-            let safe_ids: Vec<String> = managed_account_ids
-                .iter()
-                .map(|s| terminal_text(s))
-                .collect();
-            format!(
-                "unmanaged_running (identity=unknown, pids={pids:?}, managed_accounts={safe_ids:?})"
-            )
+            if managed_account_ids.is_empty() {
+                format!("unmanaged_running (pids={pids:?})")
+            } else {
+                let safe_ids: Vec<String> = managed_account_ids
+                    .iter()
+                    .map(|s| terminal_text(s))
+                    .collect();
+                format!("unmanaged_running (pids={pids:?}, managed_accounts={safe_ids:?})")
+            }
         }
         RuntimeState::Unverified { detail } => format!("unverified ({})", terminal_text(detail)),
     }
@@ -801,12 +800,12 @@ mod tests {
         assert!(compact.contains("5h"));
         assert!(compact.contains("[███████░░░]   72%"));
         assert!(compact.contains("[████░░░░░░]   37%"));
-        let expected_reset_year_minute =
-            chrono::DateTime::parse_from_rfc3339("2026-11-23T11:34:28Z")
-                .unwrap()
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string();
+        let expected_reset_year_minute = "2026-11-23T11:34:28Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::system())
+            .strftime("%Y-%m-%d %H:%M")
+            .to_string();
         assert!(compact.contains(&expected_reset_year_minute));
         assert!(!compact.contains("gemini-3.8-flash-high"));
 
@@ -815,7 +814,15 @@ mod tests {
         };
         let stale_out =
             dto.human_multiline_at("user@example.invalid", Some((&stale_eval, "all")), now);
-        assert!(stale_out.contains("add -r to refresh"));
+        assert!(stale_out.contains("add --refresh to refresh"));
+        assert!(!stale_out.contains("add -r"));
+
+        // Non-TUI `quota` human output preserves upstream `"Antigravity Starter Quota"` verbatim!
+        let mut starter_obs = obs.clone();
+        starter_obs.subscription_tier = Some("Antigravity Starter Quota".into());
+        let starter_dto = QuotaViewDto::from_observation(&starter_obs);
+        let starter_out = starter_dto.human_multiline_at("alice@example.com", None, now);
+        assert!(starter_out.contains("Account : alice@example.com  [Antigravity Starter Quota]"));
 
         let models = extract_supported_models(&obs);
         assert_eq!(models, vec!["gemini-3.8-flash-high".to_string()]);
@@ -858,11 +865,33 @@ mod tests {
         assert_eq!(format_unix_local_minute(0), "unknown");
         assert_eq!(
             format_unix_local_minute(1_794_882_405),
-            chrono::DateTime::from_timestamp(1_794_882_405, 0)
+            jiff::Timestamp::from_second(1_794_882_405)
                 .unwrap()
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
+                .to_zoned(jiff::tz::TimeZone::system())
+                .strftime("%Y-%m-%d %H:%M")
                 .to_string()
+        );
+
+        assert_eq!(format_runtime_state_human(&RuntimeState::Idle), "idle");
+        let unm_single = RuntimeState::UnmanagedRunning {
+            pids: vec![636233],
+            managed_account_ids: Vec::new(),
+        };
+        assert_eq!(
+            format_runtime_state_human(&unm_single),
+            "unmanaged_running (pids=[636233])"
+        );
+        let unm_json = serde_json::to_value(&unm_single).unwrap();
+        assert!(
+            unm_json.get("identity").is_none(),
+            "UnmanagedRunning JSON must omit redundant identity field"
+        );
+        assert_eq!(
+            format_runtime_state_human(&RuntimeState::UnmanagedRunning {
+                pids: vec![636233, 636240],
+                managed_account_ids: vec!["acc-0001".into()],
+            }),
+            "unmanaged_running (pids=[636233, 636240], managed_accounts=[\"acc-0001\"])"
         );
     }
 }

@@ -10,11 +10,11 @@
 
 ## 核心特性
 
-- **纯无头零桌面依赖**：彻底剥离 Tauri / GTK / WebKit，预编译 `musl` 产物为 **100% 纯静态单文件 ELF**，在各类 `x86_64` 与 `aarch64` Linux 发行版上开箱即用。
+- **纯静态单包全特性开箱即用**：彻底剥离 Tauri / GTK / WebKit，每个架构仅提供**单一完整预编译 `musl` 压缩包**（100% 纯静态单文件 ELF，零外部 `.so` 依赖），同时内置全部 CLI 命令、本地用量统计 `stats`、SSH 交互式看板 `tui` 与纯 Rust D-Bus 系统钥匙串协议栈；默认 `--backend auto` 在无头服务器自动使用本地文件模式（`file`），在 Linux 图形桌面自动启用钥匙串与文件事务性双写（`dual`），亦支持显式指定 `file`、`keyring` 或 `dual`。
 - **无浏览器 OAuth 登录与零丢码保护**：默认免端口监听直接粘贴回调 URL 登录（亦可加 `--ssh` 开启本地端口转发回调）；令牌签发后立即以 `0600` 权限落盘并建立两级防回退指纹库，网络中断可通过 `auth pending --resume` 无损续传。
 - **灵活的手动与自动切号方式**：
-  - *重要事实*：切换凭据槽位默认**对切换后新启动的 `agy` 进程生效**，不会篡改或打断正在运行中的 `agy` 会话。
-  - 既可通过 `tui` 终端看板或 `switch` 手动切号后直接运行 `agy`，也可按需使用 `agy-switch-cli run -- agy` 在启动前自动评估切号，或配合 `systemd --user` 运行 `daemon` 后台巡检守护进程。
+  - *重要事实*：切换凭据槽位**对切换后新启动的 `agy` 进程立即生效**，已运行中的旧 `agy` 会话保持启动时的登录态而不被打断。
+  - 既可通过 `tui` 终端看板或 `switch` 随时切号后直接运行 `agy`，也可通过 `daemon --install` 一键配置 `systemd --user` 后台巡检服务（或使用可选的 `agy-switch-cli run` 指定 `--account` / `--backend file` 包装启动 `agy`）。
 
 ---
 
@@ -22,13 +22,13 @@
 
 ### 方式一：下载预编译纯静态二进制（推荐）
 
-前往 Releases 页面下载对应架构的 `.tar.gz` 包（远程 SSH 服务器 / Docker 容器 / WSL2 下载**不带 `-all-features` 的标准版**即可；若在开启了 GNOME Keyring / KDE Wallet 的 Linux 图形桌面环境中使用，建议下载 **`-all-features` 版**，程序会自动检测并同步更新系统钥匙串与本地凭据文件）：
+前往 Releases 页面按 CPU 架构（`x86_64` 或 `aarch64`，可通过 `uname -m` 查看）下载对应的 `.tar.gz` 压缩包，无论在远程 SSH 服务器、Docker 容器、WSL2 还是开启了 GNOME Keyring / KDE Wallet 的 Linux 图形桌面上均可直接使用：
 
 ```bash
-sha256sum -c agy-switch-cli-v1.1.1-x86_64-unknown-linux-musl.tar.gz.sha256
-tar -xzf agy-switch-cli-v1.1.1-x86_64-unknown-linux-musl.tar.gz
+sha256sum -c agy-switch-cli-v1.2.0-x86_64-unknown-linux-musl.tar.gz.sha256
+tar -xzf agy-switch-cli-v1.2.0-x86_64-unknown-linux-musl.tar.gz
 mkdir -p ~/.local/bin
-install -m 0755 agy-switch-cli-v1.1.1-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
+install -m 0755 agy-switch-cli-v1.2.0-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
 ```
 
 ### 方式二：从源码编译（要求 Linux + `rustc >= 1.89`）
@@ -43,23 +43,23 @@ install -m 0755 target/release/agy-switch-cli ~/.local/bin/agy-switch-cli
 ## 五分钟快速上手
 
 ```bash
-# 1. 环境体检与官方 agy 版本探测
-agy-switch-cli doctor --verify-agy
+# 1. 环境状态只读巡检与官方 agy 版本自动探测
+agy-switch-cli status
 
 # 2. 登录添加账号（默认零配置手动粘贴回调 URL；如需本地监听可加 --ssh）
 agy-switch-cli auth login --label "主力账号"
-# 若当前设备已登录过官方 agy（或桌面端 Antigravity），也可一键读取本机当前登录账号入库：
+# 若本机官方 agy 已登录（或桌面端与 agy 在系统钥匙串中共用登录条目），也可读取当前 agy 凭据入库（不读取桌面端独立的 jetski-standalone-oauth-token 回退文件）：
 # agy-switch-cli accounts add --from-local --label "本机账号"
 # 或从原桌面版 ~/.antigravity_tools 只读迁移已有账号（不修改原目录）：
 # agy-switch-cli accounts import --from-legacy
 
-# 3. 联网刷新并直接查看所有账号的最新配额进度表
-agy-switch-cli quota -r --all
+# 3. 联网流式刷新（实时打印 [k/N] 进度）并查看所有账号的最新配额进度表
+agy-switch-cli quota --refresh --all
 
 # 4. 查看当前生效账号、运行状态与该账号支持的全部模型列表
 agy-switch-cli current
 
-# 5. 打开交互式看板管理与切号，之后直接运行 agy 即可（也可用 `agy-switch-cli run -- agy` 启动前按需自动切号）
+# 5. 打开交互式看板管理与切号，之后直接运行 agy 即可（也可用可选的 `agy-switch-cli run` 指定账号或 `file` 后端包装启动）
 agy-switch-cli tui
 ```
 
@@ -71,24 +71,27 @@ agy-switch-cli tui
 
 | 命令                                                   | 用途说明                                                                           |
 |:------------------------------------------------------ |:---------------------------------------------------------------------------------- |
-| `agy-switch-cli doctor [--fix]`                        | 诊断本地存储、权限、D-Bus 环境，并对账修复未完成的切换日志                         |
+| `agy-switch-cli status`                                | 只读巡检生效后端、本地仓库、事务日志、槽位初始化、守护进程状态与本机官方 `agy` 版本 |
 | `agy-switch-cli auth login [--ssh]`                    | 通过 PKCE (`S256`) 添加新 Google 账号（默认粘贴回调 URL；重新授权用 `reauthorize`） |
-| `agy-switch-cli accounts list / add / import / export` | 查看账号详情与排序（`--move`/`--order`）、导入本机已登录号（`--from-local`）或批量添加 Token、导入导出备份 |
+| `agy-switch-cli accounts list / add / import / export` | 查看账号详情与排序（`--move`/`--order`）、导入本机已登录号（`--from-local`）或文件/标准输入 Token（`--from-file`/`--from-stdin`）、导入导出备份 |
 | `agy-switch-cli current`                               | 查看当前生效身份、运行中进程状态及该账号支持的全部模型清单                         |
-| `agy-switch-cli quota [-r] [--all]`                    | 查看双窗口（`Weekly` + `5h`）配额进度表（加 `-r` 先联网刷新再展示）                |
-| `agy-switch-cli switch <ID\|EMAIL>`                   | 手动切换生效账号（标准版改本地槽位文件；`-all-features` 版自动检测并双写桌面钥匙串与文件） |
-| `agy-switch-cli policy set --all-candidates ...`       | 配置自动切号水位策略（可配合 `run` 启动前按需切号或 `daemon` 后台每小时巡检）      |
-| `agy-switch-cli run [--isolate-dbus] -- agy ...`       | 启动 `agy` 前按策略自动检查切号并隔离桌面钥匙串干扰                                |
-| `agy-switch-cli tui`                                   | 打开 SSH 交互式终端看板（支持切号、`r/R` 单条/批量刷新、`K/J` 调序与 `c/C/p` 策略管理） |
+| `agy-switch-cli quota [--refresh] [--all]`             | 查看双窗口（`Weekly` + `5h`）配额进度表（加 `--refresh` 先流式联网刷新再展示）     |
+| `agy-switch-cli refresh [--all]`                       | 批量流式联网刷新账号 OAuth 令牌与远端配额（终端实时输出 `[k/N]` 进度）             |
+| `agy-switch-cli stats summary / list`                  | 纯本地只读聚合模型 Token 用量与 `TTFT`/`TPS` 分位统计（`summary`），或列出最近请求明细（`list`），共享 `--source` 与 `--range` / `--date` / `--from` / `--recent` |
+| `agy-switch-cli switch <ID\|EMAIL>`                   | 手动切换生效账号（默认 `auto` 自动适配无头 `file` 与桌面钥匙串 `dual` 双写；写入前自动安全对账未完成切换日志） |
+| `agy-switch-cli policy set --all-candidates ...`       | 配置自动切号水位策略（默认 `reserve = 5%`、`minimum = 15%`，配合 `daemon` 后台自动巡检切号） |
+| `agy-switch-cli daemon [--install \| --uninstall]`     | 运行前台静默自动切号守护进程，或一键安装/卸载 `systemd --user` 后台自启服务        |
+| `agy-switch-cli [--backend file] run [--account ...] -- agy ...` | 可选方式：按指定账号或指定后端包装启动 `agy`；显式启用 `file` 后端时自动为子进程屏蔽桌面 D-Bus 钥匙串 |
+| `agy-switch-cli tui`                                   | 打开 SSH 交互式终端看板（支持 `↑/↓` 选行与内嵌 `...` 滚动提示、`g/G` 首末行、`[/]` 调序、`r/R` 刷新、`c/C/p` 策略、`e/E` 与 `d/D` 单条/全局启停、`x`+`y` 删号） |
 
-*(所有业务子命令均支持 `--json` 机器可读输出与 `0..=8` 稳定退出码。)*
+*(关于 `--json` 机器输出与 `0..=8` 稳定退出码的边界说明：全屏交互看板 `tui` 与 `--json` 互斥并返回退出码 `2`；包装器 `run` 在前置准备失败时向 `stderr` 输出错误信封，就绪后直接继承子进程标准输入输出并透传其退出码；`daemon --install --json` 与 `daemon --uninstall --json` 向 `stdout` 输出标准 `schema_version: 1` JSON 信封，而前台静默守护进程 `daemon` / `daemon --once` 不按轮向 `stdout` 打印 JSON 行［空闲或正常退出时返回 `0`，仅在启动、策略、锁或运行期出错时向 `stderr` 输出错误信封］；其余子命令均输出标准 `schema_version: 1` JSON 信封。)*
 
 ---
 
 ## 详细文档导航
 
-- **[完整使用、配置与部署手册 (`docs/user-guide.md`)](docs/user-guide.md)**：标准版与全特性版选型实例、全量命令与退出码参考、`config.json` 代理配置、`systemd --user` 部署及常见故障排查。
-- **[技术架构、安全机制与验收台账 (`docs/architecture-and-verification.md`)](docs/architecture-and-verification.md)**：目录拓扑、四级单向锁与授权世代防回退设计、4 目标 × 3 档 Release 体积/性能矩阵及诚实验收边界说明。
+- **[完整使用、配置与部署手册 (`docs/user-guide.md`)](docs/user-guide.md)**：安装指南、四种凭据后端（`auto`/`dual`/`file`/`keyring`）、全量命令与退出码参考、`config.json` 代理与自定义 OAuth 客户端配置、`daemon --install` 与容器常驻方案及常见故障排查。
+- **[技术架构、安全机制与验收台账 (`docs/architecture-and-verification.md`)](docs/architecture-and-verification.md)**：目录拓扑、四级单向锁与授权世代防回退设计、跨架构 Release 体积/性能矩阵及诚实验收边界说明。
 - **[重构溯源与第三方合规声明 (`PROVENANCE.md`)](PROVENANCE.md)** ＆ **[许可证全文 (`LICENSE`)](LICENSE)**。
 
 ---

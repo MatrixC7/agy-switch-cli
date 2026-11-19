@@ -112,6 +112,7 @@ fn build_quota(
 
 #[test]
 fn quota_eval_enforces_min_triad_free_unknown_tier_argon_8hop_forwarding_and_reset_staleness() {
+    let _guard = PROC_ENV_MUTEX.blocking_lock();
     let now = 1_800_000_000i64;
     let future_reset = "2099-01-01T00:00:00Z";
     let past_reset = "2020-01-01T00:00:00Z"; // <= now!
@@ -224,8 +225,8 @@ fn quota_eval_enforces_min_triad_free_unknown_tier_argon_8hop_forwarding_and_res
 }
 
 #[tokio::test]
-async fn managed_run_switches_low_quota_account_registers_two_factor_lease_and_forwards_exit_code()
-{
+async fn managed_run_keeps_selected_without_policy_switch_supports_explicit_account_and_forwards_exit_code(
+) {
     let _guard = PROC_ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
@@ -262,7 +263,7 @@ async fn managed_run_switches_low_quota_account_registers_two_factor_lease_and_f
     fs::write(&fake_agy, script).unwrap();
     fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let paths = HeadlessPaths::with_explicit(home.clone(), data.clone(), cache.clone());
     let repo = StoreRepository::new(paths.clone());
 
@@ -286,9 +287,9 @@ async fn managed_run_switches_low_quota_account_registers_two_factor_lease_and_f
     acc_low.quota = Some(build_quota(
         now,
         Some("Google AI Pro"),
-        0.05,
-        0.05,
-        Some(0.05),
+        0.02,
+        0.02,
+        Some(0.02),
         "2099-01-01T00:00:00Z",
     ));
 
@@ -323,8 +324,8 @@ async fn managed_run_switches_low_quota_account_registers_two_factor_lease_and_f
         tx.upsert_account(acc_high.clone(), false, now)?;
         let mut pol = SwitchPolicy {
             enabled: true,
-            reserve_percentage: 10,
-            candidate_min_percentage: 30,
+            reserve_percentage: 5,
+            candidate_min_percentage: 15,
             candidate_account_ids: vec!["acc-high".into()],
             ..SwitchPolicy::default()
         };
@@ -336,6 +337,54 @@ async fn managed_run_switches_low_quota_account_registers_two_factor_lease_and_f
         .write_slot(&paths, &serialize_session_payload(&acc_low.token).unwrap())
         .unwrap();
 
+    // 1. Bare `run -- agy`: purely launches with the currently selected account (`acc-low`),
+    //    NEVER performing implicit policy quota evaluation or auto-switching to `acc-high`!
+    let out_bare = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_RUNTIME_DIR", &run_dir)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/no-dbus", run_dir.display()),
+        )
+        .env("AGY_SWITCH_CLI_AGY_BIN", &fake_agy)
+        .args([
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--no-remote-version",
+            "run",
+            "--",
+            "agy",
+            "-p",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out_bare.status.code(),
+        Some(42),
+        "Child exit code 42 must be forwarded: stderr={}",
+        String::from_utf8_lossy(&out_bare.stderr)
+    );
+    let seen_slot_bare = fs::read_to_string(trace_dir.join("seen_slot.json")).unwrap();
+    assert!(
+        seen_slot_bare.contains("1//RT_LOW"),
+        "Bare `run` must keep selected `acc-low` without policy auto-switch: {seen_slot_bare}"
+    );
+    let lease_bare: ProcessLease =
+        serde_json::from_slice(&fs::read(trace_dir.join("seen_lease.json")).unwrap()).unwrap();
+    assert!(lease_bare.pid > 0);
+    assert!(lease_bare.proc_starttime_ticks > 0);
+    assert_eq!(lease_bare.account_id, "acc-low");
+    assert_eq!(fs::read_dir(paths.leases_dir()).unwrap().count(), 0);
+
+    // 2. Explicit `run --account acc-high -- agy`: deterministically switches slot to `acc-high`,
+    //    registers two-factor lease for `acc-high`, and forwards exit code 42!
+    let _ = fs::remove_file(trace_dir.join("seen_slot.json"));
+    let _ = fs::remove_file(trace_dir.join("seen_lease.json"));
     let out = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
         .env_clear()
         .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
@@ -352,6 +401,8 @@ async fn managed_run_switches_low_quota_account_registers_two_factor_lease_and_f
             data.to_str().unwrap(),
             "--no-remote-version",
             "run",
+            "--account",
+            "acc-high",
             "--",
             "agy",
             "-p",
@@ -764,7 +815,17 @@ async fn foreground_daemon_enforces_single_instance_lock_and_exits_gracefully_on
     fs::create_dir_all(&run_dir).unwrap();
     fs::create_dir_all(&proc_dir).unwrap();
 
-    let mut d1 = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
+    struct KillChildOnDrop(Option<std::process::Child>);
+    impl Drop for KillChildOnDrop {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.0.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    let d1 = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &home)
@@ -785,11 +846,18 @@ async fn foreground_daemon_enforces_single_instance_lock_and_exits_gracefully_on
         ])
         .spawn()
         .unwrap();
+    let mut d1_guard = KillChildOnDrop(Some(d1));
 
-    // Wait up to 500ms for daemon.lock to appear
-    for _ in 0..25 {
-        if data.join("locks/daemon.lock").exists() {
-            break;
+    // Wait up to 5s for `d1` to create and hold `flock(LOCK_EX)` on `locks/daemon.lock`
+    let daemon_lock_path = data.join("locks/daemon.lock");
+    for _ in 0..250 {
+        if let Ok(f) = fs::OpenOptions::new().read(true).open(&daemon_lock_path) {
+            use std::os::fd::AsRawFd;
+            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc < 0 {
+                break;
+            }
+            let _ = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -819,6 +887,7 @@ async fn foreground_daemon_enforces_single_instance_lock_and_exits_gracefully_on
     assert_eq!(d2.status.code(), Some(5));
 
     // Send SIGTERM to d1 -> must shut down cleanly with exit code 0!
+    let mut d1 = d1_guard.0.take().unwrap();
     unsafe {
         libc::kill(d1.id() as i32, libc::SIGTERM);
     }
@@ -929,16 +998,19 @@ async fn managed_run_refreshes_expired_slot_even_when_refresh_token_unchanged_an
         ))
     });
 
+    let _dbus_env = ScopedEnvVar::set(
+        "DBUS_SESSION_BUS_ADDRESS",
+        format!("unix:path={}/mock-bus", tmp.path().display()),
+    );
     let code = agy_switch_cli::switching::runner::run_managed_agy(
         &repo,
         &FileSessionBackend,
         &mock,
         &OAuthEndpoints::default(),
-        &CloudCodeEndpoints::default(),
         &OAuthClientRegistry::parse_from_raw(None, None),
         "vscode/1.X.X (Antigravity/4.3.0)",
         None,
-        true, // isolate_dbus = true
+        true, // explicit_file_backend = true
         &[fake_agy.to_string_lossy().into_owned()],
         now,
     )
@@ -1379,7 +1451,7 @@ async fn quota_and_quota_all_respect_policy_monitored_model_and_render_four_stat
     fs::create_dir_all(&proc_dir).unwrap();
     let _proc_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir);
 
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let paths = HeadlessPaths::with_explicit(home.clone(), data.clone(), cache.clone());
     let repo = StoreRepository::new(paths);
 
@@ -1499,7 +1571,7 @@ async fn quota_and_quota_all_respect_policy_monitored_model_and_render_four_stat
     assert!(txt_gem.contains("Status  : known (80.0% effective on gemini)"));
     assert!(!txt_gem.contains("gemini-3.8-flash"));
 
-    // 3. Stale cached quota in human mode STILL displays the cached quota table cleanly (with `-r` hint),
+    // 3. Stale cached quota in human mode STILL displays the cached quota table cleanly (with `--refresh` hint),
     //    while `--json` preserves strict exit code 4 for machine callers!
     let out_stale_human = cli()
         .args(["quota", "stale@example.invalid"])
@@ -1508,7 +1580,7 @@ async fn quota_and_quota_all_respect_policy_monitored_model_and_render_four_stat
     assert_eq!(out_stale_human.status.code(), Some(0));
     let txt_stale_human = String::from_utf8_lossy(&out_stale_human.stdout);
     assert!(txt_stale_human.contains("Account : stale@example.invalid"));
-    assert!(txt_stale_human.contains("add -r to refresh"));
+    assert!(txt_stale_human.contains("add --refresh to refresh"));
 
     let out_stale_json = cli()
         .args(["--json", "quota", "stale@example.invalid"])
@@ -1641,7 +1713,7 @@ async fn managed_run_rejects_disabled_or_unscoped_synced_slot_and_daemon_stage5_
     .unwrap();
     fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let paths = HeadlessPaths::with_explicit(home.clone(), data.clone(), cache.clone());
     let repo = StoreRepository::new(paths.clone());
     let backend = FileSessionBackend;
@@ -1857,10 +1929,12 @@ async fn synthetic_immediate_mode_overwrites_slot_with_running_agy_fails_closed_
     let repo = StoreRepository::new(paths.clone());
     let backend = FileSessionBackend;
 
-    // 1. Default policy is `Immediate` + `RoundRobin`.
+    // 1. Default policy is `Immediate` + `RoundRobin` (`reserve = 5%`, `minimum = 15%`).
     let default_pol = SwitchPolicy::default();
     assert_eq!(default_pol.mode, PolicyMode::Immediate);
     assert_eq!(default_pol.strategy, PolicyStrategy::RoundRobin);
+    assert_eq!(default_pol.reserve_percentage, 5);
+    assert_eq!(default_pol.candidate_min_percentage, 15);
 
     let make_acc = |id: &str, pct: f64| -> AccountRecord {
         let mut a = AccountRecord::new(

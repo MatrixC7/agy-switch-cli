@@ -121,25 +121,34 @@ fn open_lock_file_nofollow(base_dir: &Path, lock_path: &Path) -> CliResult<File>
 }
 
 fn try_flock_exclusive(file: &File) -> Result<bool, std::io::Error> {
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        Ok(true)
-    } else {
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(true);
+        }
         let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
         if err.kind() == std::io::ErrorKind::WouldBlock
             || err.raw_os_error() == Some(libc::EWOULDBLOCK)
             || err.raw_os_error() == Some(libc::EAGAIN)
         {
-            Ok(false)
-        } else {
-            Err(err)
+            return Ok(false);
         }
+        return Err(err);
     }
 }
 
 fn unlock_flock(file: &File) {
-    unsafe {
-        let _ = libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        if rc == 0 {
+            return;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return;
+        }
     }
 }
 
@@ -305,6 +314,10 @@ impl ActiveSlotLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub fn includes_keyring_scope(&self) -> bool {
+        self.keyring_file.is_some()
+    }
 }
 
 impl Drop for ActiveSlotLock {
@@ -416,7 +429,7 @@ where
         .await
 }
 
-/// Non-blocking RAII guard for `PendingAuthLock` used strictly inside synchronous cleanup paths (`purge`, `doctor --fix`,
+/// Non-blocking RAII guard for `PendingAuthLock` used strictly inside synchronous cleanup paths (`purge`,
 /// superseded duplicate cleanup) so the exclusive lock (`AsyncMutex` + `flock`) stays held across `remove_file`
 /// with ZERO blocking wait (making deadlock structurally impossible).
 pub struct NonBlockingPendingAuthLock {
@@ -829,5 +842,63 @@ mod tests {
         assert_eq!(p_to_l1.error_code, "lock_order_violation");
         assert_eq!(nested_p.error_code, "lock_order_violation");
         assert_eq!(forward_ok, 42);
+    }
+
+    #[test]
+    fn journal_keyring_scope_detection_covers_corrupt_legacy_and_explicit_journals() {
+        use crate::session::journal::{
+            journal_on_disk_may_need_keyring, write_journal, write_journal_with_replicas,
+            JournalReplicaRecord, JournalReplicaSnapshot, SwitchJournal,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = HeadlessPaths::with_explicit(home, data, cache);
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+
+        // 1. Absent journal -> false
+        assert!(!journal_on_disk_may_need_keyring(&paths));
+        let l_file = ActiveSlotLock::try_acquire(&paths, false).unwrap();
+        assert!(!l_file.includes_keyring_scope());
+        drop(l_file);
+
+        // 2. Explicit `file` journal -> false
+        let j = SwitchJournal::new_prepared("op-1".into(), None, "acc-1".into(), None, 1_700_000);
+        write_journal(&paths, &j).unwrap();
+        assert!(!journal_on_disk_may_need_keyring(&paths));
+
+        // 3. Explicit `keyring` journal -> true
+        let kr_meta = JournalReplicaRecord {
+            backend: "keyring".into(),
+            uses_file: false,
+            keyring: Some(JournalReplicaSnapshot {
+                prev_present: false,
+                prev_digest: None,
+                prev_uniform: true,
+                collections: Vec::new(),
+            }),
+            file: JournalReplicaSnapshot {
+                prev_present: false,
+                prev_digest: None,
+                prev_uniform: true,
+                collections: Vec::new(),
+            },
+        };
+        write_journal_with_replicas(&paths, &j, Some(&kr_meta)).unwrap();
+        assert!(journal_on_disk_may_need_keyring(&paths));
+        let l_kr = ActiveSlotLock::try_acquire(&paths, true).unwrap();
+        assert!(l_kr.includes_keyring_scope());
+        drop(l_kr);
+
+        // 4. Legacy journal (`replica_state == None`) -> true (unknown scope must lock keyring!)
+        write_journal_with_replicas(&paths, &j, None).unwrap();
+        assert!(journal_on_disk_may_need_keyring(&paths));
+
+        // 5. Corrupt/truncated JSON journal -> true (unknown scope must lock keyring!)
+        std::fs::write(paths.switch_journal_file(), b"{truncated-json").unwrap();
+        assert!(journal_on_disk_may_need_keyring(&paths));
     }
 }

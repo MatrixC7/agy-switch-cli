@@ -863,6 +863,9 @@ async fn refresh_existing_account_for_add(
                 rt_trimmed.to_string()
             };
 
+            // Preflight local store directory & target file writeability BEFORE calling `/token` over the network!
+            repo.with_write_lock(|tx| tx.preflight_account_refresh_staging(existing_id))?;
+
             // Enforce RFC 6749 single-client binding on already-bound accounts!
             let refresh_res = if let Some(ref bound_key) = current_acc.token.oauth_client_key {
                 if let Some(exp_key) = explicit_client_key {
@@ -934,7 +937,8 @@ async fn refresh_existing_account_for_add(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
-                .unwrap_or(effective_rt);
+                .unwrap_or_else(|| effective_rt.clone());
+            let was_rotated = rotated_rt != effective_rt;
             let expires_in = raw.expires_in.max(60);
             let new_token = TokenRecord {
                 access_token: raw.access_token.trim().to_string(),
@@ -958,14 +962,16 @@ async fn refresh_existing_account_for_add(
             };
 
             // CRITICAL: Persist rotated token IMMEDIATELY under L3 with ZERO `.await` points before `fetch_userinfo`!
-            let mut saved_acc = repo.with_write_lock(|tx| {
-                let merged = tx.merge_refreshed_token(existing_id, new_token, None, post_now)?;
-                if custom_label.is_some_and(|l| !l.trim().is_empty()) {
-                    tx.update_account_identity_metadata(existing_id, None, None, custom_label)
-                } else {
-                    Ok(merged)
-                }
-            })?;
+            let mut saved_acc = repo
+                .with_write_lock(|tx| {
+                    let merged = tx.merge_refreshed_token(existing_id, new_token, None, post_now)?;
+                    if custom_label.is_some_and(|l| !l.trim().is_empty()) {
+                        tx.update_account_identity_metadata(existing_id, None, None, custom_label)
+                    } else {
+                        Ok(merged)
+                    }
+                })
+                .map_err(|e| wrap_unpersisted_token_exchange_error(e, was_rotated))?;
 
             let missing = registry.missing_required_scopes(&saved_acc.token);
             if !missing.is_empty() {
@@ -1028,6 +1034,41 @@ async fn refresh_existing_account_for_add(
         },
     )
     .await
+}
+
+fn wrap_unpersisted_token_exchange_error(
+    persist_err: CliError,
+    refresh_token_rotated: bool,
+) -> CliError {
+    // Only pass through `LockBusyOrConflict` when a durable copy on disk is PROVEN to exist
+    // (`save_pending_auth_cas` already saved `pend-alt-*`, or `merge_refreshed_token` proved
+    // a newer generation already supersedes this token). Post-issuance `L3` `lock_busy` timeouts
+    // have NO durable backup and MUST return exit code 7 (`issued_token_unpersisted`).
+    if persist_err.exit_code == crate::error::ExitCode::LockBusyOrConflict
+        && matches!(
+            persist_err.error_code.as_str(),
+            "pending_auth_version_conflict" | "stale_rotated_refresh_token"
+        )
+    {
+        return persist_err;
+    }
+    let rot_note = if refresh_token_rotated {
+        "Google OAuth rotated the refresh token during exchange; re-authenticate via `agy-switch-cli auth login` after resolving local storage permissions or disk space."
+    } else {
+        "The refresh token was not rotated by the server; resolve local storage permissions or disk space and retry."
+    };
+    CliError::partial_commit(
+        "issued_token_unpersisted",
+        format!(
+            "OAuth token exchange succeeded, but persisting local 0600 staging record failed ({}). {rot_note}",
+            persist_err.error_code
+        ),
+    )
+    .with_details(serde_json::json!({
+        "state": "issued_token_unpersisted",
+        "refresh_token_rotated": refresh_token_rotated,
+        "storage_error_code": persist_err.error_code,
+    }))
 }
 
 /// Exchange and durably persist a `refresh_token` during `accounts add`:
@@ -1162,7 +1203,15 @@ pub async fn bootstrap_and_persist_refresh_token(
                     let fp = prev_p.cas_fingerprint();
                     (prev_p.id, fp, prev_p.token)
                 } else {
-                    let _ = repo.read_auth_sequence_readonly()?;
+                    let prev_id_for_preflight = prev_p.id.clone();
+                    if let Some(ref bound_key) = prev_p.token.oauth_client_key {
+                        let _ = registry.require_bound_client(bound_key)?;
+                    } else if let Some(key) = explicit_client_key {
+                        let _ = registry.select_for_login(Some(key))?;
+                    }
+                    repo.with_write_lock(|tx| {
+                        tx.preflight_pending_auth_staging(&prev_id_for_preflight, false)
+                    })?;
                     let prev_fp = prev_p.cas_fingerprint();
                     let effective_rt = prev_p.token.refresh_token.clone();
                     let (raw, used_client_key) =
@@ -1208,7 +1257,8 @@ pub async fn bootstrap_and_persist_refresh_token(
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_owned)
-                        .unwrap_or(effective_rt);
+                        .unwrap_or_else(|| effective_rt.clone());
+                    let was_rotated = rotated_rt != effective_rt;
                     let expires_in = raw.expires_in.max(60);
                     let next_tok = TokenRecord {
                         access_token: raw.access_token.trim().to_string(),
@@ -1238,15 +1288,25 @@ pub async fn bootstrap_and_persist_refresh_token(
                         ..prev_p
                     };
                     let new_fp = updated_pending.cas_fingerprint();
-                    let saved_id = repo.with_write_lock(|tx| {
-                        tx.save_pending_auth_cas(&updated_pending, Some(&prev_fp))
-                    })?;
+                    let saved_id = repo
+                        .with_write_lock(|tx| {
+                            tx.save_pending_auth_cas(&updated_pending, Some(&prev_fp))
+                        })
+                        .map_err(|e| wrap_unpersisted_token_exchange_error(e, was_rotated))?;
                     (saved_id, new_fp, next_tok)
                 }
             } else {
-                let _ = repo.read_auth_sequence_readonly()?;
-                let (raw, used_client_key) = if let Some(key) = explicit_client_key {
-                    let client = registry.select_for_login(Some(key))?;
+                let preselected_client = match explicit_client_key {
+                    Some(key) => Some(registry.select_for_login(Some(key))?),
+                    None => None,
+                };
+                // Preflight private staging directories, writeability, and reserve `auth_seq` BEFORE `/token` exchange!
+                let reserved_seq = repo
+                    .with_write_lock(|tx| {
+                        tx.preflight_pending_auth_staging(&lock_pending_id, true)
+                    })?
+                    .unwrap_or(2);
+                let (raw, used_client_key) = if let Some(client) = preselected_client {
                     let raw = refresh_raw_with_client(
                         transport, endpoints, user_agent, &client, rt_trimmed,
                     )
@@ -1269,6 +1329,7 @@ pub async fn bootstrap_and_persist_refresh_token(
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned)
                     .unwrap_or_else(|| rt_trimmed.to_string());
+                let was_rotated = rotated_rt != rt_trimmed;
                 let expires_in = raw.expires_in.max(60);
                 let tok = TokenRecord {
                     access_token: raw.access_token.trim().to_string(),
@@ -1288,26 +1349,34 @@ pub async fn bootstrap_and_persist_refresh_token(
                 };
 
                 // CRITICAL: Immediately write `0600` durable `PendingAuthRecord` with monotonic `auth_seq` BEFORE awaiting `fetch_userinfo`!
-                let (saved_id, fp) = repo.with_write_lock(|tx| {
-                    let auth_seq = tx.allocate_next_auth_seq()?;
-                    let pending = PendingAuthRecord {
-                        schema_version: STORE_SCHEMA_VERSION,
-                        id: lock_pending_id.clone(),
-                        flow: PendingAuthFlow::AddToken,
-                        token: tok.clone(),
-                        auth_seq,
-                        email_mismatch: false,
-                        input_rt_digest: Some(input_digest.clone()),
-                        custom_label: custom_label
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_owned),
-                        created_at: post_now,
-                    };
-                    let fp = pending.cas_fingerprint();
-                    let sid = tx.save_pending_auth_cas(&pending, None)?;
-                    Ok((sid, fp))
-                })?;
+                let (saved_id, fp) = repo
+                    .with_write_lock(|tx| {
+                        let cur_max = tx.current_max_auth_seq()?;
+                        let auth_seq = if reserved_seq >= cur_max {
+                            tx.ensure_auth_sequence_at_least(reserved_seq)?;
+                            reserved_seq
+                        } else {
+                            tx.allocate_next_auth_seq()?
+                        };
+                        let pending = PendingAuthRecord {
+                            schema_version: STORE_SCHEMA_VERSION,
+                            id: lock_pending_id.clone(),
+                            flow: PendingAuthFlow::AddToken,
+                            token: tok.clone(),
+                            auth_seq,
+                            email_mismatch: false,
+                            input_rt_digest: Some(input_digest.clone()),
+                            custom_label: custom_label
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_owned),
+                            created_at: post_now,
+                        };
+                        let fp = pending.cas_fingerprint();
+                        let sid = tx.save_pending_auth_cas(&pending, None)?;
+                        Ok((sid, fp))
+                    })
+                    .map_err(|e| wrap_unpersisted_token_exchange_error(e, was_rotated))?;
                 (saved_id, fp, tok)
             };
 
@@ -1386,7 +1455,9 @@ pub async fn complete_login_exchange_locked(
         &pending_id,
         Duration::from_secs(20),
         || async {
-            let _ = repo.read_auth_sequence_readonly()?;
+            let reserved_seq = repo
+                .with_write_lock(|tx| tx.preflight_pending_auth_staging(&pending_id, true))?
+                .unwrap_or(2);
             let token = exchange_authorization_code(
                 transport, endpoints, user_agent, session, code, now_unix,
             )
@@ -1394,26 +1465,34 @@ pub async fn complete_login_exchange_locked(
             let post_now = clock.now_unix();
 
             // CRITICAL: Immediately persist `0600` durable `PendingAuthRecord` with monotonic `auth_seq` BEFORE `fetch_userinfo` await!
-            let (saved_pending_id, expected_fp) = repo.with_write_lock(|tx| {
-                let auth_seq = tx.allocate_next_auth_seq()?;
-                let pending = PendingAuthRecord {
-                    schema_version: STORE_SCHEMA_VERSION,
-                    id: pending_id.clone(),
-                    flow: PendingAuthFlow::Login,
-                    token: token.clone(),
-                    auth_seq,
-                    email_mismatch: false,
-                    input_rt_digest: None,
-                    custom_label: custom_label
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned),
-                    created_at: post_now,
-                };
-                let fp = pending.cas_fingerprint();
-                let sid = tx.save_pending_auth_cas(&pending, None)?;
-                Ok((sid, fp))
-            })?;
+            let (saved_pending_id, expected_fp) = repo
+                .with_write_lock(|tx| {
+                    let cur_max = tx.current_max_auth_seq()?;
+                    let auth_seq = if reserved_seq >= cur_max {
+                        tx.ensure_auth_sequence_at_least(reserved_seq)?;
+                        reserved_seq
+                    } else {
+                        tx.allocate_next_auth_seq()?
+                    };
+                    let pending = PendingAuthRecord {
+                        schema_version: STORE_SCHEMA_VERSION,
+                        id: pending_id.clone(),
+                        flow: PendingAuthFlow::Login,
+                        token: token.clone(),
+                        auth_seq,
+                        email_mismatch: false,
+                        input_rt_digest: None,
+                        custom_label: custom_label
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned),
+                        created_at: post_now,
+                    };
+                    let fp = pending.cas_fingerprint();
+                    let sid = tx.save_pending_auth_cas(&pending, None)?;
+                    Ok((sid, fp))
+                })
+                .map_err(|e| wrap_unpersisted_token_exchange_error(e, true))?;
 
             let missing = registry.missing_required_scopes(&token);
             let userinfo_res =
@@ -1583,8 +1662,14 @@ pub async fn ensure_account_token_fresh_locked(
             });
         }
 
-        let refresh_res = if let Some(ref bound_key) = current_acc.token.oauth_client_key {
-            let client = registry.require_bound_client(bound_key)?;
+        let bound_client = match current_acc.token.oauth_client_key.as_deref() {
+            Some(bound_key) => Some(registry.require_bound_client(bound_key)?),
+            None => None,
+        };
+        // Synchronous `L3` preflight BEFORE calling `/token` over the network (never held across `.await`!)
+        repo.with_write_lock(|tx| tx.preflight_account_refresh_staging(account_id))?;
+
+        let refresh_res = if let Some(client) = bound_client {
             refresh_raw_with_client(
                 transport,
                 endpoints,
@@ -1670,7 +1755,8 @@ pub async fn ensure_account_token_fresh_locked(
         // between `/token` response parsing and durable disk write, so async cancellation / timeout during
         // optional `userinfo` lookup can NEVER drop a server-rotated `refresh_token`!
         let mut updated_acc = repo
-            .with_write_lock(|tx| tx.merge_refreshed_token(account_id, new_token, None, post_now))?;
+            .with_write_lock(|tx| tx.merge_refreshed_token(account_id, new_token, None, post_now))
+            .map_err(|e| wrap_unpersisted_token_exchange_error(e, refresh_token_rotated))?;
 
         // Check known `granted_scopes` AFTER rotated `refresh_token` is safely persisted on disk!
         let missing = registry.missing_required_scopes(&updated_acc.token);
@@ -1771,7 +1857,11 @@ pub async fn complete_reauthorize_exchange_locked(
                 Duration::from_secs(20),
                 || async {
                     let current_acc = repo.read_account_unchecked(&target_id)?;
-                    let _ = repo.read_auth_sequence_readonly()?;
+                    let reserved_seq = repo
+                        .with_write_lock(|tx| {
+                            tx.preflight_reauthorize_staging(&target_id, &pending_id, true)
+                        })?
+                        .unwrap_or(2);
                     let mut new_token = exchange_authorization_code(
                         transport,
                         endpoints,
@@ -1789,25 +1879,33 @@ pub async fn complete_reauthorize_exchange_locked(
                     // CRITICAL: Persist `0600` durable `PendingAuthRecord` with monotonic `auth_seq` IMMEDIATELY upon `/token` return
                     // BEFORE awaiting `fetch_userinfo`, so cancellation or userinfo failure NEVER loses the issued token!
                     let post_now = clock.now_unix();
-                    let (saved_pending_id, expected_fp) = repo.with_write_lock(|tx| {
-                        let auth_seq = tx.allocate_next_auth_seq()?;
-                        let pending = PendingAuthRecord {
-                            schema_version: STORE_SCHEMA_VERSION,
-                            id: pending_id.clone(),
-                            flow: PendingAuthFlow::Reauthorize {
-                                target_account_id: target_id.clone(),
-                            },
-                            token: new_token.clone(),
-                            auth_seq,
-                            email_mismatch: false,
-                            input_rt_digest: None,
-                            custom_label: None,
-                            created_at: post_now,
-                        };
-                        let fp = pending.cas_fingerprint();
-                        let sid = tx.save_pending_auth_cas(&pending, None)?;
-                        Ok((sid, fp))
-                    })?;
+                    let (saved_pending_id, expected_fp) = repo
+                        .with_write_lock(|tx| {
+                            let cur_max = tx.current_max_auth_seq()?;
+                            let auth_seq = if reserved_seq >= cur_max {
+                                tx.ensure_auth_sequence_at_least(reserved_seq)?;
+                                reserved_seq
+                            } else {
+                                tx.allocate_next_auth_seq()?
+                            };
+                            let pending = PendingAuthRecord {
+                                schema_version: STORE_SCHEMA_VERSION,
+                                id: pending_id.clone(),
+                                flow: PendingAuthFlow::Reauthorize {
+                                    target_account_id: target_id.clone(),
+                                },
+                                token: new_token.clone(),
+                                auth_seq,
+                                email_mismatch: false,
+                                input_rt_digest: None,
+                                custom_label: None,
+                                created_at: post_now,
+                            };
+                            let fp = pending.cas_fingerprint();
+                            let sid = tx.save_pending_auth_cas(&pending, None)?;
+                            Ok((sid, fp))
+                        })
+                        .map_err(|e| wrap_unpersisted_token_exchange_error(e, true))?;
 
                     let missing = registry.missing_required_scopes(&new_token);
                     let user_info = match fetch_userinfo(
@@ -1909,6 +2007,7 @@ pub async fn complete_reauthorize_exchange_locked(
 pub struct PendingResumeReport {
     pub resumed_accounts: Vec<AccountRecord>,
     pub failures: Vec<(String, String)>,
+    pub unpersisted_error: Option<CliError>,
 }
 
 const PENDING_RESUME_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
@@ -1924,10 +2023,15 @@ async fn refresh_pending_record_token(
     expected_prev_fp: &str,
     clock: &AnchoredClock,
 ) -> CliResult<(String, String, TokenRecord)> {
-    let _ = repo.read_auth_sequence_readonly()?;
     let active_token = &rec.token;
-    let (raw, used_key) = if let Some(ref bound_key) = active_token.oauth_client_key {
-        let client = registry.require_bound_client(bound_key)?;
+    let bound_client = match active_token.oauth_client_key.as_deref() {
+        Some(bound_key) => Some(registry.require_bound_client(bound_key)?),
+        None => None,
+    };
+    let pending_id_for_preflight = rec.id.clone();
+    repo.with_write_lock(|tx| tx.preflight_pending_auth_staging(&pending_id_for_preflight, false))?;
+
+    let (raw, used_key) = if let Some(client) = bound_client {
         refresh_raw_with_client(
             transport,
             endpoints,
@@ -1958,6 +2062,7 @@ async fn refresh_pending_record_token(
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| active_token.refresh_token.clone());
+    let was_rotated = rotated_rt != active_token.refresh_token;
     let expires_in = raw.expires_in.max(60);
     let next_token = TokenRecord {
         access_token: raw.access_token.trim().to_string(),
@@ -1985,8 +2090,9 @@ async fn refresh_pending_record_token(
         ..rec.clone()
     };
     let new_fp = updated_rec.cas_fingerprint();
-    let saved_id =
-        repo.with_write_lock(|tx| tx.save_pending_auth_cas(&updated_rec, Some(expected_prev_fp)))?;
+    let saved_id = repo
+        .with_write_lock(|tx| tx.save_pending_auth_cas(&updated_rec, Some(expected_prev_fp)))
+        .map_err(|e| wrap_unpersisted_token_exchange_error(e, was_rotated))?;
     Ok((saved_id, new_fp, next_token))
 }
 
@@ -2028,6 +2134,7 @@ pub async fn resume_pending_auth_records(
     let mut report = PendingResumeReport {
         resumed_accounts: Vec::new(),
         failures: Vec::new(),
+        unpersisted_error: None,
     };
 
     for listed in listed_records {
@@ -2336,7 +2443,17 @@ pub async fn resume_pending_auth_records(
                         .read_pending_auth_opt_readonly(&pid)
                         .is_ok_and(|opt| opt.is_none());
                 if !already_consumed {
+                    let is_recovery_err =
+                        e.exit_code == crate::error::ExitCode::PartialCommitOrRecovery;
+                    if is_recovery_err && report.unpersisted_error.is_none() {
+                        report.unpersisted_error = Some(e.clone());
+                    }
                     report.failures.push((pid, e.message));
+                    if is_recovery_err {
+                        // Stop immediately upon first unpersisted/recovery error (exit 7) so no
+                        // subsequent pending auth records issue further `/token` exchanges!
+                        break;
+                    }
                 }
             }
         }

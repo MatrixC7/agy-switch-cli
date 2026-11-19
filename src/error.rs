@@ -168,25 +168,88 @@ pub fn format_safe_json_error(context: &str, err: &serde_json::Error) -> String 
     )
 }
 
-fn is_safe_public_cli_token(token: &str) -> bool {
-    let t = token.trim();
-    if t.is_empty() || t.contains('=') {
+fn is_canonical_nd_range_token(token: &str) -> bool {
+    let Some(num_str) = token.strip_suffix('d') else {
         return false;
-    }
-    if let Some(flag_body) = t.strip_prefix("--") {
-        return !flag_body.is_empty()
-            && flag_body.len() <= 40
-            && flag_body
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    }
-    if let Some(short_body) = t.strip_prefix('-') {
-        return short_body.len() == 1 && short_body.as_bytes()[0].is_ascii_alphabetic();
-    }
+    };
+    !num_str.is_empty()
+        && num_str.len() <= 5
+        && !num_str.starts_with('0')
+        && num_str.bytes().all(|b| b.is_ascii_digit())
+        && num_str
+            .parse::<u32>()
+            .map(|n| (1..=crate::cli::args::MAX_STATS_RANGE_DAYS).contains(&n))
+            .unwrap_or(false)
+}
+
+fn is_known_cli_flag(token: &str) -> bool {
     matches!(
-        t,
+        token,
+        "--" | "-h"
+            | "--help"
+            | "-V"
+            | "--version"
+            | "--data-dir"
+            | "--proxy"
+            | "--backend"
+            | "--no-remote-version"
+            | "--json"
+            | "--resume"
+            | "--purge"
+            | "--client"
+            | "--ssh"
+            | "--port"
+            | "--open-browser"
+            | "--label"
+            | "--move"
+            | "--to"
+            | "--order"
+            | "--from-local"
+            | "--from-stdin"
+            | "--from-file"
+            | "--from-legacy"
+            | "--overwrite"
+            | "--force"
+            | "--output"
+            | "--include-secrets"
+            | "--accounts"
+            | "--reason"
+            | "--clear-active-slot"
+            | "--dry-run"
+            | "--allow-running"
+            | "--require-idle"
+            | "--account"
+            | "--all"
+            | "--refresh"
+            | "--concurrency"
+            | "--enabled"
+            | "--strategy"
+            | "--mode"
+            | "--reserve"
+            | "--minimum"
+            | "--model"
+            | "--candidates"
+            | "--all-candidates"
+            | "--clear-candidates"
+            | "--interval"
+            | "--cooldown"
+            | "--once"
+            | "--install"
+            | "--uninstall"
+            | "--source"
+            | "--range"
+            | "--date"
+            | "--from"
+            | "--recent"
+    )
+}
+
+fn is_known_cli_word(token: &str) -> bool {
+    matches!(
+        token,
         "agy-switch-cli"
-            | "doctor"
+            | "help"
+            | "status"
             | "auth"
             | "login"
             | "reauthorize"
@@ -211,40 +274,94 @@ fn is_safe_public_cli_token(token: &str) -> bool {
             | "set"
             | "eval"
             | "daemon"
+            | "stats"
+            | "summary"
             | "tui"
+            | "cli"
+            | "app"
+            | "all"
+            | "today"
+            | "yesterday"
             | "priority"
             | "round-robin"
-            | "round_robin"
             | "immediate"
             | "wait"
             | "auto"
+            | "dual"
             | "file"
-            | "secret-service"
-            | "secret_service"
+            | "keyring"
             | "true"
             | "false"
-    ) || (t.starts_with('<') && t.ends_with('>'))
+    )
+}
+
+fn is_known_cli_placeholder(token: &str) -> bool {
+    matches!(
+        token,
+        "<PATH>"
+            | "<URL>"
+            | "<BACKEND>"
+            | "<KEY>"
+            | "<PORT>"
+            | "<TEXT>"
+            | "<ID|EMAIL>"
+            | "<ID|EMAIL>..."
+            | "<POSITION>"
+            | "<FILE>"
+            | "[<LEGACY_DIR>]"
+            | "[LEGACY_DIR]"
+            | "<LEGACY_DIR>"
+            | "<AGY_ARGS>"
+            | "<AGY_ARGS>..."
+            | "[<AGY_ARGS>...]"
+            | "<MODEL>"
+            | "<SOURCE>"
+            | "<RANGE>"
+            | "<YYYY-MM-DD>"
+            | "<N>"
+            | "<INTERVAL>"
+            | "<COOLDOWN>"
+            | "<CONCURRENCY>"
+            | "<ENABLED>"
+            | "<STRATEGY>"
+            | "<MODE>"
+            | "<RESERVE>"
+            | "<MINIMUM>"
+    )
+}
+
+fn is_safe_public_cli_token(token: &str) -> bool {
+    let t = token.trim();
+    if t.is_empty() || t.contains('=') {
+        return false;
+    }
+    is_known_cli_flag(t) || is_known_cli_word(t) || is_canonical_nd_range_token(t)
 }
 
 fn is_safe_public_option_spec(spec: &str) -> bool {
-    // Matches clap option specs such as `--interval <INTERVAL>`, `-h`, `--json`, `<ID|EMAIL>`, `[FILE]`
+    // Strictly allow-lists actual clap option specs built ONLY from registered flags and placeholders
     let trimmed = spec.trim();
     if trimmed.is_empty() || trimmed.len() > 64 || trimmed.contains('=') {
         return false;
     }
     trimmed.split_whitespace().all(|part| {
-        is_safe_public_cli_token(part)
-            || (part.starts_with('<')
-                && part.ends_with('>')
-                && part[1..part.len() - 1]
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'|' | b'.')))
-            || (part.starts_with('[')
-                && part.ends_with(']')
-                && part[1..part.len() - 1]
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'|' | b'.')))
+        is_known_cli_flag(part) || is_known_cli_word(part) || is_known_cli_placeholder(part)
     })
+}
+
+fn format_safe_unknown_token(raw_token: &str) -> String {
+    let trimmed = raw_token.trim();
+    if (is_known_cli_flag(trimmed) || is_known_cli_word(trimmed))
+        && !looks_like_secret_argument(trimmed)
+    {
+        return format!("'{trimmed}'");
+    }
+    if let Some((lhs, _rhs)) = trimmed.split_once('=') {
+        if is_known_cli_flag(lhs) {
+            return format!("'{lhs}=[REDACTED]'");
+        }
+    }
+    "'[REDACTED]'".to_string()
 }
 
 fn format_safe_arg_token(raw_token: &str) -> String {
@@ -253,7 +370,7 @@ fn format_safe_arg_token(raw_token: &str) -> String {
         return format!("'{trimmed}'");
     }
     if let Some((lhs, _rhs)) = trimmed.split_once('=') {
-        if is_safe_public_cli_token(lhs) {
+        if is_known_cli_flag(lhs) {
             return format!("'{lhs}=[REDACTED]'");
         }
     }
@@ -284,7 +401,7 @@ pub fn format_safe_clap_error(raw_args: &[String], clap_err: &clap::Error) -> St
             ErrorKind::UnknownArgument | ErrorKind::TooManyValues | ErrorKind::InvalidValue
         )
     {
-        return "Plaintext token positional arguments are forbidden on `accounts add` to prevent process-table and log exposure. Use the hidden-echo TTY prompt, `--from-local`, `--stdin`, or `--token-file <PATH>`.".to_string();
+        return "Plaintext token positional arguments are forbidden on `accounts add` to prevent process-table and log exposure. Use the hidden-echo TTY prompt, `--from-local`, `--from-stdin`, or `--from-file <PATH>`.".to_string();
     }
 
     let safe_ctx_arg = |kind: ContextKind| -> Option<String> {
@@ -316,23 +433,48 @@ pub fn format_safe_clap_error(raw_args: &[String], clap_err: &clap::Error) -> St
         }
     };
 
+    let safe_unknown_ctx = |kind: ContextKind| -> Option<String> {
+        match clap_err.get(kind)? {
+            ContextValue::String(s) => Some(format_safe_unknown_token(s)),
+            ContextValue::Strings(list) => {
+                let items: Vec<String> =
+                    list.iter().map(|s| format_safe_unknown_token(s)).collect();
+                (!items.is_empty()).then(|| items.join(", "))
+            }
+            _ => None,
+        }
+    };
+
     let headline = match clap_err.kind() {
         ErrorKind::UnknownArgument => {
             let arg =
-                safe_ctx_arg(ContextKind::InvalidArg).unwrap_or_else(|| "'[REDACTED]'".into());
+                safe_unknown_ctx(ContextKind::InvalidArg).unwrap_or_else(|| "'[REDACTED]'".into());
             format!("unexpected argument {arg} found")
         }
         ErrorKind::InvalidSubcommand => {
-            let sub = safe_ctx_arg(ContextKind::InvalidSubcommand)
+            let sub = safe_unknown_ctx(ContextKind::InvalidSubcommand)
                 .unwrap_or_else(|| "'[REDACTED]'".into());
             format!("unrecognized subcommand {sub}")
         }
         ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
             let arg = safe_ctx_arg(ContextKind::InvalidArg).unwrap_or_else(|| "option".into());
-            format!(
-                "invalid value '[REDACTED]' for {arg}{}",
-                safe_valid_values()
-            )
+            let valid_hint = {
+                let vals = safe_valid_values();
+                if vals.is_empty() && arg == "'--range <RANGE>'" {
+                    format!(
+                        " (expected: today, yesterday, all, or <N>d with 1 <= N <= {})",
+                        crate::cli::args::MAX_STATS_RANGE_DAYS
+                    )
+                } else if vals.is_empty() && arg == "'--recent <N>'" {
+                    format!(
+                        " (expected integer 1..={})",
+                        crate::cli::args::MAX_STATS_RECENT_LIMIT
+                    )
+                } else {
+                    vals
+                }
+            };
+            format!("invalid value '[REDACTED]' for {arg}{valid_hint}")
         }
         ErrorKind::TooManyValues => {
             let arg = safe_ctx_arg(ContextKind::InvalidArg).unwrap_or_else(|| "option".into());
@@ -395,10 +537,10 @@ fn looks_like_secret_argument(val: &str) -> bool {
     looks_like_secret_value(trimmed)
 }
 
-pub(crate) fn looks_like_secret_value(val: &str) -> bool {
+pub(crate) fn has_explicit_secret_marker(val: &str) -> bool {
     let trimmed = val.trim();
     let lower = trimmed.to_ascii_lowercase();
-    if trimmed.starts_with("1//")
+    trimmed.starts_with("1//")
         || lower.starts_with("1%2f%2f")
         || trimmed.starts_with("4/")
         || lower.starts_with("4%2f")
@@ -406,6 +548,13 @@ pub(crate) fn looks_like_secret_value(val: &str) -> bool {
         || lower.starts_with("gocspx-")
         || trimmed.starts_with("eyJ")
         || lower.starts_with("aiza")
+        || lower.starts_with("sk-")
+        || lower.starts_with("ghp_")
+        || lower.starts_with("github_pat_")
+        || lower.starts_with("glpat-")
+        || lower.starts_with("xoxb-")
+        || lower.starts_with("xoxp-")
+        || lower.starts_with("bearer ")
         || lower.contains("code=")
         || lower.contains("refresh_token=")
         || lower.contains("access_token=")
@@ -413,12 +562,53 @@ pub(crate) fn looks_like_secret_value(val: &str) -> bool {
         || lower.contains("id_token=")
         || (trimmed.contains("://") && trimmed.contains('@'))
         || (trimmed.contains('|') && trimmed.len() >= 16)
-    {
+}
+
+pub(crate) fn looks_like_secret_value(val: &str) -> bool {
+    let trimmed = val.trim();
+    if has_explicit_secret_marker(trimmed) {
         return true;
     }
     let is_fs_path =
         trimmed.starts_with('/') || trimmed.starts_with("./") || trimmed.starts_with("../");
     trimmed.len() >= 28 && !trimmed.starts_with('-') && !is_fs_path && !trimmed.contains('@')
+}
+
+/// Detect accidental credential values (`1//...`, `4/...`, `ya29....`, `GOCSPX-...`, callback URLs,
+/// or high-entropy bare opaque tokens) passed to filesystem path options (`--from-file`, `--from-legacy`,
+/// `--output`, `--data-dir`) without falsely rejecting legitimate relative paths or new extensionless
+/// single-segment filenames such as `my-accounts-backup-2026-11-19` or `production_export_snapshot_v1`.
+pub(crate) fn path_looks_like_accidental_secret(path: &std::path::Path) -> bool {
+    let raw = path.to_string_lossy();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if has_explicit_secret_marker(trimmed) || trimmed.contains("://") {
+        return true;
+    }
+    // Only treat a non-existent single-segment bare word as an accidental opaque token if it has
+    // NO path/word separators (`/`, `\`, `.`, `-`, `_`, whitespace), is >= 28 chars of pure
+    // Base64/alphanumeric characters, AND mixes uppercase, lowercase, and digits (high-entropy token shape).
+    if trimmed.len() >= 28
+        && !trimmed.contains('/')
+        && !trimmed.contains('\\')
+        && !trimmed.contains('.')
+        && !trimmed.contains('-')
+        && !trimmed.contains('_')
+        && !trimmed.contains('@')
+        && trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'='))
+    {
+        let has_upper = trimmed.bytes().any(|b| b.is_ascii_uppercase());
+        let has_lower = trimmed.bytes().any(|b| b.is_ascii_lowercase());
+        let has_digit = trimmed.bytes().any(|b| b.is_ascii_digit());
+        if has_upper && has_lower && has_digit && std::fs::symlink_metadata(path).is_err() {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -508,6 +698,98 @@ mod tests {
                 ],
                 "LEAKED_ARGV_SECRET_99999",
             ),
+            (
+                &[
+                    "agy-switch-cli",
+                    "stats",
+                    "summary",
+                    "--source",
+                    "1//0gSTATS_SOURCE_SECRET_777",
+                ],
+                "STATS_SOURCE_SECRET_777",
+            ),
+            (
+                &[
+                    "agy-switch-cli",
+                    "stats",
+                    "summary",
+                    "--range",
+                    "1//0gSTATS_RANGE_SECRET_666",
+                ],
+                "STATS_RANGE_SECRET_666",
+            ),
+            (
+                &[
+                    "agy-switch-cli",
+                    "stats",
+                    "list",
+                    "--recent",
+                    "1//0gSTATS_RECENT_SECRET_555",
+                ],
+                "STATS_RECENT_SECRET_555",
+            ),
+            (
+                &["agy-switch-cli", "stats", "4/0ASTATS_POSITIONAL_SECRET_888"],
+                "STATS_POSITIONAL_SECRET_888",
+            ),
+            (
+                &[
+                    "agy-switch-cli",
+                    "accounts",
+                    "import",
+                    "1//0gIMPORT_POSITIONAL_SECRET_444",
+                ],
+                "IMPORT_POSITIONAL_SECRET_444",
+            ),
+            (
+                &[
+                    "agy-switch-cli",
+                    "stats",
+                    "summary",
+                    "--my-custom-secret-flag-123",
+                ],
+                "my-custom-secret-flag-123",
+            ),
+            (
+                &["agy-switch-cli", "stats", "<FAKE_PLACEHOLDER_SECRET>"],
+                "FAKE_PLACEHOLDER_SECRET",
+            ),
+            (
+                &["agy-switch-cli", "stats", "[FAKE_BRACKET_SECRET]"],
+                "FAKE_BRACKET_SECRET",
+            ),
+            (
+                &[
+                    "agy-switch-cli",
+                    "accounts",
+                    "add",
+                    "--from-stdin=1//0gSTDIN_EQ_SECRET_333",
+                ],
+                "STDIN_EQ_SECRET_333",
+            ),
+            (
+                &[
+                    "agy-switch-cli",
+                    "accounts",
+                    "import",
+                    "--from-file",
+                    "/tmp/b.json",
+                    "--overwrite=1//0gOVERWRITE_EQ_SECRET_222",
+                ],
+                "OVERWRITE_EQ_SECRET_222",
+            ),
+            (
+                &[
+                    "agy-switch-cli",
+                    "accounts",
+                    "export",
+                    "--accounts",
+                    "1//0gACCOUNTS_SECRET_111",
+                    "--unknown-flag",
+                ],
+                "ACCOUNTS_SECRET_111",
+            ),
+            (&["agy-switch-cli", "stats", "summary", "-z"], "'-z'"),
         ];
 
         for (argv, forbidden) in cases {
@@ -523,5 +805,144 @@ mod tests {
                 "format_safe_clap_error should not include leading `error:` prefix: {safe}"
             );
         }
+
+        // Verify whitelisted `stats` enum suggestions, `<N>d` range guidance, and `--recent <N>` bounds remain intact
+        let bad_src: Vec<String> = ["agy-switch-cli", "stats", "summary", "--source", "nope"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let src_err = Cli::try_parse_from(&bad_src).unwrap_err();
+        let src_msg = format_safe_clap_error(&bad_src, &src_err);
+        assert!(
+            src_msg.contains("possible values: all, cli, app"),
+            "{src_msg}"
+        );
+
+        let bad_rng: Vec<String> = ["agy-switch-cli", "stats", "summary", "--range", "nope"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let rng_err = Cli::try_parse_from(&bad_rng).unwrap_err();
+        let rng_msg = format_safe_clap_error(&bad_rng, &rng_err);
+        assert!(
+            rng_msg.contains("expected: today, yesterday, all, or <N>d with 1 <= N <= 36500"),
+            "{rng_msg}"
+        );
+
+        let bad_recent: Vec<String> = ["agy-switch-cli", "stats", "list", "--recent", "501"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let rec_err = Cli::try_parse_from(&bad_recent).unwrap_err();
+        let rec_msg = format_safe_clap_error(&bad_recent, &rec_err);
+        assert!(rec_msg.contains("expected integer 1..=500"), "{rec_msg}");
+
+        // Verify removed legacy flags/subcommands/aliases are strictly rejected
+        for removed in [
+            &["agy-switch-cli", "doctor"][..],
+            &["agy-switch-cli", "stats"],
+            &["agy-switch-cli", "quota", "-r"],
+            &["agy-switch-cli", "accounts", "add", "--stdin"],
+            &[
+                "agy-switch-cli",
+                "accounts",
+                "add",
+                "--token-file",
+                "/tmp/t",
+            ],
+            &["agy-switch-cli", "accounts", "import", "/tmp/b.json"],
+            &[
+                "agy-switch-cli",
+                "accounts",
+                "import",
+                "--from-file",
+                "/tmp/b.json",
+                "--force",
+            ],
+            &[
+                "agy-switch-cli",
+                "accounts",
+                "export",
+                "--output",
+                "/tmp/b.json",
+                "--include-secrets",
+                "--force",
+            ],
+            &[
+                "agy-switch-cli",
+                "accounts",
+                "export",
+                "--output",
+                "/tmp/b.json",
+                "--include-secrets",
+                "--ids",
+                "acc-1",
+            ],
+            &["agy-switch-cli", "run", "--isolate-dbus", "--", "agy"],
+            &["agy-switch-cli", "auth", "login", "--manual"],
+            &[
+                "agy-switch-cli",
+                "auth",
+                "reauthorize",
+                "alice@example.com",
+                "--manual",
+            ],
+            &[
+                "agy-switch-cli",
+                "policy",
+                "set",
+                "--strategy",
+                "round_robin",
+            ],
+            &["agy-switch-cli", "stats", "list", "-n", "10"],
+        ] {
+            assert!(
+                Cli::try_parse_from(removed).is_err(),
+                "Expected removed CLI syntax {removed:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_cli_allowlist_covers_all_registered_commands_and_flags() {
+        use clap::CommandFactory;
+        fn verify_cmd(cmd: &clap::Command) {
+            assert!(
+                is_known_cli_word(cmd.get_name()),
+                "Missing command '{}' in is_known_cli_word",
+                cmd.get_name()
+            );
+            for arg in cmd.get_arguments() {
+                if let Some(long) = arg.get_long() {
+                    let flag = format!("--{long}");
+                    assert!(
+                        is_known_cli_flag(&flag),
+                        "Missing long flag '{flag}' in is_known_cli_flag"
+                    );
+                }
+                if let Some(short) = arg.get_short() {
+                    let flag = format!("-{short}");
+                    assert!(
+                        is_known_cli_flag(&flag),
+                        "Missing short flag '{flag}' in is_known_cli_flag"
+                    );
+                }
+                if arg.get_action().takes_values() {
+                    if let Some(vals) = arg.get_value_names() {
+                        for vn in vals {
+                            let angle = format!("<{vn}>");
+                            assert!(
+                                is_known_cli_placeholder(&angle),
+                                "Missing placeholder '{angle}' in is_known_cli_placeholder"
+                            );
+                        }
+                    }
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                verify_cmd(sub);
+            }
+        }
+        verify_cmd(&Cli::command());
     }
 }

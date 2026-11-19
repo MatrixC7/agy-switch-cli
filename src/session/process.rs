@@ -478,7 +478,6 @@ pub fn observe_runtime_state(paths: &HeadlessPaths) -> RuntimeState {
         managed_accounts.dedup();
         return RuntimeState::UnmanagedRunning {
             pids: unmanaged_pids.into_iter().collect(),
-            identity: "unknown".into(),
             managed_account_ids: managed_accounts,
         };
     }

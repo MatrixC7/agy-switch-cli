@@ -10,7 +10,10 @@ use crate::oauth::registry::OAuthClientRegistry;
 use crate::paths::HeadlessPaths;
 use crate::quota::client::{refresh_account_quota_locked, CloudCodeEndpoints};
 use crate::session::backend::CredentialBackend;
-use crate::session::journal::{read_journal_readonly, reconcile_journal_locked};
+use crate::session::journal::{
+    journal_on_disk_may_need_keyring, read_journal_readonly, read_journal_record_readonly,
+    reconcile_journal_locked, JournalReplicaRecord,
+};
 use crate::session::payload::resolve_session_identity;
 use crate::session::process::observe_runtime_state;
 use crate::store::fs_atomic::{
@@ -108,33 +111,98 @@ pub fn save_daemon_state_in_tx(
     write_atomic_durable(&target, &bytes)
 }
 
-pub fn clear_daemon_pause_in_tx(paths: &HeadlessPaths, now_unix: i64) {
-    if let Ok(mut st) = read_daemon_state_readonly(paths) {
-        if st.paused_on_failure || st.consecutive_commit_failures > 0 {
-            st.paused_on_failure = false;
-            st.paused_reason = None;
-            st.consecutive_commit_failures = 0;
-            st.last_phase = "monitoring".into();
-            st.last_reason = Some("pause_cleared_by_user_action".into());
-            st.last_checked_at = Some(now_unix);
-            let _ = save_daemon_state_in_tx(paths, &st);
-        }
-    }
-}
-
-/// Used exclusively by `doctor --fix` under `L3`: tightens `0600` permissions, clears failure pause on valid
-/// `daemon_state.json`, or resets a corrupted regular `daemon_state.json` while leaving non-regular files (FIFO/symlink/dir) untouched!
-pub fn repair_or_clear_daemon_state_in_tx(paths: &HeadlessPaths, now_unix: i64) -> Option<String> {
-    use std::os::unix::fs::PermissionsExt;
+pub fn clear_daemon_pause_in_tx(paths: &HeadlessPaths, now_unix: i64) -> CliResult<()> {
     let ds_path = paths.daemon_state_file();
-    let Ok(meta) = std::fs::symlink_metadata(&ds_path) else {
-        return None;
+    ensure_no_symlink_components_under(&paths.data_dir, &ds_path)?;
+    let meta = match std::fs::symlink_metadata(&ds_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(crate::store::fs_atomic::map_io_error(
+                e,
+                &format!("Cannot inspect daemon state file '{}'", ds_path.display()),
+            ));
+        }
     };
     if !meta.file_type().is_file() {
-        return None;
+        return Ok(());
+    }
+    let mut st = read_daemon_state_readonly(paths)?;
+    if st.paused_on_failure || st.consecutive_commit_failures > 0 {
+        st.paused_on_failure = false;
+        st.paused_reason = None;
+        st.consecutive_commit_failures = 0;
+        st.last_phase = "monitoring".into();
+        st.last_reason = Some("pause_cleared_by_user_action".into());
+        st.last_checked_at = Some(now_unix);
+        save_daemon_state_in_tx(paths, &st)?;
+    }
+    Ok(())
+}
+
+/// Used under `L3` on manual switch / policy updates: tightens `0600` permissions, clears failure pause on valid
+/// `daemon_state.json`, or resets a corrupted regular `daemon_state.json` while leaving non-regular files (FIFO/symlink/dir) untouched.
+/// Propagates save/permission errors so callers NEVER disguise an un-cleared pause state as recovered!
+pub fn repair_or_clear_daemon_state_in_tx(
+    paths: &HeadlessPaths,
+    now_unix: i64,
+) -> CliResult<Option<String>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let ds_path = paths.daemon_state_file();
+    ensure_no_symlink_components_under(&paths.data_dir, &ds_path)?;
+    let meta = match std::fs::symlink_metadata(&ds_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(crate::store::fs_atomic::map_io_error(
+                e,
+                &format!("Cannot inspect daemon state file '{}'", ds_path.display()),
+            ));
+        }
+    };
+    if !meta.file_type().is_file() {
+        return Ok(None);
     }
     if (meta.permissions().mode() & 0o077) != 0 {
-        let _ = std::fs::set_permissions(&ds_path, std::fs::Permissions::from_mode(0o600));
+        let c_path = std::ffi::CString::new(ds_path.as_os_str().as_bytes())
+            .map_err(|_| CliError::data("Daemon state file path contains NUL byte."))?;
+        let raw_fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if raw_fd < 0 {
+            return Err(crate::store::fs_atomic::map_io_error(
+                std::io::Error::last_os_error(),
+                &format!(
+                    "Failed to open daemon state file '{}' to tighten permissions",
+                    ds_path.display()
+                ),
+            ));
+        }
+        let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(owned_fd.as_raw_fd(), &mut st) } != 0 {
+            return Err(crate::store::fs_atomic::map_io_error(
+                std::io::Error::last_os_error(),
+                &format!("Failed to stat daemon state file '{}'", ds_path.display()),
+            ));
+        }
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Ok(None);
+        }
+        if unsafe { libc::fchmod(owned_fd.as_raw_fd(), 0o600) } != 0 {
+            return Err(crate::store::fs_atomic::map_io_error(
+                std::io::Error::last_os_error(),
+                &format!(
+                    "Failed to tighten permissions on daemon state file '{}'",
+                    ds_path.display()
+                ),
+            ));
+        }
     }
     match read_daemon_state_readonly(paths) {
         Ok(mut st) => {
@@ -145,21 +213,20 @@ pub fn repair_or_clear_daemon_state_in_tx(paths: &HeadlessPaths, now_unix: i64) 
                 st.last_phase = "monitoring".into();
                 st.last_reason = Some("pause_cleared_by_user_action".into());
                 st.last_checked_at = Some(now_unix);
-                let _ = save_daemon_state_in_tx(paths, &st);
-                return Some("Cleared daemon failure pause in daemon_state.json.".into());
+                save_daemon_state_in_tx(paths, &st)?;
+                return Ok(Some(
+                    "Cleared daemon failure pause in daemon_state.json.".into(),
+                ));
             }
-            None
+            Ok(None)
         }
         Err(_) => {
             let reset = DaemonPersistentState {
                 last_checked_at: Some(now_unix),
                 ..DaemonPersistentState::default()
             };
-            if save_daemon_state_in_tx(paths, &reset).is_ok() {
-                Some("Reset corrupted daemon_state.json.".into())
-            } else {
-                None
-            }
+            save_daemon_state_in_tx(paths, &reset)?;
+            Ok(Some("Reset corrupted daemon_state.json.".into()))
         }
     }
 }
@@ -233,7 +300,7 @@ pub fn resolve_effective_daemon_policy(
     if let Some(raw_strat) = non_empty_env("AGY_SWITCH_CLI_STRATEGY") {
         policy.strategy = match raw_strat.to_ascii_lowercase().as_str() {
             "priority" => PolicyStrategy::Priority,
-            "round-robin" | "round_robin" => PolicyStrategy::RoundRobin,
+            "round-robin" => PolicyStrategy::RoundRobin,
             _ => {
                 return Err(CliError::usage(
                     "Invalid AGY_SWITCH_CLI_STRATEGY value (expected `priority` or `round-robin`).",
@@ -415,11 +482,15 @@ impl DaemonEngine {
         // Reconcile any leftover `switch_journal.json` before reading `index.json` (Blueprint §3.3 & §7.2 Rule 6):
         // - `CommittedIndexPending` / `AbortedUncommitted` auto-reconcile cleanly;
         // - `RecoveryIncomplete` (or corrupted journal) transitions daemon into persistent `PausedOnFailure`!
-        match read_journal_readonly(paths) {
+        match read_journal_record_readonly(paths) {
             Ok(None) => {}
-            Ok(Some(_)) => {
+            Ok(Some((_, meta_opt))) => {
                 let tick_now = active_clock.now_unix();
-                let slot_lock = match ActiveSlotLock::try_acquire(paths, backend.uses_keyring()) {
+                let needs_kr = backend.uses_keyring()
+                    || meta_opt
+                        .as_ref()
+                        .is_none_or(JournalReplicaRecord::needs_keyring);
+                let mut slot_lock = match ActiveSlotLock::try_acquire(paths, needs_kr) {
                     Ok(l) => l,
                     Err(e) if e.exit_code == ExitCode::LockBusyOrConflict => {
                         self.persist_status(
@@ -435,6 +506,25 @@ impl DaemonEngine {
                     }
                     Err(e) => return Err(e),
                 };
+                if !slot_lock.includes_keyring_scope() && journal_on_disk_may_need_keyring(paths) {
+                    drop(slot_lock);
+                    slot_lock = match ActiveSlotLock::try_acquire(paths, true) {
+                        Ok(l) => l,
+                        Err(e) if e.exit_code == ExitCode::LockBusyOrConflict => {
+                            self.persist_status(
+                                repo,
+                                &mut pstate,
+                                "lock_busy",
+                                Some("slot_lock_busy"),
+                                tick_now,
+                            )?;
+                            return Ok(TickStageOutcome::UncertainHold {
+                                reason: "slot_lock_busy".into(),
+                            });
+                        }
+                        Err(e) => return Err(e),
+                    };
+                }
                 let rec_res = reconcile_journal_locked(&slot_lock, repo, backend, false, tick_now);
                 drop(slot_lock);
                 if let Err(err) = rec_res {
@@ -816,22 +906,43 @@ impl DaemonEngine {
         }
 
         // ================= STAGE 5: REVALIDATE (HOLDING L1 LOCK!) =================
-        let slot_lock = match ActiveSlotLock::try_acquire(paths, backend.uses_keyring()) {
-            Ok(l) => l,
-            Err(e) if e.exit_code == ExitCode::LockBusyOrConflict => {
-                self.persist_status(
-                    repo,
-                    &mut pstate,
-                    "lock_busy",
-                    Some("slot_lock_busy"),
-                    active_clock.now_unix(),
-                )?;
-                return Ok(TickStageOutcome::UncertainHold {
-                    reason: "slot_lock_busy".into(),
-                });
-            }
-            Err(e) => return Err(e),
-        };
+        let existing_needs_kr = journal_on_disk_may_need_keyring(paths);
+        let mut slot_lock =
+            match ActiveSlotLock::try_acquire(paths, backend.uses_keyring() || existing_needs_kr) {
+                Ok(l) => l,
+                Err(e) if e.exit_code == ExitCode::LockBusyOrConflict => {
+                    self.persist_status(
+                        repo,
+                        &mut pstate,
+                        "lock_busy",
+                        Some("slot_lock_busy"),
+                        active_clock.now_unix(),
+                    )?;
+                    return Ok(TickStageOutcome::UncertainHold {
+                        reason: "slot_lock_busy".into(),
+                    });
+                }
+                Err(e) => return Err(e),
+            };
+        if !slot_lock.includes_keyring_scope() && journal_on_disk_may_need_keyring(paths) {
+            drop(slot_lock);
+            slot_lock = match ActiveSlotLock::try_acquire(paths, true) {
+                Ok(l) => l,
+                Err(e) if e.exit_code == ExitCode::LockBusyOrConflict => {
+                    self.persist_status(
+                        repo,
+                        &mut pstate,
+                        "lock_busy",
+                        Some("slot_lock_busy"),
+                        active_clock.now_unix(),
+                    )?;
+                    return Ok(TickStageOutcome::UncertainHold {
+                        reason: "slot_lock_busy".into(),
+                    });
+                }
+                Err(e) => return Err(e),
+            };
+        }
 
         // Capture real commit-moment timestamp INSIDE `L1 ActiveSlotLock`!
         let commit_now = active_clock.now_unix();
@@ -914,6 +1025,7 @@ impl DaemonEngine {
             user_agent,
             &plan.target_account_id,
             guard_mode,
+            false,
             commit_now,
         )
         .await;
