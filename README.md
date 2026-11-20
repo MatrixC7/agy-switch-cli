@@ -25,18 +25,46 @@
 前往 Releases 页面按 CPU 架构（`x86_64` 或 `aarch64`，可通过 `uname -m` 查看）下载对应的 `.tar.gz` 压缩包，无论在远程 SSH 服务器、Docker 容器、WSL2 还是开启了 GNOME Keyring / KDE Wallet 的 Linux 图形桌面上均可直接使用：
 
 ```bash
-sha256sum -c agy-switch-cli-v1.2.0-x86_64-unknown-linux-musl.tar.gz.sha256
-tar -xzf agy-switch-cli-v1.2.0-x86_64-unknown-linux-musl.tar.gz
+sha256sum -c agy-switch-cli-v1.2.1-x86_64-unknown-linux-musl.tar.gz.sha256
+tar -xzf agy-switch-cli-v1.2.1-x86_64-unknown-linux-musl.tar.gz
 mkdir -p ~/.local/bin
-install -m 0755 agy-switch-cli-v1.2.0-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
+install -m 0755 agy-switch-cli-v1.2.1-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
 ```
 
-### 方式二：从源码编译（要求 Linux + `rustc >= 1.89`）
+### 方式二：Arch Linux / EndeavourOS 等 Arch 系发行版（AUR）
+
+已发布 AUR 二进制包 `agy-switch-cli-bin`（直接复用本仓库 Releases 中的纯静态全功能预编译包，安装至 `/usr/bin/agy-switch-cli`，可随系统更新一并升级）：
+
+```bash
+yay -S agy-switch-cli-bin
+# 或使用 paru：
+# paru -S agy-switch-cli-bin
+```
+
+### 方式三：从源码编译（要求 Linux + `rustc >= 1.89`）
 
 ```bash
 cargo build --release --locked
 install -m 0755 target/release/agy-switch-cli ~/.local/bin/agy-switch-cli
 ```
+
+### 卸载与本地残留清理
+
+如需卸载本工具，建议按“停服务 → 删程序 → 清理自有数据目录”三步操作：
+
+```bash
+# 1. 如曾安装后台定时服务，先停用并移除 systemd user unit
+agy-switch-cli daemon --uninstall
+
+# 2. 按安装方式卸载可执行文件（二选一）
+yay -Rns agy-switch-cli-bin          # AUR 安装（或使用 paru / pacman -Rns）
+# rm -f ~/.local/bin/agy-switch-cli   # 手动解压或源码编译安装
+
+# 3. 按需清理本工具自有的本地数据、锁与缓存目录（不会影响官方 ~/.gemini 目录）
+rm -rf ~/.local/share/agy-switch-cli ~/.cache/agy-switch-cli ~/.local/state/agy-switch-cli
+```
+
+完整目录清单、系统钥匙串及避免误删官方 `~/.gemini` 凭据的详细说明见[完整使用手册第 1.5 节](docs/user-guide.md#15-完整卸载与本地遗留文件清理清单)。
 
 ---
 
@@ -77,20 +105,20 @@ agy-switch-cli tui
 | `agy-switch-cli current`                               | 查看当前生效身份、运行中进程状态及该账号支持的全部模型清单                         |
 | `agy-switch-cli quota [--refresh] [--all]`             | 查看双窗口（`Weekly` + `5h`）配额进度表（加 `--refresh` 先流式联网刷新再展示）     |
 | `agy-switch-cli refresh [--all]`                       | 批量流式联网刷新账号 OAuth 令牌与远端配额（终端实时输出 `[k/N]` 进度）             |
-| `agy-switch-cli stats summary / list`                  | 纯本地只读聚合模型 Token 用量与 `TTFT`/`TPS` 分位统计（`summary`），或列出最近请求明细（`list`），共享 `--source` 与 `--range` / `--date` / `--from` / `--recent` |
+| `agy-switch-cli stats summary / list [--watch]`        | 纯本地只读聚合模型 Token 用量与 `TTFT`/`TPS` 分位统计（`summary`），或列出最近请求明细（`list`），支持 `--watch [秒数]` 实时看板刷新（默认 `2` 秒，按 `Tab` 切换视图） |
 | `agy-switch-cli switch <ID\|EMAIL>`                   | 手动切换生效账号（默认 `auto` 自动适配无头 `file` 与桌面钥匙串 `dual` 双写；写入前自动安全对账未完成切换日志） |
 | `agy-switch-cli policy set --all-candidates ...`       | 配置自动切号水位策略（默认 `reserve = 5%`、`minimum = 15%`，配合 `daemon` 后台自动巡检切号） |
-| `agy-switch-cli daemon [--install \| --uninstall]`     | 运行前台静默自动切号守护进程，或一键安装/卸载 `systemd --user` 后台自启服务        |
+| `agy-switch-cli daemon [--install \| --uninstall]`     | 运行后台自动切号守护进程（桌面可自动推送切号/熔断通知，支持 `--no-notify` 关闭，无头环境自动静默），或安装/卸载 `systemd --user` 服务 |
 | `agy-switch-cli [--backend file] run [--account ...] -- agy ...` | 可选方式：按指定账号或指定后端包装启动 `agy`；显式启用 `file` 后端时自动为子进程屏蔽桌面 D-Bus 钥匙串 |
 | `agy-switch-cli tui`                                   | 打开 SSH 交互式终端看板（支持 `↑/↓` 选行与内嵌 `...` 滚动提示、`g/G` 首末行、`[/]` 调序、`r/R` 刷新、`c/C/p` 策略、`e/E` 与 `d/D` 单条/全局启停、`x`+`y` 删号） |
 
-*(关于 `--json` 机器输出与 `0..=8` 稳定退出码的边界说明：全屏交互看板 `tui` 与 `--json` 互斥并返回退出码 `2`；包装器 `run` 在前置准备失败时向 `stderr` 输出错误信封，就绪后直接继承子进程标准输入输出并透传其退出码；`daemon --install --json` 与 `daemon --uninstall --json` 向 `stdout` 输出标准 `schema_version: 1` JSON 信封，而前台静默守护进程 `daemon` / `daemon --once` 不按轮向 `stdout` 打印 JSON 行［空闲或正常退出时返回 `0`，仅在启动、策略、锁或运行期出错时向 `stderr` 输出错误信封］；其余子命令均输出标准 `schema_version: 1` JSON 信封。)*
+*(关于 `--json` 机器输出与 `0..=8` 稳定退出码的边界说明：全屏交互看板 `tui` 与实时刷新模式 `stats ... --watch` 均与 `--json` 互斥并返回退出码 `2`；包装器 `run` 在前置准备失败时向 `stderr` 输出错误信封，就绪后直接继承子进程标准输入输出并透传其退出码；`daemon --install --json` 与 `daemon --uninstall --json` 向 `stdout` 输出标准 `schema_version: 1` JSON 信封，而前台静默守护进程 `daemon` / `daemon --once` 不按轮向 `stdout` 打印 JSON 行［空闲或正常退出时返回 `0`，仅在启动、策略、锁或运行期出错时向 `stderr` 输出错误信封］；其余子命令均输出标准 `schema_version: 1` JSON 信封。)*
 
 ---
 
 ## 详细文档导航
 
-- **[完整使用、配置与部署手册 (`docs/user-guide.md`)](docs/user-guide.md)**：安装指南、四种凭据后端（`auto`/`dual`/`file`/`keyring`）、全量命令与退出码参考、`config.json` 代理与自定义 OAuth 客户端配置、`daemon --install` 与容器常驻方案及常见故障排查。
+- **[完整使用、配置与部署手册 (`docs/user-guide.md`)](docs/user-guide.md)**：安装与卸载清理指南、四种凭据后端（`auto`/`dual`/`file`/`keyring`）、全量命令与退出码参考、`config.json` 代理与自定义 OAuth 客户端配置、`daemon --install` 与容器常驻方案及常见故障排查。
 - **[技术架构、安全机制与验收台账 (`docs/architecture-and-verification.md`)](docs/architecture-and-verification.md)**：目录拓扑、四级单向锁与授权世代防回退设计、跨架构 Release 体积/性能矩阵及诚实验收边界说明。
 - **[重构溯源与第三方合规声明 (`PROVENANCE.md`)](PROVENANCE.md)** ＆ **[许可证全文 (`LICENSE`)](LICENSE)**。
 
@@ -100,6 +128,6 @@ agy-switch-cli tui
 
 - **上游项目致谢**：感谢 [`anglee0323/agy-switch`](https://github.com/anglee0323/agy-switch) 及其贡献者提供的原始领域探索与桌面端参考实现。
 - **AI 协同研发与独立安全审查致谢**：
-  - **Gemini 4 Carbon**：负责本项目的独立无头架构重构、四级锁与防回退核心代码实现、全套自动化测试矩阵、跨架构纯静态构建及全中文工程文档编写；
-  - **GPT 6.1 Sol**：担任独立第三方首席发版签核审计师，对本项目执行了四轮零信任源码深审、并发交错与故障注入探针验证及合规放行签核；
+  - **Gemini 4 Carbon/Neon**：负责本项目的独立无头架构重构、四级锁与防回退核心代码实现、全套自动化测试矩阵、跨架构纯静态构建及全中文工程文档编写；
+  - **GPT 6.1 Sol/6.2 Sol**：担任独立第三方首席发版签核审计师，对本项目执行了四轮零信任源码深审、并发交错与故障注入探针验证及合规放行签核；
   - 由项目维护者提供需求定义、构建验证环境与全流程统筹把关。

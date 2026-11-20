@@ -1684,18 +1684,15 @@ fn build_dashboard_frame_with_backend(
     let show_id_col = cols >= 152;
     let compact_cols = cols < 116;
 
-    let policy_header = if policy.enabled {
-        format!(
-            "ON (reserve {}% / min {}%, {:?}, {:?}, model={})",
-            policy.reserve_percentage,
-            policy.candidate_min_percentage,
-            policy.mode,
-            policy.strategy,
-            terminal_text(&policy.monitored_model)
-        )
-    } else {
-        format!("off ({} candidates)", policy.candidate_account_ids.len())
-    };
+    let state_tag = if policy.enabled { "ON" } else { "off" };
+    let policy_header = format!(
+        "{state_tag} (reserve {}% / min {}%, {:?}, {:?}, model={})",
+        policy.reserve_percentage,
+        policy.candidate_min_percentage,
+        policy.mode,
+        policy.strategy,
+        terminal_text(&policy.monitored_model)
+    );
     let sess_label = format!("Session [{clean_backend_tag}]");
     let label_w = sess_label.len();
     let compact_session_line = truncate_to_cols(
@@ -3387,6 +3384,36 @@ mod tests {
             assert_eq!(colon_1, colon_2);
             assert_eq!(colon_2, colon_3);
         }
+
+        // 2b. Disabled policy (`policy.enabled = false`) preserves full thresholds/strategy/model with `off` prefix
+        let disabled_policy = SwitchPolicy {
+            enabled: false,
+            ..policy.clone()
+        };
+        let mut off_disabled = 0usize;
+        let disabled_frame = build_dashboard_frame_with_backend(
+            std::slice::from_ref(&acc),
+            Some(&acc.id),
+            &disabled_policy,
+            &sess,
+            &runtime,
+            "file",
+            0,
+            &mut off_disabled,
+            None,
+            120,
+            20,
+        );
+        let disabled_lines: Vec<&str> = disabled_frame.split("\r\n").collect();
+        assert!(
+            disabled_lines[3].starts_with("Policy")
+                && disabled_lines[3]
+                    .contains(": off (reserve 15% / min 35%, Immediate, RoundRobin, model=all)"),
+            "Unexpected disabled Policy line: {}",
+            disabled_lines[3]
+        );
+        assert_eq!(disabled_lines[1].find(" : "), disabled_lines[3].find(" : "));
+        assert!(display_width(disabled_lines[3]) <= 120);
 
         // 3. Short height (`rows = 8 < 11`): collapses gracefully onto 1 line while preserving `[dual]` tag!
         let mut off_short = 0usize;

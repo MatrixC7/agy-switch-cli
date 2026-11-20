@@ -28,11 +28,12 @@ pub const SELF_EXE_OVERRIDE_ENV: &str = "AGY_SWITCH_CLI_SELF_EXE";
 const SYSTEMCTL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const SYSTEMCTL_ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DaemonServiceInstallOptions {
     pub explicit_interval_secs: Option<u64>,
     pub explicit_cooldown_secs: Option<i64>,
     pub explicit_backend: Option<BackendChoice>,
+    pub explicit_no_notify: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -233,7 +234,7 @@ fn path_resides_in_system_tmp(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Render the hardened `agy-switch-cli.service` user unit file matching `deploy/agy-switch-cli.service`.
+/// Render the hardened `agy-switch-cli.service` user unit file with dynamically resolved paths and sandbox directives.
 pub fn render_systemd_user_unit(
     paths: &HeadlessPaths,
     exe_path: &Path,
@@ -274,6 +275,9 @@ pub fn render_systemd_user_unit(
     if let Some(cd) = opts.explicit_cooldown_secs {
         exec_tokens.push("--cooldown".to_string());
         exec_tokens.push(cd.to_string());
+    }
+    if opts.explicit_no_notify {
+        exec_tokens.push("--no-notify".to_string());
     }
     let exec_start_line = exec_tokens.join(" ");
 
@@ -1104,6 +1108,7 @@ mod tests {
                 explicit_interval_secs: Some(7200),
                 explicit_cooldown_secs: Some(1800),
                 explicit_backend: Some(BackendChoice::Auto),
+                explicit_no_notify: true,
             },
         )
         .unwrap();
@@ -1112,7 +1117,7 @@ mod tests {
         // while `%` specifiers ARE expanded (`%%` -> `%`), and `argv[1..]` DOES expand `$` (`$$` -> `$`).
         assert_eq!(
             exec_line,
-            "\"/home/alice/bin dir/agy$switch%%cli\" --backend auto daemon --interval 7200 --cooldown 1800"
+            "\"/home/alice/bin dir/agy$switch%%cli\" --backend auto daemon --interval 7200 --cooldown 1800 --no-notify"
         );
         assert_eq!(
             systemd_quote_exec_arg("arg$with%spec", "arg").unwrap(),
@@ -1162,6 +1167,7 @@ mod tests {
                     explicit_interval_secs: Some(7200),
                     explicit_cooldown_secs: Some(1800),
                     explicit_backend: Some(BackendChoice::File),
+                    explicit_no_notify: false,
                 },
             )
             .unwrap();
@@ -1199,11 +1205,7 @@ mod tests {
         assert!(render_systemd_user_unit(
             &bad_paths,
             Path::new("/usr/local/bin/agy-switch-cli"),
-            &DaemonServiceInstallOptions {
-                explicit_interval_secs: None,
-                explicit_cooldown_secs: None,
-                explicit_backend: None,
-            }
+            &DaemonServiceInstallOptions::default()
         )
         .is_err());
     }

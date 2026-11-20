@@ -1124,6 +1124,113 @@ impl SecretServiceSessionBackend {
 }
 
 #[cfg(feature = "secret-service-backend")]
+pub(crate) fn discover_verified_dbus_endpoint() -> Option<VerifiedDbusEndpoint> {
+    for cand in extract_candidate_dbus_socket_paths() {
+        if let Some((_, _, _, ep)) = verify_and_pin_socket_endpoint(&cand) {
+            return Some(ep);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "secret-service-backend")]
+pub(crate) async fn connect_verified_session_dbus(
+    ep: &VerifiedDbusEndpoint,
+    method_timeout: Duration,
+) -> CliResult<zbus::Connection> {
+    let (pre_parent_fd, sock_opath_fd, c_leaf, live_pre) =
+        verify_and_pin_socket_endpoint(&ep.path).ok_or_else(|| {
+            CliError::env_not_ready(
+                "secret_service_unavailable",
+                "Linux Secret Service D-Bus session socket is unavailable or failed local socket verification.",
+            )
+        })?;
+    if live_pre != *ep {
+        return Err(CliError::env_not_ready(
+            "secret_service_unavailable",
+            "Linux Secret Service D-Bus session socket or parent directory changed since initialization.",
+        ));
+    }
+
+    // Connect STRICTLY through `/proc/self/fd/<sock_opath_fd>` (pinned via `O_PATH | O_NOFOLLOW`
+    // to the exact verified socket inode!) so neither ancestor directories NOR leaf names are
+    // re-resolved by string path, and NEVER fall back to raw string `ep.path`!
+    if !Path::new("/proc/self/fd").is_dir() {
+        return Err(CliError::env_not_ready(
+            "secret_service_unavailable",
+            "Cannot bind D-Bus socket connection to verified inode without `/proc/self/fd`.",
+        ));
+    }
+    let proc_sock_path = PathBuf::from(format!("/proc/self/fd/{}", sock_opath_fd.as_raw_fd()));
+    let stream = tokio::net::UnixStream::connect(&proc_sock_path)
+        .await
+        .map_err(|_| {
+            CliError::env_not_ready(
+                "secret_service_unavailable",
+                "Linux Secret Service D-Bus session socket connection failed.",
+            )
+        })?;
+
+    let mut post_st: libc::stat = unsafe { std::mem::zeroed() };
+    let post_rc = unsafe {
+        libc::fstatat(
+            pre_parent_fd.as_raw_fd(),
+            c_leaf.as_ptr(),
+            &mut post_st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    #[allow(clippy::unnecessary_cast)]
+    let same_in_pinned_parent = post_rc == 0
+        && (post_st.st_mode & libc::S_IFMT) == libc::S_IFSOCK
+        && (post_st.st_dev as u64) == ep.sock_dev
+        && (post_st.st_ino as u64) == ep.sock_ino;
+    if !same_in_pinned_parent {
+        return Err(CliError::env_not_ready(
+            "secret_service_unavailable",
+            "Linux Secret Service D-Bus session socket changed during connection.",
+        ));
+    }
+
+    // Re-walk from `/` down to `ep.path` AFTER `connect` to prove full path/parent/socket stability!
+    let Some((_, _, _, live_post)) = verify_and_pin_socket_endpoint(&ep.path) else {
+        return Err(CliError::env_not_ready(
+            "secret_service_unavailable",
+            "Linux Secret Service D-Bus session socket path failed post-connect verification.",
+        ));
+    };
+    if live_post != *ep {
+        return Err(CliError::env_not_ready(
+            "secret_service_unavailable",
+            "Linux Secret Service D-Bus session socket or parent directory changed during connection.",
+        ));
+    }
+
+    let peer_cred = stream.peer_cred().map_err(|_| {
+        CliError::env_not_ready(
+            "secret_service_unavailable",
+            "Linux Secret Service D-Bus session socket peer credential verification failed.",
+        )
+    })?;
+    if peer_cred.uid() != unsafe { libc::geteuid() } {
+        return Err(CliError::env_not_ready(
+            "secret_service_unavailable",
+            "Linux Secret Service D-Bus session socket is owned by a different user UID.",
+        ));
+    }
+    zbus::connection::Builder::unix_stream(stream)
+        .method_timeout(method_timeout)
+        .build()
+        .await
+        .map_err(|_| {
+            CliError::env_not_ready(
+                "secret_service_unavailable",
+                "Linux Secret Service D-Bus handshake failed.",
+            )
+        })
+}
+
+#[cfg(feature = "secret-service-backend")]
 mod keyring_impl {
     use super::*;
     use secret_service::{Collection, EncryptionType, SecretService};
@@ -1260,97 +1367,7 @@ mod keyring_impl {
                 "Linux Secret Service D-Bus session socket is unavailable or not a verified local Unix socket.",
             )
         })?;
-
-        let (pre_parent_fd, sock_opath_fd, c_leaf, live_pre) =
-            verify_and_pin_socket_endpoint(&ep.path).ok_or_else(|| {
-                CliError::env_not_ready(
-                    "secret_service_unavailable",
-                    "Linux Secret Service D-Bus session socket is unavailable or failed local socket verification.",
-                )
-            })?;
-        if live_pre != *ep {
-            return Err(CliError::env_not_ready(
-                "secret_service_unavailable",
-                "Linux Secret Service D-Bus session socket or parent directory changed since initialization.",
-            ));
-        }
-
-        // Connect STRICTLY through `/proc/self/fd/<sock_opath_fd>` (pinned via `O_PATH | O_NOFOLLOW`
-        // to the exact verified socket inode!) so neither ancestor directories NOR leaf names are
-        // re-resolved by string path, and NEVER fall back to raw string `ep.path`!
-        if !Path::new("/proc/self/fd").is_dir() {
-            return Err(CliError::env_not_ready(
-                "secret_service_unavailable",
-                "Cannot bind D-Bus socket connection to verified inode without `/proc/self/fd`.",
-            ));
-        }
-        let proc_sock_path = PathBuf::from(format!("/proc/self/fd/{}", sock_opath_fd.as_raw_fd()));
-        let stream = tokio::net::UnixStream::connect(&proc_sock_path)
-            .await
-            .map_err(|_| {
-                CliError::env_not_ready(
-                    "secret_service_unavailable",
-                    "Linux Secret Service D-Bus session socket connection failed.",
-                )
-            })?;
-
-        let mut post_st: libc::stat = unsafe { std::mem::zeroed() };
-        let post_rc = unsafe {
-            libc::fstatat(
-                pre_parent_fd.as_raw_fd(),
-                c_leaf.as_ptr(),
-                &mut post_st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        #[allow(clippy::unnecessary_cast)]
-        let same_in_pinned_parent = post_rc == 0
-            && (post_st.st_mode & libc::S_IFMT) == libc::S_IFSOCK
-            && (post_st.st_dev as u64) == ep.sock_dev
-            && (post_st.st_ino as u64) == ep.sock_ino;
-        if !same_in_pinned_parent {
-            return Err(CliError::env_not_ready(
-                "secret_service_unavailable",
-                "Linux Secret Service D-Bus session socket changed during connection.",
-            ));
-        }
-
-        // Re-walk from `/` down to `ep.path` AFTER `connect` to prove full path/parent/socket stability!
-        let Some((_, _, _, live_post)) = verify_and_pin_socket_endpoint(&ep.path) else {
-            return Err(CliError::env_not_ready(
-                "secret_service_unavailable",
-                "Linux Secret Service D-Bus session socket path failed post-connect verification.",
-            ));
-        };
-        if live_post != *ep {
-            return Err(CliError::env_not_ready(
-                "secret_service_unavailable",
-                "Linux Secret Service D-Bus session socket or parent directory changed during connection.",
-            ));
-        }
-
-        let peer_cred = stream.peer_cred().map_err(|_| {
-            CliError::env_not_ready(
-                "secret_service_unavailable",
-                "Linux Secret Service D-Bus session socket peer credential verification failed.",
-            )
-        })?;
-        if peer_cred.uid() != unsafe { libc::geteuid() } {
-            return Err(CliError::env_not_ready(
-                "secret_service_unavailable",
-                "Linux Secret Service D-Bus session socket is owned by a different user UID.",
-            ));
-        }
-        let conn = zbus::connection::Builder::unix_stream(stream)
-            .method_timeout(method_timeout)
-            .build()
-            .await
-            .map_err(|_| {
-                CliError::env_not_ready(
-                    "secret_service_unavailable",
-                    "Linux Secret Service D-Bus handshake failed.",
-                )
-            })?;
+        let conn = super::connect_verified_session_dbus(ep, method_timeout).await?;
         SecretService::connect_with_existing(EncryptionType::Dh, conn)
             .await
             .map_err(describe_ss_err)

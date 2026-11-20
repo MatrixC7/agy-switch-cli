@@ -1,7 +1,9 @@
 use crate::domain::account::{RuntimeState, SessionIdentity, STORE_SCHEMA_VERSION};
 use crate::domain::clock::{AnchoredClock, Clock, SystemClock};
 use crate::domain::policy::{PolicyMode, PolicyStrategy, SwitchPolicy};
-use crate::domain::quota::{evaluate_account_quota, QuotaEval, DEFAULT_QUOTA_MAX_AGE_SECS};
+use crate::domain::quota::{
+    evaluate_account_quota, evaluate_account_window_quotas, QuotaEval, DEFAULT_QUOTA_MAX_AGE_SECS,
+};
 use crate::error::{format_safe_json_error, CliError, CliResult, ExitCode};
 use crate::oauth::refresh::{
     ensure_account_token_fresh_locked, OAuthEndpoints, TOKEN_REFRESH_SKEW_SECONDS,
@@ -23,6 +25,9 @@ use crate::store::fs_atomic::{
 use crate::store::locks::{ActiveSlotLock, DaemonInstanceLock};
 use crate::store::repository::StoreRepository;
 use crate::switching::executor::{execute_switch_with_slot_lock_and_guard, RunningGuardMode};
+use crate::switching::notify::{
+    resolve_effective_notify_enabled, send_daemon_notification_best_effort, DaemonNotificationEvent,
+};
 use crate::switching::runner::ordered_candidate_ids;
 use crate::transport::client::{BoxFuture, HttpTransport};
 use rand::Rng;
@@ -260,6 +265,7 @@ pub struct DaemonConfigOverrides {
     pub cooldown_secs: i64,
     pub tick_timeout: Duration,
     pub once: bool,
+    pub notify_override: Option<bool>,
     pub policy_overlay: DaemonPolicyOverlay,
 }
 
@@ -270,9 +276,61 @@ impl Default for DaemonConfigOverrides {
             cooldown_secs: DEFAULT_DAEMON_COOLDOWN_SECS,
             tick_timeout: DEFAULT_TICK_HARD_TIMEOUT,
             once: false,
+            notify_override: None,
             policy_overlay: DaemonPolicyOverlay::default(),
         }
     }
+}
+
+fn resolve_account_notify_label(
+    snap: Option<&crate::store::repository::StoreSnapshot>,
+    id: &str,
+) -> String {
+    snap.and_then(|s| s.accounts.iter().find(|a| a.id == id))
+        .map(format_account_notify_label)
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn format_account_notify_label(acc: &crate::domain::account::AccountRecord) -> String {
+    if let Some(ref lbl) = acc.custom_label {
+        let clean = crate::cli::dto::terminal_text(lbl)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !clean.is_empty() {
+            return format!("{} ({clean})", acc.email);
+        }
+    }
+    acc.email.clone()
+}
+
+async fn notify_paused_on_failure(
+    repo: &StoreRepository,
+    notify_override: Option<bool>,
+    stage: &str,
+    target_account_id: Option<&str>,
+    pstate: &DaemonPersistentState,
+    reason: &str,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) {
+    if *shutdown_rx.borrow() || !resolve_effective_notify_enabled(repo, false, notify_override) {
+        return;
+    }
+    let target_account = target_account_id.map(|id| {
+        let snap = repo.read_snapshot().ok();
+        resolve_account_notify_label(snap.as_ref(), id)
+    });
+    send_daemon_notification_best_effort(
+        &DaemonNotificationEvent::PausedOnFailure {
+            stage: stage.to_string(),
+            target_account,
+            consecutive_failures: pstate.consecutive_commit_failures,
+            max_failures: MAX_CONSECUTIVE_COMMIT_FAILURES,
+            reason: reason.to_string(),
+        },
+        shutdown_rx,
+    )
+    .await;
 }
 
 /// Resolve effective daemon policy strictly following Blueprint §7.3 priority:
@@ -543,6 +601,16 @@ impl DaemonEngine {
                             Some(&reason),
                             active_clock.now_unix(),
                         )?;
+                        notify_paused_on_failure(
+                            repo,
+                            overrides.notify_override,
+                            "Journal recovery",
+                            None,
+                            &pstate,
+                            &err.message,
+                            shutdown_rx,
+                        )
+                        .await;
                         return Ok(TickStageOutcome::PausedOnFailure { reason });
                     }
                     return Err(err);
@@ -565,6 +633,16 @@ impl DaemonEngine {
                     Some(&reason),
                     active_clock.now_unix(),
                 )?;
+                notify_paused_on_failure(
+                    repo,
+                    overrides.notify_override,
+                    "Journal check",
+                    None,
+                    &pstate,
+                    &corrupt_err.message,
+                    shutdown_rx,
+                )
+                .await;
                 return Ok(TickStageOutcome::PausedOnFailure { reason });
             }
         }
@@ -968,6 +1046,21 @@ impl DaemonEngine {
                     Some(&reason),
                     commit_now,
                 )?;
+                let stage = if journal_corrupt {
+                    "Pre-commit journal check"
+                } else {
+                    "Pre-commit journal recovery"
+                };
+                notify_paused_on_failure(
+                    repo,
+                    overrides.notify_override,
+                    stage,
+                    Some(&plan.target_account_id),
+                    &pstate,
+                    &err.message,
+                    shutdown_rx,
+                )
+                .await;
                 return Ok(TickStageOutcome::PausedOnFailure { reason });
             }
             return Err(err);
@@ -1049,6 +1142,56 @@ impl DaemonEngine {
                     Some("switch_committed"),
                     post_commit_now,
                 )?;
+                if !*shutdown_rx.borrow()
+                    && resolve_effective_notify_enabled(repo, false, overrides.notify_override)
+                {
+                    let snap = repo.read_snapshot().ok();
+                    let source_acc = snap
+                        .as_ref()
+                        .and_then(|s| s.accounts.iter().find(|a| a.id == plan.source_account_id));
+                    let target_acc = snap
+                        .as_ref()
+                        .and_then(|s| s.accounts.iter().find(|a| a.id == plan.target_account_id));
+                    let from_account = source_acc
+                        .map(format_account_notify_label)
+                        .unwrap_or_else(|| plan.source_account_id.clone());
+                    let to_account = target_acc
+                        .map(format_account_notify_label)
+                        .unwrap_or_else(|| plan.target_account_id.clone());
+                    let source_windows = source_acc
+                        .map(|a| {
+                            evaluate_account_window_quotas(
+                                a,
+                                &guard_policy.monitored_model,
+                                post_commit_now,
+                                DEFAULT_QUOTA_MAX_AGE_SECS,
+                            )
+                        })
+                        .unwrap_or_default();
+                    let target_windows = target_acc
+                        .map(|a| {
+                            evaluate_account_window_quotas(
+                                a,
+                                &guard_policy.monitored_model,
+                                post_commit_now,
+                                DEFAULT_QUOTA_MAX_AGE_SECS,
+                            )
+                        })
+                        .unwrap_or_default();
+                    send_daemon_notification_best_effort(
+                        &DaemonNotificationEvent::Switched {
+                            from_account,
+                            to_account,
+                            source_5h_pct: source_windows.short_5h_pct,
+                            source_weekly_pct: source_windows.weekly_pct,
+                            target_5h_pct: target_windows.short_5h_pct,
+                            target_weekly_pct: target_windows.weekly_pct,
+                            running_agy_detected: !matches!(guard_runtime, RuntimeState::Idle),
+                        },
+                        shutdown_rx,
+                    )
+                    .await;
+                }
                 Ok(TickStageOutcome::CommittedSwitch {
                     source_id: plan.source_account_id,
                     target_id: plan.target_account_id,
@@ -1093,6 +1236,23 @@ impl DaemonEngine {
                     Some(&reason),
                     post_commit_now,
                 )?;
+                if paused {
+                    let stage = if is_recovery_incomplete {
+                        "Switch commit recovery"
+                    } else {
+                        "Switch commit"
+                    };
+                    notify_paused_on_failure(
+                        repo,
+                        overrides.notify_override,
+                        stage,
+                        Some(&plan.target_account_id),
+                        &pstate,
+                        &reason,
+                        shutdown_rx,
+                    )
+                    .await;
+                }
                 Ok(TickStageOutcome::CommitFailed { reason, paused })
             }
         }

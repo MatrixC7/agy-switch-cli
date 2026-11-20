@@ -19,6 +19,8 @@ pub struct HeadlessConfig {
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
+    pub notifications: NotificationsConfig,
+    #[serde(default)]
     pub oauth: OAuthFileConfig,
 }
 
@@ -28,6 +30,7 @@ impl Default for HeadlessConfig {
             schema_version: STORE_SCHEMA_VERSION,
             backend: None,
             network: NetworkConfig::default(),
+            notifications: NotificationsConfig::default(),
             oauth: OAuthFileConfig::default(),
         }
     }
@@ -50,9 +53,18 @@ impl fmt::Debug for HeadlessConfig {
             .field("schema_version", &self.schema_version)
             .field("backend", &safe_backend)
             .field("network", &self.network)
+            .field("notifications", &self.notifications)
             .field("oauth", &self.oauth)
             .finish()
     }
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, Debug)]
+pub struct NotificationsConfig {
+    /// Enable or disable Linux desktop notifications (`org.freedesktop.Notifications`) for `daemon`.
+    /// Defaults to `true` when omitted (auto-skips silently on headless systems).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +170,9 @@ mod tests {
                 proxy_url: Some("socks5h://proxyuser:PROXY_PASS_SECRET@127.0.0.1:1080".into()),
                 no_proxy: Some("internal.corp".into()),
             },
+            notifications: NotificationsConfig {
+                enabled: Some(false),
+            },
             oauth: OAuthFileConfig {
                 active_client_key: Some("custom".into()),
                 required_scopes: Some(vec!["openid".into()]),
@@ -175,5 +190,21 @@ mod tests {
         assert!(!dbg.contains("PROXY_PASS_SECRET"));
         assert!(!dbg.contains("CONFIG_SECRET_999"));
         assert!(dbg.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn config_notifications_deserializes_explicit_and_defaults_to_none() {
+        let legacy: HeadlessConfig = serde_json::from_str(r#"{"schema_version":1}"#).unwrap();
+        assert_eq!(legacy.notifications.enabled, None);
+
+        let disabled: HeadlessConfig =
+            serde_json::from_str(r#"{"schema_version":1,"notifications":{"enabled":false}}"#)
+                .unwrap();
+        assert_eq!(disabled.notifications.enabled, Some(false));
+
+        let enabled: HeadlessConfig =
+            serde_json::from_str(r#"{"schema_version":1,"notifications":{"enabled":true}}"#)
+                .unwrap();
+        assert_eq!(enabled.notifications.enabled, Some(true));
     }
 }

@@ -2307,30 +2307,36 @@ fn synthetic_stats_cli_contract_covering_sources_dates_json_fifo_symlink_and_rea
             &[pb_b(1, b"synthetic completed text"), pb_v(12, 2)].concat(),
         );
 
-        let make_blob =
-            |sys_in: u64, usr_in: u64, out_t: u64, cache_t: u64, ts: u64, label: &str| -> Vec<u8> {
-                let usage = [
-                    pb_v(1, sys_in),
-                    pb_v(2, usr_in),
-                    pb_v(3, out_t),
-                    pb_v(5, cache_t),
-                    pb_v(10, out_t),
-                ]
-                .concat();
-                let timing = pb_b(4, &pb_v(1, ts));
-                let ttft_dur = [pb_v(1, 2), pb_v(2, 500_000_000)].concat(); // 2.5s
-                let stream_dur = pb_v(1, 10); // 10.0s
-                let wrapped = [
-                    pb_b(4, &usage),
-                    pb_b(9, &timing),
-                    pb_b(11, &ttft_dur),
-                    pb_b(12, &stream_dur),
-                    pb_b(19, b"gemini-4-carbon"),
-                    pb_b(21, label.as_bytes()),
-                ]
-                .concat();
-                pb_b(1, &wrapped)
-            };
+        let make_blob = |sys_in: u64,
+                         usr_in: u64,
+                         out_t: u64,
+                         cache_t: u64,
+                         ts: u64,
+                         model_id: &str,
+                         label: &str|
+         -> Vec<u8> {
+            let usage = [
+                pb_v(1, sys_in),
+                pb_v(2, usr_in),
+                pb_v(3, out_t),
+                pb_v(5, cache_t),
+                pb_v(10, out_t),
+            ]
+            .concat();
+            let timing = pb_b(4, &pb_v(1, ts));
+            let ttft_dur = [pb_v(1, 2), pb_v(2, 500_000_000)].concat(); // 2.5s
+            let stream_dur = pb_v(1, 10); // 10.0s
+            let wrapped = [
+                pb_b(4, &usage),
+                pb_b(9, &timing),
+                pb_b(11, &ttft_dur),
+                pb_b(12, &stream_dur),
+                pb_b(19, model_id.as_bytes()),
+                pb_b(21, label.as_bytes()),
+            ]
+            .concat();
+            pb_b(1, &wrapped)
+        };
 
         conn.execute(
             "INSERT INTO steps VALUES (1, 15, ?1, 3, ?2)",
@@ -2345,6 +2351,7 @@ fn synthetic_stats_cli_contract_covering_sources_dates_json_fifo_symlink_and_rea
                 500,
                 40_000,
                 ts_nov15,
+                "gemini-4-carbon",
                 "Gemini 4 Carbon (High)"
             )],
         )
@@ -2362,6 +2369,7 @@ fn synthetic_stats_cli_contract_covering_sources_dates_json_fifo_symlink_and_rea
                 200,
                 8_000,
                 ts_nov10,
+                "gemini-4-hydrogen-xhigh",
                 "Gemini 4 Hydrogen (XHigh)"
             )],
         )
@@ -2407,6 +2415,7 @@ fn synthetic_stats_cli_contract_covering_sources_dates_json_fifo_symlink_and_rea
                     600,
                     15_000,
                     ts_nov15 + 60,
+                    "claude-opus-4-6",
                     "Claude Opus 4.6"
                 )],
             )
@@ -2621,7 +2630,15 @@ fn synthetic_stats_cli_contract_covering_sources_dates_json_fifo_symlink_and_rea
                 .unwrap();
             c.execute(
                 "INSERT INTO gen_metadata VALUES (1, ?1)",
-                rusqlite::params![make_blob(10, 90, 20, 0, ts_nov15, "Gemini 4 Carbon (High)")],
+                rusqlite::params![make_blob(
+                    10,
+                    90,
+                    20,
+                    0,
+                    ts_nov15,
+                    "gemini-4-carbon",
+                    "Gemini 4 Carbon (High)"
+                )],
             )
             .unwrap();
         }
@@ -2639,7 +2656,15 @@ fn synthetic_stats_cli_contract_covering_sources_dates_json_fifo_symlink_and_rea
         active_wal_conn
             .execute(
                 "INSERT INTO gen_metadata VALUES (1, ?1)",
-                rusqlite::params![make_blob(10, 90, 20, 0, ts_nov15, "Gemini 4 Carbon (High)")],
+                rusqlite::params![make_blob(
+                    10,
+                    90,
+                    20,
+                    0,
+                    ts_nov15,
+                    "gemini-4-carbon",
+                    "Gemini 4 Carbon (High)"
+                )],
             )
             .unwrap();
 
@@ -7506,5 +7531,909 @@ fn synthetic_v120_round3_systemd_identity_status_pgid_and_path_secret_order() {
             0
         );
         assert_ne!(post_term.c_lflag & libc::ECHO, 0);
+    }
+}
+
+#[test]
+fn daemon_no_notify_install_flag_and_invalid_env_redaction() {
+    let env = IsolatedEnv::new();
+    env.init_agy_slot_dir();
+    let now = jiff::Timestamp::now().as_second();
+    let repo = StoreRepository::new(env.paths());
+    let acc1 = sample_account("acc-a", "alice@example.com", now);
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc1.clone(), true, now)?;
+        Ok(())
+    })
+    .unwrap();
+
+    // 1. Invalid `AGY_SWITCH_CLI_NOTIFY` must return exit code 2 without echoing raw env secret.
+    let bad_env_out = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_NOTIFY", "bad_notify_secret_999")
+        .args(["--json", "daemon", "--once"])
+        .output()
+        .unwrap();
+    assert_eq!(bad_env_out.status.code(), Some(2));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bad_env_out.stdout),
+        String::from_utf8_lossy(&bad_env_out.stderr)
+    );
+    assert!(combined.contains("AGY_SWITCH_CLI_NOTIFY"));
+    assert!(!combined.contains("bad_notify_secret_999"));
+
+    // 1b. Explicit `--no-notify` takes precedence over an invalid `AGY_SWITCH_CLI_NOTIFY` value.
+    let cli_overrides_bad_env = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_NOTIFY", "bad_notify_secret_999")
+        .args(["--backend", "file", "daemon", "--once", "--no-notify"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        cli_overrides_bad_env.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&cli_overrides_bad_env.stderr)
+    );
+
+    // 2. `--no-notify` + `--uninstall` is rejected by clap with exit code 2.
+    let conflict_out = env
+        .cli_cmd()
+        .args(["daemon", "--uninstall", "--no-notify"])
+        .output()
+        .unwrap();
+    assert_eq!(conflict_out.status.code(), Some(2));
+
+    // 3. `daemon --install --no-notify` persists `--no-notify` into rendered systemd user unit.
+    let systemd_marker_dir = env._tmp.path().join("systemd_marker");
+    fs::create_dir_all(&systemd_marker_dir).unwrap();
+    let mock_systemctl = env._tmp.path().join("mock-systemctl");
+    let script = "#!/bin/sh\n\
+        if [ \"$1\" = \"--user\" ]; then shift; fi\n\
+        case \"$1\" in\n\
+          show-environment) exit 0 ;;\n\
+          daemon-reload) exit 0 ;;\n\
+          enable) exit 0 ;;\n\
+          show) echo \"FragmentPath=$XDG_CONFIG_HOME/systemd/user/agy-switch-cli.service\"; echo \"LoadState=loaded\"; echo \"UnitFileState=enabled\"; echo \"ActiveState=active\"; exit 0 ;;\n\
+          *) exit 0 ;;\n\
+        esac\n";
+    fs::write(&mock_systemctl, script).unwrap();
+    fs::set_permissions(&mock_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let inst = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_SYSTEMD_MARKER_DIR", &systemd_marker_dir)
+        .env("AGY_SWITCH_CLI_SYSTEMCTL_BIN", &mock_systemctl)
+        .args(["--json", "daemon", "--install", "--no-notify"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        inst.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&inst.stderr)
+    );
+    let inst_j: serde_json::Value = serde_json::from_slice(&inst.stdout).unwrap();
+    let unit_path = PathBuf::from(inst_j["unit_path"].as_str().unwrap());
+    let unit_text = fs::read_to_string(&unit_path).unwrap();
+    assert!(
+        unit_text.contains(" daemon --no-notify"),
+        "unit missing --no-notify:\n{unit_text}"
+    );
+}
+
+#[cfg(feature = "secret-service-backend")]
+#[test]
+fn daemon_desktop_notifications_dbus_lifecycle_headless_optout_pause_dedup_and_timeout() {
+    let allow_skip = std::env::var("AGY_SWITCH_CLI_ALLOW_SKIP_DBUS_TEST")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let has_bins =
+        Path::new("/usr/bin/dbus-daemon").is_file() && Path::new("/usr/bin/python3").is_file();
+    let has_py_deps = has_bins
+        && Command::new("/usr/bin/python3")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .args([
+                "-c",
+                "import dbus, dbus.service, dbus.mainloop.glib; from gi.repository import GLib",
+            ])
+            .status()
+            .is_ok_and(|s| s.success());
+    if !has_py_deps {
+        if allow_skip {
+            eprintln!("[SKIPPED] live isolated D-Bus notification test skipped via AGY_SWITCH_CLI_ALLOW_SKIP_DBUS_TEST=1");
+            return;
+        }
+        panic!(
+            "Live isolated D-Bus notification test requires `/usr/bin/dbus-daemon` and Python `dbus` + `gi` (set AGY_SWITCH_CLI_ALLOW_SKIP_DBUS_TEST=1 to explicitly skip)."
+        );
+    }
+
+    let make_dual_window_acc =
+        |id: &str, email: &str, short_5h: f64, weekly: f64, now: i64| -> AccountRecord {
+            let mut rec = sample_account(id, email, now);
+            let min_pct = short_5h.min(weekly);
+            if let Some(ref mut q) = rec.quota {
+                for m in &mut q.models {
+                    m.percentage = (min_pct * 100.0).round() as i32;
+                    m.observed_remaining_fraction = Some(min_pct);
+                }
+                if let Some(ref mut groups) = q.quota_groups {
+                    for g in groups {
+                        for b in &mut g.buckets {
+                            if b.window.eq_ignore_ascii_case("5h") || b.bucket_id.ends_with("-5h") {
+                                b.remaining_fraction = short_5h;
+                            } else {
+                                b.remaining_fraction = weekly;
+                            }
+                        }
+                    }
+                }
+            }
+            rec
+        };
+
+    let setup_switchable_store = |env: &IsolatedEnv, now: i64| {
+        env.init_agy_slot_dir();
+        let paths = env.paths();
+        let repo = StoreRepository::new(paths.clone());
+        let acc_a = make_dual_window_acc("acc-a", "alice@example.com", 0.02, 0.40, now);
+        let acc_b = make_dual_window_acc("acc-b", "bob@example.com", 1.00, 0.85, now);
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(acc_a.clone(), true, now)?;
+            tx.upsert_account(acc_b.clone(), false, now)?;
+            let mut pol = agy_switch_cli::domain::policy::SwitchPolicy {
+                enabled: true,
+                reserve_percentage: 5,
+                candidate_min_percentage: 15,
+                candidate_account_ids: vec!["acc-b".into()],
+                ..agy_switch_cli::domain::policy::SwitchPolicy::default()
+            };
+            tx.save_policy(&mut pol, None, now)?;
+            Ok(())
+        })
+        .unwrap();
+        FileSessionBackend
+            .write_slot(&paths, &serialize_session_payload(&acc_a.token).unwrap())
+            .unwrap();
+    };
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // Start private isolated dbus-daemon with an activatable synthetic Notifications `.service`
+    // so both headless no-owner and mid-flight owner-vanish verify zero D-Bus auto-activation.
+    let bus_env = IsolatedEnv::new();
+    let bus_sock = bus_env.runtime_dir.join("mock-notify.sock");
+    let bus_addr = format!("unix:path={}", bus_sock.display());
+    let service_dir = bus_env._tmp.path().join("dbus-services");
+    fs::create_dir_all(&service_dir).unwrap();
+    let activated_sentinel = bus_env._tmp.path().join("dbus_auto_activated");
+    let fake_activator = bus_env._tmp.path().join("fake_notify_activator.sh");
+    fs::write(
+        &fake_activator,
+        format!(
+            "#!/bin/sh\necho activated > \"{}\"\n",
+            activated_sentinel.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_activator, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        service_dir.join("org.freedesktop.Notifications.service"),
+        format!(
+            "[D-BUS Service]\nName=org.freedesktop.Notifications\nExec={}\n",
+            fake_activator.display()
+        ),
+    )
+    .unwrap();
+    let bus_conf = bus_env._tmp.path().join("private-bus.conf");
+    fs::write(
+        &bus_conf,
+        format!(
+            "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\"\n\
+             \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n\
+             <busconfig>\n\
+               <type>session</type>\n\
+               <listen>{bus_addr}</listen>\n\
+               <servicedir>{}</servicedir>\n\
+               <policy context=\"default\">\n\
+                 <allow send_destination=\"*\" eavesdrop=\"true\"/>\n\
+                 <allow eavesdrop=\"true\"/>\n\
+                 <allow own=\"*\"/>\n\
+               </policy>\n\
+             </busconfig>\n",
+            service_dir.display()
+        ),
+    )
+    .unwrap();
+    let _dbus_guard = ChildGuard(
+        Command::new("/usr/bin/dbus-daemon")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .args([
+                &format!("--config-file={}", bus_conf.display()),
+                "--nofork",
+                "--nopidfile",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    for _ in 0..50 {
+        if bus_sock.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(bus_sock.exists(), "Isolated dbus-daemon socket missing");
+
+    // 1. Live D-Bus bus with NO org.freedesktop.Notifications owner (e.g. headless server with linger):
+    //    `daemon --once` switches cleanly with exit 0 and NEVER triggers D-Bus auto-activation.
+    let now = jiff::Timestamp::now().as_second();
+    let headless_env = IsolatedEnv::new();
+    setup_switchable_store(&headless_env, now);
+    let headless_out = headless_env
+        .cli_cmd()
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus_addr)
+        .args(["--backend", "file", "daemon", "--once"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        headless_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&headless_out.stderr)
+    );
+    assert!(
+        !activated_sentinel.exists(),
+        "Headless daemon --once unexpectedly triggered D-Bus service auto-activation"
+    );
+    assert_eq!(
+        StoreRepository::new(headless_env.paths())
+            .read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-b")
+    );
+
+    // 2. Spawn mock org.freedesktop.Notifications Python D-Bus service on the isolated bus
+    let ctrl_file = bus_env._tmp.path().join("notify_ctrl.json");
+    let log_file = bus_env._tmp.path().join("notify_log.json");
+    let ready_file = bus_env._tmp.path().join("notify_ready");
+    let mock_py = bus_env._tmp.path().join("mock_notifications.py");
+    fs::write(
+        &ctrl_file,
+        r#"{"delay_ms": 0, "capabilities": ["body", "body-markup"]}"#,
+    )
+    .unwrap();
+    fs::write(&log_file, "[]").unwrap();
+
+    let py_code = r#"
+import json, sys
+import dbus
+import dbus.service
+import dbus.mainloop.glib
+from gi.repository import GLib
+
+CTRL_PATH, LOG_PATH, READY_PATH = sys.argv[1], sys.argv[2], sys.argv[3]
+
+class NotificationsObj(dbus.service.Object):
+    def __init__(self, bus):
+        super().__init__(bus, "/org/freedesktop/Notifications")
+        self.bus = bus
+        self.next_id = 1
+
+    @dbus.service.method(
+        "org.freedesktop.Notifications",
+        in_signature="",
+        out_signature="as",
+    )
+    def GetCapabilities(self):
+        with open(CTRL_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        caps = cfg.get("capabilities", ["body"])
+        if cfg.get("release_on_caps"):
+            self.bus.release_name("org.freedesktop.Notifications")
+        return dbus.Array([dbus.String(c) for c in caps], signature="s")
+
+    @dbus.service.method(
+        "org.freedesktop.Notifications",
+        in_signature="susssasa{sv}i",
+        out_signature="u",
+        async_callbacks=("ok_cb", "err_cb"),
+    )
+    def Notify(self, app_name, replaces_id, app_icon, summary, body, actions, hints, expire_timeout, ok_cb, err_cb):
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
+            items = json.load(f)
+        urgency = int(hints.get("urgency", 1)) if "urgency" in hints else 1
+        items.append({
+            "app_name": str(app_name),
+            "app_icon": str(app_icon),
+            "summary": str(summary),
+            "body": str(body),
+            "urgency": urgency,
+        })
+        with open(LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(items, f)
+        nid = self.next_id
+        self.next_id += 1
+        with open(CTRL_PATH, "r", encoding="utf-8") as f:
+            delay_ms = int(json.load(f).get("delay_ms", 0))
+        if delay_ms > 0:
+            def finish():
+                ok_cb(dbus.UInt32(nid))
+                return False
+            GLib.timeout_add(delay_ms, finish)
+        else:
+            ok_cb(dbus.UInt32(nid))
+
+dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+bus = dbus.SessionBus()
+bus_name = dbus.service.BusName("org.freedesktop.Notifications", bus)
+svc = NotificationsObj(bus)
+with open(READY_PATH, "w", encoding="utf-8") as rf:
+    rf.write("ready")
+GLib.MainLoop().run()
+"#;
+    fs::write(&mock_py, py_code).unwrap();
+    let _py_guard = ChildGuard(
+        Command::new("/usr/bin/python3")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("DBUS_SESSION_BUS_ADDRESS", &bus_addr)
+            .args([
+                mock_py.to_str().unwrap(),
+                ctrl_file.to_str().unwrap(),
+                log_file.to_str().unwrap(),
+                ready_file.to_str().unwrap(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+
+    for _ in 0..80 {
+        if ready_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(ready_file.exists(), "Mock notifications service not ready");
+
+    let read_notifications = || -> Vec<serde_json::Value> {
+        serde_json::from_slice(&fs::read(&log_file).unwrap()).unwrap()
+    };
+
+    // 2a. Successful auto-switch emits markup-formatted desktop notification when `body-markup` is advertised
+    let sw_env = IsolatedEnv::new();
+    setup_switchable_store(&sw_env, now);
+    let sw_out = sw_env
+        .cli_cmd()
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus_addr)
+        .args(["--backend", "file", "daemon", "--once"])
+        .output()
+        .unwrap();
+    assert_eq!(sw_out.status.code(), Some(0));
+    let notes = read_notifications();
+    assert_eq!(notes.len(), 1, "Expected 1 switch notification: {notes:?}");
+    assert_eq!(notes[0]["app_name"], "agy-switch-cli");
+    assert_eq!(notes[0]["summary"], "Account Switched");
+    assert_eq!(notes[0]["urgency"], 1);
+    let body0 = notes[0]["body"].as_str().unwrap();
+    assert_eq!(
+        body0,
+        "<b>▶ bob@example.com (label- [31mANSI [0m)</b>\n<b>5h 100% · Weekly 85%</b>\n– alice@example.com (label- [31mANSI [0m)\n5h 2% · Weekly 40%",
+        "body={body0}"
+    );
+    assert!(!body0.contains('\x1b'), "ANSI leaked into body={body0}");
+
+    // 2a-plain. When desktop does NOT advertise `body-markup`, notification degrades cleanly to plain text
+    fs::write(&ctrl_file, r#"{"delay_ms": 0, "capabilities": ["body"]}"#).unwrap();
+    let plain_env = IsolatedEnv::new();
+    setup_switchable_store(&plain_env, now);
+    let plain_out = plain_env
+        .cli_cmd()
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus_addr)
+        .args(["--backend", "file", "daemon", "--once"])
+        .output()
+        .unwrap();
+    assert_eq!(plain_out.status.code(), Some(0));
+    let notes_plain = read_notifications();
+    assert_eq!(notes_plain.len(), 2);
+    assert_eq!(notes_plain[1]["summary"], "Account Switched");
+    assert_eq!(
+        notes_plain[1]["body"].as_str().unwrap(),
+        "▶ bob@example.com (label- [31mANSI [0m)\n5h 100% · Weekly 85%\n– alice@example.com (label- [31mANSI [0m)\n5h 2% · Weekly 40%"
+    );
+    // Restore markup capability for subsequent checks
+    fs::write(
+        &ctrl_file,
+        r#"{"delay_ms": 0, "capabilities": ["body", "body-markup"]}"#,
+    )
+    .unwrap();
+
+    // 2b. Opt-outs: `--no-notify`, `AGY_SWITCH_CLI_NOTIFY=0`, and `config.json` `notifications.enabled = false`
+    for mode in ["cli", "env", "config"] {
+        let opt_env = IsolatedEnv::new();
+        setup_switchable_store(&opt_env, now);
+        let mut cmd = opt_env.cli_cmd();
+        cmd.env("DBUS_SESSION_BUS_ADDRESS", &bus_addr).args([
+            "--backend",
+            "file",
+            "daemon",
+            "--once",
+        ]);
+        match mode {
+            "cli" => {
+                cmd.arg("--no-notify");
+            }
+            "env" => {
+                cmd.env("AGY_SWITCH_CLI_NOTIFY", "0");
+            }
+            "config" => {
+                fs::write(
+                    opt_env.paths().config_file(),
+                    br#"{"schema_version":1,"notifications":{"enabled":false}}"#,
+                )
+                .unwrap();
+                fs::set_permissions(
+                    opt_env.paths().config_file(),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let out = cmd.output().unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(
+            StoreRepository::new(opt_env.paths())
+                .read_snapshot()
+                .unwrap()
+                .index
+                .selected_account_id
+                .as_deref(),
+            Some("acc-b")
+        );
+        assert_eq!(
+            read_notifications().len(),
+            2,
+            "Opt-out `{mode}` must suppress notification"
+        );
+    }
+
+    // 2c. PausedOnFailure notifies ONCE on transition (urgency=2) and does NOT spam on subsequent ticks
+    let pause_env = IsolatedEnv::new();
+    setup_switchable_store(&pause_env, now);
+    fs::create_dir_all(pause_env.paths().state_dir()).unwrap();
+    fs::write(pause_env.paths().switch_journal_file(), b"{not-valid-json").unwrap();
+    let pause_out_1 = pause_env
+        .cli_cmd()
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus_addr)
+        .args(["--backend", "file", "daemon", "--once"])
+        .output()
+        .unwrap();
+    assert_eq!(pause_out_1.status.code(), Some(0));
+    let notes_after_pause1 = read_notifications();
+    assert_eq!(notes_after_pause1.len(), 3);
+    assert_eq!(notes_after_pause1[2]["summary"], "Auto-Switch Paused");
+    assert_eq!(notes_after_pause1[2]["urgency"], 2);
+    let pause_body = notes_after_pause1[2]["body"].as_str().unwrap();
+    let pause_lines: Vec<&str> = pause_body.lines().collect();
+    assert_eq!(pause_lines.len(), 3, "pause_body={pause_body}");
+    assert_eq!(pause_lines[0], "■ <b>Journal check</b> · 1/3 failed");
+    assert!(
+        !pause_lines[1].contains("Paused due to"),
+        "reason should not duplicate Paused prefix: {pause_body}"
+    );
+    assert_eq!(
+        pause_lines[2],
+        "<i>Run agy-switch-cli status to inspect.</i>"
+    );
+
+    // Second run while already paused_on_failure MUST NOT emit another notification
+    let pause_out_2 = pause_env
+        .cli_cmd()
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus_addr)
+        .args(["--backend", "file", "daemon", "--once"])
+        .output()
+        .unwrap();
+    assert_eq!(pause_out_2.status.code(), Some(0));
+    assert_eq!(
+        read_notifications().len(),
+        3,
+        "Already-paused tick must not spam duplicate notifications"
+    );
+
+    // 2d. Slow notification daemon (4s delay > 2s timeout) must NOT hang `daemon --once` or block switch commit
+    fs::write(
+        &ctrl_file,
+        r#"{"delay_ms": 4000, "capabilities": ["body", "body-markup"]}"#,
+    )
+    .unwrap();
+    let slow_env = IsolatedEnv::new();
+    setup_switchable_store(&slow_env, now);
+    let t0 = std::time::Instant::now();
+    let slow_out = slow_env
+        .cli_cmd()
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus_addr)
+        .args(["--backend", "file", "daemon", "--once"])
+        .output()
+        .unwrap();
+    let elapsed = t0.elapsed();
+    assert_eq!(slow_out.status.code(), Some(0));
+    assert!(
+        elapsed < std::time::Duration::from_millis(3500),
+        "Slow notification service blocked daemon --once for {elapsed:?}"
+    );
+    assert_eq!(
+        StoreRepository::new(slow_env.paths())
+            .read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-b")
+    );
+
+    // 2e. Owner vanishes right after `GetCapabilities` (before `Notify`): `MethodFlags::NoAutoStart`
+    //     prevents D-Bus from auto-activating the synthetic `.service` file, and switch still succeeds.
+    fs::write(
+        &ctrl_file,
+        r#"{"delay_ms": 0, "capabilities": ["body"], "release_on_caps": true}"#,
+    )
+    .unwrap();
+    let vanish_env = IsolatedEnv::new();
+    setup_switchable_store(&vanish_env, now);
+    let vanish_out = vanish_env
+        .cli_cmd()
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus_addr)
+        .args(["--backend", "file", "daemon", "--once"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        vanish_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&vanish_out.stderr)
+    );
+    assert!(
+        !activated_sentinel.exists(),
+        "Notify without owner unexpectedly triggered D-Bus auto-activation despite NoAutoStart"
+    );
+    assert_eq!(
+        StoreRepository::new(vanish_env.paths())
+            .read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-b")
+    );
+}
+
+#[test]
+fn stats_watch_cli_validation_and_live_pty_lifecycle() {
+    let env = IsolatedEnv::new();
+
+    // 1. Invalid `--watch` values are rejected with exit code 2 across all feature tiers
+    for bad in ["0", "3601", "notanumber"] {
+        let out = env
+            .cli_cmd()
+            .args(["stats", "summary", "--watch", bad])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "expected exit 2 for --watch {bad}, got {:?}",
+            out.status.code()
+        );
+    }
+
+    // 2. `--watch` combined with `--json` is rejected with exit code 2
+    let json_out = env
+        .cli_cmd()
+        .args(["--json", "stats", "summary", "--watch"])
+        .output()
+        .unwrap();
+    assert_eq!(json_out.status.code(), Some(2));
+
+    // 3. Non-TTY stdin/stdout is rejected cleanly with exit code 2
+    let non_tty_out = env
+        .cli_cmd()
+        .args(["stats", "list", "--watch", "3"])
+        .output()
+        .unwrap();
+    assert_eq!(non_tty_out.status.code(), Some(2));
+
+    #[cfg(feature = "stats")]
+    {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::time::Duration;
+
+        let env = IsolatedEnv::new();
+        let cli_conv = env.home.join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&cli_conv).unwrap();
+
+        let win = libc::winsize {
+            ws_row: 24,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let mut master_fd: libc::c_int = -1;
+        let mut slave_fd: libc::c_int = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &win as *const libc::winsize as *mut libc::winsize,
+                )
+            },
+            0
+        );
+        let mut master = unsafe { fs::File::from_raw_fd(master_fd) };
+        let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
+        let inspect_slave = slave.try_clone().unwrap();
+        unsafe {
+            let fl = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+
+        let mut child = env
+            .cli_cmd()
+            .args(["stats", "summary", "--watch", "1"])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap();
+
+        let drain = |m: &mut fs::File, buf: &mut Vec<u8>| {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match m.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        };
+
+        // 4. Initial live render shows Summary view & `Live [summary]: every 1s`
+        let mut screen = Vec::new();
+        for _ in 0..80 {
+            drain(&mut master, &mut screen);
+            let txt = String::from_utf8_lossy(&screen);
+            if txt.contains("Live [summary]: every 1s") && txt.contains("Summary") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let initial_txt = String::from_utf8_lossy(&screen).into_owned();
+        assert!(
+            initial_txt.contains("Live [summary]: every 1s"),
+            "initial screen missing summary live bar:\n{initial_txt}"
+        );
+
+        // 5. Write a live synthetic SQLite DB while `--watch 1` is open -> auto-refreshes without restart!
+        let enc_v = |mut n: u64| -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let mut b = (n & 0x7f) as u8;
+                n >>= 7;
+                if n != 0 {
+                    b |= 0x80;
+                }
+                out.push(b);
+                if n == 0 {
+                    break;
+                }
+            }
+            out
+        };
+        let pb_v = |field: u64, val: u64| -> Vec<u8> {
+            let mut out = enc_v(field << 3);
+            out.extend_from_slice(&enc_v(val));
+            out
+        };
+        let pb_b = |field: u64, bytes: &[u8]| -> Vec<u8> {
+            let mut out = enc_v((field << 3) | 2);
+            out.extend_from_slice(&enc_v(bytes.len() as u64));
+            out.extend_from_slice(bytes);
+            out
+        };
+        let now_ts = jiff::Timestamp::now().as_second() as u64;
+        let usage = [
+            pb_v(1, 500),
+            pb_v(2, 1_500),
+            pb_v(3, 400),
+            pb_v(5, 8_000),
+            pb_v(10, 400),
+        ]
+        .concat();
+        let timing = pb_b(4, &pb_v(1, now_ts));
+        let wrapped = [
+            pb_b(4, &usage),
+            pb_b(9, &timing),
+            pb_b(19, b"gemini-4-carbon"),
+            pb_b(21, b"Gemini 4 Carbon"),
+        ]
+        .concat();
+        let blob = pb_b(1, &wrapped);
+
+        let live_db = cli_conv.join("live_watch.db");
+        let conn = rusqlite::Connection::open(&live_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB, status INTEGER, step_payload BLOB);
+             CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps VALUES (1, 15, ?1, 3, NULL)",
+            rusqlite::params![pb_b(1, &pb_v(1, now_ts))],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata VALUES (1, ?1)",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+        drop(conn);
+
+        screen.clear();
+        for _ in 0..120 {
+            drain(&mut master, &mut screen);
+            if String::from_utf8_lossy(&screen).contains("Gemini 4 Carbon") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            String::from_utf8_lossy(&screen).contains("Gemini 4 Carbon"),
+            "watch mode did not detect live SQLite write:\n{}",
+            String::from_utf8_lossy(&screen)
+        );
+
+        // 6. Press Tab -> switches live to `List` view (`Live [list]:`)
+        screen.clear();
+        master.write_all(b"\t").unwrap();
+        master.flush().unwrap();
+        for _ in 0..80 {
+            drain(&mut master, &mut screen);
+            let txt = String::from_utf8_lossy(&screen);
+            if txt.contains("Live [list]: every 1s") && txt.contains("Requests (newest first") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let list_txt = String::from_utf8_lossy(&screen).into_owned();
+        assert!(
+            list_txt.contains("Live [list]: every 1s")
+                && list_txt.contains("Requests (newest first"),
+            "Tab did not toggle to list view:\n{list_txt}"
+        );
+
+        // 7. Arrow key CSI sequence (`\x1b[A`) alone must NOT quit watch mode,
+        //    and `\x1b[A\t` sent together must still dispatch `Tab` back to `summary`.
+        master.write_all(b"\x1b[A").unwrap();
+        master.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "Escape sequence accidentally exited `stats --watch`"
+        );
+        screen.clear();
+        master.write_all(b"\x1b[A\t").unwrap();
+        master.flush().unwrap();
+        for _ in 0..80 {
+            drain(&mut master, &mut screen);
+            let txt = String::from_utf8_lossy(&screen);
+            if txt.contains("Live [summary]: every 1s") && txt.contains("Summary") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let back_to_summary = String::from_utf8_lossy(&screen).into_owned();
+        assert!(
+            back_to_summary.contains("Live [summary]: every 1s")
+                && back_to_summary.contains("Summary"),
+            "Arrow key followed by Tab swallowed Tab:\n{back_to_summary}"
+        );
+
+        // 7b. Resizing PTY to `5x0` (valid non-zero rows, zero cols) must NOT fall back to 120x24
+        //     or emit body text; restoring to `24x100` redraws cleanly.
+        screen.clear();
+        let zero_col_win = libc::winsize {
+            ws_row: 5,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &zero_col_win) },
+            0
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        drain(&mut master, &mut screen);
+        let zero_col_txt = String::from_utf8_lossy(&screen).into_owned();
+        assert!(
+            !zero_col_txt.contains("Live [") && !zero_col_txt.contains("Summary"),
+            "5x0 zero-col resize unexpectedly rendered body/footer:\n{zero_col_txt}"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "5x0 resize unexpectedly exited watch mode"
+        );
+        screen.clear();
+        assert_eq!(
+            unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &win) },
+            0
+        );
+        for _ in 0..80 {
+            drain(&mut master, &mut screen);
+            if String::from_utf8_lossy(&screen).contains("Live [summary]: every 1s") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            String::from_utf8_lossy(&screen).contains("Live [summary]: every 1s"),
+            "restoring PTY from 5x0 to 24x100 did not redraw frame"
+        );
+
+        // 8. Press `q` -> clean exit 0, alt screen exited, and ECHO/ICANON restored
+        screen.clear();
+        master.write_all(b"q").unwrap();
+        master.flush().unwrap();
+        let mut status_opt = None;
+        for _ in 0..80 {
+            drain(&mut master, &mut screen);
+            if let Some(st) = child.try_wait().unwrap() {
+                status_opt = Some(st);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        drain(&mut master, &mut screen);
+        let status = status_opt.expect("stats --watch did not exit after pressing q");
+        assert_eq!(status.code(), Some(0));
+        assert!(
+            String::from_utf8_lossy(&screen).contains("\x1b[?1049l"),
+            "alt-screen restore sequence missing on exit"
+        );
+        let mut final_tio: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(inspect_slave.as_raw_fd(), &mut final_tio) },
+            0
+        );
+        assert_ne!(
+            final_tio.c_lflag & libc::ECHO,
+            0,
+            "ECHO was not restored after stats --watch exit"
+        );
+        assert_ne!(
+            final_tio.c_lflag & libc::ICANON,
+            0,
+            "ICANON was not restored after stats --watch exit"
+        );
     }
 }

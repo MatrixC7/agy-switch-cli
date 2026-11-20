@@ -1403,6 +1403,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                         explicit_interval_secs: args.interval,
                         explicit_cooldown_secs: args.cooldown,
                         explicit_backend,
+                        explicit_no_notify: args.no_notify,
                     },
                 )
                 .await?;
@@ -1434,9 +1435,9 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 return Ok(ExitCode::Ok.as_i32());
             }
             if args.uninstall {
-                if has_temp_policy_flags || cli.proxy.is_some() {
+                if has_temp_policy_flags || cli.proxy.is_some() || args.no_notify {
                     return Err(CliError::usage(
-                        "Policy or `--proxy` flags cannot be combined with `daemon --uninstall`.",
+                        "Policy, `--proxy`, or `--no-notify` flags cannot be combined with `daemon --uninstall`.",
                     ));
                 }
                 let outcome = uninstall_systemd_user_service(&paths).await?;
@@ -1483,6 +1484,11 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 candidate_min_percentage: args.minimum,
                 monitored_model: args.model.clone(),
             };
+            let notify_override = if args.no_notify {
+                Some(false)
+            } else {
+                crate::switching::notify::parse_notify_env_override()?
+            };
             // Validate effective policy and acquire single-instance lock eagerly before any remote UA network check
             let _ =
                 crate::switching::daemon::resolve_effective_daemon_policy(&repo, &policy_overlay)?;
@@ -1513,6 +1519,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                     interval_secs,
                     cooldown_secs,
                     once: args.once,
+                    notify_override,
                     policy_overlay,
                     ..DaemonConfigOverrides::default()
                 },
@@ -1528,19 +1535,49 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             {
                 match sub {
                     StatsCommand::Summary(args) => {
-                        let view = crate::stats::collect_token_stats(&paths, args)?;
-                        if cli.json {
-                            print_json(&view)?;
+                        if let Some(interval_secs) = args.watch {
+                            if cli.json {
+                                return Err(CliError::usage(
+                                    "`stats --watch` is an interactive terminal view and cannot be combined with `--json`.",
+                                ));
+                            }
+                            crate::stats::watch::run_stats_watch(
+                                &paths,
+                                args,
+                                crate::stats::watch::StatsWatchView::Summary,
+                                interval_secs,
+                            )
+                            .await?;
                         } else {
-                            println!("{}", view.render_human());
+                            let view = crate::stats::collect_token_stats(&paths, args)?;
+                            if cli.json {
+                                print_json(&view)?;
+                            } else {
+                                println!("{}", view.render_human());
+                            }
                         }
                     }
                     StatsCommand::List(args) => {
-                        let view = crate::stats::collect_token_stats_list(&paths, args)?;
-                        if cli.json {
-                            print_json(&view)?;
+                        if let Some(interval_secs) = args.watch {
+                            if cli.json {
+                                return Err(CliError::usage(
+                                    "`stats --watch` is an interactive terminal view and cannot be combined with `--json`.",
+                                ));
+                            }
+                            crate::stats::watch::run_stats_watch(
+                                &paths,
+                                args,
+                                crate::stats::watch::StatsWatchView::List,
+                                interval_secs,
+                            )
+                            .await?;
                         } else {
-                            println!("{}", view.render_human());
+                            let view = crate::stats::collect_token_stats_list(&paths, args)?;
+                            if cli.json {
+                                print_json(&view)?;
+                            } else {
+                                println!("{}", view.render_human());
+                            }
                         }
                     }
                 }

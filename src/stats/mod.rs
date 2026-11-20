@@ -1,4 +1,5 @@
 mod readonly_vfs;
+pub mod watch;
 
 use crate::cli::args::{
     CliStatsRange, CliStatsSource, StatsArgs, DEFAULT_STATS_LIST_RECENT, MAX_STATS_RECENT_LIMIT,
@@ -917,16 +918,40 @@ fn verify_stats_root_dir_no_path_echo(dir: &Path, category: &str) -> CliResult<(
     }
 }
 
-pub fn collect_token_stats(paths: &HeadlessPaths, args: &StatsArgs) -> CliResult<StatsViewDto> {
+pub(crate) fn collect_token_stats_with_now(
+    paths: &HeadlessPaths,
+    args: &StatsArgs,
+    now: &jiff::Zoned,
+) -> CliResult<StatsViewDto> {
     verify_stats_root_dir_no_path_echo(&paths.home_dir, "Home")?;
-    let now = jiff::Zoned::now();
     let range_spec = resolve_stats_range_spec(args, now.date())?;
     let source = StatsSource::from(args.source);
     Ok(collect_token_stats_at(
         &paths.home_dir,
         source,
         &range_spec,
-        &now,
+        now,
+    ))
+}
+
+pub fn collect_token_stats(paths: &HeadlessPaths, args: &StatsArgs) -> CliResult<StatsViewDto> {
+    let now = jiff::Zoned::now();
+    collect_token_stats_with_now(paths, args, &now)
+}
+
+pub(crate) fn collect_token_stats_list_with_now(
+    paths: &HeadlessPaths,
+    args: &StatsArgs,
+    now: &jiff::Zoned,
+) -> CliResult<StatsListViewDto> {
+    verify_stats_root_dir_no_path_echo(&paths.home_dir, "Home")?;
+    let range_spec = resolve_stats_list_range_spec(args, now.date())?;
+    let source = StatsSource::from(args.source);
+    Ok(collect_token_stats_list_at(
+        &paths.home_dir,
+        source,
+        &range_spec,
+        now,
     ))
 }
 
@@ -934,16 +959,8 @@ pub fn collect_token_stats_list(
     paths: &HeadlessPaths,
     args: &StatsArgs,
 ) -> CliResult<StatsListViewDto> {
-    verify_stats_root_dir_no_path_echo(&paths.home_dir, "Home")?;
     let now = jiff::Zoned::now();
-    let range_spec = resolve_stats_list_range_spec(args, now.date())?;
-    let source = StatsSource::from(args.source);
-    Ok(collect_token_stats_list_at(
-        &paths.home_dir,
-        source,
-        &range_spec,
-        &now,
-    ))
+    collect_token_stats_list_with_now(paths, args, &now)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -4586,6 +4603,7 @@ mod tests {
             from: None,
             to: None,
             recent: None,
+            watch: None,
         };
         let err = resolve_stats_range_spec(&bad_date, today).unwrap_err();
         assert_eq!(err.exit_code.as_i32(), 2);
@@ -4600,6 +4618,7 @@ mod tests {
                 from: None,
                 to: None,
                 recent: None,
+                watch: None,
             };
             assert!(resolve_stats_range_spec(&args, today).is_err());
         }
@@ -4612,6 +4631,7 @@ mod tests {
             from: Some("2026-11-18".into()),
             to: Some("2026-11-17".into()),
             recent: None,
+            watch: None,
         };
         let inv_err = resolve_stats_range_spec(&inverted, today).unwrap_err();
         assert_eq!(inv_err.exit_code.as_i32(), 2);
@@ -4624,6 +4644,7 @@ mod tests {
             from: Some("2026-10-01".into()),
             to: None,
             recent: None,
+            watch: None,
         };
         let resolved = resolve_stats_range_spec(&open_to, today).unwrap();
         assert_eq!(resolved.start_date().unwrap().to_string(), "2026-10-01");
@@ -4639,6 +4660,7 @@ mod tests {
                 from: None,
                 to: None,
                 recent: None,
+                watch: None,
             },
             today,
         )
@@ -4721,6 +4743,7 @@ mod tests {
                     from: None,
                     to: None,
                     recent: None,
+                    watch: None,
                 },
                 today,
             )
@@ -5449,6 +5472,7 @@ mod tests {
                 from: None,
                 to: None,
                 recent: None,
+                watch: None,
             },
         )
         .unwrap_err();
@@ -6564,6 +6588,7 @@ mod tests {
                                ttft_ms: u64,
                                stream_ms: Option<u64>,
                                ts: u64,
+                               model_id: &str,
                                label: &str|
          -> Vec<u8> {
             let usage = [
@@ -6584,7 +6609,7 @@ mod tests {
                 pb_bytes(4, &usage),
                 pb_bytes(9, &timing),
                 pb_bytes(11, &ttft_dur),
-                pb_bytes(19, b"gemini-4-carbon"),
+                pb_bytes(19, model_id.as_bytes()),
                 pb_bytes(21, label.as_bytes()),
             ]
             .concat();
@@ -6636,6 +6661,7 @@ mod tests {
                 4_200,
                 None,
                 t1,
+                "claude-sonnet-4-6",
                 "Claude Sonnet 4.6"
             )],
         )
@@ -6654,6 +6680,7 @@ mod tests {
                 1_500,
                 Some(500),
                 t2,
+                "claude-sonnet-4-6",
                 "Claude Sonnet 4.6"
             )],
         )
@@ -6675,6 +6702,7 @@ mod tests {
                 15_000,
                 Some(44_000),
                 t3,
+                "gemini-pro-orchestrator-neon",
                 "Gemini 4 Carbon (High)"
             )],
         )
@@ -6696,6 +6724,7 @@ mod tests {
                 36_100,
                 Some(800),
                 t4,
+                "gemini-pro-orchestrator-neon",
                 "Gemini 4 Carbon (High)"
             )],
         )
@@ -6865,6 +6894,7 @@ mod tests {
                 from: None,
                 to: None,
                 recent: None,
+                watch: None,
             },
             now.date(),
         )

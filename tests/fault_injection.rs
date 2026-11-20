@@ -759,35 +759,15 @@ async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slo
     fs::write(&expired_owned_tmp, b"partial-junk").unwrap();
     fs::write(&fresh_owned_tmp, b"fresh-in-flight").unwrap();
     fs::write(&foreign_tmp, b"foreign-tool-file").unwrap();
-    // Backdate `expired_owned_tmp` mtime by 180 seconds via `utimensat`
+    // Backdate `expired_owned_tmp` mtime by 180 seconds via `File::set_modified`
     {
-        let c_exp = std::ffi::CString::new(expired_owned_tmp.to_str().unwrap()).unwrap();
-        let old_sec = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(180);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&expired_owned_tmp)
             .unwrap()
-            .as_secs()
-            .saturating_sub(180) as libc::time_t;
-        let times = [
-            libc::timespec {
-                tv_sec: old_sec,
-                tv_nsec: 0,
-            },
-            libc::timespec {
-                tv_sec: old_sec,
-                tv_nsec: 0,
-            },
-        ];
-        assert_eq!(
-            unsafe {
-                libc::utimensat(
-                    libc::AT_FDCWD,
-                    c_exp.as_ptr(),
-                    times.as_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            },
-            0
-        );
+            .set_modified(old_mtime)
+            .unwrap();
     }
     let st_human = cli().arg("status").output().unwrap();
     assert_eq!(st_human.status.code(), Some(0));
@@ -1335,33 +1315,13 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
     ));
     fs::write(&expired_tmp_err, b"orphan-needs-fsync").unwrap();
     {
-        let c_exp = std::ffi::CString::new(expired_tmp_err.to_str().unwrap()).unwrap();
-        let old_sec = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(180);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&expired_tmp_err)
             .unwrap()
-            .as_secs()
-            .saturating_sub(180) as libc::time_t;
-        let times = [
-            libc::timespec {
-                tv_sec: old_sec,
-                tv_nsec: 0,
-            },
-            libc::timespec {
-                tv_sec: old_sec,
-                tv_nsec: 0,
-            },
-        ];
-        assert_eq!(
-            unsafe {
-                libc::utimensat(
-                    libc::AT_FDCWD,
-                    c_exp.as_ptr(),
-                    times.as_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            },
-            0
-        );
+            .set_modified(old_mtime)
+            .unwrap();
     }
     let sw_tmp_sync_fail = cli()
         .env(

@@ -236,11 +236,13 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "--once"
             | "--install"
             | "--uninstall"
+            | "--no-notify"
             | "--source"
             | "--range"
             | "--date"
             | "--from"
             | "--recent"
+            | "--watch"
     )
 }
 
@@ -319,6 +321,7 @@ fn is_known_cli_placeholder(token: &str) -> bool {
             | "<RANGE>"
             | "<YYYY-MM-DD>"
             | "<N>"
+            | "<SECS>"
             | "<INTERVAL>"
             | "<COOLDOWN>"
             | "<CONCURRENCY>"

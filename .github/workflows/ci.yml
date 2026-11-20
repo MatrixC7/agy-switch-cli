@@ -16,7 +16,7 @@ jobs:
     name: Format, Clippy & 3-Tier Isolated Tests (x86_64 GNU)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -56,7 +56,7 @@ jobs:
     name: MSRV Check & Tests (Rust 1.89.0)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy
@@ -91,7 +91,7 @@ jobs:
     name: License & Advisory Audit (cargo-deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
@@ -103,7 +103,7 @@ jobs:
     name: Release ELF Zero-GUI Dependency Audit (x86_64 GNU)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build Release tiers and verify zero GUI / libdbus dynamic linkage
         run: |
@@ -127,7 +127,7 @@ jobs:
     name: Static musl & aarch64 Cross Build + QEMU Smoke Verification
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, aarch64-unknown-linux-gnu

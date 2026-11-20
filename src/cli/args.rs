@@ -421,6 +421,10 @@ pub struct DaemonArgs {
     #[arg(long, conflicts_with_all = ["once", "install"])]
     pub uninstall: bool,
 
+    /// Disable Linux desktop notifications (`org.freedesktop.Notifications`) for daemon switch/pause events (overrides AGY_SWITCH_CLI_NOTIFY and `config.json`)
+    #[arg(long, conflicts_with = "uninstall")]
+    pub no_notify: bool,
+
     /// In-memory override for active-process guard mode (`immediate` or `wait`; overrides AGY_SWITCH_CLI_MODE and `policy.json`)
     #[arg(long, value_enum)]
     pub mode: Option<CliMode>,
@@ -453,6 +457,8 @@ pub enum CliStatsSource {
 pub const MAX_STATS_RANGE_DAYS: u32 = 36_500;
 pub const MAX_STATS_RECENT_LIMIT: u32 = 500;
 pub const DEFAULT_STATS_LIST_RECENT: usize = 10;
+pub const DEFAULT_STATS_WATCH_INTERVAL_SECS: u64 = 2;
+pub const MAX_STATS_WATCH_INTERVAL_SECS: u64 = 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliStatsRange {
@@ -549,6 +555,16 @@ pub struct StatsWindowArgs {
         conflicts_with_all = ["range", "date", "from", "to"]
     )]
     pub recent: Option<u32>,
+
+    /// Stay open in an interactive terminal and refresh live every `<SECS>` seconds (default: 2, range: 1..=3600; press Tab to toggle summary/list, r to refresh, q/Esc to quit)
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "2",
+        value_name = "SECS",
+        value_parser = clap::value_parser!(u64).range(1..=MAX_STATS_WATCH_INTERVAL_SECS)
+    )]
+    pub watch: Option<u64>,
 }
 
 pub type StatsArgs = StatsWindowArgs;
