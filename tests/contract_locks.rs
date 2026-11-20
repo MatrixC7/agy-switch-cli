@@ -7942,10 +7942,14 @@ GLib.MainLoop().run()
     let body0 = notes[0]["body"].as_str().unwrap();
     assert_eq!(
         body0,
-        "<b>▶ bob@example.com (label- [31mANSI [0m)</b>\n<b>5h 100% · Weekly 85%</b>\n– alice@example.com (label- [31mANSI [0m)\n5h 2% · Weekly 40%",
+        "<b>↑ bob@example.com (label- [31mANSI [0m)</b>\n<b>5h 100% · Weekly 85%</b>\n↓ alice@example.com (label- [31mANSI [0m)\n5h 2% · Weekly 40%",
         "body={body0}"
     );
     assert!(!body0.contains('\x1b'), "ANSI leaked into body={body0}");
+    assert!(
+        !body0.contains("Restart"),
+        "Unexpected restart hint in body={body0}"
+    );
 
     // 2a-plain. When desktop does NOT advertise `body-markup`, notification degrades cleanly to plain text
     fs::write(&ctrl_file, r#"{"delay_ms": 0, "capabilities": ["body"]}"#).unwrap();
@@ -7963,7 +7967,7 @@ GLib.MainLoop().run()
     assert_eq!(notes_plain[1]["summary"], "Account Switched");
     assert_eq!(
         notes_plain[1]["body"].as_str().unwrap(),
-        "▶ bob@example.com (label- [31mANSI [0m)\n5h 100% · Weekly 85%\n– alice@example.com (label- [31mANSI [0m)\n5h 2% · Weekly 40%"
+        "↑ bob@example.com (label- [31mANSI [0m)\n5h 100% · Weekly 85%\n↓ alice@example.com (label- [31mANSI [0m)\n5h 2% · Weekly 40%"
     );
     // Restore markup capability for subsequent checks
     fs::write(

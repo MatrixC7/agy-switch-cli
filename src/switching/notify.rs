@@ -19,7 +19,6 @@ pub enum DaemonNotificationEvent {
         source_weekly_pct: Option<u8>,
         target_5h_pct: Option<u8>,
         target_weekly_pct: Option<u8>,
-        running_agy_detected: bool,
     },
     PausedOnFailure {
         stage: String,
@@ -150,7 +149,6 @@ pub fn format_notification_payload(
             source_weekly_pct,
             target_5h_pct,
             target_weekly_pct,
-            running_agy_detected,
         } => {
             let from_clean =
                 sanitize_notify_field(from_account, MAX_NOTIFY_ACCOUNT_CHARS, supports_markup);
@@ -159,29 +157,21 @@ pub fn format_notification_payload(
             let to_quota = format_window_line(*target_5h_pct, *target_weekly_pct);
             let from_quota = format_window_line(*source_5h_pct, *source_weekly_pct);
 
-            let mut lines = if supports_markup {
+            let lines = if supports_markup {
                 vec![
-                    format!("<b>▶ {to_clean}</b>"),
+                    format!("<b>↑ {to_clean}</b>"),
                     format!("<b>{to_quota}</b>"),
-                    format!("– {from_clean}"),
+                    format!("↓ {from_clean}"),
                     from_quota,
                 ]
             } else {
                 vec![
-                    format!("▶ {to_clean}"),
+                    format!("↑ {to_clean}"),
                     to_quota,
-                    format!("– {from_clean}"),
+                    format!("↓ {from_clean}"),
                     from_quota,
                 ]
             };
-
-            if *running_agy_detected {
-                lines.push(if supports_markup {
-                    "<i>Restart agy to use the new account.</i>".to_string()
-                } else {
-                    "Restart agy to use the new account.".to_string()
-                });
-            }
 
             NotificationPayload {
                 summary: "Account Switched".to_string(),
@@ -465,64 +455,62 @@ mod tests {
 
     #[test]
     fn format_notification_payload_supports_markup_and_plain_fallback_with_dual_windows() {
-        let switched_idle_event = DaemonNotificationEvent::Switched {
+        let switched_event = DaemonNotificationEvent::Switched {
             from_account: "alice+1@example.com\n\x1b[31m".into(),
             to_account: "bob&<tag>@example.com".into(),
             source_5h_pct: Some(2),
             source_weekly_pct: Some(40),
             target_5h_pct: Some(100),
             target_weekly_pct: Some(85),
-            running_agy_detected: false,
         };
 
-        let markup_idle = format_notification_payload(&switched_idle_event, true);
-        assert_eq!(markup_idle.summary, "Account Switched");
-        assert_eq!(markup_idle.icon, "dialog-information");
-        assert_eq!(markup_idle.urgency, 1);
+        let markup = format_notification_payload(&switched_event, true);
+        assert_eq!(markup.summary, "Account Switched");
+        assert_eq!(markup.icon, "dialog-information");
+        assert_eq!(markup.urgency, 1);
         assert_eq!(
-            markup_idle.body,
-            "<b>▶ bob&amp;&lt;tag&gt;@example.com</b>\n\
+            markup.body,
+            "<b>↑ bob&amp;&lt;tag&gt;@example.com</b>\n\
              <b>5h 100% · Weekly 85%</b>\n\
-             – alice+1@example.com [31m\n\
+             ↓ alice+1@example.com [31m\n\
              5h 2% · Weekly 40%"
         );
-        assert!(!markup_idle.body.contains('\x1b'));
+        assert!(!markup.body.contains('\x1b'));
+        assert!(!markup.body.contains("Restart"));
 
-        let plain_idle = format_notification_payload(&switched_idle_event, false);
+        let plain = format_notification_payload(&switched_event, false);
         assert_eq!(
-            plain_idle.body,
-            "▶ bob&<tag>@example.com\n\
+            plain.body,
+            "↑ bob&<tag>@example.com\n\
              5h 100% · Weekly 85%\n\
-             – alice+1@example.com [31m\n\
+             ↓ alice+1@example.com [31m\n\
              5h 2% · Weekly 40%"
         );
-        assert!(!plain_idle.body.contains("<b>"));
-        assert!(!plain_idle.body.contains("&amp;"));
+        assert!(!plain.body.contains("<b>"));
+        assert!(!plain.body.contains("&amp;"));
+        assert!(!plain.body.contains("Restart"));
 
-        let switched_running_event = DaemonNotificationEvent::Switched {
+        let switched_partial_windows_event = DaemonNotificationEvent::Switched {
             from_account: "alice@example.com".into(),
             to_account: "bob@example.com".into(),
             source_5h_pct: None,
             source_weekly_pct: Some(10),
             target_5h_pct: None,
             target_weekly_pct: None,
-            running_agy_detected: true,
         };
         assert_eq!(
-            format_notification_payload(&switched_running_event, true).body,
-            "<b>▶ bob@example.com</b>\n\
+            format_notification_payload(&switched_partial_windows_event, true).body,
+            "<b>↑ bob@example.com</b>\n\
              <b>5h — · Weekly —</b>\n\
-             – alice@example.com\n\
-             5h — · Weekly 10%\n\
-             <i>Restart agy to use the new account.</i>"
+             ↓ alice@example.com\n\
+             5h — · Weekly 10%"
         );
         assert_eq!(
-            format_notification_payload(&switched_running_event, false).body,
-            "▶ bob@example.com\n\
+            format_notification_payload(&switched_partial_windows_event, false).body,
+            "↑ bob@example.com\n\
              5h — · Weekly —\n\
-             – alice@example.com\n\
-             5h — · Weekly 10%\n\
-             Restart agy to use the new account."
+             ↓ alice@example.com\n\
+             5h — · Weekly 10%"
         );
 
         let long_reason = "R".repeat(200) + "<script>";

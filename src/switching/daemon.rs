@@ -1763,7 +1763,6 @@ impl DaemonEngine {
                             source_weekly_pct: source_windows.weekly_pct,
                             target_5h_pct: target_windows.short_5h_pct,
                             target_weekly_pct: target_windows.weekly_pct,
-                            running_agy_detected: !matches!(guard_runtime, RuntimeState::Idle),
                         },
                         shutdown_rx,
                     )

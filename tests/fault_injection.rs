@@ -1921,3 +1921,223 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
         .iter()
         .any(|id| id == "acc-stg"));
 }
+
+#[tokio::test]
+async fn synthetic_v123_r401_rejects_file_prev_uniform_false_and_allows_omitted_default_recovery() {
+    use agy_switch_cli::session::payload::bytes_sha256_hex;
+
+    let _guard = FAULT_ENV_MUTEX.lock().await;
+
+    let setup_fixture = |omit_prev_uniform: bool| {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = HeadlessPaths::with_explicit(
+            tmp.path().join("home"),
+            tmp.path().join("data"),
+            tmp.path().join("cache").join("agy-switch-cli"),
+        );
+        let run_dir = tmp.path().join("run");
+        let proc_dir = tmp.path().join("proc");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&proc_dir).unwrap();
+        fs::create_dir_all(&paths.active_slot_dir).unwrap();
+        let repo = StoreRepository::new(paths.clone());
+        let now = 1_850_000_000i64;
+
+        let acc_a = make_account(
+            "acc-0001",
+            "alice@example.com",
+            "1//synthetic-r401-a",
+            now + 3600,
+            now,
+        );
+        let acc_b = make_account(
+            "acc-0002",
+            "bob@example.com",
+            "1//synthetic-r401-b",
+            now + 3600,
+            now,
+        );
+        let mut pol = repo.read_policy().unwrap();
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(acc_a.clone(), true, now)?;
+            tx.upsert_account(acc_b, false, now)?;
+            tx.save_policy(&mut pol, None, now)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let slot_bytes = serialize_session_payload(&acc_a.token).unwrap();
+        FileSessionBackend.write_slot(&paths, &slot_bytes).unwrap();
+        let prev_digest = bytes_sha256_hex(slot_bytes.as_bytes());
+
+        let file_replica = if omit_prev_uniform {
+            json!({
+                "prev_present": true,
+                "prev_digest": prev_digest
+            })
+        } else {
+            json!({
+                "prev_present": true,
+                "prev_digest": prev_digest,
+                "prev_uniform": false
+            })
+        };
+
+        let journal_json = json!({
+            "schema_version": 1,
+            "operation_id": "op-synthetic-r401",
+            "phase": "aborted_uncommitted",
+            "prev_selected_account_id": "acc-0001",
+            "target_account_id": "acc-0002",
+            "prev_slot_digest": prev_digest,
+            "token_rotated": false,
+            "started_at": now,
+            "updated_at": now,
+            "replica_state": {
+                "backend": "file",
+                "uses_file": true,
+                "file": file_replica
+            }
+        });
+        fs::create_dir_all(paths.state_dir()).unwrap();
+        fs::write(
+            paths.switch_journal_file(),
+            serde_json::to_vec_pretty(&journal_json).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(
+            paths.switch_journal_file(),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        (tmp, paths, repo, run_dir, proc_dir)
+    };
+
+    let build_cli = |tmp: &tempfile::TempDir,
+                     paths: &HeadlessPaths,
+                     run_dir: &std::path::Path,
+                     proc_dir: &std::path::Path| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"));
+        c.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &paths.home_dir)
+            .env("XDG_CACHE_HOME", paths.cache_dir.parent().unwrap())
+            .env("XDG_RUNTIME_DIR", run_dir)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}/no-dbus", run_dir.display()),
+            )
+            .env("AGY_SWITCH_CLI_PROC_ROOT", proc_dir)
+            .env("AGY_SWITCH_CLI_AGY_BIN", tmp.path().join("no-agy"))
+            .args([
+                "--data-dir",
+                paths.data_dir.to_str().unwrap(),
+                "--backend",
+                "file",
+                "--no-remote-version",
+            ]);
+        c
+    };
+
+    // 1. Contradictory pure-file record (`file.prev_uniform=false`): BOTH `status` and `policy set`
+    //    MUST return exit 7 and preserve journal, slot, and business files byte-for-byte.
+    {
+        let (tmp, paths, _repo, run_dir, proc_dir) = setup_fixture(false);
+        let journal_before = fs::read(paths.switch_journal_file()).unwrap();
+        let slot_before = fs::read(&paths.active_slot_file).unwrap();
+        let index_before = fs::read(paths.index_file()).unwrap();
+        let policy_before = fs::read(paths.policy_file()).unwrap();
+        let acc_a_before = fs::read(paths.account_file("acc-0001")).unwrap();
+
+        let status_out = build_cli(&tmp, &paths, &run_dir, &proc_dir)
+            .args(["--json", "status"])
+            .output()
+            .unwrap();
+        assert_eq!(status_out.status.code(), Some(7));
+        let status_err: serde_json::Value = serde_json::from_slice(&status_out.stderr).unwrap();
+        assert_eq!(status_err["error_code"], "pending_journal_reconciliation");
+        assert_eq!(
+            fs::read(paths.switch_journal_file()).unwrap(),
+            journal_before
+        );
+        assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
+        assert_eq!(fs::read(paths.index_file()).unwrap(), index_before);
+        assert_eq!(fs::read(paths.policy_file()).unwrap(), policy_before);
+        assert_eq!(
+            fs::read(paths.account_file("acc-0001")).unwrap(),
+            acc_a_before
+        );
+
+        let policy_out = build_cli(&tmp, &paths, &run_dir, &proc_dir)
+            .args([
+                "--json",
+                "policy",
+                "set",
+                "--reserve",
+                "12",
+                "--minimum",
+                "35",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(policy_out.status.code(), Some(7));
+        let policy_err: serde_json::Value = serde_json::from_slice(&policy_out.stderr).unwrap();
+        assert_eq!(policy_err["error_code"], "recovery_incomplete");
+        assert_eq!(
+            fs::read(paths.switch_journal_file()).unwrap(),
+            journal_before
+        );
+        assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
+        assert_eq!(fs::read(paths.index_file()).unwrap(), index_before);
+        assert_eq!(fs::read(paths.policy_file()).unwrap(), policy_before);
+        assert_eq!(
+            fs::read(paths.account_file("acc-0001")).unwrap(),
+            acc_a_before
+        );
+    }
+
+    // 2. Recoverable positive control omitting `file.prev_uniform` (defaulting to `true`):
+    //    `status` stays read-only (exit 0) and `policy set` completes reconciliation & clears journal.
+    {
+        let (tmp, paths, repo, run_dir, proc_dir) = setup_fixture(true);
+        let journal_before = fs::read(paths.switch_journal_file()).unwrap();
+        let slot_before = fs::read(&paths.active_slot_file).unwrap();
+        let index_before = fs::read(paths.index_file()).unwrap();
+        let policy_before = fs::read(paths.policy_file()).unwrap();
+
+        let status_out = build_cli(&tmp, &paths, &run_dir, &proc_dir)
+            .args(["--json", "status"])
+            .output()
+            .unwrap();
+        assert_eq!(status_out.status.code(), Some(0));
+        let status_ok: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
+        assert_eq!(status_ok["journal_status"]["status"], "aborted_uncommitted");
+        assert_eq!(
+            fs::read(paths.switch_journal_file()).unwrap(),
+            journal_before
+        );
+        assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
+        assert_eq!(fs::read(paths.index_file()).unwrap(), index_before);
+        assert_eq!(fs::read(paths.policy_file()).unwrap(), policy_before);
+
+        let policy_out = build_cli(&tmp, &paths, &run_dir, &proc_dir)
+            .args([
+                "--json",
+                "policy",
+                "set",
+                "--reserve",
+                "12",
+                "--minimum",
+                "35",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(policy_out.status.code(), Some(0));
+        assert!(!paths.switch_journal_file().exists());
+        assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
+        let updated_policy = repo.read_policy().unwrap();
+        assert_eq!(updated_policy.reserve_percentage, 12);
+        assert_eq!(updated_policy.candidate_min_percentage, 35);
+    }
+}

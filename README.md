@@ -25,10 +25,10 @@
 前往 Releases 页面按 CPU 架构（`x86_64` 或 `aarch64`，可通过 `uname -m` 查看）下载对应的 `.tar.gz` 压缩包，无论在远程 SSH 服务器、Docker 容器、WSL2 还是开启了 GNOME Keyring / KDE Wallet 的 Linux 图形桌面上均可直接使用：
 
 ```bash
-sha256sum -c agy-switch-cli-v1.2.2-x86_64-unknown-linux-musl.tar.gz.sha256
-tar -xzf agy-switch-cli-v1.2.2-x86_64-unknown-linux-musl.tar.gz
+sha256sum -c agy-switch-cli-v1.2.3-x86_64-unknown-linux-musl.tar.gz.sha256
+tar -xzf agy-switch-cli-v1.2.3-x86_64-unknown-linux-musl.tar.gz
 mkdir -p ~/.local/bin
-install -m 0755 agy-switch-cli-v1.2.2-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
+install -m 0755 agy-switch-cli-v1.2.3-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
 ```
 
 ### 方式二：Arch Linux / EndeavourOS 等 Arch 系发行版（AUR）

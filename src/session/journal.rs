@@ -139,6 +139,11 @@ pub fn validate_replica_meta_completeness(meta: &JournalReplicaRecord) -> Result
     }
 
     if meta.needs_file() {
+        if !meta.file.prev_uniform {
+            return Err(
+                "Switch journal file replica metadata cannot report `prev_uniform=false`.".into(),
+            );
+        }
         let has_non_empty_dig = meta
             .file
             .prev_digest
@@ -2115,5 +2120,64 @@ mod tests {
                 prev_digest: None,
             });
         assert!(validate_replica_meta_completeness(&bad_file_cols).is_err());
+
+        // 6. R4-01: file replica metadata (`meta.needs_file()`) MUST reject explicit `prev_uniform=false`,
+        //    while omitting `file.prev_uniform` still defaults to `true` and keyring multi-collection
+        //    `prev_uniform=false` remains allowed when collections genuinely differ.
+        let mut bad_dual_file_uniform = dual_meta.clone();
+        bad_dual_file_uniform.file.prev_uniform = false;
+        assert!(validate_replica_meta_completeness(&bad_dual_file_uniform).is_err());
+
+        let file_meta_bad_uniform = JournalReplicaRecord {
+            backend: "file".into(),
+            uses_file: true,
+            keyring: None,
+            file: JournalReplicaSnapshot {
+                prev_present: true,
+                prev_digest: Some("dig-prev".into()),
+                prev_uniform: false,
+                collections: Vec::new(),
+            },
+        };
+        assert!(validate_replica_meta_completeness(&file_meta_bad_uniform).is_err());
+
+        let omitted_uniform_file_meta: JournalReplicaRecord =
+            serde_json::from_value(serde_json::json!({
+                "backend": "file",
+                "uses_file": true,
+                "file": { "prev_present": true, "prev_digest": "dig-prev" }
+            }))
+            .unwrap();
+        assert!(omitted_uniform_file_meta.file.prev_uniform);
+        assert!(validate_replica_meta_completeness(&omitted_uniform_file_meta).is_ok());
+
+        let bad_file_journal = SwitchJournal {
+            schema_version: STORE_SCHEMA_VERSION,
+            operation_id: "op-r401-bad-file-uniform".into(),
+            phase: JournalPhase::AbortedUncommitted,
+            prev_selected_account_id: Some("acc-1".into()),
+            target_account_id: "acc-2".into(),
+            prev_slot_digest: Some("dig-prev".into()),
+            target_slot_digest: None,
+            token_rotated: false,
+            started_at: now,
+            updated_at: now,
+            note: None,
+        };
+        repo.with_write_lock(|_| {
+            write_journal_with_replicas(&paths, &bad_file_journal, Some(&file_meta_bad_uniform))
+        })
+        .unwrap();
+        let raw_before = std::fs::read(paths.switch_journal_file()).unwrap();
+        let read_err = read_journal_full_with_clear_meta_readonly(&paths).unwrap_err();
+        assert_eq!(
+            read_err.exit_code,
+            crate::error::ExitCode::PartialCommitOrRecovery
+        );
+        assert_eq!(read_err.error_code, "recovery_incomplete");
+        assert_eq!(
+            std::fs::read(paths.switch_journal_file()).unwrap(),
+            raw_before
+        );
     }
 }

@@ -55,14 +55,14 @@
 
 ```bash
 # 第 1 步：校验压缩包完整性（输出显示成功 / OK 即可）
-sha256sum -c agy-switch-cli-v1.2.2-x86_64-unknown-linux-musl.tar.gz.sha256
+sha256sum -c agy-switch-cli-v1.2.3-x86_64-unknown-linux-musl.tar.gz.sha256
 
 # 第 2 步：解压压缩包
-tar -xzf agy-switch-cli-v1.2.2-x86_64-unknown-linux-musl.tar.gz
+tar -xzf agy-switch-cli-v1.2.3-x86_64-unknown-linux-musl.tar.gz
 
 # 第 3 步：安装到当前用户的可执行目录 ~/.local/bin（无需 sudo 权限）
 mkdir -p ~/.local/bin
-install -m 0755 agy-switch-cli-v1.2.2-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
+install -m 0755 agy-switch-cli-v1.2.3-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
 ```
 
 > **提示：如果输入 `agy-switch-cli --version` 提示 `command not found（找不到命令）` 怎么办？**  
@@ -175,7 +175,7 @@ agy-switch-cli status --json   # 输出结构化 JSON 巡检报告
 
 标准输出示例：
 ```text
-agy-switch-cli status (v1.2.2)
+agy-switch-cli status (v1.2.3)
   Backend:           dual
   Store status:      OK
   Journal status:    Clean
@@ -197,7 +197,7 @@ agy-switch-cli status (v1.2.2)
 - **`Journal status`（切号崩溃恢复日志状态）**：反映内部预写事务日志 `state/switch_journal.json` 的当前状态：
   - `Clean`：常规健康状态，表示没有任何中断残留的切号事务。
   - `AbortedUncommitted`：上次切号在修改外部凭据槽位之前就已经提前退出，外部凭据完好无损；后续你正常执行任意写命令（如 `switch`、`policy set`、`accounts` 等）时会自动清理该记录。
-  - `CommittedIndexPending` 或 `RecoveryIncomplete`：上次切号或清槽中途被系统信号中断（例如双写后端中仅更新了一侧副本）。由于 `status` 严格只读不会擅自改写状态，此时会如实报告该状态并返回退出码 `7`；你只需执行一次手动切号（如 `agy-switch-cli switch <ID|EMAIL>`）或其他交互式写命令，程序便会在持有锁与外部凭据防误覆盖（CAS）保护的前提下自动完成双端对账修复。
+  - `CommittedIndexPending` 或 `RecoveryIncomplete`：上次切号或清槽留下未完成、尚未确认持久化或无法核实的事务（例如中途中断、双写仅更新一侧副本、父目录持久化同步失败，或事务日志元数据损坏/矛盾）。由于 `status` 严格只读不会擅自改写状态，此时会如实报告该状态并返回退出码 `7`；后续执行交互式写命令（如 `agy-switch-cli switch <ID|EMAIL>`、`policy set` 等）会先在持有锁与外部凭据防误覆盖（CAS）保护的前提下尝试对账，只有在能够安全核实事务状态并完成耐久性检查后才会清理日志。若重放后仍返回退出码 `7`，请保留日志并按诊断信息排除底层存储、权限或后端问题后再重试，不要手动删除 `state/switch_journal.json`。
 - **`Slot initialized`（官方凭据槽位是否已初始化）**：
   - `true`：当前生效后端中已经存有 `agy` 登录凭据。
   - `false`：全新环境尚未登录或尚未向槽位写入过凭据（属于正常初始状态；若槽位文件存在但 JSON 内容损坏，`status` 会报错并返回退出码 `1`）。
@@ -452,7 +452,7 @@ agy-switch-cli switch bob@example.com --allow-running   # 在 /proc 不可读（
 - **不同环境与 `--backend` 模式下的切号行为**：
   - **纯无头环境（远程 SSH 服务器、Docker 容器、无桌面 WSL2）**：默认 `auto` 自动采用 `file` 模式，以 `0600` 权限原子替换 `~/.gemini/antigravity-cli/antigravity-oauth-token`，切完直接运行 `agy` 即刻生效。
   - **带有系统钥匙串的 Linux 图形桌面环境（如 KDE Plasma、GNOME）**：
-    - **默认用法（`auto` 自动启用 `dual` 事务性双写）**：直接运行 `agy-switch-cli switch bob@example.com`（无需手传额外参数），程序自动对系统钥匙串集合与本地 `antigravity-oauth-token` 执行前置快照、加密更新、双 `fsync` 落盘与双副本一致性回读校验（任一步失败自动双端回滚；若遇到传输中断等不确定状态则保留切换日志并返回退出码 `7`，后续任意交互式写命令会在安全 CAS 保护下自动完成对账恢复）。切完后在任意终端直接输入 `agy` 立即使用新账号。
+    - **默认用法（`auto` 自动启用 `dual` 事务性双写）**：直接运行 `agy-switch-cli switch bob@example.com`（无需手传额外参数），程序自动对系统钥匙串集合与本地 `antigravity-oauth-token` 执行前置快照、加密更新、双 `fsync` 落盘与双副本一致性回读校验（任一步失败自动双端回滚；若遇到传输中断等不确定状态则保留切换日志并返回退出码 `7`，后续交互式写命令会在安全 CAS 保护下尝试对账，并在安全核实状态与耐久性检查通过后清理日志，详见 [4.1 节 `status`](#41-环境状态只读巡检status) 的 `Journal status` 恢复指引）。切完后在任意终端直接输入 `agy` 立即使用新账号。
     - **仅用钥匙串不留本地文件（`--backend keyring`）**：执行 `agy-switch-cli --backend keyring switch bob@example.com`（或在 `config.json` 中设 `"backend": "keyring"`），程序仅读写系统钥匙串，完全不创建或修改 `~/.gemini/antigravity-cli/antigravity-oauth-token`。
     - **桌面与 CLI 账号隔离（显式 `--backend file` + `run`）**：若希望桌面端 App 保持原钥匙串账号、仅让终端里的 `agy` 换用另一个账号，可执行 `agy-switch-cli --backend file switch bob@example.com` 只改本地文件，再通过可选方式 `agy-switch-cli --backend file run -- agy` 启动（显式选择 `file` 后端时，`run` 会自动为子进程屏蔽桌面钥匙串总线）。
 
@@ -598,15 +598,14 @@ agy-switch-cli run -- agy
 - **后台巡检、桌面推送与无头静默边界说明**：
   - `daemon` 在后台定时巡检并按需提前切换凭据槽位，绝不会强行终止或打断你正在交互的 `agy` 进程。
   - **桌面通知与无头自动跳过**：
-    - 当运行于存在活跃桌面通知服务（`org.freedesktop.Notifications`，如 KDE Plasma、GNOME 等）的图形环境时，`daemon` 会在**成功自动切号**时发送普通级别提醒（顶部 `▶` 标出新切入账号及其 `5h` / `Weekly` 双窗口余量，下方 `–` 标出被切出账号；检测到正在运行的 `agy` 会话时附带一行重启提醒），并在**首次触发连续失败熔断暂停**时发送高优先级警告（后续已暂停轮次不再重复弹窗）；发送前会只读查询 `GetCapabilities`，桌面支持 `body-markup` 时自动加粗主行与斜体提示，不支持时退回纯文本：
+    - 当运行于存在活跃桌面通知服务（`org.freedesktop.Notifications`，如 KDE Plasma、GNOME 等）的图形环境时，`daemon` 会在**成功自动切号**时发送普通级别提醒（顶部 `↑` 标出新切入账号及其 `5h` / `Weekly` 双窗口余量，下方 `↓` 标出被切出账号），并在**首次触发连续失败熔断暂停**时发送高优先级警告（后续已暂停轮次不再重复弹窗）；发送前会只读查询 `GetCapabilities`，桌面支持 `body-markup` 时自动加粗新账号与新余量两行（并将 `↑` 一并置于加粗块内）、对故障排查指引使用斜体，不支持时退回纯文本：
       ```text
-      # 自动切号成功通知示例（支持 body-markup 的桌面会将前两行加粗、底行斜体；无运行中 agy 时不含最后一行）：
+      # 自动切号成功通知示例（支持 body-markup 的桌面会将前两行加粗，其中 `↑` 位于加粗块内）：
       Account Switched
-      ▶ bob@example.com
+      ↑ bob@example.com
       5h 100% · Weekly 85%
-      – alice@example.com
+      ↓ alice@example.com
       5h 2% · Weekly 40%
-      Restart agy to use the new account.
 
       # 连续失败熔断暂停通知示例（无目标账号时首行合并为 `■ Journal recovery · 1/3 failed`）：
       Auto-Switch Paused
@@ -809,8 +808,8 @@ Models (sorted by total tokens)
   - `Cache hit`：上下文缓存命中率，等于 `Input (cached) / Total input`（固定保留一位小数；只要存在未缓存输入即封顶 `99.9%`，总输入为 `0` 时显示 `—`）。
   - `Requests`：所选窗口内的有效模型生成请求总次数。
   - `TTFT (P10/P50/P90)`：首字到达耗时（单位秒 `s`）的 10% / 50% / 90% 分位值。
-  - `TPS (P10/P50/P90)`：流式阶段实测输出速度（`= output_tokens / streaming_duration`，单位 `t/s`）的 `P10 / P50 / P90` 分位值。
-  - **统一性能样本口径（`stats summary` 与 `stats list` 完全一致）**：只要当次生成步骤正常完成（未处于报错 `err`、取消 `canc` 或运行中 `run` 状态，兼容含工具调用与简短回复）、无内部重试退避污染（`retries == 0`）、总输出 `output_tokens > 0`、首字耗时 `ttft > 0` 且流式阶段耗时 **`streaming_duration >= 1.0s`**（过滤不足 `1.0` 秒的单块缓冲瞬时突发达峰，避免扭曲真实流式速度），即纳入实测 `TPS` 计算（无合格样本时显示 `—`）。
+  - `TPS (P10/P50/P90)`：流式阶段实测输出速度（`= live_output_tokens / live_streaming_duration`，单位 `t/s`）的 `P10 / P50 / P90` 分位值；分子与分母均固定取自实时生成记录的输出量与实时流式时长（即使同次请求的汇总输出量 `Total output` 优先采用了有效归档记录）。
+  - **统一性能样本口径（`stats summary` 与 `stats list` 完全一致）**：仅当该次生成步骤明确完成（`steps.status == 3` 且 `gen_metadata` 无错误字段）、无非法或超限 `step_payload`（兼容含工具调用与简短回复）、无内部重试退避污染（`retries == 0`）、实时输出 `live_output_tokens > 0`、首字耗时 `ttft > 0` 且实时流式阶段耗时 **`live_streaming_duration >= 1.0s`**（过滤不足 `1.0` 秒的单块缓冲瞬时突发达峰，避免扭曲真实流式速度）时，才纳入实测 `TPS` 计算（无合格样本时显示 `—`）。
 - **`Models` 分模型汇总表（共 7 列）**：
   - `Model` / `Reqs`：模型名称与该模型在所选窗口内的请求次数。
   - `Input` / `Cached` / `Hit%`：该模型的**总输入 Token**（`= uncached_input + cached_input`，与上方 `Total input` 口径一致）、其中命中缓存的输入 Token，以及精确到一位小数的缓存命中率（`= Cached / Input`；存在未缓存输入时最高封顶 `99.9%`）。
@@ -831,16 +830,16 @@ Requests (newest first, showing 5)
 
 - **十列字段含义与极窄终端降级说明**：
   - `Time`：请求发起的本机本地时间。宽屏（`>= 95` 列或非 TTY 管道）显示 `MM-DD HH:MM:SS`（跨年份时自动扩展为 `YYYY-MM-DD HH:MM:SS`）；常规窄屏（`< 95` 列且达到十列最小可读宽度时）保留全部 10 列，将时间收紧为 `MM-DD HH:MM` 并动态压缩 `Model` 列宽；若终端宽度低于十列最小可读宽度（例如 `50` 列极窄分屏），自动切换为紧凑多行块格式展示单条请求，确保 `TPS`、`St` 等末尾字段不会被截断丢失。
-  - `Model`：实时会话优先采用包含思考强度后缀的展示标签（protobuf field `21`，如 `Gemini 4 Carbon (High)`，与归档库 `token_usage_archive.db` 中的展示口径一致），在部分调用缺失 field `21` 时回退至原始模型 ID（protobuf field `19`，如 `gemini-pro-orchestrator-neon`）；所有名称均经过公开白名单校验，其余本地非公开自由文本、路径、无扩展名文件名或异常字段统一回退为 `"Unknown"`。
-  - `In` / `Cache` / `Out`：当次请求的**总输入 Token**（未缓存新增输入与缓存命中输入之和，与 `stats summary` 的 `Input` 口径一致）、其中命中上下文缓存的输入 Token 与总输出 Token（自适应紧凑单位）。
+  - `Model`：实时会话优先采用包含思考强度后缀的展示标签（protobuf field `21`，如 `Gemini 4 Carbon (High)`，与归档库 `token_usage_archive.db` 中的展示口径一致），在部分调用缺失 field `21` 时回退至原始模型 ID（protobuf field `19`，如 `gemini-pro-orchestrator-neon`）；所有名称均经过已知公共模型家族与受限命名语法过滤校验（自动兼容已知家族的新版本模型标签，拒绝本地非公开自由文本、路径、无扩展名文件名、邮箱、URL、IP 或异常字段，不通过者统一回退为 `"Unknown"`）。
+  - `In` / `Cache` / `Out`：当次请求的**总输入 Token**（未缓存新增输入与缓存命中输入之和，与 `stats summary` 的 `Input` 口径一致）、其中命中上下文缓存的输入 Token 与总输出 Token（自适应紧凑单位；若存在有效归档记录则优先采用归档中的用量值）。
   - `Hit%`：当次请求的缓存命中率百分比（`= Cache / In`，固定保留一位小数，如 `99.5%`、`91.9%`、`0.0%`）；只要存在未缓存输入（即 `Cache < In` 且 `Cache > 0`），上限封顶为 **`99.9%`**（防止 `99.96%` 四舍五入误显示为 `100.0%`），仅当全部输入均命中缓存（`In == Cache` 且 `Cache > 0`）时才显示 `100.0%`（总输入 `In == 0` 时显示 `—`）。
   - `TTFT` / `Dur`：首字到达耗时与请求总耗时（`Dur = ttft + streaming_duration`，流式时长缺省时取 `ttft`）。
-  - `TPS`：无单位后缀的四舍五入整数吐字速度（`= output_tokens / streaming_duration`）；采用与 `stats summary` 完全统一的事件时间戳与过滤条件（严格要求已完成步骤 `steps.status == 3`、无非法/超限 `step_payload`、`retries == 0`、`output_tokens > 0`、`ttft > 0` 且 **`streaming_duration >= 1.0s`**），包含工具调用回合与流式回复，流式阶段不足 `1.0s` 或不满足条件时显示 `—`。
+  - `TPS`：无单位后缀的四舍五入整数吐字速度（`= live_output_tokens / live_streaming_duration`，始终使用实时记录的输出量与实时流式时长；当 `Out` 取自有效归档记录时，`Out` 可以与 `TPS` 的分子不同）；采用与 `stats summary` 完全统一的事件时间戳与过滤条件（严格要求已完成步骤 `steps.status == 3`、`gen_metadata` 无错误字段、无非法/超限 `step_payload`、`retries == 0`、实时输出 `live_output_tokens > 0`、`ttft > 0` 且 **`live_streaming_duration >= 1.0s`**），包含工具调用回合与流式回复，流式阶段不足 `1.0s` 或不满足条件时显示 `—`。
   - `St`：请求状态简码，实时库映射为 `ok`（已完成 `status=3`）、`err`（报错或无效）、`canc`（取消或中断）、`run`（进行中或排队中）、`unk`（缺失或未识别的状态值），仅存于历史归档库且原实时 `.db` 已移除的记录显示为 `arch`。
 - **上限截断说明**：按日期区间（`--range` / `--date` / `--from`）查询 `stats list` 时，最多输出最新的 `500` 条记录；若匹配总数超过 `500` 条，表头会自动注明 `(newest first, showing 500 of <总数> — capped at 500)`。
 - **`stats summary --json` 与 `stats list --json` 机器输出说明（`schema_version: 1`）**：
   - 两者共享顶层 `source`、`range`（当使用 `--recent` 时为 `{"kind": "recent", "recent": N, "from": ..., "to": ...}`）、`databases_scanned`、`generations_scanned`、`skipped_large_records`、`unreadable_databases`、`last_activity`、`range_last_activity` 与 `generated_at`。
-  - `stats summary --json` 输出 `summary`、`performance` 与 `models`（每项含 `model`、`request_count`、`total_input_tokens`、`uncached_input_tokens`、`cached_input_tokens`、`cache_hit_ratio`、`cache_hit_percent`、`output_tokens`、`total_tokens`）；`stats list --json` 输出 `total_matching`、`shown_count`、`truncated` 与 `items` 数组（每项含 `timestamp`、`local_time`、`model`、`uncached_input_tokens`、`cached_input_tokens`、`total_input_tokens`、`cache_hit_ratio`、`cache_hit_percent`、`output_tokens`、`total_tokens`、`ttft_seconds`、`duration_seconds`、`output_tps`、`status`），结构中不导出 `source_key`、本机路径或账号邮箱，模型名经严格公开白名单收敛至已知公共模型或 `"Unknown"`。
+  - `stats summary --json` 输出 `summary`、`performance` 与 `models`（每项含 `model`、`request_count`、`total_input_tokens`、`uncached_input_tokens`、`cached_input_tokens`、`cache_hit_ratio`、`cache_hit_percent`、`output_tokens`、`total_tokens`）；`stats list --json` 输出 `total_matching`、`shown_count`、`truncated` 与 `items` 数组（每项含 `timestamp`、`local_time`、`model`、`uncached_input_tokens`、`cached_input_tokens`、`total_input_tokens`、`cache_hit_ratio`、`cache_hit_percent`、`output_tokens`、`total_tokens`、`ttft_seconds`、`duration_seconds`、`output_tps`、`status`），结构中不导出 `source_key`、本机路径或账号邮箱，模型名经已知公共模型家族与受限语法过滤，仅保留符合公共模型命名规范的标签，其余统一回退为 `"Unknown"`。
 
 ---
 
