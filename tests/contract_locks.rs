@@ -7353,15 +7353,23 @@ fn synthetic_v120_round3_systemd_identity_status_pgid_and_path_secret_order() {
         String::from_utf8_lossy(&sp_uninst.stderr)
     );
 
-    // 4. R3-14: `daemon --once --json` with disabled policy returns exit 0 with empty stdout/stderr!
+    // 4. J1 (`v1.2.2`): `daemon --once --json` with disabled policy returns exit 0 with valid JSON envelope & empty stderr!
     let d_once = env
         .cli_cmd()
         .args(["--json", "daemon", "--once"])
         .output()
         .unwrap();
     assert_eq!(d_once.status.code(), Some(0));
-    assert!(d_once.stdout.is_empty());
-    assert!(d_once.stderr.is_empty());
+    assert!(
+        d_once.stderr.is_empty(),
+        "stderr={}",
+        String::from_utf8_lossy(&d_once.stderr)
+    );
+    let d_once_j: serde_json::Value = serde_json::from_slice(&d_once.stdout).unwrap();
+    assert_eq!(d_once_j["schema_version"], 1);
+    assert_eq!(d_once_j["ok"], true);
+    assert_eq!(d_once_j["daemon"]["phase"], "disabled");
+    assert_eq!(d_once_j["daemon"]["outcome"], "disabled");
 
     // 5. R3-13: Real PTY test verifying `Ctrl+D` (`\x04`) cancels inline `x` (delete) and `D`
     //    (disable all) confirmations WITHOUT exiting the TUI, then exits cleanly when no
@@ -8037,6 +8045,10 @@ GLib.MainLoop().run()
     assert!(
         !pause_lines[1].contains("Paused due to"),
         "reason should not duplicate Paused prefix: {pause_body}"
+    );
+    assert!(
+        !pause_body.contains(pause_env.paths().data_dir.to_str().unwrap()),
+        "PausedOnFailure notification must not leak local filesystem paths: {pause_body}"
     );
     assert_eq!(
         pause_lines[2],

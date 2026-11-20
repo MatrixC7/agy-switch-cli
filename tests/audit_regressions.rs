@@ -6345,7 +6345,7 @@ async fn maint_daily_hub_ua_partial_3p_fallback_and_carbon_disabled_isolation() 
     assert_eq!(DEFAULT_QUOTA_MAX_AGE_SECS, 3600);
     assert_eq!(
         agy_switch_cli::switching::daemon::DEFAULT_DAEMON_INTERVAL_SECS,
-        3600
+        180
     );
     assert_eq!(
         agy_switch_cli::switching::daemon::DEFAULT_DAEMON_COOLDOWN_SECS,

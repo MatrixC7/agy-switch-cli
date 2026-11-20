@@ -1929,12 +1929,12 @@ async fn synthetic_immediate_mode_overwrites_slot_with_running_agy_fails_closed_
     let repo = StoreRepository::new(paths.clone());
     let backend = FileSessionBackend;
 
-    // 1. Default policy is `Immediate` + `RoundRobin` (`reserve = 5%`, `minimum = 15%`).
+    // 1. Default policy is `Immediate` + `RoundRobin` (`reserve = 10%`, `minimum = 30%`).
     let default_pol = SwitchPolicy::default();
     assert_eq!(default_pol.mode, PolicyMode::Immediate);
     assert_eq!(default_pol.strategy, PolicyStrategy::RoundRobin);
-    assert_eq!(default_pol.reserve_percentage, 5);
-    assert_eq!(default_pol.candidate_min_percentage, 15);
+    assert_eq!(default_pol.reserve_percentage, 10);
+    assert_eq!(default_pol.candidate_min_percentage, 30);
 
     let make_acc = |id: &str, pct: f64| -> AccountRecord {
         let mut a = AccountRecord::new(
@@ -2217,4 +2217,1358 @@ async fn synthetic_immediate_mode_overwrites_slot_with_running_agy_fails_closed_
     .unwrap();
     let bad_disk_pol = cli().args(["policy", "show"]).output().unwrap();
     assert_eq!(bad_disk_pol.status.code(), Some(1));
+}
+
+fn make_v122_account(
+    id: &str,
+    email: &str,
+    pct: f64,
+    quota_updated_at: i64,
+    now: i64,
+) -> AccountRecord {
+    let mut a = AccountRecord::new(
+        id.into(),
+        email.into(),
+        TokenRecord {
+            access_token: format!("ya29.{id}"),
+            refresh_token: format!("1//RT_{id}"),
+            expires_in: 7200,
+            expiry_timestamp: now + 7200,
+            token_type: "Bearer".into(),
+            id_token: None,
+            oauth_client_key: Some("antigravity_enterprise".into()),
+            granted_scopes: None,
+            project_id: None,
+            is_gcp_tos: true,
+        },
+        now,
+    );
+    a.quota = Some(build_quota(
+        quota_updated_at,
+        Some("Google AI Pro"),
+        pct,
+        pct,
+        Some(pct),
+        "2099-01-01T00:00:00Z",
+    ));
+    a
+}
+
+#[tokio::test]
+async fn v122_validation_blocked_manual_switch_run_dry_run_unlock_and_daemon_triple_guard() {
+    use agy_switch_cli::quota::client::refresh_account_quota_locked;
+    use agy_switch_cli::store::locks::ActiveSlotLock;
+    use agy_switch_cli::switching::executor::{
+        execute_switch_with_slot_lock, preview_switch_dry_run,
+    };
+    use serde_json::json;
+
+    let _guard = PROC_ENV_MUTEX.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    let cache = tmp.path().join("cache");
+    let run_dir = tmp.path().join("run");
+    let fake_proc = tmp.path().join("proc");
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::create_dir_all(&fake_proc).unwrap();
+    fs::create_dir_all(&bin_dir).unwrap();
+    let _proc_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc);
+
+    let paths = HeadlessPaths::with_explicit(home.clone(), data.clone(), cache.clone());
+    ensure_private_dir(&paths.active_slot_dir).unwrap();
+    let repo = StoreRepository::new(paths.clone());
+    let now = jiff::Timestamp::now().as_second();
+
+    let acc_a = make_v122_account("acc-v122-a", "alice@example.com", 0.02, now, now);
+    let mut acc_b = make_v122_account("acc-v122-b", "bob@example.com", 0.90, now, now);
+    acc_b.validation_blocked = true;
+    acc_b.validation_blocked_reason =
+        Some("Google CloudCode returned HTTP 403 VALIDATION_REQUIRED.".into());
+    let mut acc_c = make_v122_account("acc-v122-c", "charlie@example.com", 0.95, now, now);
+    acc_c.disabled = true;
+
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc_a.clone(), true, now)?;
+        tx.upsert_account(acc_b.clone(), false, now)?;
+        tx.upsert_account(acc_c.clone(), false, now)?;
+        let mut pol = SwitchPolicy {
+            enabled: true,
+            mode: PolicyMode::Immediate,
+            strategy: PolicyStrategy::Priority,
+            reserve_percentage: 5,
+            candidate_min_percentage: 15,
+            monitored_model: "all".into(),
+            candidate_account_ids: vec!["acc-v122-b".into()],
+            ..SwitchPolicy::default()
+        };
+        tx.save_policy(&mut pol, None, now)?;
+        Ok(())
+    })
+    .unwrap();
+
+    FileSessionBackend
+        .write_slot(&paths, &serialize_session_payload(&acc_a.token).unwrap())
+        .unwrap();
+
+    let reg = OAuthClientRegistry::load(&paths).unwrap();
+    let dummy_transport = MockTransport::default();
+
+    // 1. `daemon` strictly rejects `validation_blocked` candidate even when active account is at 2% <= 5%.
+    let mut engine = DaemonEngine::new();
+    let daemon_no_cand = engine
+        .run_single_tick(
+            &repo,
+            &FileSessionBackend,
+            &dummy_transport,
+            &OAuthEndpoints::default(),
+            &CloudCodeEndpoints::default(),
+            &reg,
+            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+            &DaemonConfigOverrides::default(),
+            now,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            daemon_no_cand,
+            TickStageOutcome::NoQualifiedCandidate { .. }
+        ),
+        "Daemon MUST NOT select validation_blocked candidate: got {daemon_no_cand:?}"
+    );
+
+    // 2. Low-level L1 `execute_switch_with_slot_lock` (and daemon Stage 6) still strictly rejects `validation_blocked`.
+    {
+        let slot_lock = ActiveSlotLock::try_acquire(&paths, false).unwrap();
+        let locked_err = execute_switch_with_slot_lock(
+            &slot_lock,
+            &repo,
+            &FileSessionBackend,
+            &dummy_transport,
+            &OAuthEndpoints::default(),
+            &reg,
+            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+            "acc-v122-b",
+            true,
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(locked_err.error_code, "account_validation_blocked");
+    }
+
+    // 3. `preview_switch_dry_run` (A12 zero-transport dry-run) allows `validation_blocked` with warning,
+    //    and still rejects `disabled` accounts.
+    let dry_blocked = preview_switch_dry_run(
+        &repo,
+        &FileSessionBackend,
+        &reg,
+        "acc-v122-b",
+        true,
+        false,
+        now,
+    )
+    .unwrap();
+    assert!(dry_blocked.dry_run);
+    assert!(dry_blocked.validation_blocked);
+    assert!(dry_blocked
+        .validation_warning
+        .as_deref()
+        .is_some_and(|w| w.contains("verify-blocked") && w.contains("refresh acc-v122-b")));
+
+    let dry_disabled_err = preview_switch_dry_run(
+        &repo,
+        &FileSessionBackend,
+        &reg,
+        "acc-v122-c",
+        true,
+        false,
+        now,
+    )
+    .unwrap_err();
+    assert_eq!(
+        dry_disabled_err.exit_code,
+        agy_switch_cli::error::ExitCode::InvalidUsageOrAmbiguous
+    );
+
+    // 4. Manual `execute_switch` (CLI `switch` / TUI `Enter` path) switches into `acc-v122-b`
+    //    while PRESERVING `validation_blocked = true` on disk.
+    let manual_out = execute_switch(
+        &repo,
+        &FileSessionBackend,
+        &dummy_transport,
+        &OAuthEndpoints::default(),
+        &reg,
+        "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+        "acc-v122-b",
+        &SwitchOptions {
+            dry_run: false,
+            allow_running: true,
+        },
+        now,
+    )
+    .await
+    .unwrap();
+    assert!(manual_out.validation_blocked);
+    assert!(manual_out.validation_warning.is_some());
+    assert!(
+        repo.read_account_unchecked("acc-v122-b")
+            .unwrap()
+            .validation_blocked,
+        "Manual switch MUST NOT clear validation_blocked before user verifies in agy"
+    );
+    assert!(fs::read_to_string(&paths.active_slot_file)
+        .unwrap()
+        .contains("1//RT_acc-v122-b"));
+
+    // 5. While `acc-v122-b` is selected and `validation_blocked`, `daemon` holds calmly without hijacking slot!
+    let hold_out = engine
+        .run_single_tick(
+            &repo,
+            &FileSessionBackend,
+            &dummy_transport,
+            &OAuthEndpoints::default(),
+            &CloudCodeEndpoints::default(),
+            &reg,
+            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+            &DaemonConfigOverrides::default(),
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        hold_out,
+        TickStageOutcome::UncertainHold {
+            reason: "validation_blocked".into()
+        }
+    );
+
+    // 6. CLI `switch --dry-run --json` and `run` (both already-selected and explicit `--account`) succeed
+    //    with clear stderr notice and keep `validation_blocked = true`.
+    let fake_agy = bin_dir.join("agy");
+    fs::write(&fake_agy, "#!/bin/sh\necho FAKE_AGY_STDOUT\nexit 0\n").unwrap();
+    fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cli_base = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"));
+        c.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_RUNTIME_DIR", &run_dir)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}/no-dbus", run_dir.display()),
+            )
+            .env("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc)
+            .env("AGY_SWITCH_CLI_PROXY", "direct")
+            .env("NO_PROXY", "*")
+            .args([
+                "--data-dir",
+                data.to_str().unwrap(),
+                "--backend",
+                "file",
+                "--no-remote-version",
+            ]);
+        c
+    };
+
+    let dry_cli = cli_base()
+        .args(["--json", "switch", "acc-v122-b", "--dry-run"])
+        .output()
+        .unwrap();
+    assert_eq!(dry_cli.status.code(), Some(0));
+    let dry_j: serde_json::Value = serde_json::from_slice(&dry_cli.stdout).unwrap();
+    assert_eq!(dry_j["switch"]["validation_blocked"], true);
+    assert!(dry_j["switch"]["validation_warning"]
+        .as_str()
+        .unwrap()
+        .contains("verify-blocked"));
+
+    let run_selected = cli_base()
+        .args(["run", "--", fake_agy.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(run_selected.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&run_selected.stdout).trim(),
+        "FAKE_AGY_STDOUT"
+    );
+    assert!(String::from_utf8_lossy(&run_selected.stderr).contains("verify-blocked"));
+
+    // Switch back to healthy `acc-v122-a`, then `run --account acc-v122-b` triggers switch + stderr notice.
+    let sw_back = cli_base().args(["switch", "acc-v122-a"]).output().unwrap();
+    assert_eq!(sw_back.status.code(), Some(0));
+    assert!(sw_back.stderr.is_empty());
+
+    let run_explicit = cli_base()
+        .args([
+            "run",
+            "--account",
+            "acc-v122-b",
+            "--",
+            fake_agy.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(run_explicit.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&run_explicit.stdout).trim(),
+        "FAKE_AGY_STDOUT"
+    );
+    assert!(String::from_utf8_lossy(&run_explicit.stderr).contains("refresh acc-v122-b"));
+    assert!(
+        repo.read_account_unchecked("acc-v122-b")
+            .unwrap()
+            .validation_blocked
+    );
+
+    // 7. After user completes Google verification in `agy`, primary HTTP 200 refresh auto-clears `validation_blocked`!
+    let ok_mock = MockTransport::from_handler(|req| {
+        if req.url.ends_with(":loadCodeAssist") {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
+            ));
+        }
+        if req.url.ends_with(":fetchAvailableModels") {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"}}}}),
+            ));
+        }
+        Ok(MockTransport::json_response(
+            200,
+            json!({"groups": [{"displayName": "Gemini Models", "buckets": [
+                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"},
+                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.95, "resetTime": "2099-01-07T00:00:00Z"}
+            ]}]}),
+        ))
+    });
+    let unlocked = refresh_account_quota_locked(
+        &repo,
+        &ok_mock,
+        &OAuthEndpoints::default(),
+        &CloudCodeEndpoints {
+            environments: vec![(
+                QuotaSourceEnv::Daily,
+                "http://127.0.0.1:9/v1internal".into(),
+            )],
+            fallback_delay: std::time::Duration::from_millis(1),
+        },
+        &reg,
+        "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+        "acc-v122-b",
+        now + 5,
+    )
+    .await
+    .unwrap();
+    assert!(!unlocked.validation_blocked);
+}
+
+#[tokio::test]
+async fn v122_daemon_once_live_refresh_180s_max_age_and_human_json_output() {
+    use agy_switch_cli::switching::daemon::{
+        effective_source_quota_max_age_secs, DEFAULT_DAEMON_COOLDOWN_SECS,
+        DEFAULT_DAEMON_INTERVAL_SECS,
+    };
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    assert_eq!(DEFAULT_DAEMON_INTERVAL_SECS, 180);
+    assert_eq!(DEFAULT_DAEMON_COOLDOWN_SECS, 3600);
+    assert_eq!(effective_source_quota_max_age_secs(180), 144);
+    assert_eq!(effective_source_quota_max_age_secs(300), 240);
+    assert_eq!(effective_source_quota_max_age_secs(3600), 2880);
+    assert_eq!(effective_source_quota_max_age_secs(7200), 3600);
+    assert_eq!(effective_source_quota_max_age_secs(1), 4);
+
+    let _guard = PROC_ENV_MUTEX.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    let cache = tmp.path().join("cache");
+    let run_dir = tmp.path().join("run");
+    let fake_proc = tmp.path().join("proc");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::create_dir_all(&fake_proc).unwrap();
+    let _proc_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc);
+
+    let paths = HeadlessPaths::with_explicit(home.clone(), data.clone(), cache.clone());
+    ensure_private_dir(&paths.active_slot_dir).unwrap();
+    let repo = StoreRepository::new(paths.clone());
+    let now = jiff::Timestamp::now().as_second();
+
+    // Seed `acc-src` with a 41-minute-old cached quota of 26.7% (> 5% reserve, < 3600s old),
+    // reproducing the exact live issue where `daemon --once` previously skipped refreshing!
+    let acc_src = make_v122_account("acc-src", "alice@example.com", 0.267, now - 2453, now);
+    let acc_dst = make_v122_account("acc-dst", "bob@example.com", 1.0, now - 10, now);
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc_src.clone(), true, now)?;
+        tx.upsert_account(acc_dst.clone(), false, now)?;
+        let mut pol = SwitchPolicy {
+            enabled: true,
+            mode: PolicyMode::Immediate,
+            strategy: PolicyStrategy::RoundRobin,
+            reserve_percentage: 5,
+            candidate_min_percentage: 15,
+            monitored_model: "all".into(),
+            candidate_account_ids: vec!["acc-src".into(), "acc-dst".into()],
+            ..SwitchPolicy::default()
+        };
+        tx.save_policy(&mut pol, None, now)?;
+        Ok(())
+    })
+    .unwrap();
+    fs::create_dir_all(&paths.active_slot_dir).unwrap();
+    FileSessionBackend
+        .write_slot(&paths, &serialize_session_payload(&acc_src.token).unwrap())
+        .unwrap();
+
+    let reg = OAuthClientRegistry::load(&paths).unwrap();
+    let fast_cc = CloudCodeEndpoints {
+        environments: vec![(
+            QuotaSourceEnv::Daily,
+            "http://127.0.0.1:9/v1internal".into(),
+        )],
+        fallback_delay: std::time::Duration::from_millis(1),
+    };
+
+    // 1. When `--once` attempts live refresh and network fails, MUST fail closed into `UncertainHold`
+    //    instead of trusting the 41-minute-old 26.7% cache!
+    let failing_transport = MockTransport::from_handler(|_| {
+        Err(agy_switch_cli::transport::client::TransportError {
+            is_timeout: false,
+            is_connect: true,
+            message: "simulated offline".into(),
+        })
+    });
+    let mut engine = DaemonEngine::new();
+    let (_tx, mut dummy_rx) = tokio::sync::watch::channel(false);
+    let fail_report = engine
+        .run_single_tick_report_with_shutdown(
+            &repo,
+            &FileSessionBackend,
+            &failing_transport,
+            &OAuthEndpoints::default(),
+            &fast_cc,
+            &reg,
+            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+            &DaemonConfigOverrides {
+                once: true,
+                ..DaemonConfigOverrides::default()
+            },
+            now,
+            &mut dummy_rx,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        fail_report.outcome,
+        TickStageOutcome::UncertainHold { ref reason } if reason.starts_with("source_refresh_failed:")
+    ));
+    assert!(!fail_report.source_refreshed);
+    assert!(fail_report.format_human_line().contains("daemon: hold"));
+
+    // 2. Fresh engine with live mock returning 0.2% (0% rounded): `daemon --once` MUST refresh live,
+    //    immediately switch from `acc-src` to `acc-dst`, and format a clear switched report!
+    let live_hits = Arc::new(AtomicUsize::new(0));
+    let live_hits_c = live_hits.clone();
+    let zero_mock = MockTransport::from_handler(move |req| {
+        if req.url.ends_with(":loadCodeAssist") {
+            live_hits_c.fetch_add(1, Ordering::SeqCst);
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
+            ));
+        }
+        if req.url.ends_with(":fetchAvailableModels") {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.002, "resetTime": "2099-01-01T05:00:00Z"}}}}),
+            ));
+        }
+        Ok(MockTransport::json_response(
+            200,
+            json!({"groups": [{"displayName": "Gemini Models", "buckets": [
+                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.002, "resetTime": "2099-01-01T05:00:00Z"},
+                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.30, "resetTime": "2099-01-07T00:00:00Z"}
+            ]}]}),
+        ))
+    });
+    let mut engine2 = DaemonEngine::new();
+    let sw_report = engine2
+        .run_single_tick_report_with_shutdown(
+            &repo,
+            &FileSessionBackend,
+            &zero_mock,
+            &OAuthEndpoints::default(),
+            &fast_cc,
+            &reg,
+            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+            &DaemonConfigOverrides {
+                once: true,
+                ..DaemonConfigOverrides::default()
+            },
+            now,
+            &mut dummy_rx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(live_hits.load(Ordering::SeqCst), 1);
+    assert!(sw_report.source_refreshed);
+    assert_eq!(
+        sw_report.outcome,
+        TickStageOutcome::CommittedSwitch {
+            source_id: "acc-src".into(),
+            target_id: "acc-dst".into(),
+        }
+    );
+    let sw_line = sw_report.format_human_line();
+    assert!(
+        sw_line.contains("daemon: switched")
+            && sw_line.contains("acc-src")
+            && sw_line.contains("acc-dst"),
+        "unexpected human line: {sw_line}"
+    );
+
+    // 3. G1: Continuous mode (`once = false`) explicitly refreshes eligible active accounts on
+    //    scheduled wake-ups regardless of slow prior tick `last_updated` skew:
+    //    - Default `interval = 180s`: prior tick completed at `T+20s` (writing `26.7%`), next
+    //      negative-jitter wake-up at `T+162s` (`age = 142s <= 144s`) MUST still refresh live!
+    //    - Short `interval = 5s`: prior tick at `T`, next negative-jitter wake-up at `T+4s`
+    //      (`age = 4s == effective_source_quota_max_age_secs(5)`) MUST still refresh live!
+    //    - Active `refresh_backoff_until` still suppresses redundant network calls.
+    let cont_hits = Arc::new(AtomicUsize::new(0));
+    let cont_hits_c = cont_hits.clone();
+    let ok_mock = MockTransport::from_handler(move |req| {
+        if req.url.ends_with(":loadCodeAssist") {
+            cont_hits_c.fetch_add(1, Ordering::SeqCst);
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
+            ));
+        }
+        if req.url.ends_with(":fetchAvailableModels") {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.376, "resetTime": "2099-01-01T05:00:00Z"}}}}),
+            ));
+        }
+        Ok(MockTransport::json_response(
+            200,
+            json!({"groups": [{"displayName": "Gemini Models", "buckets": [
+                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.376, "resetTime": "2099-01-01T05:00:00Z"},
+                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.90, "resetTime": "2099-01-07T00:00:00Z"}
+            ]}]}),
+        ))
+    });
+    // Seed `acc-dst` as if Tick 1 finished slowly at `now + 20` with `26.7%` and clear cooldown.
+    repo.with_write_lock(|tx| {
+        agy_switch_cli::switching::daemon::clear_daemon_pause_in_tx(tx.paths(), now)?;
+        let mut ds = read_daemon_state_readonly(tx.paths())?;
+        ds.cooldown_until = 0;
+        agy_switch_cli::switching::daemon::save_daemon_state_in_tx(tx.paths(), &ds)?;
+        let mut dst = tx.load_account_opt("acc-dst")?.unwrap();
+        dst.quota = Some(build_quota(
+            now + 20,
+            Some("Google AI Pro"),
+            0.90,
+            0.267,
+            Some(0.267),
+            "2099-01-01T05:00:00Z",
+        ));
+        tx.save_account(&dst)
+    })
+    .unwrap();
+
+    let mut engine3 = DaemonEngine::new();
+    // Tick 2 wakes at `now + 162` (`-10%` jitter of 180s from `now`, actual age = 142s <= 144s):
+    // MUST refresh live and observe 37.6% instead of reusing cached 26.7%!
+    let live_skew_rep = engine3
+        .run_single_tick_report_with_shutdown(
+            &repo,
+            &FileSessionBackend,
+            &ok_mock,
+            &OAuthEndpoints::default(),
+            &fast_cc,
+            &reg,
+            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+            &DaemonConfigOverrides::default(),
+            now + 162,
+            &mut dummy_rx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(live_skew_rep.outcome, TickStageOutcome::IdleSufficientQuota);
+    assert!(live_skew_rep.source_refreshed);
+    assert_eq!(cont_hits.load(Ordering::SeqCst), 1);
+    assert!((live_skew_rep.source_remaining_percentage.unwrap() - 37.6).abs() < 0.05);
+    assert!(live_skew_rep.format_human_line().contains("refreshed live"));
+
+    // Short `interval = 5s`: prior update at `now + 162`, next tick at `now + 166` (`age = 4s == 4s` TTL):
+    // MUST still refresh live!
+    let short_interval_rep = engine3
+        .run_single_tick_report_with_shutdown(
+            &repo,
+            &FileSessionBackend,
+            &ok_mock,
+            &OAuthEndpoints::default(),
+            &fast_cc,
+            &reg,
+            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+            &DaemonConfigOverrides {
+                interval_secs: 5,
+                ..DaemonConfigOverrides::default()
+            },
+            now + 166,
+            &mut dummy_rx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        short_interval_rep.outcome,
+        TickStageOutcome::IdleSufficientQuota
+    );
+    assert!(short_interval_rep.source_refreshed);
+    assert_eq!(cont_hits.load(Ordering::SeqCst), 2);
+    assert!(short_interval_rep
+        .format_human_line()
+        .contains("refreshed live"));
+
+    // Active refresh backoff still skips network calls cleanly and reports cached status!
+    engine3
+        .refresh_backoff_until
+        .insert("acc-dst".into(), now + 500);
+    let backoff_rep = engine3
+        .run_single_tick_report_with_shutdown(
+            &repo,
+            &FileSessionBackend,
+            &ok_mock,
+            &OAuthEndpoints::default(),
+            &fast_cc,
+            &reg,
+            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+            &DaemonConfigOverrides::default(),
+            now + 170,
+            &mut dummy_rx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(backoff_rep.outcome, TickStageOutcome::IdleSufficientQuota);
+    assert!(!backoff_rep.source_refreshed);
+    assert_eq!(cont_hits.load(Ordering::SeqCst), 2);
+    assert!(backoff_rep.format_human_line().contains("cached"));
+
+    // 4. Real CLI binary `daemon --once` prints human status line, and `daemon --once --json` emits J1 envelope!
+    let mut pol = repo.read_policy().unwrap();
+    pol.enabled = false;
+    repo.with_write_lock(|tx| tx.save_policy(&mut pol, None, now + 200))
+        .unwrap();
+    let cli_human = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_RUNTIME_DIR", &run_dir)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/no-dbus", run_dir.display()),
+        )
+        .env("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc)
+        .args([
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--backend",
+            "file",
+            "--no-remote-version",
+            "daemon",
+            "--once",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(cli_human.status.code(), Some(0));
+    assert!(cli_human.stderr.is_empty());
+    let human_out = String::from_utf8_lossy(&cli_human.stdout);
+    assert!(
+        human_out.contains("daemon: disabled"),
+        "expected human status line, got: {human_out}"
+    );
+
+    let cli_json = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_RUNTIME_DIR", &run_dir)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/no-dbus", run_dir.display()),
+        )
+        .env("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc)
+        .args([
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--backend",
+            "file",
+            "--no-remote-version",
+            "--json",
+            "daemon",
+            "--once",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(cli_json.status.code(), Some(0));
+    assert!(cli_json.stderr.is_empty());
+    let j: serde_json::Value = serde_json::from_slice(&cli_json.stdout).unwrap();
+    assert_eq!(j["schema_version"], 1);
+    assert_eq!(j["ok"], true);
+    assert_eq!(j["daemon"]["phase"], "disabled");
+    assert_eq!(j["daemon"]["outcome"], "disabled");
+}
+
+#[tokio::test]
+async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
+    use agy_switch_cli::switching::daemon::{
+        save_daemon_state_in_tx, DaemonPersistentState, DaemonTickReport,
+    };
+    use agy_switch_cli::transport::client::{BoxFuture, HttpRequest, HttpResponse, HttpTransport};
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::time::Duration;
+
+    let _proc_lock = PROC_ENV_MUTEX.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    let cache = tmp.path().join("cache");
+    let run_dir = tmp.path().join("run");
+    let fake_proc = tmp.path().join("proc");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&data).unwrap();
+    fs::create_dir_all(&cache).unwrap();
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::create_dir_all(&fake_proc).unwrap();
+    let _proc_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc);
+
+    let now = 1_800_260_000i64;
+    let paths = HeadlessPaths::with_explicit(home.clone(), data.clone(), cache.clone());
+    let repo = StoreRepository::new(paths.clone());
+
+    let mut acc_src = make_v122_account("acc-g2-src", "alice@example.com", 0.267, now - 3, now);
+    acc_src.quota = Some(build_quota(
+        now - 3,
+        Some("Google AI Pro"),
+        0.70,
+        0.267,
+        Some(0.267),
+        "2099-01-01T05:00:00Z",
+    ));
+    let mut acc_dst = make_v122_account("acc-g2-dst", "bob@example.com", 0.90, now - 3, now);
+    acc_dst.quota = Some(build_quota(
+        now - 3,
+        Some("Google AI Pro"),
+        0.90,
+        0.90,
+        Some(0.90),
+        "2099-01-01T05:00:00Z",
+    ));
+
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc_src.clone(), true, now)?;
+        tx.upsert_account(acc_dst.clone(), false, now)?;
+        let mut pol = SwitchPolicy {
+            enabled: true,
+            mode: PolicyMode::Immediate,
+            strategy: PolicyStrategy::RoundRobin,
+            reserve_percentage: 10,
+            candidate_min_percentage: 30,
+            monitored_model: "all".into(),
+            candidate_account_ids: vec!["acc-g2-src".into(), "acc-g2-dst".into()],
+            ..SwitchPolicy::default()
+        };
+        tx.save_policy(&mut pol, None, now)?;
+        Ok(())
+    })
+    .unwrap();
+    fs::create_dir_all(&paths.active_slot_dir).unwrap();
+    FileSessionBackend
+        .write_slot(&paths, &serialize_session_payload(&acc_src.token).unwrap())
+        .unwrap();
+    let slot_before = fs::read(&paths.active_slot_file).unwrap();
+    let index_before = fs::read(paths.index_file()).unwrap();
+
+    let reg = OAuthClientRegistry::load(&paths).unwrap();
+    let fast_cc = CloudCodeEndpoints {
+        fallback_delay: Duration::from_millis(1),
+        ..CloudCodeEndpoints::default()
+    };
+    let (_tx, mut dummy_rx) = tokio::sync::watch::channel(false);
+
+    // G2-a: Catalog 200 + required summary 503 on `--once` -> `hold` + `source_refresh_failed: quota_network_error`,
+    // `source_refreshed == false`, `source_remaining_percentage == None`, slot & index untouched.
+    let summary_503_mock = MockTransport::from_handler(|req| {
+        if req.url.ends_with(":loadCodeAssist") {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
+            ));
+        }
+        if req.url.ends_with(":fetchAvailableModels") {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.267, "resetTime": "2099-01-01T05:00:00Z"}}}}),
+            ));
+        }
+        Ok(MockTransport::json_response(503, json!({"error": "busy"})))
+    });
+    let mut eng_503 = DaemonEngine::new();
+    let rep_503 = eng_503
+        .run_single_tick_report_with_shutdown(
+            &repo,
+            &FileSessionBackend,
+            &summary_503_mock,
+            &OAuthEndpoints::default(),
+            &fast_cc,
+            &reg,
+            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+            &DaemonConfigOverrides {
+                once: true,
+                ..DaemonConfigOverrides::default()
+            },
+            now,
+            &mut dummy_rx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rep_503.phase, "hold");
+    assert_eq!(
+        rep_503.reason.as_deref(),
+        Some("source_refresh_failed: quota_network_error")
+    );
+    assert_eq!(
+        rep_503.outcome,
+        TickStageOutcome::UncertainHold {
+            reason: "source_refresh_failed: quota_network_error".into()
+        }
+    );
+    assert!(!rep_503.source_refreshed);
+    assert!(rep_503.source_remaining_percentage.is_none());
+    assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
+    assert_eq!(fs::read(paths.index_file()).unwrap(), index_before);
+
+    // G2-b: Catalog 200 + HTTP 200 empty groups is NOT an HTTP/transport failure -> remains `unknown_pool`.
+    let empty_200_mock = MockTransport::from_handler(|req| {
+        if req.url.ends_with(":loadCodeAssist") {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
+            ));
+        }
+        if req.url.ends_with(":fetchAvailableModels") {
+            return Ok(MockTransport::json_response(
+                200,
+                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.267, "resetTime": "2099-01-01T05:00:00Z"}}}}),
+            ));
+        }
+        Ok(MockTransport::json_response(200, json!({"groups": []})))
+    });
+    let mut eng_empty = DaemonEngine::new();
+    let rep_empty = eng_empty
+        .run_single_tick_report_with_shutdown(
+            &repo,
+            &FileSessionBackend,
+            &empty_200_mock,
+            &OAuthEndpoints::default(),
+            &fast_cc,
+            &reg,
+            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+            &DaemonConfigOverrides {
+                once: true,
+                ..DaemonConfigOverrides::default()
+            },
+            now + 1,
+            &mut dummy_rx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rep_empty.phase, "hold");
+    assert_eq!(rep_empty.reason.as_deref(), Some("unknown_pool"));
+    assert!(rep_empty.source_refreshed);
+
+    // Restore 3s-old 26.7% cache before timeout probe.
+    repo.with_write_lock(|tx| {
+        let mut s = tx.load_account_opt("acc-g2-src")?.unwrap();
+        s.quota = Some(build_quota(
+            now,
+            Some("Google AI Pro"),
+            0.70,
+            0.267,
+            Some(0.267),
+            "2099-01-01T05:00:00Z",
+        ));
+        tx.save_account(&s)
+    })
+    .unwrap();
+
+    // G2-c: Source refresh stalls past `tick_timeout` on `--once` -> `source_refresh_failed: tick_budget_timeout`!
+    struct StallTransport;
+    impl HttpTransport for StallTransport {
+        fn execute(
+            &self,
+            _req: HttpRequest,
+        ) -> BoxFuture<'_, Result<HttpResponse, agy_switch_cli::transport::client::TransportError>>
+        {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                unreachable!()
+            })
+        }
+    }
+    let mut eng_timeout = DaemonEngine::new();
+    let rep_src_to = eng_timeout
+        .run_single_tick_report_with_shutdown(
+            &repo,
+            &FileSessionBackend,
+            &StallTransport,
+            &OAuthEndpoints::default(),
+            &fast_cc,
+            &reg,
+            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+            &DaemonConfigOverrides {
+                once: true,
+                tick_timeout: Duration::from_millis(60),
+                ..DaemonConfigOverrides::default()
+            },
+            now + 3,
+            &mut dummy_rx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rep_src_to.phase, "hold");
+    assert_eq!(
+        rep_src_to.reason.as_deref(),
+        Some("source_refresh_failed: tick_budget_timeout")
+    );
+    assert!(!rep_src_to.source_refreshed);
+    assert!(rep_src_to.source_remaining_percentage.is_none());
+    assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
+    assert_eq!(fs::read(paths.index_file()).unwrap(), index_before);
+
+    // G2-d: Candidate stage stall (source already ultra-fresh low 2%, candidate quota missing -> probes candidate)
+    // MUST remain plain `tick_budget_timeout`, NOT `source_refresh_failed`!
+    repo.with_write_lock(|tx| {
+        let mut s = tx.load_account_opt("acc-g2-src")?.unwrap();
+        s.quota = Some(build_quota(
+            now + 5,
+            Some("Google AI Pro"),
+            0.02,
+            0.02,
+            Some(0.02),
+            "2099-01-01T05:00:00Z",
+        ));
+        tx.save_account(&s)?;
+        let mut d = tx.load_account_opt("acc-g2-dst")?.unwrap();
+        d.quota = None;
+        tx.save_account(&d)
+    })
+    .unwrap();
+    let mut eng_cand_to = DaemonEngine::new();
+    let rep_cand_to = eng_cand_to
+        .run_single_tick_report_with_shutdown(
+            &repo,
+            &FileSessionBackend,
+            &StallTransport,
+            &OAuthEndpoints::default(),
+            &fast_cc,
+            &reg,
+            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+            &DaemonConfigOverrides {
+                once: true,
+                tick_timeout: Duration::from_millis(60),
+                ..DaemonConfigOverrides::default()
+            },
+            now + 5,
+            &mut dummy_rx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rep_cand_to.phase, "hold");
+    assert_eq!(rep_cand_to.reason.as_deref(), Some("tick_budget_timeout"));
+
+    // G3-c: Missing `/proc` (Stage 4 Unverified) MUST NOT leak filesystem path in human line or JSON!
+    repo.with_write_lock(|tx| {
+        let mut d = tx.load_account_opt("acc-g2-dst")?.unwrap();
+        d.quota = Some(build_quota(
+            now + 5,
+            Some("Google AI Pro"),
+            0.90,
+            0.90,
+            Some(0.90),
+            "2099-01-01T05:00:00Z",
+        ));
+        tx.save_account(&d)
+    })
+    .unwrap();
+    let missing_proc = tmp.path().join("missing-proc-g3-secret-dir");
+    let rep_unver: DaemonTickReport = {
+        let _unver = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &missing_proc);
+        let mut eng_unver = DaemonEngine::new();
+        eng_unver
+            .run_single_tick_report_with_shutdown(
+                &repo,
+                &FileSessionBackend,
+                &MockTransport::default(),
+                &OAuthEndpoints::default(),
+                &fast_cc,
+                &reg,
+                "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+                &DaemonConfigOverrides {
+                    once: true,
+                    ..DaemonConfigOverrides::default()
+                },
+                now + 5,
+                &mut dummy_rx,
+            )
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        rep_unver.outcome,
+        TickStageOutcome::UncertainHold {
+            reason: "process_state_unverified".into()
+        }
+    );
+    let unver_human = rep_unver.format_human_line();
+    let unver_json = serde_json::to_string(&rep_unver).unwrap();
+    assert!(!unver_human.contains("missing-proc-g3-secret-dir"));
+    assert!(!unver_json.contains("missing-proc-g3-secret-dir"));
+    assert!(unver_human.contains("agy-switch-cli status"));
+
+    // G3-d: Stage 6 commit failure (read-only slot dir) MUST emit safe error code without path!
+    fs::set_permissions(&paths.active_slot_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let mut eng_ro = DaemonEngine::new();
+    let rep_ro = eng_ro
+        .run_single_tick_report_with_shutdown(
+            &repo,
+            &FileSessionBackend,
+            &MockTransport::default(),
+            &OAuthEndpoints::default(),
+            &fast_cc,
+            &reg,
+            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
+            &DaemonConfigOverrides {
+                once: true,
+                ..DaemonConfigOverrides::default()
+            },
+            now + 5,
+            &mut dummy_rx,
+        )
+        .await
+        .unwrap();
+    fs::set_permissions(&paths.active_slot_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(
+        rep_ro.outcome,
+        TickStageOutcome::CommitFailed { .. }
+    ));
+    let ro_human = rep_ro.format_human_line();
+    let ro_json = serde_json::to_string(&rep_ro).unwrap();
+    let tmp_str = tmp.path().to_str().unwrap();
+    assert!(
+        !ro_human.contains(tmp_str),
+        "ro_human leaked path: {ro_human}"
+    );
+    assert!(!ro_json.contains(tmp_str), "ro_json leaked path: {ro_json}");
+    let ds_ro = read_daemon_state_readonly(&paths).unwrap();
+    assert!(
+        !ds_ro.last_reason.as_deref().unwrap_or("").contains(tmp_str),
+        "daemon_state.last_reason leaked path: {:?}",
+        ds_ro.last_reason
+    );
+
+    // G3-a: Real CLI `daemon --once` and `daemon --once --json` on corrupt truncated journal:
+    // zero paths in human line, JSON, or persisted `daemon_state.json`; journal preserved byte-for-byte!
+    repo.with_write_lock(|tx| {
+        agy_switch_cli::switching::daemon::clear_daemon_pause_in_tx(tx.paths(), now + 6)
+    })
+    .unwrap();
+    fs::create_dir_all(paths.state_dir()).unwrap();
+    fs::write(paths.switch_journal_file(), b"{").unwrap();
+    let run_cli = |extra: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"));
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_RUNTIME_DIR", &run_dir)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}/no-dbus", run_dir.display()),
+            )
+            .env("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc)
+            .args([
+                "--data-dir",
+                data.to_str().unwrap(),
+                "--backend",
+                "file",
+                "--no-remote-version",
+            ]);
+        cmd.args(extra);
+        cmd.output().unwrap()
+    };
+
+    let corrupt_human = run_cli(&["daemon", "--once", "--no-notify"]);
+    assert_eq!(corrupt_human.status.code(), Some(0));
+    assert!(corrupt_human.stderr.is_empty());
+    let corrupt_human_s = String::from_utf8_lossy(&corrupt_human.stdout);
+    assert!(corrupt_human_s.contains("daemon: paused"));
+    assert!(corrupt_human_s.contains("corrupted_switch_journal"));
+    assert!(corrupt_human_s.contains("agy-switch-cli status"));
+    assert!(
+        !corrupt_human_s.contains(tmp_str) && !corrupt_human_s.contains("switch_journal.json"),
+        "human output leaked path: {corrupt_human_s}"
+    );
+    assert_eq!(fs::read(paths.switch_journal_file()).unwrap(), b"{");
+    assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
+    assert_eq!(fs::read(paths.index_file()).unwrap(), index_before);
+    let ds_corrupt = read_daemon_state_readonly(&paths).unwrap();
+    assert!(ds_corrupt.paused_on_failure);
+    assert_eq!(
+        ds_corrupt.paused_reason.as_deref(),
+        Some("corrupted_switch_journal")
+    );
+
+    let corrupt_json = run_cli(&["--json", "daemon", "--once", "--no-notify"]);
+    assert_eq!(corrupt_json.status.code(), Some(0));
+    assert!(corrupt_json.stderr.is_empty());
+    let corrupt_json_s = String::from_utf8_lossy(&corrupt_json.stdout);
+    assert!(
+        !corrupt_json_s.contains(tmp_str) && !corrupt_json_s.contains("switch_journal.json"),
+        "JSON output leaked path: {corrupt_json_s}"
+    );
+    let cj: serde_json::Value = serde_json::from_str(&corrupt_json_s).unwrap();
+    assert_eq!(cj["daemon"]["phase"], "paused_on_failure");
+    assert_eq!(cj["daemon"]["reason"], "corrupted_switch_journal");
+    assert_eq!(
+        cj["daemon"]["outcome"]["paused_on_failure"]["reason"],
+        "corrupted_switch_journal"
+    );
+
+    // G3-b: Legacy v1.2.1 `daemon_state.json` containing an embedded absolute path in `paused_reason`
+    // MUST be sanitized before emitting in both human and JSON reports!
+    let legacy_paused = DaemonPersistentState {
+        paused_on_failure: true,
+        paused_reason: Some(format!(
+            "Paused due to corrupted switch journal: Switch journal '{}/state/switch_journal.json' is invalid JSON.",
+            data.display()
+        )),
+        consecutive_commit_failures: 1,
+        last_phase: "paused_on_failure".into(),
+        ..DaemonPersistentState::default()
+    };
+    repo.with_write_lock(|tx| save_daemon_state_in_tx(tx.paths(), &legacy_paused))
+        .unwrap();
+    let leg_human = run_cli(&["daemon", "--once", "--no-notify"]);
+    assert_eq!(leg_human.status.code(), Some(0));
+    let leg_human_s = String::from_utf8_lossy(&leg_human.stdout);
+    assert!(leg_human_s.contains("corrupted_switch_journal"));
+    assert!(
+        !leg_human_s.contains(tmp_str) && !leg_human_s.contains("switch_journal.json"),
+        "legacy human output leaked path: {leg_human_s}"
+    );
+    let leg_json = run_cli(&["--json", "daemon", "--once", "--no-notify"]);
+    assert_eq!(leg_json.status.code(), Some(0));
+    let leg_json_s = String::from_utf8_lossy(&leg_json.stdout);
+    assert!(
+        !leg_json_s.contains(tmp_str) && !leg_json_s.contains("switch_journal.json"),
+        "legacy JSON output leaked path: {leg_json_s}"
+    );
+    let lj: serde_json::Value = serde_json::from_str(&leg_json_s).unwrap();
+    assert_eq!(lj["daemon"]["reason"], "corrupted_switch_journal");
+
+    // G3-e (Round-2 signoff closure): Stage 1 journal reconciliation returning non-recovery `Err`
+    // (e.g. recoverable `prepared` journal + `locks/store.lock` replaced by a directory) MUST redact
+    // all absolute paths & lock filenames in BOTH `daemon --once` human stderr AND `--json daemon --once`
+    // JSON error envelope (matching continuous daemon stderr), while preserving non-zero exit code `1`,
+    // `error_code = "io_error"`, and disk state (journal, slot, index, and absent `daemon_state.json`)!
+    let r2_tmp = tempfile::tempdir().unwrap();
+    let r2_home = r2_tmp.path().join("home");
+    let r2_data = r2_tmp.path().join("data");
+    let r2_cache = r2_tmp.path().join("cache");
+    let r2_run = r2_tmp.path().join("run");
+    fs::create_dir_all(&r2_home).unwrap();
+    fs::create_dir_all(&r2_data).unwrap();
+    fs::create_dir_all(&r2_cache).unwrap();
+    fs::create_dir_all(&r2_run).unwrap();
+    let r2_paths = HeadlessPaths::with_explicit(r2_home.clone(), r2_data.clone(), r2_cache.clone());
+    let r2_repo = StoreRepository::new(r2_paths.clone());
+    let r2_a1 = make_v122_account("acc-0001", "alice@example.com", 0.50, now, now);
+    let r2_a2 = make_v122_account("acc-0002", "bob@example.com", 0.90, now, now);
+    r2_repo
+        .with_write_lock(|tx| {
+            tx.upsert_account(r2_a1.clone(), true, now)?;
+            tx.upsert_account(r2_a2.clone(), false, now)?;
+            Ok(())
+        })
+        .unwrap();
+    fs::create_dir_all(&r2_paths.active_slot_dir).unwrap();
+    FileSessionBackend
+        .write_slot(&r2_paths, &serialize_session_payload(&r2_a1.token).unwrap())
+        .unwrap();
+    let r2_slot_digest = FileSessionBackend
+        .inspect_slot(&r2_paths)
+        .raw_digest()
+        .unwrap()
+        .to_string();
+    fs::create_dir_all(r2_paths.state_dir()).unwrap();
+    let prep_journal = json!({
+        "schema_version": 1,
+        "operation_id": "synthetic-op-0001",
+        "phase": "prepared",
+        "prev_selected_account_id": "acc-0001",
+        "target_account_id": "acc-0002",
+        "prev_slot_digest": r2_slot_digest,
+        "token_rotated": false,
+        "started_at": now,
+        "updated_at": now,
+        "replica_state": {
+            "backend": "file",
+            "uses_file": true,
+            "file": {
+                "prev_present": true,
+                "prev_digest": r2_slot_digest
+            }
+        }
+    });
+    fs::write(
+        r2_paths.switch_journal_file(),
+        serde_json::to_vec_pretty(&prep_journal).unwrap(),
+    )
+    .unwrap();
+    // Replace `locks/store.lock` with a directory so L3 lock open fails with EISDIR (`io_error`)!
+    let _ = fs::remove_file(r2_paths.store_lock_file());
+    fs::create_dir_all(r2_paths.store_lock_file()).unwrap();
+
+    let r2_slot_before = fs::read(&r2_paths.active_slot_file).unwrap();
+    let r2_index_before = fs::read(r2_paths.index_file()).unwrap();
+    let r2_journal_before = fs::read(r2_paths.switch_journal_file()).unwrap();
+    let r2_tmp_str = r2_tmp.path().to_str().unwrap();
+
+    let run_r2_cli = |extra: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"));
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &r2_home)
+            .env("XDG_CACHE_HOME", &r2_cache)
+            .env("XDG_RUNTIME_DIR", &r2_run)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}/no-dbus", r2_run.display()),
+            )
+            .env("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc)
+            .args([
+                "--data-dir",
+                r2_data.to_str().unwrap(),
+                "--backend",
+                "file",
+                "--no-remote-version",
+            ]);
+        cmd.args(extra);
+        cmd.output().unwrap()
+    };
+
+    let once_err_human = run_r2_cli(&["daemon", "--once", "--no-notify"]);
+    assert_eq!(once_err_human.status.code(), Some(1));
+    assert!(once_err_human.stdout.is_empty());
+    let once_err_h_str = String::from_utf8_lossy(&once_err_human.stderr);
+    assert!(
+        once_err_h_str.contains("code: io_error")
+            && once_err_h_str.contains("agy-switch-cli status"),
+        "unexpected human stderr: {once_err_h_str}"
+    );
+    assert!(
+        !once_err_h_str.contains(r2_tmp_str) && !once_err_h_str.contains("store.lock"),
+        "daemon --once human stderr leaked path or lock filename: {once_err_h_str}"
+    );
+
+    let once_err_json = run_r2_cli(&["--json", "daemon", "--once", "--no-notify"]);
+    assert_eq!(once_err_json.status.code(), Some(1));
+    assert!(once_err_json.stdout.is_empty());
+    let once_err_j_str = String::from_utf8_lossy(&once_err_json.stderr);
+    assert!(
+        !once_err_j_str.contains(r2_tmp_str) && !once_err_j_str.contains("store.lock"),
+        "daemon --once --json stderr leaked path or lock filename: {once_err_j_str}"
+    );
+    let ej: serde_json::Value = serde_json::from_str(&once_err_j_str).unwrap();
+    assert_eq!(ej["schema_version"], 1);
+    assert_eq!(ej["ok"], false);
+    assert_eq!(ej["error_code"], "io_error");
+    assert_eq!(ej["exit_code"], 1);
+    assert!(ej.get("details").is_none());
+    assert!(ej["message"]
+        .as_str()
+        .unwrap()
+        .contains("agy-switch-cli status"));
+
+    // Continuous daemon contrast: emits sanitized stderr line and exits 0 on SIGTERM.
+    let mut cont_child = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &r2_home)
+        .env("XDG_CACHE_HOME", &r2_cache)
+        .env("XDG_RUNTIME_DIR", &r2_run)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/no-dbus", r2_run.display()),
+        )
+        .env("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc)
+        .args([
+            "--data-dir",
+            r2_data.to_str().unwrap(),
+            "--backend",
+            "file",
+            "--no-remote-version",
+            "daemon",
+            "--no-notify",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut cont_stderr_line = String::new();
+    {
+        use std::io::BufRead;
+        let stderr_pipe = cont_child.stderr.take().unwrap();
+        let mut reader = std::io::BufReader::new(stderr_pipe);
+        reader.read_line(&mut cont_stderr_line).unwrap();
+        unsafe {
+            libc::kill(cont_child.id() as libc::pid_t, libc::SIGTERM);
+        }
+    }
+    let cont_out = cont_child.wait_with_output().unwrap();
+    assert_eq!(cont_out.status.code(), Some(0));
+    assert!(cont_out.stdout.is_empty());
+    assert!(
+        cont_stderr_line.contains("code: io_error")
+            && cont_stderr_line.contains("agy-switch-cli status")
+            && !cont_stderr_line.contains(r2_tmp_str)
+            && !cont_stderr_line.contains("store.lock"),
+        "unexpected continuous daemon stderr line: {cont_stderr_line}"
+    );
+
+    assert_eq!(
+        fs::read(&r2_paths.active_slot_file).unwrap(),
+        r2_slot_before
+    );
+    assert_eq!(fs::read(r2_paths.index_file()).unwrap(), r2_index_before);
+    assert_eq!(
+        fs::read(r2_paths.switch_journal_file()).unwrap(),
+        r2_journal_before
+    );
+    assert!(!r2_paths.daemon_state_file().exists());
 }

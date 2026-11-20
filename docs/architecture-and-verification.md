@@ -37,7 +37,7 @@
 - **运行中会话保护与故障关闭边界**：
   - 已经启动并正在运行的 `agy` 进程在内存中持有其启动时加载的身份会话，本工具不会向运行中的 `agy` 进程注入信号或篡改其内存状态。
   - 执行手动 `switch` 或在 `tui` 中按 `Enter`/`s` 切号时，若 `/proc` 已核验到活跃 `agy` 进程正在运行，默认会立即更新凭据槽位并输出清晰提示，说明已运行的旧 `agy` 窗口保持原登录态、后续新启动的 `agy` 会话将使用新账号（如自动化脚本需要严格空闲才能切号，可传 `--require-idle` 返回退出码 `8`）。
-  - 若受限环境无法完整读取 `/proc`（`RuntimeState::Unverified`），自动切号与未显式传入 `--allow-running` 的手动切号均严格按故障关闭拒绝改写并返回退出码 `8`；可选包装器 `run -- agy` 在检测到未受管运行中 `agy` 进程或 `Unverified` 时同样返回退出码 `8`。
+  - 若受限环境无法完整读取 `/proc`（`RuntimeState::Unverified`），未显式传入 `--allow-running` 的手动切号与可选包装器 `run -- agy`（含检测到未受管运行中 `agy` 进程时）均严格按故障关闭拒绝改写并返回退出码 `8`；后台自动切号 `daemon` 同样保持故障关闭绝不盲写，并在轮次报告中进入 `hold`（固定原因 `process_state_unverified`，单轮 `--once` 正常汇报并退出 `0`）。
 
 ---
 
@@ -188,7 +188,7 @@ flowchart LR
 
 **崩溃恢复与多副本外部漂移保护（CAS）**：
 - 若进程在阶段一刚写完、尚未改动槽位时遭遇 `SIGKILL` 或断电，下次对账时核实全部事务副本仍匹配各自的前置状态，直接清理未提交日志即可无损恢复。
-- 若进程在阶段二已完成全部副本写入、`index.json` 更新前崩溃，下次对账核实全部应有副本均等于 `target_slot_digest` 时，才会自动前滚补齐 `index.json` 并清理日志；若仅部分副本写入导致钥匙串与磁盘不一致，只读命令 `status` 与无人值守后台 `daemon` 会保持日志为 `RecoveryIncomplete`（分别返回退出码 `7` 或进入故障暂停），而交互式写命令（`switch`、`policy set`、`accounts` 等）在满足同后端或超集后端且通过逐集合 CAS 保护与隐藏集合校验的前提下会自动同步修复双端副本（手动 `switch` 同时基于钉扎目录 FD 清理本工具已过期的残留临时文件并解除 `daemon` 暂停标记，若这两项辅助操作失败均明确报错而不伪装为已恢复）。若 `switch_journal.json` 内容损坏、schema 版本不符或副本元数据不完整，程序一律保留日志并返回退出码 `7`，绝不在单后端下擅自清除。
+- 若进程在阶段二已完成全部副本写入、`index.json` 更新前崩溃，下次对账核实全部应有副本均等于 `target_slot_digest` 时，才会自动前滚补齐 `index.json` 并清理日志；若仅部分副本写入导致钥匙串与磁盘不一致，只读命令 `status` 返回退出码 `7`、无人值守后台 `daemon` 保留日志并进入持久故障暂停（`paused_on_failure`，单轮 `--once` 以固定原因码汇报并退出 `0`），而交互式写命令（`switch`、`policy set`、`accounts` 等）在满足同后端或超集后端且通过逐集合 CAS 保护与隐藏集合校验的前提下会自动同步修复双端副本（手动 `switch` 同时基于钉扎目录 FD 清理本工具已过期的残留临时文件并解除 `daemon` 暂停标记，若这两项辅助操作失败均明确报错而不伪装为已恢复）。若 `switch_journal.json` 内容损坏、schema 版本不符或副本元数据不完整，程序一律保留现场绝不在单后端下擅自清除（`status` 与交互式写命令返回退出码 `7`，后台 `daemon` 进入 `paused_on_failure` 并以固定 `corrupted_switch_journal` 原因码汇报）。
 - 若崩溃后用户在外部登录了第三个新账号，写前对账机不会盲目用旧快照覆盖用户刚在外部登录的新凭据，而是自动保护该外部凭据或遇到双外部冲突时保留现场返回退出码 `7`。
 
 ### 4.3 零丢码暂存、授权世代（`auth_seq`）与两级防回退谱系
@@ -220,12 +220,12 @@ Google OAuth 刷新令牌在轮换或重新授权时，一旦服务端 `/token` 
 ### 5.3 受管启动 `run` 与七阶段守护引擎 `daemon`
 
 - **双因子防 PID 复用租约（`session/process.rs`）**：`run -- agy` 启动子进程后，读取 `/proc/<pid>/stat`（反向定位最后一个 `)` 以抵御包含空格或括号的特殊进程名）提取第 22 字段内核启动时钟滴答 `starttime`，将 `(pid, proc_starttime_ticks, account_id)` 写入 `state/leases/<pid>.json`。即使子进程异常崩溃且 Linux 内核稍后将该 PID 分配给了其他无关进程，由于 `starttime` 不匹配，旧租约会被立即识别为已失效而不会阻塞守护进程；若容器完全屏蔽了 `/proc` 导致进程状态无法核实，系统按**故障关闭（Fail-Closed）**拒绝盲目切号。
-- **七阶段守护状态机（`switching/daemon.rs`）**：每轮巡检（默认间隔 `3600s ± 10%`，切号冷却 `3600s`）依次经历：
-  1. `Observe`（对账日志、检查冷却与暂停状态、评估当前账号本地缓存）；
-  2. `Evaluate`（若当前账号额度已知且高于 `reserve_percentage`，零网络请求直接休眠；若缓存过期则仅刷新当前账号复核）；
-  3. `Prepare`（当前账号确已跌破 `reserve_percentage` 时，记录此刻的 `index.revision` 与 `policy.revision` 快照，按默认的 `round-robin` 或 `priority` 顺序受控刷新探测未禁用候选账号直至找到首个 `>= candidate_min_percentage` 的达标目标）；
+- **七阶段守护状态机（`switching/daemon.rs`）**：每轮巡检（默认间隔 `180s ± 10%`，切号冷却 `3600s`，默认策略水位 `reserve = 10%` / `minimum = 30%`；非 `--json` 模式每轮向 `stdout` 实时刷新输出带本地时间戳的单行决策日志，`daemon --once --json` 输出标准结果信封；轮次报告、`daemon_state.json` 新写原因及 `--once`/常驻单轮错误出口均收敛为不含本机路径的固定机器错误码并附 `agy-switch-cli status` 指引，历史遗留的带路径 `paused_reason` 在转述时仅清洗输出而不改写旧状态字节，桌面通知 `Auto-Switch Paused` 正文使用无路径短句而非底层错误正文）依次经历：
+  1. `Observe`（对账日志、检查冷却与暂停状态；常驻定时唤醒与 `--once` 对非 `Unavailable` 活跃账号均直接执行实时联网刷新，仅当本地处于短低水位宽限窗口内——`--once` 为 `<= 15s`、常驻模式为 `min(15s, source_max_age - 1)` 且已确认 `<= reserve` 并未跨重置点——或处于失败退避期时跳过重复查询；`--once` 源刷新遇到网络错误、必要摘要错误或源阶段预算超时时统一映射为 `source_refresh_failed: ...` 故障关闭，绝不回退旧缓存；`source_max_age = clamp(80% * max(interval, 5), 1, 3600)` 用于约束 `Wait` 模式挂起计划的源复验保鲜期）；
+  2. `Evaluate`（若当前账号额度已知且高于 `reserve_percentage`，直接进入下轮休眠；`validation_blocked` 账号保持 `UncertainHold` 不抢切，并继续严格排除在候选池与 Stage 5/6 提交外）；
+  3. `Prepare`（当前账号确已跌破 `reserve_percentage` 时，记录此刻的 `index.revision` 与 `policy.revision` 快照，按默认的 `round-robin` 或 `priority` 顺序受控刷新探测未禁用候选账号直至找到首个 `>= candidate_min_percentage` 的达标目标，闲置候选沿用 `3600s` 缓存）；
   4. `Guard`（先核验 `/proc` 与版本快照：若在 `Prepare` 期间或跨轮等待期间 `index.revision`、`policy.revision` 或槽位指纹已发生变更则立即作废旧计划；随后在默认的 `immediate` 模式下不中断运行中的 `agy` 进程而直接进入重验与切槽供后续新终端使用，在 `wait` 模式下若检测到活跃 `agy` 进程则暂缓等待空闲；无论何种模式，若遇到 `/proc` 不可读即 `RuntimeState::Unverified`，均严格保持故障关闭绝不盲写）；
-  5. `Revalidate`（在真正获取 `L1` 切号前，重新核对 `index.revision`、`policy.revision`、槽位指纹以及高优先级候选状态——若在网络探测期间用户手动切了号、改了策略或排在前面的候选号已被重新启用，立即取消过时切换计划）；
+  5. `Revalidate`（在持有 `L1` 锁后、提交槽位前重新核对未决日志、`index.revision`、`policy.revision`、槽位指纹、目标可用性及高优先级候选状态——若在网络探测期间用户手动切了号、改了策略或排在前面的候选号已被重新启用，立即取消过时切换计划）；
   6. `Commit`（在 `L1` 锁下原子提交切号并写入冷却截止时间；连续 3 次提交失败自动置 `paused_on_failure = true` 保护停机）；
   7. `Sleep`（可被 `SIGTERM` / `SIGINT` 毫秒级唤醒并优雅退出）。
 

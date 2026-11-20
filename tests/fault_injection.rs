@@ -1675,7 +1675,7 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
 
     let idx_replay_policy = cli()
         .env("AGY_SWITCH_CLI_FAULT_SPEC", "sync_parent_dir:index.json:io")
-        .args(["--json", "policy", "set", "--reserve", "10"])
+        .args(["--json", "policy", "set", "--reserve", "12"])
         .output()
         .unwrap();
     assert_eq!(
@@ -1684,7 +1684,7 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
         "policy set under persistent index.json sync_parent_dir MUST exit 7 and preserve journal!"
     );
     assert!(paths.switch_journal_file().exists());
-    assert_eq!(repo.read_policy().unwrap().reserve_percentage, 5);
+    assert_eq!(repo.read_policy().unwrap().reserve_percentage, 10);
 
     let ext_after_stage1 = make_account(
         "acc-ext-stage1",
@@ -1789,7 +1789,7 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
             "AGY_SWITCH_CLI_FAULT_SPEC",
             "sync_parent_dir:policy.json:io",
         )
-        .args(["--json", "policy", "set", "--reserve", "10"])
+        .args(["--json", "policy", "set", "--reserve", "12"])
         .output()
         .unwrap();
     assert_eq!(
@@ -1798,7 +1798,7 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
         "policy set under persistent policy.json sync_parent_dir MUST exit 7 and preserve journal (NOT exit 1)!"
     );
     assert!(paths.switch_journal_file().exists());
-    assert_eq!(repo.read_policy().unwrap().reserve_percentage, 5);
+    assert_eq!(repo.read_policy().unwrap().reserve_percentage, 10);
 
     let pol_replay_ok = cli()
         .args(["--json", "accounts", "enable", "acc-dis2"])

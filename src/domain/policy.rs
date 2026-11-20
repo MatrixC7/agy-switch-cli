@@ -42,8 +42,8 @@ impl Default for SwitchPolicy {
             enabled: false,
             mode: PolicyMode::Immediate,
             strategy: PolicyStrategy::RoundRobin,
-            reserve_percentage: 5,
-            candidate_min_percentage: 15,
+            reserve_percentage: 10,
+            candidate_min_percentage: 30,
             monitored_model: "all".to_string(),
             candidate_account_ids: Vec::new(),
             updated_at: 0,
@@ -163,8 +163,8 @@ mod tests {
         let def = SwitchPolicy::default();
         assert_eq!(def.mode, PolicyMode::Immediate);
         assert_eq!(def.strategy, PolicyStrategy::RoundRobin);
-        assert_eq!(def.reserve_percentage, 5);
-        assert_eq!(def.candidate_min_percentage, 15);
+        assert_eq!(def.reserve_percentage, 10);
+        assert_eq!(def.candidate_min_percentage, 30);
 
         let imm: PolicyMode = serde_json::from_str("\"immediate\"").unwrap();
         assert_eq!(imm, PolicyMode::Immediate);

@@ -57,6 +57,129 @@ pub struct SwitchOutcome {
     pub token_refreshed: bool,
     pub refresh_token_rotated: bool,
     pub runtime_warning: Option<String>,
+    pub validation_blocked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_warning: Option<String>,
+}
+
+pub(crate) fn format_validation_blocked_warning(target_id: &str) -> String {
+    format!(
+        "Note: account `{target_id}` is currently marked verification-required (`verify-blocked`) and remains excluded from daemon auto-switching. Open `agy` to complete Google verification, then run `agy-switch-cli refresh {target_id}` to clear this status."
+    )
+}
+
+/// Strictly read-only, zero-network dry-run preview for manual credential switching.
+/// Never touches the network, never acquires write locks, and never modifies slot/store state.
+pub fn preview_switch_dry_run(
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    registry: &OAuthClientRegistry,
+    selector: &str,
+    allow_running: bool,
+    require_idle: bool,
+    now_unix: i64,
+) -> CliResult<SwitchOutcome> {
+    let paths = repo.paths();
+    let guard_mode = RunningGuardMode::from_flags(allow_running, require_idle);
+
+    let replica_state = backend.inspect_replicas(paths);
+    let slot_state = replica_state.effective_slot_state();
+    let journal_full = read_journal_full_readonly(paths)?;
+    let clear_intent = journal_full.as_ref().is_some_and(|(_, _, c)| *c);
+    let journal_diag = diagnose_journal_replicas_with_intent(
+        journal_full.as_ref().map(|(j, _, _)| j),
+        journal_full.as_ref().and_then(|(_, m, _)| m.as_ref()),
+        clear_intent,
+        &replica_state,
+    );
+    if let JournalDiagnosis::RecoveryIncomplete { reason, .. } = journal_diag {
+        return Err(CliError::partial_commit(
+            "recovery_incomplete",
+            format!(
+                "Previous switch recovery is incomplete ({reason}). Run `agy-switch-cli switch <ID|EMAIL>` to reconcile before further switching."
+            ),
+        ));
+    }
+
+    let snapshot = repo.read_snapshot()?;
+    let target = snapshot.select(selector)?;
+    validate_target_usable(target, now_unix, true)?;
+    let missing_scopes = registry.missing_required_scopes(&target.token);
+    if !missing_scopes.is_empty() {
+        return Err(CliError::auth(
+            "scope_reauth_required",
+            format!(
+                "Account '{}' ({}) lacks required OAuth scope(s) ({}). Token refresh cannot upgrade scopes (RFC 6749 §6); run `agy-switch-cli auth reauthorize {}`.",
+                target.id,
+                target.email,
+                missing_scopes.join(", "),
+                target.id
+            ),
+        ));
+    }
+
+    if replica_state.uses_file && matches!(replica_state.file, SlotInspectState::Uninitialized) {
+        return Err(CliError::env_not_ready(
+            "agy_uninitialized",
+            format!(
+                "No initialized agy CLI session directory found at '{}'.",
+                paths.active_slot_dir.display()
+            ),
+        ));
+    }
+    if let SlotInspectState::Corrupt(detail) = slot_state {
+        return Err(CliError::data(format!(
+            "Active credential slot is corrupt: {detail}"
+        )));
+    }
+    if replica_state.uses_file {
+        if let SlotInspectState::Corrupt(ref detail) = replica_state.file {
+            return Err(CliError::data(format!(
+                "Active credential file replica is corrupt: {detail}"
+            )));
+        }
+    }
+    if replica_state.uses_keyring {
+        if let Some(SlotInspectState::Unverified(ref detail)) = replica_state.keyring {
+            return Err(CliError::env_not_ready(
+                "secret_service_unavailable",
+                detail.clone(),
+            ));
+        }
+    }
+
+    let runtime = observe_runtime_state(paths);
+    let runtime_warning = check_running_guard(&runtime, guard_mode)?;
+    let effective_prev = match journal_diag {
+        JournalDiagnosis::CommittedIndexPending { target_account_id } => {
+            if clear_intent {
+                snapshot
+                    .index
+                    .selected_account_id
+                    .as_ref()
+                    .filter(|s| *s != &target_account_id)
+                    .cloned()
+            } else {
+                Some(target_account_id)
+            }
+        }
+        _ => snapshot.index.selected_account_id.clone(),
+    };
+    let validation_blocked = target.is_validation_blocked_at(now_unix);
+    let validation_warning =
+        validation_blocked.then(|| format_validation_blocked_warning(&target.id));
+
+    Ok(SwitchOutcome {
+        dry_run: true,
+        previous_selected_id: effective_prev,
+        target_account_id: target.id.clone(),
+        target_email: target.email.clone(),
+        token_refreshed: false,
+        refresh_token_rotated: false,
+        runtime_warning,
+        validation_blocked,
+        validation_warning,
+    })
 }
 
 /// Execute a single safe credential switch strictly following `L1 -> L2 -> L3` lock hierarchy
@@ -108,100 +231,15 @@ pub async fn execute_switch_with_idle_policy(
     let guard_mode = RunningGuardMode::from_flags(options.allow_running, require_idle);
 
     if options.dry_run {
-        let replica_state = backend.inspect_replicas(paths);
-        let slot_state = replica_state.effective_slot_state();
-        let journal_full = read_journal_full_readonly(paths)?;
-        let clear_intent = journal_full.as_ref().is_some_and(|(_, _, c)| *c);
-        let journal_diag = diagnose_journal_replicas_with_intent(
-            journal_full.as_ref().map(|(j, _, _)| j),
-            journal_full.as_ref().and_then(|(_, m, _)| m.as_ref()),
-            clear_intent,
-            &replica_state,
+        return preview_switch_dry_run(
+            repo,
+            backend,
+            registry,
+            selector,
+            options.allow_running,
+            require_idle,
+            now_unix,
         );
-        if let JournalDiagnosis::RecoveryIncomplete { reason, .. } = journal_diag {
-            return Err(CliError::partial_commit(
-                "recovery_incomplete",
-                format!(
-                    "Previous switch recovery is incomplete ({reason}). Run `agy-switch-cli switch <ID|EMAIL>` to reconcile before further switching."
-                ),
-            ));
-        }
-
-        let snapshot = repo.read_snapshot()?;
-        let target = snapshot.select(selector)?;
-        validate_target_usable(target, now_unix)?;
-        let missing_scopes = registry.missing_required_scopes(&target.token);
-        if !missing_scopes.is_empty() {
-            return Err(CliError::auth(
-                "scope_reauth_required",
-                format!(
-                    "Account '{}' ({}) lacks required OAuth scope(s) ({}). Token refresh cannot upgrade scopes (RFC 6749 §6); run `agy-switch-cli auth reauthorize {}`.",
-                    target.id,
-                    target.email,
-                    missing_scopes.join(", "),
-                    target.id
-                ),
-            ));
-        }
-
-        if replica_state.uses_file && matches!(replica_state.file, SlotInspectState::Uninitialized)
-        {
-            return Err(CliError::env_not_ready(
-                "agy_uninitialized",
-                format!(
-                    "No initialized agy CLI session directory found at '{}'.",
-                    paths.active_slot_dir.display()
-                ),
-            ));
-        }
-        if let SlotInspectState::Corrupt(detail) = slot_state {
-            return Err(CliError::data(format!(
-                "Active credential slot is corrupt: {detail}"
-            )));
-        }
-        if replica_state.uses_file {
-            if let SlotInspectState::Corrupt(ref detail) = replica_state.file {
-                return Err(CliError::data(format!(
-                    "Active credential file replica is corrupt: {detail}"
-                )));
-            }
-        }
-        if replica_state.uses_keyring {
-            if let Some(SlotInspectState::Unverified(ref detail)) = replica_state.keyring {
-                return Err(CliError::env_not_ready(
-                    "secret_service_unavailable",
-                    detail.clone(),
-                ));
-            }
-        }
-
-        let runtime = observe_runtime_state(paths);
-        let runtime_warning = check_running_guard(&runtime, guard_mode)?;
-        let effective_prev = match journal_diag {
-            JournalDiagnosis::CommittedIndexPending { target_account_id } => {
-                if clear_intent {
-                    snapshot
-                        .index
-                        .selected_account_id
-                        .as_ref()
-                        .filter(|s| *s != &target_account_id)
-                        .cloned()
-                } else {
-                    Some(target_account_id)
-                }
-            }
-            _ => snapshot.index.selected_account_id.clone(),
-        };
-
-        return Ok(SwitchOutcome {
-            dry_run: true,
-            previous_selected_id: effective_prev,
-            target_account_id: target.id.clone(),
-            target_email: target.email.clone(),
-            token_refreshed: false,
-            refresh_token_rotated: false,
-            runtime_warning,
-        });
     }
 
     // 1. Acquire L1 ActiveSlotLock FIRST (`~/.cache/agy-switch-cli/locks/slot-<sha256>.lock`)
@@ -223,6 +261,7 @@ pub async fn execute_switch_with_idle_policy(
         user_agent,
         selector,
         guard_mode,
+        true,
         true,
         now_unix,
     )
@@ -254,6 +293,7 @@ pub async fn execute_switch_with_slot_lock(
         selector,
         RunningGuardMode::from_flags(allow_running, false),
         false,
+        false,
         now_unix,
     )
     .await
@@ -271,6 +311,7 @@ pub(crate) async fn execute_switch_with_slot_lock_and_guard(
     selector: &str,
     guard_mode: RunningGuardMode,
     allow_repair_incomplete: bool,
+    allow_validation_blocked: bool,
     now_unix: i64,
 ) -> CliResult<SwitchOutcome> {
     let paths = repo.paths();
@@ -294,7 +335,7 @@ pub(crate) async fn execute_switch_with_slot_lock_and_guard(
 
     let snapshot = repo.read_snapshot()?;
     let target_initial = snapshot.select(selector)?.clone();
-    validate_target_usable(&target_initial, clock.now_unix())?;
+    validate_target_usable(&target_initial, clock.now_unix(), allow_validation_blocked)?;
 
     // Check active slot directory is initialized and snapshot ALL replicas before write
     let pre_snap = backend.snapshot_replicas_before_write(paths)?;
@@ -406,7 +447,7 @@ pub(crate) async fn execute_switch_with_slot_lock_and_guard(
     // Re-verify target account still exists and wasn't disabled concurrently
     let commit_now = clock.now_unix();
     let latest_target = repo.read_account_unchecked(&target_initial.id)?;
-    validate_target_usable(&latest_target, commit_now)?;
+    validate_target_usable(&latest_target, commit_now, allow_validation_blocked)?;
 
     let payload = serialize_session_payload(&latest_target.token)?;
     let target_digest = bytes_sha256_hex(payload.as_bytes());
@@ -619,6 +660,10 @@ pub(crate) async fn execute_switch_with_slot_lock_and_guard(
         })));
     }
 
+    let validation_blocked = latest_target.is_validation_blocked_at(commit_now);
+    let validation_warning =
+        validation_blocked.then(|| format_validation_blocked_warning(&latest_target.id));
+
     Ok(SwitchOutcome {
         dry_run: false,
         previous_selected_id: snapshot.index.selected_account_id,
@@ -627,12 +672,15 @@ pub(crate) async fn execute_switch_with_slot_lock_and_guard(
         token_refreshed: refresh_outcome.refreshed_over_network,
         refresh_token_rotated: refresh_outcome.refresh_token_rotated,
         runtime_warning,
+        validation_blocked,
+        validation_warning,
     })
 }
 
 pub(crate) fn validate_target_usable(
     target: &crate::domain::account::AccountRecord,
     now_unix: i64,
+    allow_validation_blocked: bool,
 ) -> CliResult<()> {
     if target.disabled {
         return match target.disabled_code {
@@ -656,7 +704,7 @@ pub(crate) fn validate_target_usable(
             ))),
         };
     }
-    if target.is_validation_blocked_at(now_unix) {
+    if !allow_validation_blocked && target.is_validation_blocked_at(now_unix) {
         return Err(CliError::auth(
             "account_validation_blocked",
             format!(

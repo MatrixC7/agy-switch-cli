@@ -8,12 +8,11 @@
 
 ## 目录
 
-1. [安装指南、架构选型与完整卸载（按步操作）](#1-安装指南架构选型与完整卸载按步操作)
+1. [安装指南与架构选型（按步操作）](#1-安装指南与架构选型按步操作)
    - [1.1 按 CPU 架构选择预编译压缩包（全功能合一纯静态单文件）](#11-按-cpu-架构选择预编译压缩包全功能合一纯静态单文件)
    - [1.2 下载、校验与安装步骤](#12-下载校验与安装步骤)
    - [1.3 Arch Linux / EndeavourOS 等 Arch 系发行版（AUR 安装）](#13-arch-linux--endeavouros-等-arch-系发行版aur-安装)
    - [1.4 从源码自行编译（可选，要求 Rust 1.89 及以上）](#14-从源码自行编译可选要求-rust-189-及以上)
-   - [1.5 完整卸载与本地遗留文件清理清单](#15-完整卸载与本地遗留文件清理清单)
 2. [上手前必读：四个核心概念](#2-上手前必读四个核心概念)
 3. [全局选项与环境变量](#3-全局选项与环境变量)
 4. [全量命令与参数详解](#4-全量命令与参数详解)
@@ -31,10 +30,11 @@
 6. [可选配置文件（`config.json` 网络代理与自定义 OAuth 客户端）](#6-可选配置文件configjson-网络代理与自定义-oauth-客户端)
 7. [后台常驻运行指南（`systemd --user` 与无 `systemd` 的 Docker 容器环境）](#7-后台常驻运行指南systemd---user-与无-systemd-的-docker-容器环境)
 8. [常见问题解答（FAQ）](#8-常见问题解答faq)
+9. [完整卸载与本地遗留文件清理清单](#9-完整卸载与本地遗留文件清理清单)
 
 ---
 
-## 1. 安装指南、架构选型与完整卸载（按步操作）
+## 1. 安装指南与架构选型（按步操作）
 
 ### 1.1 按 CPU 架构选择预编译压缩包（全功能合一纯静态单文件）
 
@@ -55,14 +55,14 @@
 
 ```bash
 # 第 1 步：校验压缩包完整性（输出显示成功 / OK 即可）
-sha256sum -c agy-switch-cli-v1.2.1-x86_64-unknown-linux-musl.tar.gz.sha256
+sha256sum -c agy-switch-cli-v1.2.2-x86_64-unknown-linux-musl.tar.gz.sha256
 
 # 第 2 步：解压压缩包
-tar -xzf agy-switch-cli-v1.2.1-x86_64-unknown-linux-musl.tar.gz
+tar -xzf agy-switch-cli-v1.2.2-x86_64-unknown-linux-musl.tar.gz
 
 # 第 3 步：安装到当前用户的可执行目录 ~/.local/bin（无需 sudo 权限）
 mkdir -p ~/.local/bin
-install -m 0755 agy-switch-cli-v1.2.1-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
+install -m 0755 agy-switch-cli-v1.2.2-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
 ```
 
 > **提示：如果输入 `agy-switch-cli --version` 提示 `command not found（找不到命令）` 怎么办？**  
@@ -97,67 +97,6 @@ cargo build --release --locked                                       # 默认全
 cargo build --release --locked --target x86_64-unknown-linux-musl    # 纯静态 musl 全功能构建
 ```
 
-### 1.5 完整卸载与本地遗留文件清理清单
-
-在 Linux 系统中，包管理器（如 `pacman`、`yay`、`paru`）或手动删除二进制文件都只负责移除“程序本身”，**不会自动删除你主目录（`~`）下的个人配置与数据文件夹**，这是 Linux 防止更新或重装软件时误删用户数据的通用保护机制。如果你希望在卸载 `agy-switch-cli` 时连同本地账号库、缓存与服务配置一并清理干净，请按以下四个步骤操作。
-
-#### 第 1 步：停止并移除后台守护服务（若从未启用 `daemon` 可跳过）
-
-- **通过 `systemd --user` 安装过后台服务的环境**：务必先在卸载程序之前执行一键卸载服务命令：
-  ```bash
-  agy-switch-cli daemon --uninstall
-  ```
-  该命令会自动停止运行中的后台服务、取消开机自启、安全删除 `~/.config/systemd/user/agy-switch-cli.service`，并通知 `systemd` 重载配置。
-- **在无 `systemd` 容器环境中手动配置过后台常驻的情况**（参见第 `7.2` 节）：按你当时选用的托管方式停止进程并移除对应自启项：
-  - 使用 `nohup`：执行 `pkill -TERM -f "agy-switch-cli daemon"`，并删除 `~/.bashrc` 中你追加的自动拉起片段。
-  - 使用 `tmux`：执行 `tmux kill-session -t agy-daemon`。
-  - 使用 `supervisord`：执行 `supervisorctl stop agy-switch-cli`，随后移除 `/etc/supervisor/conf.d/agy-switch-cli.conf` 并执行 `supervisorctl reread && supervisorctl update`。
-  - 使用 `cron`：执行 `crontab -e` 删除包含 `agy-switch-cli daemon --once` 的定时任务行。
-
-#### 第 2 步：移除可执行程序本身（按当初的安装方式二选一）
-
-- **Arch Linux / EndeavourOS（通过 AUR 安装）**：
-  ```bash
-  yay -Rns agy-switch-cli-bin
-  # 或使用 paru / pacman：
-  # paru -Rns agy-switch-cli-bin
-  # sudo pacman -Rns agy-switch-cli-bin
-  ```
-  包管理器会自动移除 `/usr/bin/agy-switch-cli`、`/usr/share/licenses/agy-switch-cli-bin/` 与 `/usr/share/doc/agy-switch-cli-bin/`。
-- **手动安装（下载预编译包或源码编译）**：
-  ```bash
-  rm -f ~/.local/bin/agy-switch-cli
-  ```
-  如果你当初将二进制放到了自定义目录（而非 `~/.local/bin`），可先执行 `command -v agy-switch-cli` 确认准确路径后再删除。
-
-#### 第 3 步：彻底清理本工具在主目录下生成的全部文件（可选）
-
-如果你日后还可能重装，建议在执行第 2 步卸载程序前先导出备份（`agy-switch-cli accounts export --output backup.json`）；若确认不再保留任何数据，可参考下表逐一或一键清理：
-
-| 本地路径（括号内为自定义环境变量时的对应位置） | 存放内容与用途说明 | 是否建议删除 |
-| :--- | :--- | :--- |
-| `~/.local/share/agy-switch-cli/`<br>（或 `$XDG_DATA_HOME/agy-switch-cli/`、`--data-dir` 指定目录） | 本工具的独立数据目录：包含账号索引 `index.json`、各账号 OAuth 凭据 `accounts/*.json`、自动切号策略 `policy.json`、可选代理/客户端配置 `config.json`、事务状态 `state/` 与目录锁 `locks/`。 | 彻底卸载不再使用时可删 |
-| `~/.cache/agy-switch-cli/`<br>（或 `$XDG_CACHE_HOME/agy-switch-cli/`） | 缓存与全局跨目录锁：包含官方客户端版本号缓存 `ua_version_cache.json` 以及账号槽位/钥匙串锁 `locks/`。 | 彻底卸载时可安全删除 |
-| `~/.config/systemd/user/agy-switch-cli.service`<br>（或 `$XDG_CONFIG_HOME/systemd/user/agy-switch-cli.service`） | 用户级 `systemd` 服务单元文件（第 1 步执行 `daemon --uninstall` 时已自动清除；若先卸载了程序，可检查确认其已不存在）。 | 彻底卸载时应删除 |
-| `~/.local/state/agy-switch-cli/` | 仅在无 `systemd` 的容器环境中按第 `7.2` 节手动重定向保存 `daemon.log` 时才会存在；标准环境下不会创建该目录。 | 若存在且无需查日志可删 |
-
-确认无需保留本工具保存的账号库与缓存后，在终端执行以下一条命令即可全部清理：
-
-```bash
-rm -rf ~/.local/share/agy-switch-cli ~/.cache/agy-switch-cli ~/.local/state/agy-switch-cli
-```
-
-#### 第 4 步：明确哪些外部目录属于官方 `agy` 或上游工具（默认无需删除）
-
-以下路径不属于 `agy-switch-cli` 的安装残留，卸载本工具时保留它们可以确保你的官方 `agy` 继续保持当前账号正常登录，避免误删工作环境：
-
-- **官方 `agy` 生效凭据槽位与系统钥匙串**：
-  - 磁盘槽位文件：`~/.gemini/antigravity-cli/antigravity-oauth-token`（以及对话历史数据库 `~/.gemini/antigravity-cli/`、`~/.gemini/antigravity/`）。
-  - 图形桌面系统钥匙串（GNOME Keyring / KDE Wallet）中标签为 `Password for 'antigravity' on 'gemini'`（属性 `service="gemini", username="antigravity"`）的条目。
-  - 这些位置保存的是官方 `agy` 自身当前正在使用的登录身份；只有当你希望连同官方 `agy` 一起退出登录时，才需要自行删除它们。
-- **上游桌面端数据目录 `~/.antigravity_tools/`**：
-  - 这是桌面端工具 `agy-switch` 自身的存储目录；`agy-switch-cli` 仅在执行 `accounts import --from-legacy` 时以只读方式读取该目录，从未向其中写入或修改任何文件。
-
 ---
 
 ## 2. 上手前必读：四个核心概念
@@ -187,10 +126,13 @@ rm -rf ~/.local/share/agy-switch-cli ~/.cache/agy-switch-cli ~/.local/state/agy-
     - **`Claude / GPT` 池**：Claude Sonnet / Opus 与 GPT-OSS 等模型共用。
     - **`Argon` 池**：仅部分灰度测试账号才会被下发。普通商业订阅账号没有该池，`tui` 和 `quota` 会默认将其隐藏，属于正常现象。
   - 每个配额池同时受 **`Weekly`（7 天滚动周总额度）** 和 **`5h`（5 小时短期防刷窗口）** 限制，任意一个窗口降为 `0%` 都会触发限流，因此工具会同时展示这两个窗口。
-- **“1 小时配额缓存保鲜期（`stale`）”机制**
-  - 为避免高频请求触发 Google 服务端风控，本地配额缓存的默认保鲜期设为 **`1 小时（3600 秒）`**：
-    - 距离上次刷新 **1 小时以内**（且未跨过重置时间点），缓存状态为 `known`（新鲜有效），自动切号无需重复请求网络。
-    - 超过 **1 小时**后，缓存标为 `stale`。此时手动运行 `agy-switch-cli quota` **依然会正常展示上次缓存的进度表**，并在状态行温和提示可加 `--refresh`（`agy-switch-cli quota --refresh`）联网更新；而后台自动切号守护进程 `daemon` 遇到 `stale` 时会先自动联网刷新一次最新额度，再决定是否切号。
+- **配额缓存保鲜期（`stale`）与 `daemon` 实时刷新机制**
+  - 为避免高频请求触发 Google 服务端风控，通用本地配额缓存（`quota` 只读查看与闲置候选账号缓存）的默认保鲜期为 **`1 小时（3600 秒）`**：
+    - 距离上次刷新 **1 小时以内**（且未跨过重置时间点），只读查看 `agy-switch-cli quota` 显示为 `known`（新鲜有效）。
+    - 超过 **1 小时**后，缓存标为 `stale`。此时手动运行 `agy-switch-cli quota` **依然会正常展示上次缓存的进度表**，并在状态行温和提示可加 `--refresh`（`agy-switch-cli quota --refresh`）联网更新。
+  - **后台守护进程 `daemon` 对当前活跃账号采用实时刷新机制**：
+    - 常驻 `daemon`（默认每 `180` 秒巡检一次）在每次定时唤醒且不处于冷却期、失败退避或不可用阻断态（`disabled` / `verify-blocked` / `quota_forbidden`）时，都会直接对当前正在消耗的活跃账号执行实时联网配额复核（避免慢轮落盘或负抖动跳过刷新；仅在极短低水位宽限窗口内跳过重复查询，且 `Wait` 模式挂起计划的锁内复验保鲜期随巡检间隔缩放到 `80%`，范围 `1..=3600` 秒），而闲置备用候选号继续沿用 `3600s` 缓存避免高频轰炸。
+    - 手动或通过 `cron` 执行 `daemon --once` 时，会对非阻断态的当前活跃账号直接执行一次实时联网配额刷新（仅当本地 `<= 15` 秒前刚确认额度已低于保留线且未过重置点时跳过重复查询）；若此次联网请求、必要摘要获取或源刷新预算超时失败，则严格故障关闭进入 `hold`（`source_refresh_failed: ...`），绝不回退旧缓存误判。
 
 ---
 
@@ -233,7 +175,7 @@ agy-switch-cli status --json   # 输出结构化 JSON 巡检报告
 
 标准输出示例：
 ```text
-agy-switch-cli status (v1.2.1)
+agy-switch-cli status (v1.2.2)
   Backend:           dual
   Store status:      OK
   Journal status:    Clean
@@ -503,6 +445,10 @@ agy-switch-cli switch bob@example.com --allow-running   # 在 /proc 不可读（
 - **当已有 `agy` 窗口正在运行时执行 `switch`（或 `tui` 切号）会发生什么？**
   - 默认情况下，检测到正在运行的 `agy` 进程时**不会报错拦截**，而是立即完成凭据切换，并输出一条温和提示：正在运行的旧 `agy` 窗口继续保持其启动时的原账号会话不受打断，而此后新打开的 `agy` 终端窗口将立即使用刚切好的新账号。
   - 如果你的自动化脚本希望“只要有 `agy` 在跑就禁止切号”，可显式加上 `--require-idle`（存在活跃 `agy` 时返回退出码 `8`）；若处于 `/proc` 被屏蔽的特殊容器（`unverified`），默认仍保持故障关闭拦截，确认安全时可加 `--allow-running` 放行（`--require-idle` 与 `--allow-running` 互斥）。
+- **当账号处于 `verify-blocked`（`[verification required]`）风控验证状态时**：
+  - 当账号因 Google CloudCode 返回 `403 VALIDATION_REQUIRED` 被标为 `verify-blocked` 时，其 OAuth 登录令牌本身仍有效。手动执行 `switch --dry-run` 可正常预检，手动执行 `switch`、`tui` 按 `Enter` 或可选的 `run` 均允许切入该账号以便打开官方 `agy` 完成网页/扫码验证。
+  - 人工切入时**不会提前清除** `verify-blocked` 标记，同时会打印操作指引：后台 `daemon` 仍将其严格排除在自动切号候选之外（且当前生效账号处于 `verify-blocked` 时 `daemon` 会自动进入 `hold` 等待而不抢切槽位）。在官方 `agy` 内完成验证后，执行 `agy-switch-cli refresh <ID|EMAIL>`（或在 `tui` 中按 `r`），当最终采用主环境未阻断的有效观测时即自动解除该状态。
+  - 被禁用（`disabled`）、令牌已被吊销或缺失 OAuth 权限范围（`scope_reauth_required`）的账号在所有入口仍严格拒绝切换。
 - **不同环境与 `--backend` 模式下的切号行为**：
   - **纯无头环境（远程 SSH 服务器、Docker 容器、无桌面 WSL2）**：默认 `auto` 自动采用 `file` 模式，以 `0600` 权限原子替换 `~/.gemini/antigravity-cli/antigravity-oauth-token`，切完直接运行 `agy` 即刻生效。
   - **带有系统钥匙串的 Linux 图形桌面环境（如 KDE Plasma、GNOME）**：
@@ -559,7 +505,7 @@ Status  : known (37.0% effective on all) · updated just now (source: Daily)
 - **`policy` 同时监控双时间窗口**：对于 `--model` 所指定的目标模型池（默认 `all`，或单独指定 `gemini`、`claude`/`3p`、`argon` 及具体模型 ID），系统会**同时读取该池的 `5h`（五小时短期窗口）与 `Weekly`（7 天滚动周窗口）两个剩余百分比**，按木桶短板原理取 **`min(5h, Weekly)`** 作为该账号的有效剩余额度百分比（免费层 `Free` / `Starter` 账号若无 `5h` 桶则直接按 `Weekly` 评估）。
 - **触发线与准入线共用同一有效百分比**：
   - 当前生效账号的有效剩余百分比 `min(5h, Weekly) <= --reserve` 时，无论是 `5h` 窗口见底还是周中后期 `Weekly` 周额度见底，都会触发换号评估；
-  - 备选账号同样要求 `min(5h, Weekly) >= --minimum` 才具备接班资格。因此默认将 `--reserve` 设为 **`5%`**、`--minimum` 设为 **`15%`**，既能让每个账号消耗满 `95%` 以上充分榨干额度，又能确保周中后期仅剩十几个百分点周额度的账号依然能被自动轮换利用，同时保留 `10%` 的安全水位差防止来回震荡。
+  - 备选账号同样要求 `min(5h, Weekly) >= --minimum` 才具备接班资格。因此默认将 `--reserve` 设为 **`10%`**、`--minimum` 设为 **`30%`**，在重度编码与 `180` 秒巡检间隔下预留充足的提前切号缓冲以减少 `5h` 撞墙，同时确保接班候选号拥有足够续航、不易切入低余量账号后被 `3600` 秒冷却卡住，并保留 `20%` 的安全水位差防止来回震荡（若账号池较小希望更充分用尽残余额度，也可按需通过 `policy set` 下调）。
 
 #### `policy set` 全部参数说明表
 
@@ -568,8 +514,8 @@ Status  : known (37.0% effective on all) · updated just now (source: Daily)
 | **`--enabled`** | `true` 或 `false` | `false` | **自动切号总开关**。开启前候选名单里至少需要包含 1 个账号。 |
 | **`--all-candidates`** | 无需填值（直接添加该开关） | — | **一键将当前所有已启用账号（按 `accounts list` 顺序）全部设为候选账号**，免去逐个输入邮箱的步骤。 |
 | **`--candidates`** | 空格分隔的 `<ID\|EMAIL>` | 空 | 只希望将部分特定账号放入轮换池时使用，填写对应账号的邮箱或 ID（如 `--candidates alice@example.com bob@example.com`），或在 `tui` 中按 `c` / `C` 键可视化勾选。清空候选池可使用 `--clear-candidates`。 |
-| **`--reserve`** | `1` ～ `98`（整数百分比） | **`5`** | **保底警戒线（触发换号线）**。默认 `5`：当正在使用的账号有效剩余额度 `min(5h, Weekly)` 降至 `5%` 或以下（即已消耗 `95%` 以上）时，触发自动换号。 |
-| **`--minimum`** | `2` ～ `100`（整数百分比） | **`15`** | **候选接班准入线**。默认 `15`：准备接班的备用账号有效剩余额度 `min(5h, Weekly)` 必须至少达到 `15%` 才会被选中（要求严格大于 `--reserve` 以留出防抖回差）。 |
+| **`--reserve`** | `1` ～ `98`（整数百分比） | **`10`** | **保底警戒线（触发换号线）**。默认 `10`：当正在使用的账号有效剩余额度 `min(5h, Weekly)` 降至 `10%` 或以下（即已消耗 `90%` 以上）时，触发自动换号。 |
+| **`--minimum`** | `2` ～ `100`（整数百分比） | **`30`** | **候选接班准入线**。默认 `30`：准备接班的备用账号有效剩余额度 `min(5h, Weekly)` 必须至少达到 `30%` 才会被选中（要求严格大于 `--reserve` 以留出防抖回差）。 |
 | **`--strategy`** | `round-robin` 或 `priority` | `round-robin` | **候选账号挑选顺序**（详见表下分点说明）。 |
 | **`--mode`** | `immediate` 或 `wait` | `immediate` | **后台 `daemon` 检测到运行中 `agy` 进程时的处理方式**（详见表下分点说明）。 |
 | **`--model`** | `all`、`gemini`、`claude`（等价别名 `3p`）、`argon` 或具体模型名 | `all` | **监控的模型池范围**（详见表下分点说明）。 |
@@ -590,25 +536,25 @@ Status  : known (37.0% effective on all) · updated just now (source: Daily)
 
 #### 水位区间与“无候选账号达到 `minimum`”时的行为说明
 
-以默认的保底警戒线 `--reserve 5`（`5%`）与候选准入线 `--minimum 15`（`15%`）为例，自动切号在不同剩余额度组合下的决策逻辑如下：
+以默认的保底警戒线 `--reserve 10`（`10%`）与候选准入线 `--minimum 30`（`30%`）为例，自动切号在不同剩余额度组合下的决策逻辑如下：
 
-- **情况一：当前正在使用的账号有效额度介于 `5%` 与 `15%` 之间（例如剩余 `10%`）**：
+- **情况一：当前正在使用的账号有效额度介于 `10%` 与 `30%` 之间（例如剩余 `20%`）**：
   - **不会触发切换，继续稳定使用当前账号**。
-  - `--minimum`（`15%`）仅用于筛选“准备新换上来的接班候选账号”，并不会限制已经在用的当前账号；只有当当前账号继续消耗至 **`<= 5%`（`--reserve`）** 时才会开始寻找接班账号。
-- **情况二：当前账号已降至 `<= 5%`（如剩余 `3%`），但池中其余候选账号全部 `< 15%`（没有任何候选号达到 `>= 15%`）**：
+  - `--minimum`（`30%`）仅用于筛选“准备新换上来的接班候选账号”，并不会限制已经在用的当前账号；只有当当前账号继续消耗至 **`<= 10%`（`--reserve`）** 时才会开始寻找接班账号。
+- **情况二：当前账号已降至 `<= 10%`（如剩余 `6%`），但池中其余候选账号全部 `< 30%`（没有任何候选号达到 `>= 30%`）**：
   - 系统判定为**暂无达标接班候选（`no_qualified_candidate`）**：
-    - 后台 `daemon` 会**保持当前账号不变**（不会在两个只剩百分之几的低额度账号之间来回横跳浪费请求），静默等待任意候选账号跨过 `5h` 或 `Weekly` 重置时间恢复到 `>= 15%` 后再自动切入。
+    - 后台 `daemon` 会**保持当前账号不变**（不会在两个低余量账号之间来回横跳浪费请求），静默等待任意候选账号跨过 `5h` 或 `Weekly` 重置时间恢复到 `>= 30%` 后再自动切入。
     - 执行 `agy-switch-cli policy eval` 模拟测算时，会清晰显示 `would_switch=false` 与 `reason=source_below_reserve_but_no_qualified_candidate`。
-    - **如何手动介入使用那些仅剩 `8% ~ 14%` 的备用号？** 手动切号（`agy-switch-cli switch <ID|EMAIL>` 或 `tui` 中按回车 / `s`）不受 `--minimum` 准入线限制，你随时可以手动切到任意未禁用账号把剩余零头额度用尽。
+    - **如何手动介入使用那些仅剩 `15% ~ 29%` 的备用号？** 手动切号（`agy-switch-cli switch <ID|EMAIL>` 或 `tui` 中按回车 / `s`）不受 `--minimum` 准入线限制，你随时可以手动切到任意未禁用账号把剩余零头额度用尽。
 
 #### `policy` 常用命令示例
 
 ```bash
-# 1. 将当前所有启用账号加入候选池并启用自动切号（默认即为 immediate + round-robin，reserve 5% / minimum 15%），重点监控 Claude/GPT 池：
+# 1. 将当前所有启用账号加入候选池并启用自动切号（默认即为 immediate + round-robin，reserve 10% / minimum 30%），重点监控 Claude/GPT 池：
 agy-switch-cli policy set --enabled true --all-candidates --model claude
 
-# 2. 如需自定义更保守的水位线、等待旧 agy 进程全部退出后再切号并采用主备优先级顺序：
-agy-switch-cli policy set --mode wait --strategy priority --reserve 10 --minimum 25 --candidates alice@example.com bob@example.com
+# 2. 如需自定义更保守或更激进的水位线、等待旧 agy 进程全部退出后再切号并采用主备优先级顺序：
+agy-switch-cli policy set --mode wait --strategy priority --reserve 15 --minimum 40 --candidates alice@example.com bob@example.com
 
 # 3. 查看当前策略详情、调整候选优先级顺序、或空跑模拟测算当前是否会触发切号：
 agy-switch-cli policy show
@@ -677,27 +623,28 @@ agy-switch-cli run -- agy
 # 1. 在支持 systemd 的 Linux 系统上，一键安装并启动开机自启后台用户服务（最简常驻方式）：
 agy-switch-cli daemon --install
 # 如需自定义后台服务的固定巡检间隔与冷却秒数，可在 --install 时一并传入写入服务文件：
-agy-switch-cli daemon --install --interval 7200 --cooldown 3600
+agy-switch-cli daemon --install --interval 300 --cooldown 3600
 
 # 2. 一键停止、取消自启并安全移除用户级 systemd 服务文件：
 agy-switch-cli daemon --uninstall
 
-# 3. 直接在当前终端前台运行守护进程（按默认每 3600 秒即 1 小时巡检一次，切号冷却 3600 秒）：
+# 3. 直接在当前终端前台运行守护进程（按默认每 180 秒即 3 分钟巡检一次，切号冷却 3600 秒，每轮打印单行状态日志）：
 agy-switch-cli daemon
-agy-switch-cli daemon --interval 7200 --cooldown 3600
+agy-switch-cli daemon --interval 300 --cooldown 3600
 
-# 4. 仅执行单轮“检查 -> 按需刷新 -> 按需切号”后立即退出（适合配合 crontab 定时任务）：
+# 4. 仅执行单轮实时核查与按需切换后立即退出（输出本轮结论；适合手动排查或配合 crontab 定时任务）：
 agy-switch-cli daemon --once
+agy-switch-cli --json daemon --once
 ```
 
 #### 全部命令选项详解
 
 - **服务管理与运行模式**
-  - `--install`（默认关闭，与 `--uninstall`、`--once` 互斥）：检测系统 `systemd --user` 可用性，原子生成 `~/.config/systemd/user/agy-switch-cli.service` 并自动执行 `daemon-reload` 与 `enable --now`（在无 `systemd` 的 Docker 容器中会给出清晰提示并引导参见第 `7.2` 节）。
+  - `--install`（默认关闭，与 `--uninstall`、`--once` 互斥）：检测系统 `systemd --user` 可用性，原子生成 `~/.config/systemd/user/agy-switch-cli.service` 并自动执行 `daemon-reload` 与 `enable --now`（在无 `systemd` 的 Docker 容器中会给出清晰提示并引导参见第 `7.2` 节）。若此前旧版安装时曾显式传入 `--interval 3600`，升级后重新执行一次 `agy-switch-cli daemon --install` 即可切回新默认 `180` 秒。
   - `--uninstall`（默认关闭，与 `--install`、`--once`、`--no-notify` 互斥）：自动执行 `disable --now`、防符号链接安全删除 `agy-switch-cli.service` 并重载 `daemon-reload`。
-  - `--once`（默认关闭，与 `--install`、`--uninstall` 互斥）：仅执行单轮评估与按需切换后立即退出，适合 `cron` 或单次验证。
+  - `--once`（默认关闭，与 `--install`、`--uninstall` 互斥）：执行单轮实时评估与按需切换后立即退出，非 `--json` 模式向 `stdout` 输出单行状态结论，`--json` 模式输出标准 JSON 结果信封，适合 `cron` 或单次验证排障。
 - **巡检周期、冷却时间与桌面通知**
-  - `--interval <秒>`（环境变量 `AGY_SWITCH_CLI_INTERVAL`，默认值 `3600` 即 1 小时，最小 `1`）：后台巡检间隔秒数（常驻模式内置 `±10%` 随机时间抖动，保持温和低频访问）。配合 `daemon --install` 传入时写入服务单元长期生效。
+  - `--interval <秒>`（环境变量 `AGY_SWITCH_CLI_INTERVAL`，默认值 `180` 即 3 分钟，最小 `1`）：后台巡检间隔秒数（常驻模式内置 `±10%` 随机时间抖动，每次合资格的定时唤醒均会直接联网复核当前活跃账号，`Wait` 模式挂起计划的复验保鲜期自动收紧为有效间隔的 `80%`、范围 `1..=3600` 秒）。配合 `daemon --install` 传入时写入服务单元长期生效。
   - `--cooldown <秒>`（环境变量 `AGY_SWITCH_CLI_COOLDOWN`，默认值 `3600` 即 1 小时，要求 `>= 0`）：完成一次自动切号后的冷却保护秒数，冷却期内不再连续触发第二次切换。配合 `daemon --install` 传入时写入服务单元长期生效。
   - `--no-notify`（环境变量 `AGY_SWITCH_CLI_NOTIFY`，默认开启桌面推送并在无头环境自动静默跳过）：关闭 `daemon` 在切号成功或首次熔断暂停时的 Linux 桌面通知（`--install --no-notify` 会将该参数写入生成的 `systemd` 单元；环境变量支持 `1`/`true`/`yes`/`on` 或 `0`/`false`/`no`/`off`，优先级为 `--no-notify` > `AGY_SWITCH_CLI_NOTIFY` > `config.json` > 默认开启）。
 - **单次运行策略内存覆盖（仅对当前前台 `daemon` / `daemon --once` 生效，不会写回 `policy.json` 或 `systemd` 服务文件）**
@@ -708,9 +655,9 @@ agy-switch-cli daemon --once
   - `--model <MODEL>`（环境变量 `AGY_SWITCH_CLI_MODEL`，默认读取 `policy.json`）：临时覆盖监控目标（`all`、`gemini`、`claude`、`argon` 或指定模型 ID）。
 
 > **关于 `--interval`、`--cooldown` 及临时覆盖参数是否持久保存的重要说明**：
-> - 直接在前台运行 `agy-switch-cli daemon --interval 7200 --cooldown 3600`（或附加 `--reserve`、`--mode` 等参数）时，这些命令行参数**仅对当前这一个 `daemon` 进程本次运行生效，不会修改磁盘上的 `policy.json` 或 `config.json`**；关掉该进程后下次裸跑 `daemon` 仍恢复默认 `3600` 秒。
+> - 直接在前台运行 `agy-switch-cli daemon --interval 300 --cooldown 3600`（或附加 `--reserve`、`--mode` 等参数）时，这些命令行参数**仅对当前这一个 `daemon` 进程本次运行生效，不会修改磁盘上的 `policy.json` 或 `config.json`**；关掉该进程后下次裸跑 `daemon` 仍恢复默认巡检 `180` 秒、冷却 `3600` 秒。
 > - **如何持久保存巡检间隔与冷却时间？**
->   - 使用 `systemd` 后台服务时：执行 `agy-switch-cli daemon --install --interval 7200 --cooldown 3600`，程序会将这两项参数直接写入 `~/.config/systemd/user/agy-switch-cli.service` 的启动命令中长期生效。
+>   - 使用 `systemd` 后台服务时：执行 `agy-switch-cli daemon --install --interval 300 --cooldown 3600`，程序会将这两项参数直接写入 `~/.config/systemd/user/agy-switch-cli.service` 的启动命令中长期生效。
 >   - 在无 `systemd` 容器中使用 `nohup` / `supervisord` / `tmux` 时：在启动命令中带上 `--interval` / `--cooldown`，或配置环境变量 `AGY_SWITCH_CLI_INTERVAL` 与 `AGY_SWITCH_CLI_COOLDOWN`。
 > - **如何持久保存自动切号水位、策略规则与网络代理？** 请分别使用 `agy-switch-cli policy set ...` 将策略规则写入 `policy.json`、在 `config.json` 中写入 `network.proxy_url` 保存代理地址（因此在执行 `daemon --install` 时若误带了 `--reserve` 或 `--proxy` 等单次临时参数，程序会主动提醒先持久保存配置）。
 
@@ -905,7 +852,8 @@ Requests (newest first, showing 5)
   - **`tui` 与 `stats ... --watch`**：全屏交互终端界面，均与 `--json` 互斥并直接返回退出码 `2`。
   - **`run -- agy ...`**：在前置凭据准备、锁检查或进程检查失败时向 `stderr` 输出结构化错误信封；前置准备成功后直接将标准输入输出交给 `agy` 子进程并原样透传其退出码。
   - **`daemon --install --json` 与 `daemon --uninstall --json`**：服务安装与卸载属于一次性单目标管理命令，成功时向 `stdout` 输出包含 `"schema_version": 1, "ok": true` 的结果信封并返回退出码 `0`，失败时向 `stderr` 输出结构化错误信封并返回非零退出码。
-  - **前台 `daemon --json` 与 `daemon --once --json`**：后台与单轮巡检采用静默执行设计，**不按轮向 `stdout` 输出 JSON 信封**（空闲、单轮完成或收到退出信号正常停止时两流保持静默并返回退出码 `0`）；仅当启动参数非法、策略校验失败、单实例锁冲突或运行期致命错误发生时向 `stderr` 输出结构化 JSON 错误信封并返回对应非零退出码（日常运维日志可在非 `--json` 模式下通过 `RUST_LOG` 输出至 `stderr`）。
+  - **`daemon --once --json`**：单轮巡检完成后向 `stdout` 输出包含 `"schema_version": 1, "ok": true, "daemon": { ... }` 的结构化结果信封（包含 `outcome`、`phase`、不含本机路径的固定结构化 `reason`、`source_account_id`、`source_remaining_percentage`、`source_refreshed`、`target_account_id` 等字段）并返回退出码 `0`（仅当收到外部终止信号提前取消时静默返回 `0`）。
+  - **前台常驻 `daemon --json`**：为避免多轮循环向 `stdout` 连续输出多个根 JSON 对象破坏单 JSON 解析，常驻模式在 `--json` 下保持正常轮次静默，仅在启动校验失败、单实例锁冲突或致命错误时向 `stderr` 输出错误信封并返回非零退出码；需要查看逐轮巡检日志时请在非 `--json` 模式下运行（或通过 `journalctl --user -u agy-switch-cli.service -f` 查看标准输出记录）。
 
 - **单目标命令与前置参数/文件校验**
   - **执行成功时**：将结果信封（包含 `"schema_version": 1, "ok": true`）输出至 `stdout`，并返回退出码 `0`。
@@ -1070,7 +1018,7 @@ Requests (newest first, showing 5)
 程序内置了 `daemon --install` 与 `daemon --uninstall`，无需手动复制修改服务模板文件即可一键完成部署（若当前处于无 `systemd` 的 Docker 容器或精简 WSL 中，`daemon --install` 会自动识别并提示改用下方第 `7.2` 节方案）：
 
 ```bash
-# 第 1 步：启动服务前，先确认已添加账号并开启了自动切号策略（默认 reserve 5% / minimum 15%）
+# 第 1 步：启动服务前，先确认已添加账号并开启了自动切号策略（默认 reserve 10% / minimum 30%）
 agy-switch-cli policy set --enabled true --all-candidates
 agy-switch-cli policy show
 
@@ -1203,8 +1151,76 @@ supervisorctl stop agy-switch-cli      # 停止后台守护进程
     - **单次临时使用**：在命令中直接加上 `--proxy http://127.0.0.1:7890`（请替换为实际代理端口）。
     - **当前终端内免重复传参**：在当前终端执行 `export https_proxy=http://127.0.0.1:7890`（或将其写入 `~/.bashrc` / `~/.zshrc`）。
     - **所有终端与后台 `daemon` 持久生效**：按第 `6.1` 节编辑 `~/.local/share/agy-switch-cli/config.json`，写入 `"network": { "proxy_url": "http://127.0.0.1:7890" }`。
+- **问：某个账号刷新后显示 `verify-blocked`（`[verification required]`），应该怎么解锁？**
+  - **答**：该状态表示 Google CloudCode 返回了 `403 VALIDATION_REQUIRED`，需要在官方 `agy` 中打开验证链接完成扫码或网页安全核验（重新授权 `auth reauthorize` 无法代替网页验证）。按三步即可解锁：
+    - 直接使用 `agy-switch-cli switch <ID|EMAIL>`（或在 `tui` 中选中后按 `Enter`，或用可选的 `run --account <ID|EMAIL> -- agy`）切入该账号（人工切号会放行，同时保留 `verify-blocked` 标记确保后台 `daemon` 不会误选或抢切槽位）。
+    - 启动官方 `agy`，按界面提示打开网页或扫码完成 Google 安全验证。
+    - 验证完成后执行 `agy-switch-cli refresh <ID|EMAIL>`（或在 `tui` 按 `r`），当最终采用主环境未阻断的有效观测后即自动清除 `verify-blocked` 标记并恢复参与自动切号。
 - **问：日常使用时，手动切号、可选的 `run` 包装启动与后台 `daemon` 各自适合什么场景？**
   - **答**：三种方式定位清晰，可按实际需求选用：
     - **交互式看板或手动切号（`tui` / `switch`）**：适合日常按需查看额度并手动切换账号，切完直接运行 `agy` 即可。
     - **可选启动包装器 `run`**：适合单次临时指定某个账号（`run --account <ID|EMAIL> -- agy`），或在图形桌面上通过 `--backend file run -- agy` 将终端 `agy` 登录态与桌面端钥匙串隔离。
     - **后台守护进程 `daemon`**：适合已配置 `policy` 且希望后台静默监控额度、在触及保留线时提前换好凭据槽位，省去重开 `agy` 时手动进看板切号的步骤。
+
+---
+
+## 9. 完整卸载与本地遗留文件清理清单
+
+在 Linux 系统中，包管理器（如 `pacman`、`yay`、`paru`）或手动删除二进制文件都只负责移除“程序本身”，**不会自动删除你主目录（`~`）下的个人配置与数据文件夹**，这是 Linux 防止更新或重装软件时误删用户数据的通用保护机制。如果你希望在卸载 `agy-switch-cli` 时连同本地账号库、缓存与服务配置一并清理干净，请按以下四个步骤操作。
+
+### 第 1 步：停止并移除后台守护服务（若从未启用 `daemon` 可跳过）
+
+- **通过 `systemd --user` 安装过后台服务的环境**：务必先在卸载程序之前执行一键卸载服务命令：
+  ```bash
+  agy-switch-cli daemon --uninstall
+  ```
+  该命令会自动停止运行中的后台服务、取消开机自启、安全删除 `~/.config/systemd/user/agy-switch-cli.service`，并通知 `systemd` 重载配置。
+- **在无 `systemd` 容器环境中手动配置过后台常驻的情况**（参见第 `7.2` 节）：按你当时选用的托管方式停止进程并移除对应自启项：
+  - 使用 `nohup`：执行 `pkill -TERM -f "agy-switch-cli daemon"`，并删除 `~/.bashrc` 中你追加的自动拉起片段。
+  - 使用 `tmux`：执行 `tmux kill-session -t agy-daemon`。
+  - 使用 `supervisord`：执行 `supervisorctl stop agy-switch-cli`，随后移除 `/etc/supervisor/conf.d/agy-switch-cli.conf` 并执行 `supervisorctl reread && supervisorctl update`。
+  - 使用 `cron`：执行 `crontab -e` 删除包含 `agy-switch-cli daemon --once` 的定时任务行。
+
+### 第 2 步：移除可执行程序本身（按当初的安装方式二选一）
+
+- **Arch Linux / EndeavourOS（通过 AUR 安装）**：
+  ```bash
+  yay -Rns agy-switch-cli-bin
+  # 或使用 paru / pacman：
+  # paru -Rns agy-switch-cli-bin
+  # sudo pacman -Rns agy-switch-cli-bin
+  ```
+  包管理器会自动移除 `/usr/bin/agy-switch-cli`、`/usr/share/licenses/agy-switch-cli-bin/` 与 `/usr/share/doc/agy-switch-cli-bin/`。
+- **手动安装（下载预编译包或源码编译）**：
+  ```bash
+  rm -f ~/.local/bin/agy-switch-cli
+  ```
+  如果你当初将二进制放到了自定义目录（而非 `~/.local/bin`），可先执行 `command -v agy-switch-cli` 确认准确路径后再删除。
+
+### 第 3 步：彻底清理本工具在主目录下生成的全部文件（可选）
+
+如果你日后还可能重装，建议在执行第 2 步卸载程序前先导出备份（`agy-switch-cli accounts export --output backup.json --include-secrets`，并确认命令成功返回且备份文件已生成后再清理数据目录）；若确认不再保留任何数据，可参考下表逐一或一键清理：
+
+| 本地路径（括号内为自定义环境变量时的对应位置） | 存放内容与用途说明 | 是否建议删除 |
+| :--- | :--- | :--- |
+| `~/.local/share/agy-switch-cli/`<br>（或 `$XDG_DATA_HOME/agy-switch-cli/`、`--data-dir` 指定目录） | 本工具的独立数据目录：包含账号索引 `index.json`、各账号 OAuth 凭据 `accounts/*.json`、自动切号策略 `policy.json`、可选代理/客户端配置 `config.json`、事务状态 `state/` 与目录锁 `locks/`。 | 彻底卸载不再使用时可删 |
+| `~/.cache/agy-switch-cli/`<br>（或 `$XDG_CACHE_HOME/agy-switch-cli/`） | 缓存与全局跨目录锁：包含官方客户端版本号缓存 `ua_version_cache.json` 以及账号槽位/钥匙串锁 `locks/`。 | 彻底卸载时可安全删除 |
+| `~/.config/systemd/user/agy-switch-cli.service`<br>（或 `$XDG_CONFIG_HOME/systemd/user/agy-switch-cli.service`） | 用户级 `systemd` 服务单元文件（第 1 步执行 `daemon --uninstall` 时已自动清除；若先卸载了程序，可检查确认其已不存在）。 | 彻底卸载时应删除 |
+| `~/.local/state/agy-switch-cli/` | 仅在无 `systemd` 的容器环境中按第 `7.2` 节手动重定向保存 `daemon.log` 时才会存在；标准环境下不会创建该目录。 | 若存在且无需查日志可删 |
+
+确认无需保留本工具保存的账号库与缓存后，在终端执行以下一条命令即可全部清理：
+
+```bash
+rm -rf ~/.local/share/agy-switch-cli ~/.cache/agy-switch-cli ~/.local/state/agy-switch-cli
+```
+
+### 第 4 步：明确哪些外部目录属于官方 `agy` 或上游工具（默认无需删除）
+
+以下路径不属于 `agy-switch-cli` 的安装残留，卸载本工具时保留它们可以确保你的官方 `agy` 继续保持当前账号正常登录，避免误删工作环境：
+
+- **官方 `agy` 生效凭据槽位与系统钥匙串**：
+  - 磁盘槽位文件：`~/.gemini/antigravity-cli/antigravity-oauth-token`（以及对话历史数据库 `~/.gemini/antigravity-cli/`、`~/.gemini/antigravity/`）。
+  - 图形桌面系统钥匙串（GNOME Keyring / KDE Wallet）中标签为 `Password for 'antigravity' on 'gemini'`（属性 `service="gemini", username="antigravity"`）的条目。
+  - 这些位置保存的是官方 `agy` 自身当前正在使用的登录身份；只有当你希望连同官方 `agy` 一起退出登录时，才需要自行删除它们。
+- **上游桌面端数据目录 `~/.antigravity_tools/`**：
+  - 这是桌面端工具 `agy-switch` 自身的存储目录；`agy-switch-cli` 仅在执行 `accounts import --from-legacy` 时以只读方式读取该目录，从未向其中写入或修改任何文件。

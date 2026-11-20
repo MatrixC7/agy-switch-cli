@@ -2242,8 +2242,7 @@ where
     F: FnMut(&PinnedSqliteConnection) -> Result<T, rusqlite::Error>,
 {
     for attempt in 0..TRANSIENT_DB_RETRY_LIMIT {
-        let mut local_seen = seen_inodes.clone();
-        match open_pinned_readonly_sqlite(dir_fd, leaf_name, &mut local_seen) {
+        match open_pinned_readonly_sqlite(dir_fd, leaf_name, seen_inodes) {
             PinnedSqliteOpen::Absent => return RetryScanOutcome::Absent,
             PinnedSqliteOpen::SkippedUnsafeOrDuplicate => {
                 return RetryScanOutcome::SkippedUnsafeOrDuplicate;
@@ -2256,32 +2255,35 @@ where
                 return RetryScanOutcome::Unreadable;
             }
             PinnedSqliteOpen::Unreadable => return RetryScanOutcome::Unreadable,
-            PinnedSqliteOpen::Opened(pinned) => match scan_fn(&pinned) {
-                Ok(val) => {
-                    *seen_inodes = local_seen;
-                    return RetryScanOutcome::Scanned(val);
-                }
-                Err(err) => {
-                    // Verify cohort & file consistency on error too: if an unshmed/closing WAL cohort
-                    // changed mid-query and caused SQLite to return `SQLITE_CORRUPT` / `SQLITE_IOERR`
-                    // before `scan_fn` reached its end-of-tx `verify_snapshot_consistent()`, mark
-                    // `saw_cohort_change` / `saw_unsafe_companion` so we retry cleanly!
-                    let _ = pinned.verify_snapshot_consistent();
-                    if pinned.saw_unsafe_companion() {
-                        *seen_inodes = local_seen;
-                        return RetryScanOutcome::SkippedUnsafeOrDuplicate;
+            PinnedSqliteOpen::Opened(pinned) => {
+                let opened_id = pinned.main_file_id();
+                match scan_fn(&pinned) {
+                    Ok(val) => {
+                        seen_inodes.insert(opened_id);
+                        return RetryScanOutcome::Scanned(val);
                     }
-                    if attempt + 1 < TRANSIENT_DB_RETRY_LIMIT
-                        && (pinned.saw_cohort_change() || is_transient_sqlite_err(&err))
-                    {
-                        drop(pinned);
-                        std::thread::sleep(transient_retry_backoff(attempt));
-                        continue;
+                    Err(err) => {
+                        // Verify cohort & file consistency on error too: if an unshmed/closing WAL cohort
+                        // changed mid-query and caused SQLite to return `SQLITE_CORRUPT` / `SQLITE_IOERR`
+                        // before `scan_fn` reached its end-of-tx `verify_snapshot_consistent()`, mark
+                        // `saw_cohort_change` / `saw_unsafe_companion` so we retry cleanly!
+                        let _ = pinned.verify_snapshot_consistent();
+                        if pinned.saw_unsafe_companion() {
+                            seen_inodes.insert(opened_id);
+                            return RetryScanOutcome::SkippedUnsafeOrDuplicate;
+                        }
+                        if attempt + 1 < TRANSIENT_DB_RETRY_LIMIT
+                            && (pinned.saw_cohort_change() || is_transient_sqlite_err(&err))
+                        {
+                            drop(pinned);
+                            std::thread::sleep(transient_retry_backoff(attempt));
+                            continue;
+                        }
+                        seen_inodes.insert(opened_id);
+                        return RetryScanOutcome::Unreadable;
                     }
-                    *seen_inodes = local_seen;
-                    return RetryScanOutcome::Unreadable;
                 }
-            },
+            }
         }
     }
     RetryScanOutcome::Unreadable
@@ -7509,5 +7511,78 @@ mod tests {
             collect_token_stats_at(&h_wrid, StatsSource::Cli, &StatsRangeSpec::AllTime, &now);
         assert_eq!(sum_wrid.unreadable_databases, 1);
         assert_eq!(sum_wrid.summary.request_count, 0);
+    }
+
+    #[test]
+    fn a08a_scan_with_bounded_retry_dedups_hardlinks_and_preserves_transient_retry_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_a = tmp.path().join("a.db");
+        let db_a_link = tmp.path().join("a_hardlink.db");
+        let conn_a = Connection::open(&db_a).unwrap();
+        conn_a
+            .execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (42);")
+            .unwrap();
+        drop(conn_a);
+        fs::hard_link(&db_a, &db_a_link).unwrap();
+
+        let db_b = tmp.path().join("b.db");
+        let db_b_link = tmp.path().join("b_hardlink.db");
+        let conn_b = Connection::open(&db_b).unwrap();
+        conn_b
+            .execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (7);")
+            .unwrap();
+        drop(conn_b);
+        fs::hard_link(&db_b, &db_b_link).unwrap();
+
+        let dir_fd = open_existing_dir_nofollow(tmp.path()).unwrap().unwrap();
+        let mut seen = HashSet::new();
+
+        // 1. Attempt 0 returns a transient `SQLITE_BUSY` error -> MUST NOT mark inode as seen yet;
+        //    attempt 1 re-opens the exact same inode, succeeds, and records the inode once.
+        let mut attempts = 0usize;
+        let res_a = scan_with_bounded_retry(&dir_fd, OsStr::new("a.db"), &mut seen, |pinned| {
+            attempts += 1;
+            if attempts == 1 {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                ));
+            }
+            pinned
+                .conn()
+                .query_row("SELECT v FROM t", [], |r| r.get::<_, i64>(0))
+        });
+        assert!(matches!(res_a, RetryScanOutcome::Scanned(42)));
+        assert_eq!(attempts, 2);
+        assert_eq!(seen.len(), 1);
+
+        // 2. Hardlink to `a.db` is immediately skipped as duplicate without invoking `scan_fn`.
+        let mut link_a_called = false;
+        let res_a_dup =
+            scan_with_bounded_retry(&dir_fd, OsStr::new("a_hardlink.db"), &mut seen, |_| {
+                link_a_called = true;
+                Ok(0i64)
+            });
+        assert!(matches!(
+            res_a_dup,
+            RetryScanOutcome::SkippedUnsafeOrDuplicate
+        ));
+        assert!(!link_a_called);
+
+        // 3. Final non-transient error returns `Unreadable` and records inode so its hardlink is not double-counted.
+        let res_b = scan_with_bounded_retry(&dir_fd, OsStr::new("b.db"), &mut seen, |_| {
+            Err::<i64, _>(rusqlite::Error::QueryReturnedNoRows)
+        });
+        assert!(matches!(res_b, RetryScanOutcome::Unreadable));
+        assert_eq!(seen.len(), 2);
+
+        let res_b_dup =
+            scan_with_bounded_retry(&dir_fd, OsStr::new("b_hardlink.db"), &mut seen, |_| {
+                Ok(0i64)
+            });
+        assert!(matches!(
+            res_b_dup,
+            RetryScanOutcome::SkippedUnsafeOrDuplicate
+        ));
     }
 }

@@ -391,7 +391,7 @@ pub struct PolicySetArgs {
 
 #[derive(Debug, Args)]
 pub struct DaemonArgs {
-    /// Poll interval in seconds (default: 3600 / 1 hour; in-memory unless persisted via `--install` or `AGY_SWITCH_CLI_INTERVAL`)
+    /// Poll interval in seconds (default: 180 / 3 minutes; in-memory unless persisted via `--install` or `AGY_SWITCH_CLI_INTERVAL`)
     #[arg(
         long,
         env = "AGY_SWITCH_CLI_INTERVAL",

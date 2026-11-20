@@ -490,19 +490,7 @@ pub async fn run_interactive_tui(
                     let done_at = Instant::now();
                     match res {
                         Ok(out) => {
-                            let msg = if out.runtime_warning.is_some() {
-                                format!(
-                                    "{proxy_prefix}Switched active slot to {} ({}) — running `agy` keeps startup login; new `agy` uses this account.",
-                                    terminal_text(&out.target_account_id),
-                                    terminal_text(&out.target_email)
-                                )
-                            } else {
-                                format!(
-                                    "{proxy_prefix}Switched active slot to {} ({}).",
-                                    terminal_text(&out.target_account_id),
-                                    terminal_text(&out.target_email)
-                                )
-                            };
+                            let msg = format_tui_switch_status_notice(&proxy_prefix, &out);
                             transient_status.set_info(msg, done_at);
                         }
                         Err(e) => transient_status.set_error(
@@ -1645,6 +1633,27 @@ fn build_dashboard_frame(
         term_cols,
         term_rows,
     )
+}
+
+fn format_tui_switch_status_notice(
+    proxy_prefix: &str,
+    out: &crate::switching::executor::SwitchOutcome,
+) -> String {
+    let id = terminal_text(&out.target_account_id);
+    let email = terminal_text(&out.target_email);
+    if out.validation_blocked && out.runtime_warning.is_some() {
+        format!("{proxy_prefix}Switched (verify-blocked): open new agy to verify, press r — {email} ({id})")
+    } else if out.validation_blocked {
+        format!(
+            "{proxy_prefix}Switched (verify-blocked): open agy to verify, press r — {email} ({id})"
+        )
+    } else if out.runtime_warning.is_some() {
+        format!(
+            "{proxy_prefix}Switched active slot to {id} ({email}) — running `agy` keeps startup login; new `agy` uses this account."
+        )
+    } else {
+        format!("{proxy_prefix}Switched active slot to {id} ({email}).")
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3882,6 +3891,119 @@ mod tests {
             token_calls.load(Ordering::SeqCst),
             1,
             "Queued accounts MUST NOT issue `/token` requests after first exit 7!"
+        );
+    }
+
+    #[test]
+    fn v122_tui_verify_blocked_switch_status_fits_80_columns() {
+        use crate::domain::account::{AccountRecord, RuntimeState, SessionIdentity};
+        use crate::domain::token::TokenRecord;
+        use crate::switching::executor::SwitchOutcome;
+
+        let acc = AccountRecord::new(
+            "acc-0002".into(),
+            "bob@example.com".into(),
+            TokenRecord {
+                access_token: "ya29.test".into(),
+                refresh_token: "1//RT_TEST".into(),
+                expires_in: 3600,
+                expiry_timestamp: 2_000_000_000,
+                token_type: "Bearer".into(),
+                id_token: None,
+                oauth_client_key: None,
+                project_id: None,
+                is_gcp_tos: false,
+                granted_scopes: None,
+            },
+            1_800_000_000,
+        );
+        let policy = SwitchPolicy::default();
+        let session_id = SessionIdentity::Matched {
+            account_id: "acc-0002".into(),
+            email: "bob@example.com".into(),
+            expiry: "2099-01-01T00:00:00Z".into(),
+        };
+
+        let idle_out = SwitchOutcome {
+            dry_run: false,
+            previous_selected_id: Some("acc-0001".into()),
+            target_account_id: "acc-0002".into(),
+            target_email: "bob@example.com".into(),
+            token_refreshed: false,
+            refresh_token_rotated: false,
+            runtime_warning: None,
+            validation_blocked: true,
+            validation_warning: Some("warning".into()),
+        };
+        let idle_msg = format_tui_switch_status_notice("", &idle_out);
+        let mut scroll = 0usize;
+        let frame_idle_80 = build_dashboard_frame_with_backend(
+            std::slice::from_ref(&acc),
+            Some("acc-0002"),
+            &policy,
+            &session_id,
+            &RuntimeState::Idle,
+            "file",
+            0,
+            &mut scroll,
+            Some(&idle_msg),
+            80,
+            24,
+        );
+        assert!(
+            frame_idle_80
+                .contains("Status: Switched (verify-blocked): open agy to verify, press r"),
+            "80-col idle TUI frame must show full verify-blocked action: {frame_idle_80}"
+        );
+
+        let running_out = SwitchOutcome {
+            runtime_warning: Some("running agy".into()),
+            ..idle_out
+        };
+        let running_msg = format_tui_switch_status_notice("", &running_out);
+        let frame_running_80 = build_dashboard_frame_with_backend(
+            std::slice::from_ref(&acc),
+            Some("acc-0002"),
+            &policy,
+            &session_id,
+            &RuntimeState::UnmanagedRunning {
+                pids: vec![4242],
+                managed_account_ids: vec![],
+            },
+            "file",
+            0,
+            &mut scroll,
+            Some(&running_msg),
+            80,
+            24,
+        );
+        assert!(
+            frame_running_80
+                .contains("Status: Switched (verify-blocked): open new agy to verify, press r"),
+            "80-col running TUI frame must show full `open new agy` + `press r` action: {frame_running_80}"
+        );
+
+        let frame_running_160 = build_dashboard_frame_with_backend(
+            std::slice::from_ref(&acc),
+            Some("acc-0002"),
+            &policy,
+            &session_id,
+            &RuntimeState::UnmanagedRunning {
+                pids: vec![4242],
+                managed_account_ids: vec![],
+            },
+            "file",
+            0,
+            &mut scroll,
+            Some(&running_msg),
+            160,
+            24,
+        );
+        assert!(
+            frame_running_160.contains(
+                "Status: Switched (verify-blocked): open new agy to verify, press r — bob@example.com (acc-0002)"
+            ),
+            "160-col TUI frame must include full email and account ID: {frame_running_160}"
         );
     }
 }

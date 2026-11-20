@@ -1,3 +1,4 @@
+use crate::cli::dto::terminal_text;
 use crate::domain::account::{AccountRecord, DisableReasonCode, RuntimeState};
 use crate::domain::clock::{AnchoredClock, Clock};
 use crate::domain::policy::PolicyStrategy;
@@ -97,7 +98,7 @@ pub async fn run_managed_agy(
         RuntimeState::Idle | RuntimeState::ManagedRunning { .. } => {}
     }
 
-    let active_account_id = prepare_account_before_spawn(
+    let (active_account_id, target_validation_blocked) = prepare_account_before_spawn(
         repo,
         backend,
         transport,
@@ -109,6 +110,13 @@ pub async fn run_managed_agy(
         &clock,
     )
     .await?;
+
+    if target_validation_blocked {
+        let safe_id = terminal_text(&active_account_id);
+        eprintln!(
+            "Note: account `{safe_id}` is currently marked verification-required (`verify-blocked`) and remains excluded from daemon auto-switching. Complete Google verification in `agy`, then run `agy-switch-cli refresh {safe_id}` to clear this status."
+        );
+    }
 
     // 4. Spawn child `agy`, register two-factor lease (`pid` + `/proc/<pid>/stat` field 22 `starttime`),
     // forward signals, and return exact child exit code!
@@ -194,7 +202,7 @@ async fn prepare_account_before_spawn(
     explicit_account: Option<&str>,
     runtime: &RuntimeState,
     clock: &dyn Clock,
-) -> CliResult<String> {
+) -> CliResult<(String, bool)> {
     let paths = repo.paths();
     let snapshot = repo.read_snapshot()?;
 
@@ -212,8 +220,8 @@ async fn prepare_account_before_spawn(
     ensure_no_conflicting_managed_session(runtime, &target_id)?;
 
     let replicas = backend.inspect_replicas(paths);
-    if !is_slot_synced_and_fresh(&replicas, &snapshot, target, ts) {
-        execute_switch(
+    let validation_blocked = if !is_slot_synced_and_fresh(&replicas, &snapshot, target, ts) {
+        let outcome = execute_switch(
             repo,
             backend,
             transport,
@@ -228,9 +236,12 @@ async fn prepare_account_before_spawn(
             clock.now_unix(),
         )
         .await?;
-    }
+        outcome.validation_blocked
+    } else {
+        target.is_validation_blocked_at(ts)
+    };
 
-    Ok(target_id)
+    Ok((target_id, validation_blocked))
 }
 
 fn ensure_account_usable_and_scoped(
@@ -241,7 +252,7 @@ fn ensure_account_usable_and_scoped(
 ) -> CliResult<()> {
     let clock = AnchoredClock::new(now_unix);
     let ts = clock.now_unix();
-    validate_target_usable(target, ts)?;
+    validate_target_usable(target, ts, true)?;
     let missing = registry.missing_required_scopes(&target.token);
     if !missing.is_empty() {
         let scope_err = CliError::auth(

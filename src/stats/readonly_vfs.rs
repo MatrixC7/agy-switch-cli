@@ -89,6 +89,10 @@ impl PinnedSqliteConnection {
         self.conn.as_ref().expect("connection active before drop")
     }
 
+    pub(crate) fn main_file_id(&self) -> (u64, u64) {
+        (self.ctx.main_file.dev, self.ctx.main_file.ino)
+    }
+
     pub(crate) fn saw_unsafe_companion(&self) -> bool {
         self.ctx.saw_unsafe_companion.load(Ordering::SeqCst)
     }
@@ -465,7 +469,7 @@ fn verify_cohort_entry_at_open(
 pub(crate) fn open_pinned_readonly_sqlite(
     dir_fd: &OwnedFd,
     leaf_name: &OsStr,
-    seen_inodes: &mut HashSet<(u64, u64)>,
+    seen_inodes: &HashSet<(u64, u64)>,
 ) -> PinnedSqliteOpen {
     if !ensure_vfs_registered() {
         return PinnedSqliteOpen::Unreadable;
@@ -552,7 +556,6 @@ pub(crate) fn open_pinned_readonly_sqlite(
         return PinnedSqliteOpen::Unreadable;
     };
 
-    let (main_dev, main_ino) = (main_file.dev, main_file.ino);
     let slot_id = NEXT_SLOT_ID.fetch_add(1, Ordering::Relaxed);
     let ctx = Arc::new(PinnedSlotContext {
         dir_fd: owned_dir_fd,
@@ -624,7 +627,6 @@ pub(crate) fn open_pinned_readonly_sqlite(
         };
     }
 
-    seen_inodes.insert((main_dev, main_ino));
     let _ = &mut guard;
     PinnedSqliteOpen::Opened(guard)
 }
@@ -2404,9 +2406,9 @@ mod tests {
         );
 
         let dir_fd = open_existing_dir_nofollow(tmp.path()).unwrap().unwrap();
-        let mut seen = HashSet::new();
+        let seen = HashSet::new();
         let PinnedSqliteOpen::Opened(pinned) =
-            open_pinned_readonly_sqlite(&dir_fd, OsStr::new("sixtyfour_k.db"), &mut seen)
+            open_pinned_readonly_sqlite(&dir_fd, OsStr::new("sixtyfour_k.db"), &seen)
         else {
             panic!("expected Opened under simulated 64 KiB OS page size");
         };
@@ -2446,9 +2448,9 @@ mod tests {
         drop(oconn);
 
         let o_dir_fd = open_existing_dir_nofollow(&orph_dst).unwrap().unwrap();
-        let mut o_seen = HashSet::new();
+        let o_seen = HashSet::new();
         let PinnedSqliteOpen::Opened(o_pinned) =
-            open_pinned_readonly_sqlite(&o_dir_fd, OsStr::new("orph.db"), &mut o_seen)
+            open_pinned_readonly_sqlite(&o_dir_fd, OsStr::new("orph.db"), &o_seen)
         else {
             panic!("expected Opened on orphaned -shm cohort");
         };
@@ -2613,9 +2615,9 @@ mod tests {
         let dir_fd = open_existing_dir_nofollow(&dst_dir).unwrap().unwrap();
 
         // Attempt 1 MUST detect `-shm` appearance (`saw_cohort_change() == true`) and abort with `SQLITE_PROTOCOL`!
-        let mut seen1 = HashSet::new();
+        let seen1 = HashSet::new();
         let PinnedSqliteOpen::Opened(pinned1) =
-            open_pinned_readonly_sqlite(&dir_fd, OsStr::new("sync.db"), &mut seen1)
+            open_pinned_readonly_sqlite(&dir_fd, OsStr::new("sync.db"), &seen1)
         else {
             panic!("expected initial Opened");
         };
@@ -2631,9 +2633,9 @@ mod tests {
 
         // Attempt 2 (while separate OS writer STILL holds live `-shm` DMS lock!) reopens the fresh cohort,
         // acquires real cross-process DMS + `WAL_READ_LOCK` on `sync.db-shm`, and reads exact consistent sum `300`!
-        let mut seen2 = HashSet::new();
+        let seen2 = HashSet::new();
         let PinnedSqliteOpen::Opened(pinned2) =
-            open_pinned_readonly_sqlite(&dir_fd, OsStr::new("sync.db"), &mut seen2)
+            open_pinned_readonly_sqlite(&dir_fd, OsStr::new("sync.db"), &seen2)
         else {
             panic!("expected retry Opened with live -shm");
         };
@@ -2707,12 +2709,10 @@ mod tests {
                 let dir_fd = open_existing_dir_nofollow(&cdir).unwrap().unwrap();
                 for _ in 0..40 {
                     assert_eq!(effective_os_page_size(), host_page_size);
-                    let mut seen = HashSet::new();
-                    let PinnedSqliteOpen::Opened(pinned) = open_pinned_readonly_sqlite(
-                        &dir_fd,
-                        OsStr::new("closed_wal.db"),
-                        &mut seen,
-                    ) else {
+                    let seen = HashSet::new();
+                    let PinnedSqliteOpen::Opened(pinned) =
+                        open_pinned_readonly_sqlite(&dir_fd, OsStr::new("closed_wal.db"), &seen)
+                    else {
                         panic!("expected Opened on closed_wal.db");
                     };
                     let v: i64 = pinned
@@ -2763,9 +2763,9 @@ mod tests {
                         }));
                     });
 
-                    let mut seen = HashSet::new();
+                    let seen = HashSet::new();
                     let PinnedSqliteOpen::Opened(pinned) =
-                        open_pinned_readonly_sqlite(&dir_fd, OsStr::new("unshmed.db"), &mut seen)
+                        open_pinned_readonly_sqlite(&dir_fd, OsStr::new("unshmed.db"), &seen)
                     else {
                         panic!("expected Opened on unshmed.db");
                     };
@@ -2831,9 +2831,9 @@ mod tests {
         );
 
         let dir_fd = open_existing_dir_nofollow(&dst_dir).unwrap().unwrap();
-        let mut seen = HashSet::new();
+        let seen = HashSet::new();
         let PinnedSqliteOpen::Opened(pinned) =
-            open_pinned_readonly_sqlite(&dir_fd, OsStr::new("zero_shm.db"), &mut seen)
+            open_pinned_readonly_sqlite(&dir_fd, OsStr::new("zero_shm.db"), &seen)
         else {
             panic!("expected Opened on 0-byte DMS-locked -shm");
         };
@@ -3000,9 +3000,9 @@ mod tests {
         let shm_holder = TestOfdLockGuard::lock_shared(shm_file, UNIX_SHM_DMS, 1);
 
         let dir_fd = open_existing_dir_nofollow(&wal_dir).unwrap().unwrap();
-        let mut seen = HashSet::new();
+        let seen = HashSet::new();
         let PinnedSqliteOpen::Opened(pinned) =
-            open_pinned_readonly_sqlite(&dir_fd, OsStr::new("checkpointed.db"), &mut seen)
+            open_pinned_readonly_sqlite(&dir_fd, OsStr::new("checkpointed.db"), &seen)
         else {
             panic!("expected Opened on WAL DB with absent -wal and DMS-locked -shm");
         };
@@ -3204,9 +3204,9 @@ mod tests {
         let _guard = ForceOfdEinvalGuard;
 
         let dir_fd = open_existing_dir_nofollow(&wal_dir).unwrap().unwrap();
-        let mut seen = HashSet::new();
+        let seen = HashSet::new();
         let PinnedSqliteOpen::Opened(pinned) =
-            open_pinned_readonly_sqlite(&dir_fd, OsStr::new("active.db"), &mut seen)
+            open_pinned_readonly_sqlite(&dir_fd, OsStr::new("active.db"), &seen)
         else {
             panic!("Expected active WAL DB to open cleanly under simulated OFD EINVAL");
         };

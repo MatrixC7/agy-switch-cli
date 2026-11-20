@@ -43,7 +43,7 @@ use crate::switching::daemon::{
     DaemonPolicyOverlay, DEFAULT_DAEMON_COOLDOWN_SECS, DEFAULT_DAEMON_INTERVAL_SECS,
 };
 use crate::switching::executor::{
-    execute_account_delete, execute_switch_with_idle_policy, SwitchOptions,
+    execute_account_delete, execute_switch_with_idle_policy, preview_switch_dry_run, SwitchOptions,
 };
 use crate::switching::runner::{ordered_candidate_ids, run_managed_agy};
 use crate::switching::systemd::{
@@ -52,8 +52,8 @@ use crate::switching::systemd::{
 use crate::transport::client::{HttpTransport, ReqwestTransport};
 use crate::transport::proxy::ProxyMode;
 use crate::transport::user_agent::{
-    format_native_oauth_user_agent, probe_local_agy_for_status, resolve_native_oauth_user_agent,
-    LocalAgyProbeOutcome, CLI_PKG_VERSION, KNOWN_COMPAT_FLOOR_UA_VERSION,
+    probe_local_agy_for_status, resolve_native_oauth_user_agent, LocalAgyProbeOutcome,
+    CLI_PKG_VERSION,
 };
 use serde::Serialize;
 use std::collections::{HashSet, VecDeque};
@@ -720,28 +720,22 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
         Commands::Switch(args) => {
             let registry = OAuthClientRegistry::load(&paths)?;
             if args.dry_run {
-                let dummy = crate::transport::client::MockTransport::default();
-                let floor_ua = format_native_oauth_user_agent(KNOWN_COMPAT_FLOOR_UA_VERSION);
-                let outcome = execute_switch_with_idle_policy(
+                let outcome = preview_switch_dry_run(
                     &repo,
                     backend,
-                    &dummy,
-                    &OAuthEndpoints::default(),
                     &registry,
-                    &floor_ua,
                     &args.selector,
-                    &SwitchOptions {
-                        dry_run: true,
-                        allow_running: args.allow_running,
-                    },
+                    args.allow_running,
                     args.require_idle,
                     now_unix,
-                )
-                .await?;
+                )?;
                 if cli.json {
                     print_json(&serde_json::json!({ "switch": outcome }))?;
                 } else {
                     if let Some(ref warn) = outcome.runtime_warning {
+                        eprintln!("{}", terminal_text(warn));
+                    }
+                    if let Some(ref warn) = outcome.validation_warning {
                         eprintln!("{}", terminal_text(warn));
                     }
                     println!(
@@ -782,6 +776,9 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 print_json(&serde_json::json!({ "switch": outcome }))?;
             } else {
                 if let Some(ref warn) = outcome.runtime_warning {
+                    eprintln!("{}", terminal_text(warn));
+                }
+                if let Some(ref warn) = outcome.validation_warning {
                     eprintln!("{}", terminal_text(warn));
                 }
                 println!(
@@ -1519,6 +1516,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                     interval_secs,
                     cooldown_secs,
                     once: args.once,
+                    json_mode: cli.json,
                     notify_override,
                     policy_overlay,
                     ..DaemonConfigOverrides::default()
@@ -2992,13 +2990,6 @@ mod tests {
         .unwrap();
 
         let registry = OAuthClientRegistry::load(&paths).unwrap();
-        let transport = MockTransport::default();
-        let endpoints = OAuthEndpoints::default();
-        let dry_opts = SwitchOptions {
-            dry_run: true,
-            allow_running: true,
-        };
-        let floor_ua = format_native_oauth_user_agent(KNOWN_COMPAT_FLOOR_UA_VERSION);
 
         // 1. `file` backend before slot dir exists: single probe per command and strictly zero slot dir creation.
         assert!(!paths.active_slot_dir.exists());
@@ -3020,19 +3011,15 @@ mod tests {
         assert_eq!(file_backend.counts(), (0, 1, 1));
         file_backend.reset_counts();
 
-        let uninit_dry_err = execute_switch_with_idle_policy(
+        let uninit_dry_err = preview_switch_dry_run(
             &repo,
             &file_backend,
-            &transport,
-            &endpoints,
             &registry,
-            &floor_ua,
             "acc-0002",
-            &dry_opts,
+            true,
             false,
             now,
         )
-        .await
         .unwrap_err();
         assert_eq!(uninit_dry_err.error_code, "agy_uninitialized");
         assert_eq!(file_backend.counts(), (0, 1, 1));
@@ -3058,22 +3045,19 @@ mod tests {
         assert_eq!(file_backend.counts(), (0, 1, 1));
         file_backend.reset_counts();
 
-        let dry_ok = execute_switch_with_idle_policy(
+        let dry_ok = preview_switch_dry_run(
             &repo,
             &file_backend,
-            &transport,
-            &endpoints,
             &registry,
-            &floor_ua,
             "acc-0002",
-            &dry_opts,
+            true,
             false,
             now,
         )
-        .await
         .unwrap();
         assert!(dry_ok.dry_run);
         assert_eq!(dry_ok.target_account_id, "acc-0002");
+        assert!(!dry_ok.validation_blocked);
         assert_eq!(file_backend.counts(), (0, 1, 1));
 
         // 2. `dual` backend:
@@ -3086,20 +3070,9 @@ mod tests {
             SessionIdentity::Matched { ref account_id, .. } if account_id == "acc-0001"
         ));
         dual_absent.reset_counts();
-        let dry_dual_fb = execute_switch_with_idle_policy(
-            &repo,
-            &dual_absent,
-            &transport,
-            &endpoints,
-            &registry,
-            &floor_ua,
-            "acc-0002",
-            &dry_opts,
-            false,
-            now,
-        )
-        .await
-        .unwrap();
+        let dry_dual_fb =
+            preview_switch_dry_run(&repo, &dual_absent, &registry, "acc-0002", true, false, now)
+                .unwrap();
         assert!(dry_dual_fb.dry_run);
         assert_eq!(dual_absent.counts(), (0, 1, 1));
 
@@ -3119,19 +3092,15 @@ mod tests {
         assert_eq!(st_kr_bad.details.as_ref().unwrap()["slot_corrupt"], true);
         assert_eq!(dual_kr_corrupt.counts(), (0, 1, 1));
         dual_kr_corrupt.reset_counts();
-        let dry_kr_bad = execute_switch_with_idle_policy(
+        let dry_kr_bad = preview_switch_dry_run(
             &repo,
             &dual_kr_corrupt,
-            &transport,
-            &endpoints,
             &registry,
-            &floor_ua,
             "acc-0002",
-            &dry_opts,
+            true,
             false,
             now,
         )
-        .await
         .unwrap_err();
         assert_eq!(dry_kr_bad.exit_code, ExitCode::GeneralOrDataError);
         assert_eq!(dual_kr_corrupt.counts(), (0, 1, 1));
@@ -3145,20 +3114,9 @@ mod tests {
             SessionIdentity::Unverified { ref detail } if detail == "kr-locked"
         ));
         dual_kr_unv.reset_counts();
-        let dry_kr_unv = execute_switch_with_idle_policy(
-            &repo,
-            &dual_kr_unv,
-            &transport,
-            &endpoints,
-            &registry,
-            &floor_ua,
-            "acc-0002",
-            &dry_opts,
-            false,
-            now,
-        )
-        .await
-        .unwrap_err();
+        let dry_kr_unv =
+            preview_switch_dry_run(&repo, &dual_kr_unv, &registry, "acc-0002", true, false, now)
+                .unwrap_err();
         assert_eq!(dry_kr_unv.error_code, "secret_service_unavailable");
         assert_eq!(dual_kr_unv.counts(), (0, 1, 1));
 
@@ -3179,19 +3137,15 @@ mod tests {
         assert_eq!(st_disk_bad.details.as_ref().unwrap()["slot_corrupt"], true);
         assert_eq!(dual_disk_bad.counts(), (0, 1, 1));
         dual_disk_bad.reset_counts();
-        let dry_disk_bad = execute_switch_with_idle_policy(
+        let dry_disk_bad = preview_switch_dry_run(
             &repo,
             &dual_disk_bad,
-            &transport,
-            &endpoints,
             &registry,
-            &floor_ua,
             "acc-0002",
-            &dry_opts,
+            true,
             false,
             now,
         )
-        .await
         .unwrap_err();
         assert_eq!(dry_disk_bad.exit_code, ExitCode::GeneralOrDataError);
         assert_eq!(dual_disk_bad.counts(), (0, 1, 1));
@@ -3211,20 +3165,9 @@ mod tests {
         handle_status(&repo, &kr_present, true).await.unwrap();
         assert_eq!(kr_present.counts(), (0, 1, 0));
         kr_present.reset_counts();
-        let dry_kr_only = execute_switch_with_idle_policy(
-            &repo,
-            &kr_present,
-            &transport,
-            &endpoints,
-            &registry,
-            &floor_ua,
-            "acc-0002",
-            &dry_opts,
-            false,
-            now,
-        )
-        .await
-        .unwrap();
+        let dry_kr_only =
+            preview_switch_dry_run(&repo, &kr_present, &registry, "acc-0002", true, false, now)
+                .unwrap();
         assert!(dry_kr_only.dry_run);
         assert_eq!(kr_present.counts(), (0, 1, 0));
 

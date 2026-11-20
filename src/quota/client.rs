@@ -377,12 +377,31 @@ pub async fn fetch_quota_summary_from_environments(
     access_token: &str,
     project_id: Option<&str>,
 ) -> Result<SummaryFetchOutcome, QuotaApiError> {
+    let (outcome, _) = fetch_quota_summary_from_environments_with_detail(
+        transport,
+        environments,
+        user_agent,
+        access_token,
+        project_id,
+    )
+    .await?;
+    Ok(outcome)
+}
+
+async fn fetch_quota_summary_from_environments_with_detail(
+    transport: &dyn HttpTransport,
+    environments: &[(QuotaSourceEnv, String)],
+    user_agent: &str,
+    access_token: &str,
+    project_id: Option<&str>,
+) -> Result<(SummaryFetchOutcome, Option<&'static str>), QuotaApiError> {
     let default_project = project_id
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("aicode-consumers");
     let primary_payload = json!({ "project": default_project });
     let mut partial_fallback: Option<(QuotaSourceEnv, Vec<QuotaGroup>)> = None;
+    let mut last_failure_code: Option<&'static str> = None;
 
     for (env, base_url) in environments {
         let url = format!("{base_url}:retrieveUserQuotaSummary");
@@ -408,19 +427,30 @@ pub async fn fetch_quota_summary_from_environments(
                     if resp.status == 403 {
                         if let Some((reason, vurl)) = detect_403_validation_block(&resp.body) {
                             if let Some((f_env, f_groups)) = partial_fallback {
-                                return Ok(SummaryFetchOutcome::Groups(f_env, f_groups));
+                                return Ok((SummaryFetchOutcome::Groups(f_env, f_groups), None));
                             }
-                            return Ok(SummaryFetchOutcome::ValidationBlocked(reason, vurl));
+                            return Ok((
+                                SummaryFetchOutcome::ValidationBlocked(reason, vurl),
+                                None,
+                            ));
                         }
                         if attempt_idx + 1 < attempts.len() {
                             continue;
                         }
                     }
                     if !(200..300).contains(&resp.status) {
+                        last_failure_code = Some(if resp.status == 429 {
+                            "quota_rate_limited"
+                        } else if resp.status >= 500 {
+                            "quota_network_error"
+                        } else {
+                            "data_error"
+                        });
                         break;
                     }
                     let Ok(parsed) = serde_json::from_slice::<QuotaSummaryResponse>(&resp.body)
                     else {
+                        last_failure_code = Some("data_error");
                         break;
                     };
                     let groups: Vec<QuotaGroup> = parsed
@@ -451,7 +481,7 @@ pub async fn fetch_quota_summary_from_environments(
                         break;
                     }
                     if summary_has_gemini_group(&groups) {
-                        return Ok(SummaryFetchOutcome::Groups(*env, groups));
+                        return Ok((SummaryFetchOutcome::Groups(*env, groups), None));
                     }
                     if partial_fallback.is_none() {
                         partial_fallback = Some((*env, groups));
@@ -462,14 +492,17 @@ pub async fn fetch_quota_summary_from_environments(
                     }
                     break;
                 }
-                Err(_) => break,
+                Err(_) => {
+                    last_failure_code = Some("quota_network_error");
+                    break;
+                }
             }
         }
     }
     if let Some((f_env, f_groups)) = partial_fallback {
-        return Ok(SummaryFetchOutcome::Groups(f_env, f_groups));
+        return Ok((SummaryFetchOutcome::Groups(f_env, f_groups), None));
     }
-    Ok(SummaryFetchOutcome::Unavailable)
+    Ok((SummaryFetchOutcome::Unavailable, last_failure_code))
 }
 
 async fn sleep_with_jitter(base: Duration, retry_after_secs: Option<u64>) {
@@ -493,6 +526,9 @@ pub struct QuotaFetchOutcome {
     pub validation_block: Option<(String, Option<String>)>,
     /// True ONLY when the configured primary environment (`ep_idx == 0`) succeeded cleanly.
     pub allow_clear_validation_block: bool,
+    /// Structured error code if `:retrieveUserQuotaSummary` failed with HTTP/transport/parse error
+    /// and yielded `SummaryFetchOutcome::Unavailable` (always `None` for valid groups or HTTP 200 empty groups).
+    pub summary_error_code: Option<&'static str>,
 }
 
 fn detect_403_validation_block(body: &[u8]) -> Option<(String, Option<String>)> {
@@ -603,6 +639,7 @@ pub async fn fetch_quota_once(
                         discovered_project_id: normalized_cached_proj,
                         validation_block: Some((reason, validation_url)),
                         allow_clear_validation_block: false,
+                        summary_error_code: None,
                     });
                 }
                 EnvLoadOutcome::Unavailable => (None, None),
@@ -651,6 +688,7 @@ pub async fn fetch_quota_once(
                                 discovered_project_id: effective_project,
                                 validation_block: Some((reason, vurl)),
                                 allow_clear_validation_block: false,
+                                summary_error_code: None,
                             });
                         }
                         if current_payload.get("project").is_some() && !retried_without_project {
@@ -748,15 +786,17 @@ pub async fn fetch_quota_once(
                     let same_env_slice = [(*source_env, base_url.clone())];
                     let mut has_full_gemini_summary = false;
                     let mut is_partial_3p_only = false;
-                    match fetch_quota_summary_from_environments(
-                        transport,
-                        &same_env_slice,
-                        user_agent,
-                        access_token,
-                        effective_project.as_deref(),
-                    )
-                    .await?
-                    {
+                    let mut summary_error_code = None;
+                    let (summary_outcome, summary_err_opt) =
+                        fetch_quota_summary_from_environments_with_detail(
+                            transport,
+                            &same_env_slice,
+                            user_agent,
+                            access_token,
+                            effective_project.as_deref(),
+                        )
+                        .await?;
+                    match summary_outcome {
                         SummaryFetchOutcome::Groups(sum_env, groups) => {
                             has_full_gemini_summary = summary_has_gemini_group(&groups);
                             is_partial_3p_only = !has_full_gemini_summary;
@@ -776,10 +816,12 @@ pub async fn fetch_quota_once(
                                 discovered_project_id: effective_project,
                                 validation_block: Some((reason, vurl)),
                                 allow_clear_validation_block: false,
+                                summary_error_code: None,
                             });
                         }
                         SummaryFetchOutcome::Unavailable => {
                             obs.last_updated = clock.now_unix();
+                            summary_error_code = summary_err_opt;
                         }
                     }
 
@@ -788,6 +830,7 @@ pub async fn fetch_quota_once(
                         discovered_project_id: effective_project,
                         validation_block: None,
                         allow_clear_validation_block: is_authoritative_primary,
+                        summary_error_code,
                     };
 
                     if has_full_gemini_summary {
@@ -843,6 +886,7 @@ pub async fn fetch_quota_once(
                 discovered_project_id: f_proj,
                 validation_block: None,
                 allow_clear_validation_block: false,
+                summary_error_code: None,
             });
         }
     }
@@ -870,6 +914,31 @@ pub async fn refresh_account_quota_locked(
     account_id: &str,
     now_unix: i64,
 ) -> CliResult<AccountRecord> {
+    let (acc, _) = refresh_account_quota_locked_with_meta(
+        repo,
+        transport,
+        oauth_endpoints,
+        quota_endpoints,
+        registry,
+        user_agent,
+        account_id,
+        now_unix,
+    )
+    .await?;
+    Ok(acc)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn refresh_account_quota_locked_with_meta(
+    repo: &StoreRepository,
+    transport: &dyn HttpTransport,
+    oauth_endpoints: &OAuthEndpoints,
+    quota_endpoints: &CloudCodeEndpoints,
+    registry: &OAuthClientRegistry,
+    user_agent: &str,
+    account_id: &str,
+    now_unix: i64,
+) -> CliResult<(AccountRecord, Option<&'static str>)> {
     let clock = AnchoredClock::new(now_unix);
     let ensured = ensure_account_token_fresh_locked(
         repo,
@@ -949,7 +1018,8 @@ pub async fn refresh_account_quota_locked(
         Err(other_err) => return Err(other_err.into_cli_error()),
     };
 
-    repo.with_write_lock(|tx| {
+    let summary_error_code = fetched.summary_error_code;
+    let updated = repo.with_write_lock(|tx| {
         tx.merge_quota_observation(
             account_id,
             fetched.observation,
@@ -957,5 +1027,6 @@ pub async fn refresh_account_quota_locked(
             fetched.validation_block,
             fetched.allow_clear_validation_block,
         )
-    })
+    })?;
+    Ok((updated, summary_error_code))
 }
