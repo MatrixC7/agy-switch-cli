@@ -1626,14 +1626,14 @@ async fn synthetic_accounts_add_from_local_reads_agy_slot_and_rejects_symlinks()
         "antigravity/1.5.7 linux/amd64",
         &rt_agy,
         None,
-        Some("本机账号"),
+        Some("local-main"),
         1_800_000_000,
     )
     .await
     .unwrap();
     assert!(created);
     assert_eq!(saved.email, "alice@example.com");
-    assert_eq!(saved.custom_label.as_deref(), Some("本机账号"));
+    assert_eq!(saved.custom_label.as_deref(), Some("local-main"));
 
     // 3. Symlinked `antigravity-oauth-token` MUST be rejected
     std::fs::remove_file(&paths.active_slot_file).unwrap();

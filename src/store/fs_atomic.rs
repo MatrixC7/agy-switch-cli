@@ -642,6 +642,84 @@ pub fn map_io_error(err: std::io::Error, context: &str) -> CliError {
 /// 3. `write_all` -> `file.sync_all()` -> `drop(file)` -> `fs::rename` -> `parent_dir.sync_all()`.
 /// 4. Safe non-blocking regular-file readback verification checking exact byte equality.
 pub fn write_atomic_durable(target: &Path, content: &[u8]) -> CliResult<()> {
+    write_atomic_durable_impl(target, content, true)
+}
+
+/// Durable single-file atomic write that NEVER replaces an existing target path (even under
+/// concurrent writers racing toward the same destination):
+/// - Preserves same-directory `0600` temporary file creation, `fsync`, parent directory `fsync`,
+///   and non-blocking regular-file readback verification;
+/// - Commits via Linux `renameat2(..., RENAME_NOREPLACE)` (falling back to atomic `linkat` +
+///   `unlinkat` only when `renameat2` returns `ENOSYS`/`EINVAL`/`EOPNOTSUPP`) and fails with
+///   `error_code == "target_already_exists"` without modifying any existing file when `EEXIST`.
+pub fn write_atomic_durable_create_new(target: &Path, content: &[u8]) -> CliResult<()> {
+    write_atomic_durable_impl(target, content, false)
+}
+
+fn commit_temp_noreplace_in_dir(
+    dir_fd: libc::c_int,
+    temp_name: &str,
+    target_name: &str,
+    target: &Path,
+) -> CliResult<()> {
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    let c_tmp = CString::new(temp_name.as_bytes())
+        .map_err(|_| CliError::data("Temporary file name contains NUL byte."))?;
+    let c_target = CString::new(target_name.as_bytes())
+        .map_err(|_| CliError::data("Target file name contains NUL byte."))?;
+
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            dir_fd,
+            c_tmp.as_ptr(),
+            dir_fd,
+            c_target.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(code) if code == libc::EEXIST => Err(CliError::io(
+            "target_already_exists",
+            format!("Target '{}' already exists.", target.display()),
+        )),
+        Some(code) if code == libc::ENOSYS || code == libc::EINVAL || code == libc::EOPNOTSUPP => {
+            let link_rc =
+                unsafe { libc::linkat(dir_fd, c_tmp.as_ptr(), dir_fd, c_target.as_ptr(), 0) };
+            if link_rc == 0 {
+                let _ = unsafe { libc::unlinkat(dir_fd, c_tmp.as_ptr(), 0) };
+                Ok(())
+            } else {
+                let link_err = std::io::Error::last_os_error();
+                if link_err.raw_os_error() == Some(libc::EEXIST) {
+                    Err(CliError::io(
+                        "target_already_exists",
+                        format!("Target '{}' already exists.", target.display()),
+                    ))
+                } else {
+                    Err(map_io_error(
+                        link_err,
+                        &format!("Failed to atomically create '{}'", target.display()),
+                    ))
+                }
+            }
+        }
+        _ => Err(map_io_error(
+            err,
+            &format!("Failed to atomically create '{}'", target.display()),
+        )),
+    }
+}
+
+fn write_atomic_durable_impl(
+    target: &Path,
+    content: &[u8],
+    replace_existing: bool,
+) -> CliResult<()> {
     let raw_parent = target.parent().ok_or_else(|| {
         CliError::data(format!(
             "Target path '{}' has no parent directory.",
@@ -677,6 +755,12 @@ pub fn write_atomic_durable(target: &Path, content: &[u8]) -> CliResult<()> {
                 target.display()
             )));
         }
+        Ok(_) if !replace_existing => {
+            return Err(CliError::io(
+                "target_already_exists",
+                format!("Target '{}' already exists.", target.display()),
+            ));
+        }
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
@@ -693,8 +777,8 @@ pub fn write_atomic_durable(target: &Path, content: &[u8]) -> CliResult<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| CliError::data("Invalid target file name."))?;
-    let temp_path: PathBuf =
-        parent_dir.join(format!("{file_name}{OWNED_TMP_MARKER}{}", Uuid::new_v4()));
+    let temp_name = format!("{file_name}{OWNED_TMP_MARKER}{}", Uuid::new_v4());
+    let temp_path: PathBuf = parent_dir.join(&temp_name);
 
     let mut options = OpenOptions::new();
     options
@@ -738,30 +822,58 @@ pub fn write_atomic_durable(target: &Path, content: &[u8]) -> CliResult<()> {
         return Err(e);
     }
 
-    if let Err(e) = fs::rename(&temp_path, target) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(map_io_error(
-            e,
-            &format!("Failed to atomically replace '{}'", target.display()),
-        ));
-    }
+    let opened_dir_file = if replace_existing {
+        if let Err(e) = fs::rename(&temp_path, target) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(map_io_error(
+                e,
+                &format!("Failed to atomically replace '{}'", target.display()),
+            ));
+        }
+        None
+    } else {
+        let dir_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(parent_dir)
+            .map_err(|e| {
+                let _ = fs::remove_file(&temp_path);
+                map_io_error(
+                    e,
+                    &format!(
+                        "Failed to open parent directory '{}' for atomic commit",
+                        parent_dir.display()
+                    ),
+                )
+            })?;
+        if let Err(e) =
+            commit_temp_noreplace_in_dir(dir_file.as_raw_fd(), &temp_name, file_name, target)
+        {
+            let _ = fs::remove_file(&temp_path);
+            return Err(e);
+        }
+        Some(dir_file)
+    };
 
     check_fault_injection("sync_parent_dir", target)?;
 
     // Parent directory fsync (`O_DIRECTORY | O_NOFOLLOW`) to guarantee directory entry durability.
-    let dir_file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(parent_dir)
-        .map_err(|e| {
-            map_io_error(
-                e,
-                &format!(
-                    "Failed to open parent directory '{}' for fsync",
-                    parent_dir.display()
-                ),
-            )
-        })?;
+    let dir_file = match opened_dir_file {
+        Some(f) => f,
+        None => OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(parent_dir)
+            .map_err(|e| {
+                map_io_error(
+                    e,
+                    &format!(
+                        "Failed to open parent directory '{}' for fsync",
+                        parent_dir.display()
+                    ),
+                )
+            })?,
+    };
     dir_file.sync_all().map_err(|e| {
         map_io_error(
             e,
@@ -1852,5 +1964,91 @@ mod tests {
         assert_eq!(mode2, 0o600);
         assert_eq!(fs::read(&target).unwrap(), b"{\"v\":2}");
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn synthetic_write_atomic_durable_create_new_is_atomic_under_concurrency() {
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let payload_a = br#"{"writer":"A","accounts":["alice@example.com"]}"#.to_vec();
+        let payload_b =
+            br#"{"writer":"B","accounts":["bob@example.com","charlie@example.com"]}"#.to_vec();
+
+        // Race two concurrent writers with different payloads toward the same target across rounds.
+        for round in 0..24 {
+            let target = tmp.path().join(format!("concurrent-export-{round}.json"));
+            let barrier = Arc::new(Barrier::new(2));
+            let t_a = target.clone();
+            let b_a = Arc::clone(&barrier);
+            let p_a = payload_a.clone();
+            let h_a = std::thread::spawn(move || {
+                b_a.wait();
+                write_atomic_durable_create_new(&t_a, &p_a)
+            });
+
+            let t_b = target.clone();
+            let b_b = Arc::clone(&barrier);
+            let p_b = payload_b.clone();
+            let h_b = std::thread::spawn(move || {
+                b_b.wait();
+                write_atomic_durable_create_new(&t_b, &p_b)
+            });
+
+            let res_a = h_a.join().unwrap();
+            let res_b = h_b.join().unwrap();
+            let final_bytes = fs::read(&target).unwrap();
+            let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+
+            match (res_a, res_b) {
+                (Ok(()), Err(e)) => {
+                    assert_eq!(e.error_code, "target_already_exists");
+                    assert_eq!(final_bytes, payload_a);
+                }
+                (Err(e), Ok(())) => {
+                    assert_eq!(e.error_code, "target_already_exists");
+                    assert_eq!(final_bytes, payload_b);
+                }
+                (r1, r2) => panic!(
+                    "expected strictly one winner and one target_already_exists error on round {round}, got ({r1:?}, {r2:?})"
+                ),
+            }
+        }
+
+        // Verify zero leftover temp files remain in the directory.
+        let names: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 24);
+        assert!(names.iter().all(|n| !n.contains(OWNED_TMP_MARKER)));
+
+        // Direct commit helper also refuses replacing an already-present regular file or symlink.
+        let existing = tmp.path().join("existing.json");
+        write_atomic_durable(&existing, b"original-bytes").unwrap();
+        let err = write_atomic_durable_create_new(&existing, b"new-bytes").unwrap_err();
+        assert_eq!(err.error_code, "target_already_exists");
+        assert_eq!(fs::read(&existing).unwrap(), b"original-bytes");
+
+        // Direct commit_temp_noreplace_in_dir test simulating race past preflight!
+        let dir_fd = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(tmp.path())
+            .unwrap();
+        let temp_name = format!("existing.json{OWNED_TMP_MARKER}race");
+        let temp_path = tmp.path().join(&temp_name);
+        fs::write(&temp_path, b"raced-loser-bytes").unwrap();
+        let commit_err = commit_temp_noreplace_in_dir(
+            dir_fd.as_raw_fd(),
+            &temp_name,
+            "existing.json",
+            &existing,
+        )
+        .unwrap_err();
+        let _ = fs::remove_file(&temp_path);
+        assert_eq!(commit_err.error_code, "target_already_exists");
+        assert_eq!(fs::read(&existing).unwrap(), b"original-bytes");
     }
 }

@@ -22,13 +22,18 @@
 
 ### 方式一：下载预编译纯静态二进制（推荐）
 
-前往 Releases 页面按 CPU 架构（`x86_64` 或 `aarch64`，可通过 `uname -m` 查看）下载对应的 `.tar.gz` 压缩包，无论在远程 SSH 服务器、Docker 容器、WSL2 还是开启了 GNOME Keyring / KDE Wallet 的 Linux 图形桌面上均可直接使用：
+可直接在终端按当前 CPU 架构（`uname -m` 自动输出 `x86_64` 或 `aarch64`）从 Releases 下载对应的 `.tar.gz` 压缩包与校验文件（也可在浏览器访问 Releases 页面手动下载），无论在远程 SSH 服务器、Docker 容器、WSL2 还是开启了 GNOME Keyring / KDE Wallet 的 Linux 图形桌面上均可直接使用：
 
 ```bash
-sha256sum -c agy-switch-cli-v1.2.3-x86_64-unknown-linux-musl.tar.gz.sha256
-tar -xzf agy-switch-cli-v1.2.3-x86_64-unknown-linux-musl.tar.gz
+VER=v1.2.4
+ARCH="$(uname -m)"   # x86_64 或 aarch64
+curl -fLO "https://github.com/MatrixC7/agy-switch-cli/releases/download/${VER}/agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz"
+curl -fLO "https://github.com/MatrixC7/agy-switch-cli/releases/download/${VER}/agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz.sha256"
+
+sha256sum -c "agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz.sha256"
+tar -xzf "agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz"
 mkdir -p ~/.local/bin
-install -m 0755 agy-switch-cli-v1.2.3-x86_64-unknown-linux-musl/agy-switch-cli ~/.local/bin/agy-switch-cli
+install -m 0755 "agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl/agy-switch-cli" ~/.local/bin/agy-switch-cli
 ```
 
 ### 方式二：Arch Linux / EndeavourOS 等 Arch 系发行版（AUR）
@@ -57,9 +62,9 @@ install -m 0755 target/release/agy-switch-cli ~/.local/bin/agy-switch-cli
 agy-switch-cli status
 
 # 2. 登录添加账号（默认零配置手动粘贴回调 URL；如需本地监听可加 --ssh）
-agy-switch-cli auth login --label "主力账号"
+agy-switch-cli auth login --label "primary"
 # 若本机官方 agy 已登录（或桌面端与 agy 在系统钥匙串中共用登录条目），也可读取当前 agy 凭据入库（不读取桌面端独立的 jetski-standalone-oauth-token 回退文件）：
-# agy-switch-cli accounts add --from-local --label "本机账号"
+# agy-switch-cli accounts add --from-local --label "local"
 # 或从原桌面版 ~/.antigravity_tools 只读迁移已有账号（不修改原目录）：
 # agy-switch-cli accounts import --from-legacy
 
@@ -81,7 +86,7 @@ agy-switch-cli tui
 
 | 命令                                                   | 用途说明                                                                           |
 |:------------------------------------------------------ |:---------------------------------------------------------------------------------- |
-| `agy-switch-cli status`                                | 只读巡检生效后端、本地仓库、事务日志、槽位初始化、守护进程状态与本机官方 `agy` 版本 |
+| `agy-switch-cli status`                                | 只读巡检生效后端、本地仓库、事务日志、槽位初始化、守护进程运行/服务状态、本机官方 `agy` 与已安装桌面端 Antigravity App 版本 |
 | `agy-switch-cli auth login [--ssh]`                    | 通过 PKCE (`S256`) 添加新 Google 账号（默认粘贴回调 URL；重新授权用 `reauthorize`） |
 | `agy-switch-cli accounts list / add / import / export` | 查看账号详情与排序（`--move`/`--order`）、导入本机已登录号（`--from-local`）或文件/标准输入 Token（`--from-file`/`--from-stdin`）、导入导出备份 |
 | `agy-switch-cli current`                               | 查看当前生效身份、运行中进程状态及该账号支持的全部模型清单                         |
@@ -92,7 +97,7 @@ agy-switch-cli tui
 | `agy-switch-cli policy set --all-candidates ...`       | 配置自动切号水位策略（默认 `reserve = 10%`、`minimum = 30%`，配合 `daemon` 后台自动巡检切号） |
 | `agy-switch-cli daemon [--install \| --uninstall \| --reset-cooldown]` | 运行后台自动切号守护进程（默认每 `180` 秒巡检、切号冷却 `3600` 秒；支持 `--reset-cooldown` 主动解除冷却期；桌面切号/熔断通知默认常驻，可在 `config.json` 调整或用 `--no-notify` 关闭，无头环境自动静默），或安装/卸载 `systemd --user` 服务 |
 | `agy-switch-cli [--backend file] run [--account ...] -- agy ...` | 可选方式：按指定账号或指定后端包装启动 `agy`；显式启用 `file` 后端时自动为子进程屏蔽桌面 D-Bus 钥匙串 |
-| `agy-switch-cli tui`                                   | 打开 SSH 交互式终端看板（支持 `↑/↓` 选行与内嵌 `...` 滚动提示、`g/G` 首末行、`[/]` 调序、`r/R` 刷新、`c/C/p` 策略、`e/E` 与 `d/D` 单条/全局启停、`x`+`y` 删号） |
+| `agy-switch-cli tui`                                   | 打开 SSH 交互式终端看板（支持 `↑/↓` 与 `g/G` 浏览、`Space` 多选联动、`[/]` 调序、`i` 可滚动详情/重置倒计时、`r/R` 刷新、`c/C/p` 策略、`k` 清冷却、`e/E` 与 `d/D` 启停、`l` 改备注、`o/O` `0600` 导出与 `x`+`y` 删号） |
 
 **关于 `--json` 机器输出与 `0..=8` 稳定退出码的边界说明**：
 - 全屏交互看板 `tui` 与实时刷新模式 `stats ... --watch` 均与 `--json` 互斥并返回退出码 `2`。
@@ -119,8 +124,8 @@ agy-switch-cli tui
 agy-switch-cli daemon --uninstall
 
 # 2. 按安装方式卸载可执行文件（二选一）
-yay -Rns agy-switch-cli-bin          # AUR 安装（或使用 paru / pacman -Rns）
-# rm -f ~/.local/bin/agy-switch-cli   # 手动解压或源码编译安装
+rm -f ~/.local/bin/agy-switch-cli    # 手动解压或源码编译安装
+# yay -Rns agy-switch-cli-bin        # AUR 安装（或使用 paru / sudo pacman -Rns）
 
 # 3. 按需清理本工具自有的本地数据、锁与缓存目录（不会影响官方 ~/.gemini 目录）
 rm -rf ~/.local/share/agy-switch-cli ~/.cache/agy-switch-cli ~/.local/state/agy-switch-cli

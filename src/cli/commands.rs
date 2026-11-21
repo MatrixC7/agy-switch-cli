@@ -32,29 +32,30 @@ use crate::session::journal::{
 };
 use crate::session::payload::resolve_session_identity;
 use crate::session::process::observe_runtime_state;
-use crate::store::locks::DaemonInstanceLock;
+use crate::store::locks::{probe_daemon_lock_readonly, DaemonInstanceLock};
 use crate::store::repository::StoreRepository;
 use crate::store::transfer::{
     export_transfer_bundle_file, import_from_legacy_dir, import_transfer_bundle_file,
 };
 use crate::switching::daemon::{
-    format_local_ts as format_daemon_local_ts, read_daemon_state_readonly,
-    repair_or_clear_daemon_state_in_tx, reset_daemon_cooldown, run_foreground_daemon_with_shutdown,
-    spawn_shutdown_signal_watcher, DaemonConfigOverrides, DaemonPolicyOverlay,
-    DEFAULT_DAEMON_COOLDOWN_SECS, DEFAULT_DAEMON_INTERVAL_SECS,
+    build_daemon_runtime_status, format_local_ts as format_daemon_local_ts,
+    read_daemon_state_readonly, repair_or_clear_daemon_state_in_tx, reset_daemon_cooldown,
+    run_foreground_daemon_with_shutdown, spawn_shutdown_signal_watcher, DaemonConfigOverrides,
+    DaemonPolicyOverlay, DEFAULT_DAEMON_COOLDOWN_SECS, DEFAULT_DAEMON_INTERVAL_SECS,
 };
 use crate::switching::executor::{
     execute_account_delete, execute_switch_with_idle_policy, preview_switch_dry_run, SwitchOptions,
 };
 use crate::switching::runner::{ordered_candidate_ids, run_managed_agy};
 use crate::switching::systemd::{
-    install_systemd_user_service_with_reset, uninstall_systemd_user_service,
-    DaemonServiceInstallOptions,
+    install_systemd_user_service_with_reset, probe_systemd_user_service_readonly,
+    uninstall_systemd_user_service, DaemonServiceInstallOptions,
 };
 use crate::transport::client::{HttpTransport, ReqwestTransport};
 use crate::transport::proxy::ProxyMode;
 use crate::transport::user_agent::{
-    probe_local_agy_for_status, resolve_native_oauth_user_agent, LocalAgyProbeOutcome,
+    probe_local_agy_for_status, probe_local_antigravity_app_for_status,
+    resolve_native_oauth_user_agent, LocalAgyProbeOutcome, LocalAntigravityAppProbeOutcome,
     CLI_PKG_VERSION,
 };
 use serde::Serialize;
@@ -661,17 +662,12 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             }
             Ok(ExitCode::Ok.as_i32())
         }
-        Commands::Accounts(AccountsCommand::Disable { selector, reason }) => {
+        Commands::Accounts(AccountsCommand::Disable { selector }) => {
             reconcile_pending_journal_before_write(&repo, backend, now_unix)?;
             let snap = repo.read_snapshot()?;
             let target = snap.select(selector)?;
             let updated = repo.with_write_lock(|tx| {
-                tx.mark_account_disabled(
-                    &target.id,
-                    DisableReasonCode::Manual,
-                    reason.clone(),
-                    now_unix,
-                )
+                tx.mark_account_disabled(&target.id, DisableReasonCode::Manual, None, now_unix)
             })?;
             let is_sel = snap.index.selected_account_id.as_deref() == Some(updated.id.as_str());
             let dto = AccountViewDto::from_record(&updated, is_sel);
@@ -2124,8 +2120,18 @@ async fn handle_status(
     let dbus_warning = (!backend.uses_keyring())
         .then(detect_dbus_session_socket_warning)
         .flatten();
+    let now_unix = SystemClock.now_unix();
     let dstate_res = read_daemon_state_readonly(paths);
+    let daemon_lock_probe = probe_daemon_lock_readonly(paths);
+    let daemon_systemd_probe = probe_systemd_user_service_readonly(paths).await;
+    let daemon_runtime = build_daemon_runtime_status(
+        daemon_lock_probe,
+        &daemon_systemd_probe,
+        dstate_res.as_ref().ok(),
+        now_unix,
+    );
     let agy_probe = probe_local_agy_for_status().await;
+    let app_probe = probe_local_antigravity_app_for_status();
 
     let agy_json = match &agy_probe {
         LocalAgyProbeOutcome::Detected {
@@ -2134,7 +2140,7 @@ async fn handle_status(
         } => serde_json::json!({
             "checked": true,
             "found": true,
-            "executable": executable,
+            "executable": executable.to_string_lossy().into_owned(),
             "version": version,
         }),
         LocalAgyProbeOutcome::NotFound => serde_json::json!({
@@ -2145,8 +2151,21 @@ async fn handle_status(
         LocalAgyProbeOutcome::Failed { executable, error } => serde_json::json!({
             "checked": true,
             "found": true,
-            "executable": executable,
+            "executable": executable.to_string_lossy().into_owned(),
             "error": error,
+        }),
+    };
+
+    let app_json = match &app_probe {
+        LocalAntigravityAppProbeOutcome::Detected { path, version } => serde_json::json!({
+            "checked": true,
+            "found": true,
+            "path": path.to_string_lossy().into_owned(),
+            "version": version,
+        }),
+        LocalAntigravityAppProbeOutcome::NotFound => serde_json::json!({
+            "checked": true,
+            "found": false,
         }),
     };
 
@@ -2200,8 +2219,10 @@ async fn handle_status(
         "daemon_state_ok": dstate_res.is_ok(),
         "daemon_state_error": dstate_res.as_ref().err().map(|e| &e.message),
         "daemon_paused_on_failure": dstate_res.as_ref().ok().map(|d| d.paused_on_failure),
+        "daemon_runtime": daemon_runtime,
         "dbus_keyring_warning": dbus_warning,
         "agy_probe": agy_json,
+        "antigravity_app_probe": app_json,
     });
 
     if matches!(
@@ -2280,8 +2301,8 @@ async fn handle_status(
         println!("  Slot initialized:  {}", slot_initialized);
         if let Ok(ref ds) = dstate_res {
             println!(
-                "  Daemon state:      OK (paused_on_failure={})",
-                ds.paused_on_failure
+                "  Daemon state:      {}",
+                daemon_runtime.format_human(Some(ds))
             );
         }
         match &agy_probe {
@@ -2290,15 +2311,22 @@ async fn handle_status(
                 version,
             } => {
                 println!(
-                    "  Official agy:      {} v{}",
+                    "  Antigravity CLI:   {} v{}",
                     terminal_text(&executable.to_string_lossy()),
                     terminal_text(version)
                 );
             }
             LocalAgyProbeOutcome::NotFound => {
-                println!("  Official agy:      not found in PATH");
+                println!("  Antigravity CLI:   not found in PATH");
             }
             LocalAgyProbeOutcome::Failed { .. } => unreachable!(),
+        }
+        if let LocalAntigravityAppProbeOutcome::Detected { path, version } = &app_probe {
+            println!(
+                "  Antigravity App:   {} v{}",
+                terminal_text(&path.to_string_lossy()),
+                terminal_text(version)
+            );
         }
         for cw in &config_warnings {
             println!("  Config warning:    {}", terminal_text(cw));

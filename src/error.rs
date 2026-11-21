@@ -213,7 +213,6 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "--output"
             | "--include-secrets"
             | "--accounts"
-            | "--reason"
             | "--clear-active-slot"
             | "--dry-run"
             | "--allow-running"

@@ -380,7 +380,7 @@ fn format_pool_display_name(bucket_id: &str, group_name: &str) -> String {
     }
 }
 
-fn format_window_label(window: &str, bucket_id: &str) -> String {
+pub(crate) fn format_window_label(window: &str, bucket_id: &str) -> String {
     let w = window.trim();
     let lower_w = w.to_ascii_lowercase();
     let lower_id = bucket_id.trim().to_ascii_lowercase();
@@ -395,7 +395,7 @@ fn format_window_label(window: &str, bucket_id: &str) -> String {
     }
 }
 
-fn format_bar_and_pct(pct: Option<i32>) -> String {
+pub(crate) fn format_bar_and_pct(pct: Option<i32>) -> String {
     match pct {
         Some(p) => {
             let clamped = p.clamp(0, 100);
@@ -415,7 +415,7 @@ fn format_bar_and_pct(pct: Option<i32>) -> String {
     }
 }
 
-fn format_relative_age(updated_unix: i64, now_unix: i64) -> String {
+pub(crate) fn format_relative_age(updated_unix: i64, now_unix: i64) -> String {
     if updated_unix <= 0 {
         return "unknown".into();
     }
@@ -454,7 +454,7 @@ pub fn format_unix_local_minute(unix_secs: i64) -> String {
     }
 }
 
-fn format_reset_local(reset_rfc3339: &str, now_unix: i64) -> String {
+pub(crate) fn format_reset_local(reset_rfc3339: &str, now_unix: i64) -> String {
     let trimmed = reset_rfc3339.trim();
     if trimmed.is_empty() {
         return "—".into();

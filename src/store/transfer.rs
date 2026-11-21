@@ -7,7 +7,7 @@ use crate::domain::token::TokenRecord;
 use crate::error::{format_safe_json_error, CliError, CliResult};
 use crate::store::fs_atomic::{
     ensure_no_symlink_ancestors, ensure_private_dir, map_io_error, read_regular_file_bounded,
-    write_atomic_durable, MAX_STORE_FILE_BYTES,
+    write_atomic_durable, write_atomic_durable_create_new, MAX_STORE_FILE_BYTES,
 };
 use crate::store::locks::with_account_refresh_lock;
 use crate::store::repository::{select_from_slice, ImportUpsertOutcome, StoreRepository};
@@ -652,6 +652,16 @@ pub fn export_transfer_bundle_file(
     let count = bundle.accounts.len();
     let bytes = serde_json::to_vec_pretty(&bundle)
         .map_err(|_| CliError::data("Failed to serialize transfer bundle."))?;
-    write_atomic_durable(output_path, &bytes)?;
+    if overwrite {
+        write_atomic_durable(output_path, &bytes)?;
+    } else if let Err(e) = write_atomic_durable_create_new(output_path, &bytes) {
+        if e.error_code == "target_already_exists" {
+            return Err(CliError::usage(format!(
+                "Export output '{}' already exists. Pass `--overwrite` to overwrite.",
+                output_path.display()
+            )));
+        }
+        return Err(e);
+    }
     Ok(count)
 }

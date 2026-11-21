@@ -79,7 +79,7 @@ flowchart TD
 | `quota/client.rs` / `fusion.rs` | 单环境隔离的 CloudCode 三步配额拉取（`Daily -> Sandbox -> Production`）、401 单次强刷重试与双窗口配额融合 |
 | `switching/executor.rs` / `runner.rs` / `daemon.rs` / `notify.rs` / `systemd.rs` | 切号与事务性删号核心执行器、指定凭据与显式 `file` 后端自动隔离 D-Bus 的 `run -- agy` 受管包装启动器、七阶段静默自动切号守护引擎（含 `--reset-cooldown` 与普通状态回写竞态防覆盖）、纯 Rust D-Bus 桌面通知分发器（无头零自动激活与默认常驻可选配置），以及带沙盒安全转义与防符号链接保护的 `daemon --install` / `--uninstall` 用户级服务管理器 |
 | `stats/{mod,readonly_vfs,watch}.rs` | 纯离线零写入的本地 SQLite 会话库扫描器（自定义 `"agy_pinned_ro"` VFS 绑定 `openat` 目录句柄）、有效归档优先与实时回退去重、逐片段独立 Protobuf 帧校验、自然日与 `--recent <N>` 有界最小堆（`O(500)`）窗口下的 `stats summary` 聚合与 `stats list` 十列明细渲染，以及基于只读 `stat` 元数据指纹跳过解码的 `--watch [SECS]` 实时终端看板 |
-| `cli/*` / `tui/mod.rs` | 规范化长选项参数定义（无短参数、无隐藏兼容别名、严格 `<ID\|EMAIL>` 选择器）、只读 `status` 巡检、流式 `[k/N]` 批量刷新、无回显私密令牌读取器、物理白名单 DTO 渲染器，以及支持 `↑/↓` 选行与内嵌定高 `...` 滚动提示、`[/]` 调序、`e/E` 与 `d/D` 单条/全局启停、`x`+`y` 事务删号及双行分组底栏的 SSH 交互式终端看板 |
+| `cli/*` / `tui/mod.rs` | 规范化长选项参数定义（无短参数、无隐藏兼容别名、严格 `<ID\|EMAIL>` 选择器）、只读 `status` 巡检（含零写入 `daemon` 运行态/服务探测与零子进程桌面端 Antigravity App 版本探测）、流式 `[k/N]` 批量刷新、无回显私密令牌读取器、物理白名单 DTO 渲染器，以及支持 `↑/↓` 选行、`Space` 多选联动与底栏常驻标记提示、`[/]` 调序、`i` 可滚动账号详情卡片、`k` 清冷却、`l` 内联改备注、`o/O` `0600` 明文二次确认导出、`e/E` 与 `d/D` 启停、`x`+`y` 事务删号及双行分组底栏的 SSH 交互式终端看板 |
 
 ---
 

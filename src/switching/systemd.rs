@@ -1117,6 +1117,217 @@ pub async fn uninstall_systemd_user_service(
     })
 }
 
+/// Strictly read-only inspection result for the user-level `agy-switch-cli.service` systemd unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonSystemdProbe {
+    NotInstalled,
+    InstalledForOtherDataDir,
+    Installed {
+        active_state: Option<String>,
+        unit_file_state: Option<String>,
+        main_pid: Option<u32>,
+    },
+    InstalledManagerUnreachable,
+}
+
+fn unquote_systemd_setting_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next) = chars.peek() {
+                if next == '\\' || next == '"' {
+                    out.push(next);
+                    chars.next();
+                    continue;
+                }
+            }
+        } else if ch == '%' && chars.peek() == Some(&'%') {
+            out.push('%');
+            chars.next();
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+pub(crate) fn parse_unit_data_dir(unit_text: &str) -> Option<PathBuf> {
+    for line in unit_text.lines() {
+        let trimmed = line.trim();
+        let Some(val) = trimmed.strip_prefix("Environment=") else {
+            continue;
+        };
+        let unquoted = unquote_systemd_setting_value(val);
+        if let Some(dir) = unquoted.strip_prefix("AGY_SWITCH_CLI_DATA_DIR=") {
+            if !dir.is_empty() {
+                return Some(PathBuf::from(dir));
+            }
+        }
+    }
+    None
+}
+
+fn same_data_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// Strictly read-only, best-effort probe for whether `agy-switch-cli.service` is installed for
+/// `paths.data_dir` and what state `systemd --user` reports for it.
+/// Never writes files and skips `systemctl` entirely when the unit file does not exist.
+pub async fn probe_systemd_user_service_readonly(paths: &HeadlessPaths) -> DaemonSystemdProbe {
+    const MAX_UNIT_READ_BYTES: u64 = 64 * 1024;
+    const STATUS_SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(2);
+
+    if ensure_no_symlink_ancestors(&paths.config_dir).is_err() {
+        return DaemonSystemdProbe::NotInstalled;
+    }
+    let user_dir = paths.systemd_user_dir();
+    let unit_path = paths.systemd_user_unit_file();
+    if ensure_no_symlink_components_under(&paths.config_dir, &unit_path).is_err() {
+        return DaemonSystemdProbe::NotInstalled;
+    }
+    let Ok(Some(dir_fd)) = open_existing_dir_nofollow(&user_dir) else {
+        return DaemonSystemdProbe::NotInstalled;
+    };
+    let Ok(c_unit_name) = CString::new(SYSTEMD_SERVICE_NAME) else {
+        return DaemonSystemdProbe::NotInstalled;
+    };
+    let raw_unit = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            c_unit_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if raw_unit < 0 {
+        return DaemonSystemdProbe::NotInstalled;
+    }
+    let file = unsafe { fs::File::from_raw_fd(raw_unit) };
+    let Ok(meta) = file.metadata() else {
+        return DaemonSystemdProbe::NotInstalled;
+    };
+    if !meta.file_type().is_file() {
+        return DaemonSystemdProbe::NotInstalled;
+    }
+    let unit_id = (meta.dev(), meta.ino());
+
+    let mut raw_bytes = Vec::new();
+    if file
+        .take(MAX_UNIT_READ_BYTES + 1)
+        .read_to_end(&mut raw_bytes)
+        .is_err()
+        || (raw_bytes.len() as u64) > MAX_UNIT_READ_BYTES
+    {
+        return DaemonSystemdProbe::InstalledForOtherDataDir;
+    }
+    let Ok(unit_text) = std::str::from_utf8(&raw_bytes) else {
+        return DaemonSystemdProbe::InstalledForOtherDataDir;
+    };
+    let Some(unit_data_dir) = parse_unit_data_dir(unit_text) else {
+        return DaemonSystemdProbe::InstalledForOtherDataDir;
+    };
+    if !same_data_dir(&unit_data_dir, &paths.data_dir) {
+        return DaemonSystemdProbe::InstalledForOtherDataDir;
+    }
+
+    if ensure_systemd_booted().is_err() {
+        return DaemonSystemdProbe::InstalledManagerUnreachable;
+    }
+    let Ok(systemctl_bin) = resolve_systemctl_executable() else {
+        return DaemonSystemdProbe::InstalledManagerUnreachable;
+    };
+
+    let Ok((code, stdout_raw, _)) = run_systemctl_user_raw(
+        &systemctl_bin,
+        paths,
+        &[
+            "show",
+            "-p",
+            "FragmentPath",
+            "-p",
+            "LoadState",
+            "-p",
+            "UnitFileState",
+            "-p",
+            "ActiveState",
+            "-p",
+            "MainPID",
+            SYSTEMD_SERVICE_NAME,
+        ],
+        STATUS_SYSTEMCTL_TIMEOUT,
+    )
+    .await
+    else {
+        return DaemonSystemdProbe::InstalledManagerUnreachable;
+    };
+    if code != 0 {
+        return DaemonSystemdProbe::InstalledManagerUnreachable;
+    }
+
+    let mut fragment_path: Option<PathBuf> = None;
+    let mut load_state: Option<String> = None;
+    let mut unit_file_state: Option<String> = None;
+    let mut active_state: Option<String> = None;
+    let mut main_pid: Option<u32> = None;
+    for line in stdout_raw.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let v_trimmed = v.trim();
+        match key {
+            "FragmentPath" if !v.is_empty() => fragment_path = Some(PathBuf::from(v)),
+            "LoadState" if !v_trimmed.is_empty() => load_state = Some(v_trimmed.to_string()),
+            "UnitFileState" if !v_trimmed.is_empty() => {
+                unit_file_state = Some(v_trimmed.to_string())
+            }
+            "ActiveState" if !v_trimmed.is_empty() => active_state = Some(v_trimmed.to_string()),
+            "MainPID" => {
+                if let Ok(p) = v_trimmed.parse::<u32>() {
+                    if p > 0 {
+                        main_pid = Some(p);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if load_state.as_deref() == Some("not-found") {
+        return DaemonSystemdProbe::Installed {
+            active_state: Some("inactive".into()),
+            unit_file_state,
+            main_pid: None,
+        };
+    }
+
+    let Some(ref frag_path) = fragment_path else {
+        return DaemonSystemdProbe::InstalledManagerUnreachable;
+    };
+    match stat_regular_path_nofollow(frag_path) {
+        Ok(Some(frag_id)) if frag_id == unit_id => {}
+        _ => return DaemonSystemdProbe::InstalledManagerUnreachable,
+    }
+
+    DaemonSystemdProbe::Installed {
+        active_state,
+        unit_file_state,
+        main_pid,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,6 +1363,10 @@ mod tests {
             "\"arg$$with%%spec\""
         );
         assert!(unit.contains("Environment=\"AGY_SWITCH_CLI_DATA_DIR=/home/alice/my data%%dir$1\""));
+        assert_eq!(
+            parse_unit_data_dir(&unit).as_deref(),
+            Some(Path::new("/home/alice/my data%dir$1"))
+        );
         assert!(unit.contains("Environment=\"XDG_CACHE_HOME=/home/alice/.custom cache%%dir\""));
         assert!(unit.contains("NoNewPrivileges=true"));
         assert!(unit.contains("PrivateTmp=true"));

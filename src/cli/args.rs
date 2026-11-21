@@ -160,8 +160,6 @@ pub enum AccountsCommand {
     Disable {
         #[arg(value_name = "ID|EMAIL")]
         selector: String,
-        #[arg(long, value_name = "TEXT")]
-        reason: Option<String>,
     },
     /// Delete an account from the local store
     Delete(AccountsDeleteArgs),

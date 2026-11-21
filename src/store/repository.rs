@@ -1918,6 +1918,28 @@ impl<'a> StoreWriteTx<'a> {
         Ok(latest)
     }
 
+    /// Update or clear an account's `custom_label` inside `L3`.
+    /// Strips control characters and normalizes whitespace; empty or `None` clears the label.
+    pub fn set_account_custom_label(
+        &self,
+        account_id: &str,
+        custom_label: Option<&str>,
+    ) -> CliResult<AccountRecord> {
+        let mut latest = self.load_account_opt(account_id)?.ok_or_else(|| {
+            CliError::not_found(format!("Account '{account_id}' does not exist."))
+        })?;
+        latest.custom_label = custom_label
+            .map(|raw| {
+                crate::cli::dto::terminal_text(raw)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|s| !s.is_empty());
+        self.save_account(&latest)?;
+        Ok(latest)
+    }
+
     pub fn update_account_identity_metadata(
         &self,
         account_id: &str,

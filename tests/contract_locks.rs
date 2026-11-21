@@ -82,6 +82,10 @@ impl IsolatedEnv {
                 "AGY_SWITCH_CLI_AGY_BIN",
                 self._tmp.path().join("no-host-agy"),
             )
+            .env(
+                "AGY_SWITCH_CLI_ANTIGRAVITY_APP_DIR",
+                self._tmp.path().join("no-host-antigravity-app"),
+            )
             .args([
                 "--data-dir",
                 data_dir.to_str().unwrap(),
@@ -1746,7 +1750,7 @@ fn synthetic_human_timestamps_session_id_strip_and_pty_tui_batch_shortcuts_work_
     assert_eq!(cur_json["session_identity"]["account_id"], "acc-ts-1");
     assert_eq!(cur_json["session_identity"]["expiry"], raw_expiry);
 
-    // 2. `status` human output reports Backend/Store/Journal/Slot/Daemon/Official agy and omits Session identity, Runtime state, and Stray slot files.
+    // 2. `status` human output reports Backend/Store/Journal/Slot/Daemon/Antigravity CLI and omits Session identity, Runtime state, and Stray slot files.
     let status_human = env.cli_cmd().arg("status").output().unwrap();
     assert_eq!(status_human.status.code(), Some(0));
     let status_txt = String::from_utf8_lossy(&status_human.stdout);
@@ -1755,7 +1759,7 @@ fn synthetic_human_timestamps_session_id_strip_and_pty_tui_batch_shortcuts_work_
     assert!(status_txt.contains("Journal status:"));
     assert!(status_txt.contains("Slot initialized:"));
     assert!(status_txt.contains("Daemon state:"));
-    assert!(status_txt.contains("Official agy:"));
+    assert!(status_txt.contains("Antigravity CLI:"));
     assert!(!status_txt.contains("Session identity:"));
     assert!(!status_txt.contains("Runtime state:"));
     assert!(!status_txt.contains("Stray slot files:"));
@@ -6398,7 +6402,7 @@ fn synthetic_v120_status_probe_stats_list_streaming_refresh_and_tui_reorder_dele
     assert_eq!(st_human.status.code(), Some(0));
     let st_txt = String::from_utf8_lossy(&st_human.stdout);
     assert!(
-        st_txt.contains("Official agy:")
+        st_txt.contains("Antigravity CLI:")
             && st_txt.contains("v1.6.0")
             && !st_txt.contains("verified"),
         "{st_txt}"
@@ -6826,7 +6830,7 @@ fn synthetic_v120_status_probe_stats_list_streaming_refresh_and_tui_reorder_dele
             "TUI must abbreviate `Antigravity Starter Quota` to `Free`:\n{init_screen}"
         );
         assert!(init_screen.contains("Keys   : ↑/↓ select · g/G top/end · [/] reorder"));
-        assert!(init_screen.contains("e/E enable · d/D disable · x delete"));
+        assert!(init_screen.contains("e/E enable · d/D disable · l label · o/O export · x delete"));
 
         // Verify `D` + `Esc` cancels disabling all accounts without quitting TUI,
         // `D` + `y` disables all 2 accounts, and `E` re-enables all 2 accounts immediately!
@@ -8839,4 +8843,971 @@ fn stats_watch_cli_validation_and_live_pty_lifecycle() {
             "ICANON was not restored after stats --watch exit"
         );
     }
+}
+
+#[cfg(feature = "tui")]
+#[test]
+fn synthetic_v124_tui_pty_mark_export_label_cooldown_and_detail_m2() {
+    use agy_switch_cli::domain::account::{TransferBundle, STORE_SCHEMA_VERSION};
+    use agy_switch_cli::store::locks::DaemonInstanceLock;
+    use agy_switch_cli::switching::daemon::{
+        read_daemon_state_readonly, save_daemon_state_in_tx, DaemonPersistentState,
+    };
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::time::Duration;
+
+    let env = IsolatedEnv::new();
+    env.init_agy_slot_dir();
+    let paths = env.paths();
+    let repo = StoreRepository::new(paths.clone());
+    let now = jiff::Timestamp::now().as_second();
+
+    let mut acc1 = sample_account("acc-a", "alice@example.com", now);
+    acc1.custom_label = Some("Main".into());
+    let mut acc2 = sample_account("acc-b", "bob@example.com", now);
+    acc2.custom_label = None;
+    let mut acc3 = sample_account("acc-c", "charlie@example.com", now);
+    acc3.custom_label = Some("Backup".into());
+
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc1.clone(), true, now)?;
+        tx.upsert_account(acc2.clone(), false, now)?;
+        tx.upsert_account(acc3.clone(), false, now)?;
+        let mut pol = agy_switch_cli::domain::policy::SwitchPolicy {
+            enabled: true,
+            candidate_account_ids: vec!["acc-a".into()],
+            ..agy_switch_cli::domain::policy::SwitchPolicy::default()
+        };
+        tx.save_policy(&mut pol, None, now)?;
+        let dstate = DaemonPersistentState {
+            schema_version: STORE_SCHEMA_VERSION,
+            cooldown_until: now + 3_600,
+            last_phase: "cooldown".into(),
+            last_reason: Some("switch_committed".into()),
+            ..DaemonPersistentState::default()
+        };
+        save_daemon_state_in_tx(tx.paths(), &dstate)?;
+        Ok(())
+    })
+    .unwrap();
+    FileSessionBackend
+        .write_slot(&paths, &serialize_session_payload(&acc1.token).unwrap())
+        .unwrap();
+
+    // Hold DaemonInstanceLock throughout the PTY session so `k` proves concurrent cooldown clear!
+    let _daemon_lock = DaemonInstanceLock::try_acquire(&paths).unwrap();
+
+    let mut master_fd: libc::c_int = -1;
+    let mut slave_fd: libc::c_int = -1;
+    let win = libc::winsize {
+        ws_row: 24,
+        ws_col: 120,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &win,
+            )
+        },
+        0
+    );
+    let slave_out_fd = unsafe { libc::dup(slave_fd) };
+    let inspect_fd = unsafe { libc::dup(slave_fd) };
+    let slave_in = unsafe { fs::File::from_raw_fd(slave_fd) };
+    let slave_out = unsafe { fs::File::from_raw_fd(slave_out_fd) };
+    let inspect_slave = unsafe { fs::File::from_raw_fd(inspect_fd) };
+    let mut master = unsafe { fs::File::from_raw_fd(master_fd) };
+    unsafe {
+        let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
+        let _ = libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
+    let mut child = env
+        .cli_cmd()
+        .args(["--backend", "file", "tui"])
+        .stdin(Stdio::from(slave_in))
+        .stdout(Stdio::from(slave_out))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let drain = |m: &mut fs::File, buf: &mut Vec<u8>| {
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = m.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    };
+
+    let mut screen = Vec::new();
+    for _ in 0..60 {
+        drain(&mut master, &mut screen);
+        if String::from_utf8_lossy(&screen).contains("Manage : r/R refresh") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let init = String::from_utf8_lossy(&screen).into_owned();
+    assert!(
+        init.contains("alice@example.com (Main)"),
+        "Scheme L1 label missing on initial TUI screen:\n{init}"
+    );
+    assert!(
+        init.contains("· cooldown "),
+        "Daemon cooldown suffix missing on initial TUI header:\n{init}"
+    );
+
+    // 1. Mark row #1 (`alice`) and row #3 (`charlie`) via Space + Down + Down + Space.
+    screen.clear();
+    master.write_all(b" \x1b[B\x1b[B ").unwrap();
+    master.flush().unwrap();
+    for _ in 0..50 {
+        drain(&mut master, &mut screen);
+        if String::from_utf8_lossy(&screen)
+            .contains("Marked (2): alice@example.com, charlie@example.com")
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        String::from_utf8_lossy(&screen)
+            .contains("Marked (2): alice@example.com, charlie@example.com  [Esc to clear]"),
+        "Strategy B persistent marked footer missing:\n{}",
+        String::from_utf8_lossy(&screen)
+    );
+
+    // 2. Press `o` -> clear default path (`Ctrl+U`) -> type `~/tui-export.json` -> Enter -> `y`.
+    screen.clear();
+    master.write_all(b"o\x15~/tui-export.json\r").unwrap();
+    master.flush().unwrap();
+    for _ in 0..50 {
+        drain(&mut master, &mut screen);
+        let s = String::from_utf8_lossy(&screen);
+        if s.contains("PLAINTEXT tokens [y/N]") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let exp_prompt_screen = String::from_utf8_lossy(&screen).into_owned();
+    assert!(
+        exp_prompt_screen.contains("PLAINTEXT tokens [y/N]"),
+        "expected risk-first plaintext confirm prompt:\n{exp_prompt_screen}"
+    );
+    let exported_path = env.home.join("tui-export.json");
+    assert!(
+        !exported_path.exists(),
+        "Enter alone must not write export file before explicit 'y'"
+    );
+
+    screen.clear();
+    master.write_all(b"y").unwrap();
+    master.flush().unwrap();
+    for _ in 0..60 {
+        drain(&mut master, &mut screen);
+        if exported_path.exists() && String::from_utf8_lossy(&screen).contains("2 marked") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(exported_path.exists(), "TUI export file was not created");
+    let exp_mode = fs::metadata(&exported_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(exp_mode, 0o600);
+    let bundle: TransferBundle =
+        serde_json::from_slice(&fs::read(&exported_path).unwrap()).unwrap();
+    let exported_emails: Vec<&str> = bundle.accounts.iter().map(|a| a.email.as_str()).collect();
+    assert_eq!(
+        exported_emails,
+        vec!["alice@example.com", "charlie@example.com"]
+    );
+
+    // Strategy B: after export, marks are STILL retained (`2 marked`)!
+    assert!(
+        String::from_utf8_lossy(&screen).contains("2 marked"),
+        "Strategy B must keep marked accounts after export:\n{}",
+        String::from_utf8_lossy(&screen)
+    );
+
+    // 2b. P1-01 real PTY regression: accidentally pasting a synthetic credential into the export
+    //     path edit bar masks immediately as `[REDACTED]`, rejects BEFORE entering confirmation,
+    //     never echoes any substring of the synthetic credential, and writes zero files!
+    let sentinel_secret = "1//0gSyntheticPtyExportSentinel98765";
+    screen.clear();
+    master.write_all(b"o").unwrap();
+    master.flush().unwrap();
+    for _ in 0..50 {
+        drain(&mut master, &mut screen);
+        if String::from_utf8_lossy(&screen).contains("Export 2 marked path:") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    screen.clear();
+    let paste_cmd = format!("\x15{sentinel_secret}");
+    master.write_all(paste_cmd.as_bytes()).unwrap();
+    master.flush().unwrap();
+    for _ in 0..50 {
+        drain(&mut master, &mut screen);
+        if String::from_utf8_lossy(&screen).contains("[REDACTED]") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let masked_edit = String::from_utf8_lossy(&screen).into_owned();
+    assert!(
+        masked_edit.contains("[REDACTED]"),
+        "expected [REDACTED] in PTY export edit bar:\n{masked_edit}"
+    );
+    assert!(
+        !masked_edit.contains("SyntheticPtyExportSentinel"),
+        "PTY export edit bar leaked pasted credential:\n{masked_edit}"
+    );
+    screen.clear();
+    master.write_all(b"\r").unwrap();
+    master.flush().unwrap();
+    for _ in 0..50 {
+        drain(&mut master, &mut screen);
+        if String::from_utf8_lossy(&screen).contains("redacted") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let rejected_screen = String::from_utf8_lossy(&screen).into_owned();
+    assert!(
+        rejected_screen.contains("redacted"),
+        "expected sanitized rejection error after pressing Enter on credential:\n{rejected_screen}"
+    );
+    assert!(
+        !rejected_screen.contains("PLAINTEXT"),
+        "secret-like export path must not enter confirmation:\n{rejected_screen}"
+    );
+    assert!(
+        !rejected_screen.contains("SyntheticPtyExportSentinel"),
+        "PTY error output leaked pasted credential:\n{rejected_screen}"
+    );
+
+    // 3. Press `k` -> clears active cooldown concurrently while `_daemon_lock` is held!
+    screen.clear();
+    master.write_all(b"k").unwrap();
+    master.flush().unwrap();
+    for _ in 0..50 {
+        drain(&mut master, &mut screen);
+        if read_daemon_state_readonly(&paths).is_ok_and(|d| d.cooldown_until == 0) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        read_daemon_state_readonly(&paths).unwrap().cooldown_until,
+        0
+    );
+
+    // 4. Press `l` on row #3 (`charlie`) -> `Ctrl+U` -> type `NewTag` -> Enter -> persists & renders!
+    screen.clear();
+    master.write_all(b"l\x15NewTag\r").unwrap();
+    master.flush().unwrap();
+    for _ in 0..50 {
+        drain(&mut master, &mut screen);
+        if repo
+            .read_account_unchecked("acc-c")
+            .is_ok_and(|a| a.custom_label.as_deref() == Some("NewTag"))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        repo.read_account_unchecked("acc-c")
+            .unwrap()
+            .custom_label
+            .as_deref(),
+        Some("NewTag")
+    );
+
+    // 5. Press `i` -> opens M2 Account Detail card -> `i` returns -> `Esc` clears marks (stays open) -> `q` exits cleanly!
+    screen.clear();
+    master.write_all(b"i").unwrap();
+    master.flush().unwrap();
+    for _ in 0..50 {
+        drain(&mut master, &mut screen);
+        if String::from_utf8_lossy(&screen).contains("Account Detail 3/3") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let detail_scr = String::from_utf8_lossy(&screen).into_owned();
+    assert!(detail_scr.contains("Account Detail 3/3"));
+    assert!(detail_scr.contains("charlie@example.com (NewTag)"));
+    assert!(detail_scr.contains("Quotas  :"));
+    assert!(detail_scr.contains("Models ("));
+
+    // Exit detail (`i`), press `Esc` once to clear marks (must NOT quit TUI), then press `q` to quit!
+    screen.clear();
+    master.write_all(b"i\x1b").unwrap();
+    master.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(120));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "Esc while marked must clear marks without quitting TUI"
+    );
+
+    master.write_all(b"q").unwrap();
+    master.flush().unwrap();
+    let mut exit_status = None;
+    for _ in 0..60 {
+        drain(&mut master, &mut screen);
+        if let Some(st) = child.try_wait().unwrap() {
+            exit_status = Some(st);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let st = exit_status.expect("TUI did not exit cleanly after pressing q");
+    assert_eq!(st.code(), Some(0));
+
+    let mut post_tio: libc::termios = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::tcgetattr(inspect_slave.as_raw_fd(), &mut post_tio) },
+        0
+    );
+    assert_ne!(post_tio.c_lflag & libc::ECHO, 0);
+
+    // 6. P2-01 real narrow PTY checks:
+    //    (a) 30x16 displays `PLAINTEXT` + `[y/N]`, writes nothing before `y`, and writes `0600` v2 on `y`.
+    //    (b) 20x16 cannot fit `PLAINTEXT [y/N]` and refuses confirmation even when `y` is pressed!
+    for (ws_col, ws_row, rel_file, expect_created) in [
+        (30u16, 16u16, "narrow-30x16-export.json", true),
+        (20u16, 16u16, "tiny-20x16-export.json", false),
+    ] {
+        let mut m_fd: libc::c_int = -1;
+        let mut s_fd: libc::c_int = -1;
+        let ws = libc::winsize {
+            ws_row,
+            ws_col,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut m_fd,
+                    &mut s_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &ws,
+                )
+            },
+            0
+        );
+        let s_out_fd = unsafe { libc::dup(s_fd) };
+        let s_in = unsafe { fs::File::from_raw_fd(s_fd) };
+        let s_out = unsafe { fs::File::from_raw_fd(s_out_fd) };
+        let mut m_file = unsafe { fs::File::from_raw_fd(m_fd) };
+        unsafe {
+            let flags = libc::fcntl(m_file.as_raw_fd(), libc::F_GETFL);
+            let _ = libc::fcntl(m_file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let mut c = env
+            .cli_cmd()
+            .args(["--backend", "file", "tui"])
+            .stdin(Stdio::from(s_in))
+            .stdout(Stdio::from(s_out))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let mut buf = Vec::new();
+        for _ in 0..60 {
+            drain(&mut m_file, &mut buf);
+            if String::from_utf8_lossy(&buf).contains("Manage :") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        buf.clear();
+        let target_file = env.home.join(rel_file);
+        let cmd_str = format!("O\x15~/{rel_file}\r");
+        m_file.write_all(cmd_str.as_bytes()).unwrap();
+        m_file.flush().unwrap();
+        for _ in 0..50 {
+            drain(&mut m_file, &mut buf);
+            let txt = String::from_utf8_lossy(&buf);
+            if expect_created && txt.contains("PLAINTEXT") && txt.contains("[y/N]") {
+                break;
+            }
+            if !expect_created && txt.contains("Status: Export") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let after_enter = String::from_utf8_lossy(&buf).into_owned();
+        assert!(
+            !target_file.exists(),
+            "file must not exist before 'y' at {ws_col}x{ws_row}"
+        );
+        if expect_created {
+            assert!(
+                after_enter.contains("PLAINTEXT") && after_enter.contains("[y/N]"),
+                "30x16 confirmation must visibly display PLAINTEXT + [y/N]:\n{after_enter}"
+            );
+        }
+
+        m_file.write_all(b"y").unwrap();
+        m_file.flush().unwrap();
+        if expect_created {
+            for _ in 0..60 {
+                drain(&mut m_file, &mut buf);
+                if target_file.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(target_file.exists(), "30x16 export failed after pressing y");
+            assert_eq!(
+                fs::metadata(&target_file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        } else {
+            std::thread::sleep(Duration::from_millis(120));
+            drain(&mut m_file, &mut buf);
+            assert!(
+                !target_file.exists(),
+                "20x16 must refuse export confirmation when PLAINTEXT warning cannot fit"
+            );
+        }
+
+        m_file.write_all(b"q").unwrap();
+        m_file.flush().unwrap();
+        let mut exited = None;
+        for _ in 0..60 {
+            drain(&mut m_file, &mut buf);
+            if let Some(st) = c.try_wait().unwrap() {
+                exited = Some(st);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(exited.expect("narrow PTY did not exit").code(), Some(0));
+    }
+}
+
+#[test]
+fn synthetic_v124_status_daemon_runtime_app_probe_and_disable_without_reason() {
+    use agy_switch_cli::domain::account::STORE_SCHEMA_VERSION;
+    use agy_switch_cli::store::locks::DaemonInstanceLock;
+    use agy_switch_cli::switching::daemon::{save_daemon_state_in_tx, DaemonPersistentState};
+    use agy_switch_cli::switching::systemd::{
+        render_systemd_user_unit, DaemonServiceInstallOptions, SYSTEMCTL_BIN_ENV,
+        SYSTEMD_MARKER_DIR_ENV,
+    };
+    use agy_switch_cli::transport::user_agent::ANTIGRAVITY_APP_DIR_ENV;
+
+    let env = IsolatedEnv::new();
+    env.init_agy_slot_dir();
+    let paths = env.paths();
+    let repo = StoreRepository::new(paths.clone());
+    let now = jiff::Timestamp::now().as_second();
+    let acc1 = sample_account("acc-stat-1", "alice@example.com", now);
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc1.clone(), true, now)?;
+        Ok(())
+    })
+    .unwrap();
+    FileSessionBackend
+        .write_slot(&paths, &serialize_session_payload(&acc1.token).unwrap())
+        .unwrap();
+
+    // 1. Default status: no daemon running, no systemd service, no desktop app -> clean idle output, zero `daemon.lock` creation!
+    let st_idle = env.cli_cmd().arg("status").output().unwrap();
+    assert_eq!(st_idle.status.code(), Some(0));
+    let idle_txt = String::from_utf8_lossy(&st_idle.stdout);
+    assert!(
+        idle_txt.contains("Daemon state:      not running (no service; ready for daemon / --once)"),
+        "unexpected idle status:\n{idle_txt}"
+    );
+    assert!(
+        !idle_txt.contains("Antigravity App:"),
+        "absent desktop app must be omitted from human status:\n{idle_txt}"
+    );
+    assert!(
+        !paths.daemon_lock_file().exists(),
+        "read-only status must never create daemon.lock"
+    );
+
+    let st_idle_json = env.cli_cmd().args(["--json", "status"]).output().unwrap();
+    assert_eq!(st_idle_json.status.code(), Some(0));
+    let idle_j: serde_json::Value = serde_json::from_slice(&st_idle_json.stdout).unwrap();
+    assert_eq!(idle_j["daemon_state_ok"], true);
+    assert_eq!(idle_j["daemon_paused_on_failure"], false);
+    assert_eq!(idle_j["daemon_runtime"]["mode"], "not_running");
+    assert_eq!(idle_j["daemon_runtime"]["running"], false);
+    assert_eq!(idle_j["antigravity_app_probe"]["found"], false);
+
+    // 2. Live manual daemon lock held -> reports `running (manual/foreground...)` in both human and JSON.
+    let held_lock = DaemonInstanceLock::try_acquire(&paths).unwrap();
+    let st_manual = env.cli_cmd().arg("status").output().unwrap();
+    assert_eq!(st_manual.status.code(), Some(0));
+    let manual_txt = String::from_utf8_lossy(&st_manual.stdout);
+    assert!(
+        manual_txt.contains("Daemon state:      running (manual/foreground"),
+        "expected manual daemon state:\n{manual_txt}"
+    );
+    let st_manual_json = env.cli_cmd().args(["--json", "status"]).output().unwrap();
+    assert_eq!(st_manual_json.status.code(), Some(0));
+    let manual_j: serde_json::Value = serde_json::from_slice(&st_manual_json.stdout).unwrap();
+    assert_eq!(manual_j["daemon_runtime"]["mode"], "manual");
+    assert_eq!(manual_j["daemon_runtime"]["running"], true);
+    drop(held_lock);
+
+    // 3. Installed systemd user unit (active with cooldown + stopped/inactive) using fake systemd marker & stub `systemctl`.
+    let fake_marker = env._tmp.path().join("fake-systemd-marker");
+    fs::create_dir_all(&fake_marker).unwrap();
+    let unit_dir = env._tmp.path().join("xdg_cfg/systemd/user");
+    fs::create_dir_all(&unit_dir).unwrap();
+    let unit_file = unit_dir.join("agy-switch-cli.service");
+    let (unit_body, _) = render_systemd_user_unit(
+        &paths,
+        Path::new("/usr/bin/agy-switch-cli"),
+        &DaemonServiceInstallOptions::default(),
+    )
+    .unwrap();
+    fs::write(&unit_file, &unit_body).unwrap();
+
+    let fake_systemctl = env._tmp.path().join("fake-systemctl");
+    let state_flag = env._tmp.path().join("systemctl-active-state.txt");
+    let current_pid = std::process::id();
+    fs::write(
+        &state_flag,
+        format!("active\n{current_pid}\n{}\n", unit_file.display()),
+    )
+    .unwrap();
+    let systemctl_call_marker = env._tmp.path().join("systemctl-invoked.marker");
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\necho called >> \"{}\"\nSTATE=$(sed -n '1p' \"{}\")\nPID=$(sed -n '2p' \"{}\")\nFRAG=$(sed -n '3p' \"{}\")\nprintf 'FragmentPath=%s\\nLoadState=loaded\\nUnitFileState=enabled\\nActiveState=%s\\nMainPID=%s\\n' \"$FRAG\" \"$STATE\" \"$PID\"\n",
+            systemctl_call_marker.display(),
+            state_flag.display(),
+            state_flag.display(),
+            state_flag.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Seed active cooldown so status prints `· cooldown ...`.
+    let cd_state = DaemonPersistentState {
+        schema_version: STORE_SCHEMA_VERSION,
+        cooldown_until: now + 2_520,
+        last_phase: "cooldown".into(),
+        ..DaemonPersistentState::default()
+    };
+    repo.with_write_lock(|tx| save_daemon_state_in_tx(tx.paths(), &cd_state))
+        .unwrap();
+
+    // 3a. Same-directory live lock held by `MainPID` (verified via synthetic `proc/locks`)
+    //     -> `running (systemd service, pid=<current_pid>)`.
+    use std::os::unix::fs::MetadataExt;
+    let held_svc_lock = DaemonInstanceLock::try_acquire(&paths).unwrap();
+    let lock_meta = fs::metadata(paths.daemon_lock_file()).unwrap();
+    #[allow(clippy::unnecessary_cast)]
+    let lock_maj = libc::major(lock_meta.dev() as libc::dev_t);
+    #[allow(clippy::unnecessary_cast)]
+    let lock_min = libc::minor(lock_meta.dev() as libc::dev_t);
+    let proc_locks_path = env.proc_dir.join("locks");
+    fs::write(
+        &proc_locks_path,
+        format!(
+            "1: FLOCK  ADVISORY  WRITE {current_pid} {:02x}:{:02x}:{} 0 EOF\n",
+            lock_maj,
+            lock_min,
+            lock_meta.ino()
+        ),
+    )
+    .unwrap();
+    let st_svc = env
+        .cli_cmd()
+        .env(SYSTEMD_MARKER_DIR_ENV, &fake_marker)
+        .env(SYSTEMCTL_BIN_ENV, &fake_systemctl)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(st_svc.status.code(), Some(0));
+    let svc_txt = String::from_utf8_lossy(&st_svc.stdout);
+    assert!(
+        svc_txt.contains(&format!(
+            "Daemon state:      running (systemd service, pid={current_pid}) · cooldown "
+        )),
+        "expected active systemd service + cooldown:\n{svc_txt}"
+    );
+    // When `/proc/locks` cannot confirm lock holder PID, live lock still reports `running=true`
+    // without attributing unverified `MainPID`!
+    let _ = fs::remove_file(&proc_locks_path);
+    let st_svc_nopid = env
+        .cli_cmd()
+        .env(SYSTEMD_MARKER_DIR_ENV, &fake_marker)
+        .env(SYSTEMCTL_BIN_ENV, &fake_systemctl)
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(st_svc_nopid.status.code(), Some(0));
+    let nopid_j: serde_json::Value = serde_json::from_slice(&st_svc_nopid.stdout).unwrap();
+    assert_eq!(nopid_j["daemon_runtime"]["mode"], "manual");
+    assert_eq!(nopid_j["daemon_runtime"]["running"], true);
+    assert_eq!(nopid_j["daemon_runtime"]["pid"], serde_json::Value::Null);
+    drop(held_svc_lock);
+
+    // 3b. P2-02 A->B regression: unit overwritten to point to data dir B while old process on A
+    //     keeps A's lock and systemd still reports `ActiveState=active` + `MainPID=<A's PID>`,
+    //     but data dir B holds NO lock -> B must report `systemd_stopped`, `running=false`, `pid=null`!
+    let data_dir_b = env._tmp.path().join("data_dir_b");
+    fs::create_dir_all(&data_dir_b).unwrap();
+    let paths_b = HeadlessPaths::with_explicit(
+        env.home.clone(),
+        data_dir_b.clone(),
+        env._tmp.path().join("xdg_cache/agy-switch-cli"),
+    );
+    // Keep A's lock held while unit still points to A -> B excludes A cleanly.
+    let held_a_lock = DaemonInstanceLock::try_acquire(&paths).unwrap();
+    let st_b_excl = env
+        .cli_cmd_with_data_dir(&data_dir_b)
+        .env(SYSTEMD_MARKER_DIR_ENV, &fake_marker)
+        .env(SYSTEMCTL_BIN_ENV, &fake_systemctl)
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(st_b_excl.status.code(), Some(0));
+    let b_excl_j: serde_json::Value = serde_json::from_slice(&st_b_excl.stdout).unwrap();
+    assert_eq!(b_excl_j["daemon_runtime"]["mode"], "not_running");
+    assert_eq!(b_excl_j["daemon_runtime"]["running"], false);
+    assert_eq!(b_excl_j["daemon_runtime"]["systemd_unit_installed"], false);
+
+    // Now overwrite unit to point to B (like `daemon --install` without restart): B still has NO lock!
+    let (unit_body_b, _) = render_systemd_user_unit(
+        &paths_b,
+        Path::new("/usr/bin/agy-switch-cli"),
+        &DaemonServiceInstallOptions::default(),
+    )
+    .unwrap();
+    fs::write(&unit_file, &unit_body_b).unwrap();
+    let st_b_after_reinstall = env
+        .cli_cmd_with_data_dir(&data_dir_b)
+        .env(SYSTEMD_MARKER_DIR_ENV, &fake_marker)
+        .env(SYSTEMCTL_BIN_ENV, &fake_systemctl)
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(st_b_after_reinstall.status.code(), Some(0));
+    let b_j: serde_json::Value = serde_json::from_slice(&st_b_after_reinstall.stdout).unwrap();
+    assert_eq!(b_j["daemon_runtime"]["mode"], "systemd_stopped");
+    assert_eq!(b_j["daemon_runtime"]["running"], false);
+    assert_eq!(b_j["daemon_runtime"]["pid"], serde_json::Value::Null);
+    assert_eq!(b_j["daemon_runtime"]["systemd_unit_installed"], true);
+    assert_eq!(b_j["daemon_runtime"]["systemd_active_state"], "active");
+    let st_b_human = env
+        .cli_cmd_with_data_dir(&data_dir_b)
+        .env(SYSTEMD_MARKER_DIR_ENV, &fake_marker)
+        .env(SYSTEMCTL_BIN_ENV, &fake_systemctl)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(st_b_human.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&st_b_human.stdout).contains(
+            "Daemon state:      stopped (systemd service active, no lock held here; ready for --once)"
+        ),
+        "unexpected A->B human status:\n{}",
+        String::from_utf8_lossy(&st_b_human.stdout)
+    );
+
+    // 3c. P2-02 FragmentPath pointing to a non-existent file must degrade cleanly (`manager unreachable`),
+    //     never reporting running=true!
+    fs::write(
+        &state_flag,
+        format!(
+            "active\n{current_pid}\n{}/nonexistent.service\n",
+            unit_dir.display()
+        ),
+    )
+    .unwrap();
+    let st_b_missing_frag = env
+        .cli_cmd_with_data_dir(&data_dir_b)
+        .env(SYSTEMD_MARKER_DIR_ENV, &fake_marker)
+        .env(SYSTEMCTL_BIN_ENV, &fake_systemctl)
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(st_b_missing_frag.status.code(), Some(0));
+    let mf_j: serde_json::Value = serde_json::from_slice(&st_b_missing_frag.stdout).unwrap();
+    assert_eq!(mf_j["daemon_runtime"]["mode"], "systemd_stopped");
+    assert_eq!(mf_j["daemon_runtime"]["running"], false);
+    assert_eq!(
+        mf_j["daemon_runtime"]["systemd_active_state"],
+        serde_json::Value::Null
+    );
+
+    // 3d. P2-02 Disk unit missing `AGY_SWITCH_CLI_DATA_DIR=` must NOT claim ownership and must NOT invoke systemctl!
+    let _ = fs::remove_file(&systemctl_call_marker);
+    fs::write(
+        &unit_file,
+        "[Unit]\nDescription=Foreign\n[Service]\nExecStart=/bin/true\n",
+    )
+    .unwrap();
+    let st_b_foreign = env
+        .cli_cmd_with_data_dir(&data_dir_b)
+        .env(SYSTEMD_MARKER_DIR_ENV, &fake_marker)
+        .env(SYSTEMCTL_BIN_ENV, &fake_systemctl)
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(st_b_foreign.status.code(), Some(0));
+    let foreign_j: serde_json::Value = serde_json::from_slice(&st_b_foreign.stdout).unwrap();
+    assert_eq!(foreign_j["daemon_runtime"]["mode"], "not_running");
+    assert_eq!(foreign_j["daemon_runtime"]["systemd_unit_installed"], false);
+    assert!(
+        !systemctl_call_marker.exists(),
+        "unowned unit without AGY_SWITCH_CLI_DATA_DIR must not invoke systemctl"
+    );
+    drop(held_a_lock);
+
+    // Restore unit for A and switch stub to `inactive` -> reports `stopped (systemd service inactive; ready for --once)`.
+    fs::write(&unit_file, &unit_body).unwrap();
+    fs::write(
+        &state_flag,
+        format!("inactive\n0\n{}\n", unit_file.display()),
+    )
+    .unwrap();
+    let st_stopped = env
+        .cli_cmd()
+        .env(SYSTEMD_MARKER_DIR_ENV, &fake_marker)
+        .env(SYSTEMCTL_BIN_ENV, &fake_systemctl)
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(st_stopped.status.code(), Some(0));
+    let stopped_j: serde_json::Value = serde_json::from_slice(&st_stopped.stdout).unwrap();
+    assert_eq!(stopped_j["daemon_runtime"]["mode"], "systemd_stopped");
+    assert_eq!(stopped_j["daemon_runtime"]["running"], false);
+    assert_eq!(stopped_j["daemon_runtime"]["systemd_unit_installed"], true);
+    assert_eq!(
+        stopped_j["daemon_runtime"]["systemd_active_state"],
+        "inactive"
+    );
+
+    // 4. Desktop Antigravity App detection via pure read-only ASAR parsing (proves binary is NEVER executed!).
+    let fake_app_dir = env._tmp.path().join("fake-antigravity-app");
+    fs::create_dir_all(fake_app_dir.join("resources")).unwrap();
+    let trap_marker = env._tmp.path().join("app-was-executed.marker");
+    let fake_app_bin = fake_app_dir.join("antigravity");
+    fs::write(
+        &fake_app_bin,
+        format!("#!/bin/sh\necho executed > \"{}\"\n", trap_marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_app_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    // Electron runtime `version` file (`44.9.1`) must NOT be mistaken for App version (`2.33.0`)!
+    fs::write(fake_app_dir.join("version"), b"44.9.1\n").unwrap();
+    let pkg_bytes = br#"{"name":"antigravity","productName":"Antigravity","version":"2.33.0"}"#;
+    let hdr_json = serde_json::to_vec(&serde_json::json!({
+        "files": {
+            "package.json": { "size": pkg_bytes.len(), "offset": "0" }
+        }
+    }))
+    .unwrap();
+    let json_len = hdr_json.len() as u32;
+    let pad = (4 - (hdr_json.len() % 4)) % 4;
+    let inner_size = 4u32 + json_len + (pad as u32);
+    let header_size = 4u32 + inner_size;
+    let mut asar = Vec::new();
+    asar.extend_from_slice(&4u32.to_le_bytes());
+    asar.extend_from_slice(&header_size.to_le_bytes());
+    asar.extend_from_slice(&inner_size.to_le_bytes());
+    asar.extend_from_slice(&json_len.to_le_bytes());
+    asar.extend_from_slice(&hdr_json);
+    asar.resize(asar.len() + pad, 0);
+    asar.extend_from_slice(pkg_bytes);
+    fs::write(fake_app_dir.join("resources/app.asar"), &asar).unwrap();
+
+    let st_app = env
+        .cli_cmd()
+        .env(ANTIGRAVITY_APP_DIR_ENV, &fake_app_dir)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(st_app.status.code(), Some(0));
+    let app_txt = String::from_utf8_lossy(&st_app.stdout);
+    assert!(
+        app_txt.contains("Antigravity App:") && app_txt.contains("v2.33.0"),
+        "expected detected Antigravity App line:\n{app_txt}"
+    );
+    assert!(
+        !trap_marker.exists(),
+        "status MUST NOT execute desktop Antigravity binary!"
+    );
+
+    let st_app_json = env
+        .cli_cmd()
+        .env(ANTIGRAVITY_APP_DIR_ENV, &fake_app_dir)
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(st_app_json.status.code(), Some(0));
+    let app_j: serde_json::Value = serde_json::from_slice(&st_app_json.stdout).unwrap();
+    assert_eq!(app_j["antigravity_app_probe"]["found"], true);
+    assert_eq!(app_j["antigravity_app_probe"]["version"], "2.33.0");
+
+    // 4b. P2-03 regression: valid Linux non-UTF-8 install directory must NOT panic (exit 101)
+    //     in either human or `--json` mode, and must still never execute desktop binary!
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let mut non_utf8_bytes = env._tmp.path().as_os_str().as_encoded_bytes().to_vec();
+        non_utf8_bytes.extend_from_slice(b"/app-\xff\xfe-nonutf8");
+        let non_utf8_app_dir = PathBuf::from(OsString::from_vec(non_utf8_bytes));
+        fs::create_dir_all(non_utf8_app_dir.join("resources")).unwrap();
+        let non_utf8_trap = env._tmp.path().join("nonutf8-app-trap.marker");
+        let non_utf8_bin = non_utf8_app_dir.join("antigravity");
+        fs::write(
+            &non_utf8_bin,
+            format!(
+                "#!/bin/sh\necho executed > \"{}\"\n",
+                non_utf8_trap.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&non_utf8_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(non_utf8_app_dir.join("resources/app.asar"), &asar).unwrap();
+
+        let st_nonutf8_txt = env
+            .cli_cmd()
+            .env(ANTIGRAVITY_APP_DIR_ENV, &non_utf8_app_dir)
+            .arg("status")
+            .output()
+            .unwrap();
+        assert_eq!(
+            st_nonutf8_txt.status.code(),
+            Some(0),
+            "non-UTF-8 desktop app dir failed human status: stderr={}",
+            String::from_utf8_lossy(&st_nonutf8_txt.stderr)
+        );
+        assert!(String::from_utf8_lossy(&st_nonutf8_txt.stdout).contains("v2.33.0"));
+
+        let st_nonutf8_json = env
+            .cli_cmd()
+            .env(ANTIGRAVITY_APP_DIR_ENV, &non_utf8_app_dir)
+            .args(["--json", "status"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            st_nonutf8_json.status.code(),
+            Some(0),
+            "non-UTF-8 desktop app dir failed JSON status: stderr={}",
+            String::from_utf8_lossy(&st_nonutf8_json.stderr)
+        );
+        let nonutf8_j: serde_json::Value = serde_json::from_slice(&st_nonutf8_json.stdout).unwrap();
+        assert_eq!(nonutf8_j["antigravity_app_probe"]["found"], true);
+        assert_eq!(nonutf8_j["antigravity_app_probe"]["version"], "2.33.0");
+        assert!(
+            !non_utf8_trap.exists(),
+            "status must never execute non-UTF-8 desktop Antigravity binary"
+        );
+    }
+
+    // 4c. P1-02 regression: concurrent `export_transfer_bundle_file(..., overwrite = false)` with
+    //     distinct account subsets toward the same path permits strictly ONE writer to succeed
+    //     and guarantees the loser never modifies committed bytes.
+    {
+        use agy_switch_cli::domain::account::TransferBundle;
+        use agy_switch_cli::store::transfer::export_transfer_bundle_file;
+        use std::sync::{Arc, Barrier};
+
+        let acc2 = sample_account("acc-stat-2", "bob@example.com", now);
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(acc2.clone(), false, now)?;
+            Ok(())
+        })
+        .unwrap();
+
+        for round in 0..12 {
+            let target = env
+                ._tmp
+                .path()
+                .join(format!("concurrent-bundle-{round}.json"));
+            let barrier = Arc::new(Barrier::new(2));
+            let r1 = repo.clone();
+            let t1 = target.clone();
+            let b1 = Arc::clone(&barrier);
+            let h1 = std::thread::spawn(move || {
+                b1.wait();
+                export_transfer_bundle_file(&r1, &t1, true, false, &["acc-stat-1".to_string()])
+            });
+            let r2 = repo.clone();
+            let t2 = target.clone();
+            let b2 = Arc::clone(&barrier);
+            let h2 = std::thread::spawn(move || {
+                b2.wait();
+                export_transfer_bundle_file(&r2, &t2, true, false, &["acc-stat-2".to_string()])
+            });
+
+            let res1 = h1.join().unwrap();
+            let res2 = h2.join().unwrap();
+            let bundle: TransferBundle =
+                serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let emails: Vec<&str> = bundle.accounts.iter().map(|a| a.email.as_str()).collect();
+            match (res1, res2) {
+                (Ok(1), Err(e)) => {
+                    assert_eq!(e.error_code, "invalid_usage");
+                    assert!(e.message.contains("already exists"));
+                    assert_eq!(emails, vec!["alice@example.com"]);
+                }
+                (Err(e), Ok(1)) => {
+                    assert_eq!(e.error_code, "invalid_usage");
+                    assert!(e.message.contains("already exists"));
+                    assert_eq!(emails, vec!["bob@example.com"]);
+                }
+                other => panic!("unexpected concurrent export outcome on round {round}: {other:?}"),
+            }
+        }
+    }
+
+    // 5. `accounts disable` works without `--reason`, and removed `--reason` is rejected with exit code 2.
+    let dis_bad = env
+        .cli_cmd()
+        .args(["accounts", "disable", "acc-stat-1", "--reason", "manual"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        dis_bad.status.code(),
+        Some(2),
+        "removed --reason flag must exit 2"
+    );
+    let dis_ok = env
+        .cli_cmd()
+        .args(["accounts", "disable", "acc-stat-1"])
+        .output()
+        .unwrap();
+    assert_eq!(dis_ok.status.code(), Some(0));
+    assert!(
+        repo.read_snapshot()
+            .unwrap()
+            .accounts
+            .iter()
+            .find(|a| a.id == "acc-stat-1")
+            .unwrap()
+            .disabled
+    );
 }

@@ -1,9 +1,14 @@
 use crate::cli::dto::{
-    format_pct, format_runtime_state_human, format_session_identity_human, terminal_text,
-    AccountViewDto,
+    extract_supported_models, format_bar_and_pct, format_pct, format_relative_age,
+    format_reset_local, format_runtime_state_human, format_session_identity_human,
+    format_unix_local_minute, format_window_label, terminal_text, AccountViewDto,
 };
+use crate::domain::account::DisableReasonCode;
 use crate::domain::policy::SwitchPolicy;
-use crate::domain::quota::{observed_quota_percentage, quota_pool, QuotaPool};
+use crate::domain::quota::{
+    evaluate_account_quota, observed_quota_percentage, quota_pool, QuotaEval, QuotaPool,
+    DEFAULT_QUOTA_MAX_AGE_SECS,
+};
 use crate::error::{CliError, CliResult};
 use crate::oauth::refresh::OAuthEndpoints;
 use crate::oauth::registry::OAuthClientRegistry;
@@ -13,7 +18,11 @@ use crate::session::journal::reconcile_pending_journal_before_write;
 use crate::session::payload::resolve_session_identity;
 use crate::session::process::observe_runtime_state;
 use crate::store::repository::StoreRepository;
-use crate::switching::daemon::clear_daemon_pause_in_tx;
+use crate::store::transfer::export_transfer_bundle_file;
+use crate::switching::daemon::{
+    clear_daemon_pause_in_tx, format_local_ts as format_daemon_local_ts,
+    read_daemon_state_readonly, reset_daemon_cooldown, DaemonPersistentState,
+};
 use crate::switching::executor::{execute_account_delete, execute_switch, SwitchOptions};
 use crate::transport::client::{HttpTransport, ReqwestTransport};
 use crate::transport::proxy::ProxyMode;
@@ -27,6 +36,7 @@ use crossterm::{
 };
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -133,14 +143,18 @@ impl Drop for RawModeGuard {
 }
 
 pub const TUI_KEYS_LINE_1: &str =
-    "Keys   : ↑/↓ select · g/G top/end · [/] reorder · Enter/s switch · q/Esc quit";
+    "Keys   : ↑/↓ select · g/G top/end · [/] reorder · Space mark · Enter/s switch · i info · q/Esc quit";
 pub const TUI_KEYS_LINE_2: &str =
-    "Manage : r/R refresh · c/C cand · p policy · e/E enable · d/D disable · x delete";
+    "Manage : r/R refresh · c/C cand · p policy · k cd · e/E enable · d/D disable · l label · o/O export · x delete";
 pub const TUI_KEYS_HELP_LINE: &str =
-    "Keys: ↑/↓ select · g/G top/end · [/] reorder · Enter/s switch · r/R refresh · c/C cand · p policy · e/E enable · d/D disable · x delete · q/Esc quit";
+    "Keys: ↑/↓ select · g/G top/end · [/] reorder · Space mark · Enter/s switch · i info · r/R refresh · c/C cand · p policy · k cd · e/E enable · d/D disable · l label · o/O export · x delete · q/Esc quit";
+const TUI_DETAIL_KEYS_LINE: &str =
+    "Keys   : ←/→ account · ↑/↓ scroll · Space mark · l label · r refresh · k cd · Enter/s switch · i/Esc back · q quit";
 const TUI_BATCH_REFRESH_CONCURRENCY: usize = 2;
 const TRANSIENT_INFO_TTL: Duration = Duration::from_secs(3);
 const TRANSIENT_ERROR_TTL: Duration = Duration::from_secs(5);
+const MAX_TUI_LABEL_CHARS: usize = 64;
+const MAX_TUI_EXPORT_PATH_CHARS: usize = 512;
 
 #[derive(Debug, Clone)]
 enum PendingTuiConfirm {
@@ -149,13 +163,61 @@ enum PendingTuiConfirm {
         email: String,
         clear_active_slot: bool,
     },
+    DeleteMarked {
+        account_ids: Vec<String>,
+        includes_active: bool,
+    },
     DisableAll {
         enabled_count: usize,
     },
+    DisableMarked {
+        account_ids: Vec<String>,
+    },
+    ExportBundle {
+        account_ids: Vec<String>,
+        output_path: PathBuf,
+    },
+}
+
+const EXPORT_CONFIRM_MIN_COLS: usize = 23; // `"Status: PLAINTEXT [y/N]"`
+const EXPORT_CONFIRM_MIN_ROWS: usize = 2;
+
+fn export_confirm_warning_fits(cols: usize, rows: usize) -> bool {
+    cols >= EXPORT_CONFIRM_MIN_COLS && rows >= EXPORT_CONFIRM_MIN_ROWS
+}
+
+fn rendered_frame_shows_export_plaintext_warning(frame: &str) -> bool {
+    frame
+        .lines()
+        .any(|line| line.contains("PLAINTEXT") && line.contains("[y/N]"))
+}
+
+fn export_path_looks_like_secret(raw: &str, home_dir: &Path) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if crate::error::path_looks_like_accidental_secret(Path::new(trimmed)) {
+        return true;
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        let rest_clean = rest.trim_start_matches('/');
+        if !rest_clean.is_empty()
+            && crate::error::path_looks_like_accidental_secret(Path::new(rest_clean))
+        {
+            return true;
+        }
+    }
+    if let Ok(expanded) = expand_tui_export_path(trimmed, home_dir) {
+        if crate::error::path_looks_like_accidental_secret(&expanded) {
+            return true;
+        }
+    }
+    false
 }
 
 impl PendingTuiConfirm {
-    fn prompt_message(&self) -> String {
+    fn prompt_message_for_cols(&self, term_cols: usize) -> String {
         match self {
             Self::DeleteAccount {
                 email,
@@ -174,11 +236,178 @@ impl PendingTuiConfirm {
                     )
                 }
             }
+            Self::DeleteMarked {
+                account_ids,
+                includes_active,
+            } => {
+                let count = account_ids.len();
+                if *includes_active {
+                    format!(
+                        "Delete {count} marked account(s) (including active agy slot)? Press 'y' to confirm (any other key cancels)."
+                    )
+                } else {
+                    format!(
+                        "Delete {count} marked account(s)? Press 'y' to confirm (any other key cancels)."
+                    )
+                }
+            }
             Self::DisableAll { enabled_count } => format!(
                 "Disable all {enabled_count} account(s)? Press 'y' to confirm (any other key cancels)."
             ),
+            Self::DisableMarked { account_ids } => format!(
+                "Disable {} marked account(s)? Press 'y' to confirm (any other key cancels).",
+                account_ids.len()
+            ),
+            Self::ExportBundle {
+                account_ids,
+                output_path,
+            } => {
+                let avail_cols = term_cols.saturating_sub("Status: ".len());
+                let safe_path = if crate::error::path_looks_like_accidental_secret(output_path) {
+                    "[REDACTED]".to_string()
+                } else {
+                    terminal_text(&output_path.to_string_lossy())
+                };
+                if avail_cols >= 32 {
+                    format!(
+                        "PLAINTEXT tokens [y/N]: export {} to {} (0600)",
+                        account_ids.len(),
+                        safe_path
+                    )
+                } else if avail_cols >= 22 {
+                    "PLAINTEXT tokens [y/N]".to_string()
+                } else {
+                    "PLAINTEXT [y/N]".to_string()
+                }
+            }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+enum PendingTuiInput {
+    ExportPath {
+        account_ids: Vec<String>,
+        scope_label: String,
+        buffer: String,
+    },
+    EditLabel {
+        account_id: String,
+        email: String,
+        buffer: String,
+    },
+}
+
+impl PendingTuiInput {
+    fn prompt_message(&self, home_dir: &Path) -> String {
+        match self {
+            Self::ExportPath {
+                scope_label,
+                buffer,
+                ..
+            } => {
+                if export_path_looks_like_secret(buffer, home_dir) {
+                    format!(
+                        "Export {} path: [REDACTED]_  (Ctrl+U clear / Esc)",
+                        terminal_text(scope_label)
+                    )
+                } else {
+                    format!(
+                        "Export {} path: {}_  (Enter/Esc)",
+                        terminal_text(scope_label),
+                        terminal_text(buffer)
+                    )
+                }
+            }
+            Self::EditLabel { email, buffer, .. } => format!(
+                "Label for {} (empty clears): {}_  (Enter/Esc)",
+                terminal_text(email),
+                terminal_text(buffer)
+            ),
+        }
+    }
+
+    fn max_chars(&self) -> usize {
+        match self {
+            Self::ExportPath { .. } => MAX_TUI_EXPORT_PATH_CHARS,
+            Self::EditLabel { .. } => MAX_TUI_LABEL_CHARS,
+        }
+    }
+
+    fn buffer_mut(&mut self) -> &mut String {
+        match self {
+            Self::ExportPath { buffer, .. } | Self::EditLabel { buffer, .. } => buffer,
+        }
+    }
+
+    fn push_char(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        let cap = self.max_chars();
+        let buf = self.buffer_mut();
+        if buf.chars().count() < cap {
+            buf.push(ch);
+        }
+    }
+
+    fn pop_grapheme(&mut self) {
+        let buf = self.buffer_mut();
+        if let Some((idx, _)) =
+            UnicodeSegmentation::grapheme_indices(buf.as_str(), true).next_back()
+        {
+            buf.truncate(idx);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buffer_mut().clear();
+    }
+}
+
+fn default_tui_export_path(cwd: &Path, now_unix: i64) -> String {
+    let stamp = jiff::Timestamp::from_second(now_unix)
+        .ok()
+        .map(|ts| {
+            ts.to_zoned(jiff::tz::TimeZone::system())
+                .strftime("%Y%m%d-%H%M%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| now_unix.to_string());
+    let base = format!("agy-export-{stamp}");
+    let first_name = format!("{base}.json");
+    if std::fs::symlink_metadata(cwd.join(&first_name)).is_err() {
+        return format!("./{first_name}");
+    }
+    for n in 2..=999 {
+        let cand = format!("{base}-{n}.json");
+        if std::fs::symlink_metadata(cwd.join(&cand)).is_err() {
+            return format!("./{cand}");
+        }
+    }
+    format!("./{base}-new.json")
+}
+
+fn expand_tui_export_path(raw: &str, home_dir: &Path) -> CliResult<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::usage("Export path cannot be empty."));
+    }
+    if trimmed == "~" {
+        return Err(CliError::usage(
+            "Export path must point to a file, not a directory.",
+        ));
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        let rest = rest.trim_start_matches('/');
+        if rest.is_empty() {
+            return Err(CliError::usage(
+                "Export path must point to a file, not a directory.",
+            ));
+        }
+        return Ok(home_dir.join(rest));
+    }
+    Ok(PathBuf::from(trimmed))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -211,11 +440,133 @@ impl TransientStatus {
     }
 }
 
+fn resolve_tui_targets<'a>(
+    accounts: &'a [crate::domain::account::AccountRecord],
+    cursor_idx: usize,
+    marked_ids: &HashSet<String>,
+) -> (Vec<&'a crate::domain::account::AccountRecord>, bool) {
+    if !marked_ids.is_empty() {
+        let marked: Vec<&crate::domain::account::AccountRecord> = accounts
+            .iter()
+            .filter(|a| marked_ids.contains(&a.id))
+            .collect();
+        if !marked.is_empty() {
+            return (marked, true);
+        }
+    }
+    match accounts.get(cursor_idx) {
+        Some(acc) => (vec![acc], false),
+        None => (Vec::new(), false),
+    }
+}
+
+enum InputKeyOutcome {
+    Continue(PendingTuiInput),
+    Finished,
+}
+
+fn apply_pending_input_key(
+    mut inp: PendingTuiInput,
+    key: crossterm::event::KeyEvent,
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    pending_confirm: &mut Option<PendingTuiConfirm>,
+    export_confirm_warning_rendered: &mut bool,
+    transient_status: &mut TransientStatus,
+) -> InputKeyOutcome {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('u' | 'U'))
+    {
+        inp.clear();
+        return InputKeyOutcome::Continue(inp);
+    }
+    match key.code {
+        KeyCode::Esc => {
+            let msg = match inp {
+                PendingTuiInput::ExportPath { .. } => "Canceled export.",
+                PendingTuiInput::EditLabel { .. } => "Canceled label edit.",
+            };
+            transient_status.set_info(msg.into(), Instant::now());
+            InputKeyOutcome::Finished
+        }
+        KeyCode::Backspace => {
+            inp.pop_grapheme();
+            InputKeyOutcome::Continue(inp)
+        }
+        KeyCode::Enter => {
+            match inp {
+                PendingTuiInput::ExportPath {
+                    account_ids,
+                    buffer,
+                    ..
+                } => {
+                    if export_path_looks_like_secret(&buffer, &repo.paths().home_dir) {
+                        transient_status.set_error(
+                            "Export error: Export path expects a filesystem file path, not a literal credential value (redacted)."
+                                .into(),
+                            Instant::now(),
+                        );
+                    } else {
+                        match expand_tui_export_path(&buffer, &repo.paths().home_dir) {
+                            Ok(output_path) => {
+                                let (cols, rows) = current_terminal_size();
+                                if !export_confirm_warning_fits(cols as usize, rows as usize) {
+                                    transient_status.set_error(
+                                        "Export canceled: terminal too small to display PLAINTEXT export warning."
+                                            .into(),
+                                        Instant::now(),
+                                    );
+                                } else {
+                                    *pending_confirm = Some(PendingTuiConfirm::ExportBundle {
+                                        account_ids,
+                                        output_path,
+                                    });
+                                    *export_confirm_warning_rendered = false;
+                                }
+                            }
+                            Err(e) => {
+                                transient_status.set_error(
+                                    format!("Export error: {}", terminal_text(&e.message)),
+                                    Instant::now(),
+                                );
+                            }
+                        }
+                    }
+                }
+                PendingTuiInput::EditLabel {
+                    account_id,
+                    email,
+                    buffer,
+                } => {
+                    update_label_in_tui(
+                        repo,
+                        backend,
+                        &account_id,
+                        &email,
+                        &buffer,
+                        transient_status,
+                    );
+                }
+            }
+            InputKeyOutcome::Finished
+        }
+        KeyCode::Char(ch)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            inp.push_char(ch);
+            InputKeyOutcome::Continue(inp)
+        }
+        _ => InputKeyOutcome::Continue(inp),
+    }
+}
+
 /// Optional interactive SSH dashboard (`#[cfg(feature = "tui")]`).
 /// Strictly delegates ALL mutations to the application service layer (`execute_switch`,
-/// `refresh_account_quota_locked`, `repo.with_write_lock`) and integrates OS signal streams
-/// (`SIGTERM`, `SIGINT`, `SIGHUP`, `SIGQUIT`) so terminal `ECHO` and alternate screen are
-/// reliably restored even on external signal termination!
+/// `refresh_account_quota_locked`, `repo.with_write_lock`, `export_transfer_bundle_file`,
+/// `reset_daemon_cooldown`) and integrates OS signal streams (`SIGTERM`, `SIGINT`, `SIGHUP`,
+/// `SIGQUIT`) so terminal `ECHO` and alternate screen are reliably restored even on external
+/// signal termination!
 pub async fn run_interactive_tui(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
@@ -229,15 +580,23 @@ pub async fn run_interactive_tui(
     let _guard = RawModeGuard::enter()?;
     let mut cursor_idx: usize = 0;
     let mut scroll_offset: usize = 0;
+    let mut detail_view = false;
+    let mut detail_scroll: usize = 0;
+    let mut marked_ids: HashSet<String> = HashSet::new();
     let mut transient_status = TransientStatus::default();
     let mut pending_confirm: Option<PendingTuiConfirm> = None;
+    let mut export_confirm_warning_rendered = false;
+    let mut pending_input: Option<PendingTuiInput> = None;
     let mut last_redraw = Instant::now()
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
     let mut force_redraw = true;
 
     loop {
-        if pending_confirm.is_none() && transient_status.expire_if_due(Instant::now()) {
+        if pending_input.is_none()
+            && pending_confirm.is_none()
+            && transient_status.expire_if_due(Instant::now())
+        {
             force_redraw = true;
         }
 
@@ -247,17 +606,47 @@ pub async fn run_interactive_tui(
             let slot_state = backend.inspect_slot(repo.paths());
             let session_id = resolve_session_identity(&slot_state, &snap);
             let runtime_st = observe_runtime_state(repo.paths());
+            let daemon_state = read_daemon_state_readonly(repo.paths()).ok();
+            let now_unix = crate::domain::clock::current_unix_seconds();
+
+            marked_ids.retain(|id| snap.accounts.iter().any(|a| &a.id == id));
 
             if snap.accounts.is_empty() {
                 cursor_idx = 0;
+                detail_view = false;
+                detail_scroll = 0;
                 pending_confirm = None;
+                pending_input = None;
             } else {
                 if cursor_idx >= snap.accounts.len() {
                     cursor_idx = snap.accounts.len() - 1;
+                    detail_scroll = 0;
+                }
+                match &mut pending_input {
+                    Some(PendingTuiInput::EditLabel { account_id, .. }) => {
+                        if !snap.accounts.iter().any(|a| &a.id == account_id) {
+                            pending_input = None;
+                        }
+                    }
+                    Some(PendingTuiInput::ExportPath { account_ids, .. }) => {
+                        account_ids.retain(|id| snap.accounts.iter().any(|a| &a.id == id));
+                        if account_ids.is_empty() {
+                            pending_input = None;
+                        }
+                    }
+                    None => {}
                 }
                 match &mut pending_confirm {
                     Some(PendingTuiConfirm::DeleteAccount { account_id, .. }) => {
                         if !snap.accounts.iter().any(|a| &a.id == account_id) {
+                            pending_confirm = None;
+                        }
+                    }
+                    Some(PendingTuiConfirm::DeleteMarked { account_ids, .. })
+                    | Some(PendingTuiConfirm::DisableMarked { account_ids })
+                    | Some(PendingTuiConfirm::ExportBundle { account_ids, .. }) => {
+                        account_ids.retain(|id| snap.accounts.iter().any(|a| &a.id == id));
+                        if account_ids.is_empty() {
                             pending_confirm = None;
                         }
                     }
@@ -273,24 +662,51 @@ pub async fn run_interactive_tui(
                 }
             }
 
+            let (term_cols, term_rows) = current_terminal_size();
+            let input_msg = pending_input
+                .as_ref()
+                .map(|inp| inp.prompt_message(&repo.paths().home_dir));
             let confirm_msg = pending_confirm
                 .as_ref()
-                .map(PendingTuiConfirm::prompt_message);
-            let notice = confirm_msg
+                .map(|c| c.prompt_message_for_cols(term_cols as usize));
+            let transient_with_marks = transient_status.active_text().map(|msg| {
+                if !marked_ids.is_empty() && !msg.contains("marked") {
+                    format!("{msg} ({} marked)", marked_ids.len())
+                } else {
+                    msg.to_string()
+                }
+            });
+            let notice = input_msg
                 .as_deref()
-                .or_else(|| transient_status.active_text());
+                .or(confirm_msg.as_deref())
+                .or(transient_with_marks.as_deref());
 
-            render_dashboard(
-                &snap.accounts,
-                snap.index.selected_account_id.as_deref(),
-                &policy,
-                &session_id,
-                &runtime_st,
-                backend.name(),
-                cursor_idx,
-                &mut scroll_offset,
-                notice,
+            let rendered_frame = render_dashboard_full_with_size(
+                &mut TuiFrameView {
+                    accounts: &snap.accounts,
+                    selected_id: snap.index.selected_account_id.as_deref(),
+                    policy: &policy,
+                    session_id: &session_id,
+                    runtime_st: &runtime_st,
+                    backend_tag: backend.name(),
+                    daemon_state: daemon_state.as_ref(),
+                    marked_ids: &marked_ids,
+                    detail_view,
+                    detail_scroll: &mut detail_scroll,
+                    cursor_idx,
+                    scroll_offset: &mut scroll_offset,
+                    transient_notice: notice,
+                    now_unix,
+                },
+                term_cols,
+                term_rows,
             )?;
+            export_confirm_warning_rendered =
+                matches!(
+                    pending_confirm,
+                    Some(PendingTuiConfirm::ExportBundle { .. })
+                ) && export_confirm_warning_fits(term_cols as usize, term_rows as usize)
+                    && rendered_frame_shows_export_plaintext_warning(&rendered_frame);
             last_redraw = Instant::now();
             force_redraw = false;
         }
@@ -319,6 +735,7 @@ pub async fn run_interactive_tui(
             .map_err(|e| CliError::io("tui_read_error", format!("TUI event read error: {e}")))?;
         let key = match ev {
             Event::Resize(_, _) => {
+                export_confirm_warning_rendered = false;
                 force_redraw = true;
                 continue;
             }
@@ -332,8 +749,63 @@ pub async fn run_interactive_tui(
             break;
         }
 
+        if let Some(mut inp) = pending_input.take() {
+            force_redraw = true;
+            let mut current_key = key;
+            let mut drained = 0usize;
+            let mut quit_tui = false;
+            while let InputKeyOutcome::Continue(next_inp) = apply_pending_input_key(
+                inp,
+                current_key,
+                repo,
+                backend,
+                &mut pending_confirm,
+                &mut export_confirm_warning_rendered,
+                &mut transient_status,
+            ) {
+                inp = next_inp;
+                if drained >= 1024 || !event::poll(Duration::ZERO).unwrap_or(false) {
+                    pending_input = Some(inp);
+                    break;
+                }
+                match event::read() {
+                    Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                        if k.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(k.code, KeyCode::Char('c' | 'C'))
+                        {
+                            quit_tui = true;
+                            break;
+                        }
+                        current_key = k;
+                        drained += 1;
+                    }
+                    Ok(Event::Resize(_, _)) => {
+                        export_confirm_warning_rendered = false;
+                        pending_input = Some(inp);
+                        break;
+                    }
+                    Ok(_) => {
+                        pending_input = Some(inp);
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(CliError::io(
+                            "tui_read_error",
+                            format!("TUI event read error: {e}"),
+                        ));
+                    }
+                }
+            }
+            if quit_tui {
+                break;
+            }
+            continue;
+        }
+
         if let Some(pending) = pending_confirm.take() {
             force_redraw = true;
+            let warning_was_visible = export_confirm_warning_rendered;
+            export_confirm_warning_rendered = false;
             let confirmed = matches!(key.code, KeyCode::Char('y' | 'Y'))
                 && !key
                     .modifiers
@@ -345,7 +817,7 @@ pub async fn run_interactive_tui(
                     clear_active_slot,
                 } => {
                     if confirmed {
-                        delete_account_in_tui(
+                        let deleted_ok = delete_account_in_tui(
                             repo,
                             backend,
                             &account_id,
@@ -354,9 +826,29 @@ pub async fn run_interactive_tui(
                             &mut cursor_idx,
                             &mut transient_status,
                         );
+                        if deleted_ok {
+                            marked_ids.remove(&account_id);
+                        }
                     } else {
                         transient_status
                             .set_info("Canceled account deletion.".into(), Instant::now());
+                    }
+                }
+                PendingTuiConfirm::DeleteMarked { account_ids, .. } => {
+                    if confirmed {
+                        let deleted_ids = delete_marked_accounts_in_tui(
+                            repo,
+                            backend,
+                            &account_ids,
+                            &mut cursor_idx,
+                            &mut transient_status,
+                        );
+                        for id in deleted_ids {
+                            marked_ids.remove(&id);
+                        }
+                    } else {
+                        transient_status
+                            .set_info("Canceled deleting marked accounts.".into(), Instant::now());
                     }
                 }
                 PendingTuiConfirm::DisableAll { .. } => {
@@ -365,6 +857,45 @@ pub async fn run_interactive_tui(
                     } else {
                         transient_status
                             .set_info("Canceled disabling all accounts.".into(), Instant::now());
+                    }
+                }
+                PendingTuiConfirm::DisableMarked { account_ids } => {
+                    if confirmed {
+                        disable_marked_accounts_in_tui(
+                            repo,
+                            backend,
+                            &account_ids,
+                            &mut transient_status,
+                        );
+                    } else {
+                        transient_status
+                            .set_info("Canceled disabling marked accounts.".into(), Instant::now());
+                    }
+                }
+                PendingTuiConfirm::ExportBundle {
+                    account_ids,
+                    output_path,
+                } => {
+                    let (live_cols, live_rows) = current_terminal_size();
+                    if confirmed {
+                        if !warning_was_visible
+                            || !export_confirm_warning_fits(live_cols as usize, live_rows as usize)
+                        {
+                            transient_status.set_error(
+                                "Export canceled: terminal too small to display PLAINTEXT export warning."
+                                    .into(),
+                                Instant::now(),
+                            );
+                        } else {
+                            export_accounts_in_tui(
+                                repo,
+                                &output_path,
+                                &account_ids,
+                                &mut transient_status,
+                            );
+                        }
+                    } else {
+                        transient_status.set_info("Canceled export.".into(), Instant::now());
                     }
                 }
             }
@@ -389,10 +920,215 @@ pub async fn run_interactive_tui(
         let slot_state = backend.inspect_slot(repo.paths());
         let session_id = resolve_session_identity(&slot_state, &snap);
         let runtime_st = observe_runtime_state(repo.paths());
+        let daemon_state = read_daemon_state_readonly(repo.paths()).ok();
+        marked_ids.retain(|id| snap.accounts.iter().any(|a| &a.id == id));
+        if snap.accounts.is_empty() {
+            cursor_idx = 0;
+            detail_view = false;
+            detail_scroll = 0;
+        } else if cursor_idx >= snap.accounts.len() {
+            cursor_idx = snap.accounts.len() - 1;
+        }
         force_redraw = true;
 
+        if detail_view {
+            match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Char('i') | KeyCode::Esc => {
+                    detail_view = false;
+                    detail_scroll = 0;
+                }
+                KeyCode::Left => {
+                    if cursor_idx > 0 {
+                        cursor_idx -= 1;
+                        detail_scroll = 0;
+                    }
+                }
+                KeyCode::Right => {
+                    if !snap.accounts.is_empty() && cursor_idx + 1 < snap.accounts.len() {
+                        cursor_idx += 1;
+                        detail_scroll = 0;
+                    }
+                }
+                KeyCode::Up => {
+                    detail_scroll = detail_scroll.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    detail_scroll = detail_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    detail_scroll = detail_scroll.saturating_sub(5);
+                }
+                KeyCode::PageDown => {
+                    detail_scroll = detail_scroll.saturating_add(5);
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    detail_scroll = 0;
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    detail_scroll = usize::MAX;
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(target) = snap.accounts.get(cursor_idx) {
+                        if !marked_ids.remove(&target.id) {
+                            marked_ids.insert(target.id.clone());
+                        }
+                    }
+                }
+                KeyCode::Char('k') => {
+                    reset_cooldown_in_tui(repo, &mut transient_status);
+                }
+                KeyCode::Char('l') => {
+                    if let Some(target) = snap.accounts.get(cursor_idx) {
+                        let initial = target
+                            .custom_label
+                            .as_deref()
+                            .map(|s| terminal_text(s).trim().to_string())
+                            .unwrap_or_default();
+                        pending_input = Some(PendingTuiInput::EditLabel {
+                            account_id: target.id.clone(),
+                            email: target.email.clone(),
+                            buffer: initial,
+                        });
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char('s') => {
+                    if let Some(target) = snap.accounts.get(cursor_idx) {
+                        run_single_switch_in_tui(
+                            repo,
+                            backend,
+                            cli_proxy,
+                            &snap,
+                            &cur_policy,
+                            &session_id,
+                            &runtime_st,
+                            daemon_state.as_ref(),
+                            &marked_ids,
+                            true,
+                            &mut detail_scroll,
+                            cursor_idx,
+                            &mut scroll_offset,
+                            target,
+                            &mut transient_status,
+                        )
+                        .await;
+                    }
+                }
+                KeyCode::Char('r') => {
+                    let interrupted = run_r_refresh_in_tui(
+                        repo,
+                        backend,
+                        cli_proxy,
+                        &snap,
+                        &cur_policy,
+                        &session_id,
+                        &runtime_st,
+                        daemon_state.as_ref(),
+                        &marked_ids,
+                        true,
+                        &mut detail_scroll,
+                        cursor_idx,
+                        &mut scroll_offset,
+                        &mut transient_status,
+                        &mut sigterm,
+                        &mut sigint,
+                        &mut sighup,
+                    )
+                    .await;
+                    if interrupted {
+                        break;
+                    }
+                }
+                _ => {
+                    force_redraw = false;
+                }
+            }
+            continue;
+        }
+
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => break,
+            KeyCode::Char('q') => break,
+            KeyCode::Esc => {
+                if !marked_ids.is_empty() {
+                    marked_ids.clear();
+                } else {
+                    break;
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(target) = snap.accounts.get(cursor_idx) {
+                    if !marked_ids.remove(&target.id) {
+                        marked_ids.insert(target.id.clone());
+                    }
+                }
+            }
+            KeyCode::Char('i') => {
+                if snap.accounts.is_empty() {
+                    transient_status.set_info("No account to inspect.".into(), Instant::now());
+                } else {
+                    detail_view = true;
+                    detail_scroll = 0;
+                }
+            }
+            KeyCode::Char('k') => {
+                reset_cooldown_in_tui(repo, &mut transient_status);
+            }
+            KeyCode::Char('l') => {
+                if let Some(target) = snap.accounts.get(cursor_idx) {
+                    let initial = target
+                        .custom_label
+                        .as_deref()
+                        .map(|s| terminal_text(s).trim().to_string())
+                        .unwrap_or_default();
+                    pending_input = Some(PendingTuiInput::EditLabel {
+                        account_id: target.id.clone(),
+                        email: target.email.clone(),
+                        buffer: initial,
+                    });
+                } else {
+                    transient_status.set_info("No account to label.".into(), Instant::now());
+                }
+            }
+            KeyCode::Char('o') => {
+                let (targets, from_marked) =
+                    resolve_tui_targets(&snap.accounts, cursor_idx, &marked_ids);
+                if targets.is_empty() {
+                    transient_status.set_info("No accounts to export.".into(), Instant::now());
+                } else {
+                    let cwd =
+                        std::env::current_dir().unwrap_or_else(|_| repo.paths().home_dir.clone());
+                    let default_path =
+                        default_tui_export_path(&cwd, crate::domain::clock::current_unix_seconds());
+                    let scope_label = if from_marked {
+                        format!("{} marked account(s)", targets.len())
+                    } else {
+                        terminal_text(&targets[0].email)
+                    };
+                    let account_ids: Vec<String> = targets.iter().map(|a| a.id.clone()).collect();
+                    pending_input = Some(PendingTuiInput::ExportPath {
+                        account_ids,
+                        scope_label,
+                        buffer: default_path,
+                    });
+                }
+            }
+            KeyCode::Char('O') => {
+                if snap.accounts.is_empty() {
+                    transient_status.set_info("No accounts to export.".into(), Instant::now());
+                } else {
+                    let cwd =
+                        std::env::current_dir().unwrap_or_else(|_| repo.paths().home_dir.clone());
+                    let default_path =
+                        default_tui_export_path(&cwd, crate::domain::clock::current_unix_seconds());
+                    let account_ids: Vec<String> =
+                        snap.accounts.iter().map(|a| a.id.clone()).collect();
+                    pending_input = Some(PendingTuiInput::ExportPath {
+                        scope_label: format!("all {} account(s)", account_ids.len()),
+                        account_ids,
+                        buffer: default_path,
+                    });
+                }
+            }
             KeyCode::Home | KeyCode::Char('g') => {
                 cursor_idx = 0;
             }
@@ -439,184 +1175,49 @@ pub async fn run_interactive_tui(
             }
             KeyCode::Enter | KeyCode::Char('s') => {
                 if let Some(target) = snap.accounts.get(cursor_idx) {
-                    let switching_msg = format!("Switching to {}...", terminal_text(&target.email));
-                    let _ = render_dashboard(
-                        &snap.accounts,
-                        snap.index.selected_account_id.as_deref(),
+                    run_single_switch_in_tui(
+                        repo,
+                        backend,
+                        cli_proxy,
+                        &snap,
                         &cur_policy,
                         &session_id,
                         &runtime_st,
-                        backend.name(),
+                        daemon_state.as_ref(),
+                        &marked_ids,
+                        false,
+                        &mut detail_scroll,
                         cursor_idx,
                         &mut scroll_offset,
-                        Some(&switching_msg),
-                    );
-                    let now_unix = crate::domain::clock::current_unix_seconds();
-                    let mut proxy_warnings = Vec::new();
-                    let res = async {
-                        let cfg = repo.read_config()?;
-                        let registry = OAuthClientRegistry::load(repo.paths())?;
-                        let (proxy_mode, warns) = ProxyMode::resolve_with_config_and_warnings(
-                            cli_proxy,
-                            Some(&cfg.network),
-                        )?;
-                        proxy_warnings = warns;
-                        let transport = ReqwestTransport::build(proxy_mode)?;
-                        let ua = resolve_native_oauth_user_agent(
-                            repo.paths(),
-                            &transport,
-                            false,
-                            now_unix,
-                        )
-                        .await;
-                        execute_switch(
-                            repo,
-                            backend,
-                            &transport,
-                            &OAuthEndpoints::default(),
-                            &registry,
-                            &ua,
-                            &target.id,
-                            &SwitchOptions {
-                                dry_run: false,
-                                allow_running: false,
-                            },
-                            crate::domain::clock::current_unix_seconds(),
-                        )
-                        .await
-                    }
+                        target,
+                        &mut transient_status,
+                    )
                     .await;
-                    let proxy_prefix = format_tui_proxy_warning_prefix(&proxy_warnings);
-                    let done_at = Instant::now();
-                    match res {
-                        Ok(out) => {
-                            let msg = format_tui_switch_status_notice(&proxy_prefix, &out);
-                            transient_status.set_info(msg, done_at);
-                        }
-                        Err(e) => transient_status.set_error(
-                            format!("{proxy_prefix}Switch error: {}", terminal_text(&e.message)),
-                            done_at,
-                        ),
-                    }
                 }
             }
             KeyCode::Char('r') => {
-                if let Some(target) = snap.accounts.get(cursor_idx) {
-                    let refreshing_msg =
-                        format!("Refreshing quota for {}...", terminal_text(&target.email));
-                    let _ = render_dashboard(
-                        &snap.accounts,
-                        snap.index.selected_account_id.as_deref(),
-                        &cur_policy,
-                        &session_id,
-                        &runtime_st,
-                        backend.name(),
-                        cursor_idx,
-                        &mut scroll_offset,
-                        Some(&refreshing_msg),
-                    );
-                    let now_unix = crate::domain::clock::current_unix_seconds();
-                    let proxy_warnings_r = std::sync::Mutex::new(Vec::new());
-                    let mut refresh_fut = std::pin::pin!(async {
-                        reconcile_pending_journal_before_write(repo, backend, now_unix)?;
-                        let cfg = repo.read_config()?;
-                        let registry = OAuthClientRegistry::load(repo.paths())?;
-                        let (proxy_mode, warns) = ProxyMode::resolve_with_config_and_warnings(
-                            cli_proxy,
-                            Some(&cfg.network),
-                        )?;
-                        *proxy_warnings_r.lock().unwrap() = warns;
-                        let transport = ReqwestTransport::build(proxy_mode)?;
-                        let ua = resolve_native_oauth_user_agent(
-                            repo.paths(),
-                            &transport,
-                            false,
-                            now_unix,
-                        )
-                        .await;
-                        refresh_account_quota_locked(
-                            repo,
-                            &transport,
-                            &OAuthEndpoints::default(),
-                            &CloudCodeEndpoints::default(),
-                            &registry,
-                            &ua,
-                            &target.id,
-                            crate::domain::clock::current_unix_seconds(),
-                        )
-                        .await
-                    });
-                    let mut interrupted_r = false;
-                    let refresh_res = loop {
-                        tokio::select! {
-                            _ = async {
-                                if let Some(ref mut s) = sigterm { let _ = s.recv().await; }
-                                else { std::future::pending::<()>().await; }
-                            } => {
-                                interrupted_r = true;
-                                break None;
-                            }
-                            _ = async {
-                                if let Some(ref mut s) = sigint { let _ = s.recv().await; }
-                                else { std::future::pending::<()>().await; }
-                            } => {
-                                interrupted_r = true;
-                                break None;
-                            }
-                            _ = async {
-                                if let Some(ref mut s) = sighup { let _ = s.recv().await; }
-                                else { std::future::pending::<()>().await; }
-                            } => {
-                                interrupted_r = true;
-                                break None;
-                            }
-                            _ = tokio::time::sleep(Duration::from_millis(20)) => {
-                                let (should_exit, saw_resize) = poll_raw_tty_interrupt_or_resize();
-                                if should_exit {
-                                    interrupted_r = true;
-                                    break None;
-                                }
-                                if saw_resize {
-                                    let _ = render_dashboard(
-                                        &snap.accounts,
-                                        snap.index.selected_account_id.as_deref(),
-                                        &cur_policy,
-                                        &session_id,
-                                        &runtime_st,
-                                        backend.name(),
-                                        cursor_idx,
-                                        &mut scroll_offset,
-                                        Some(&refreshing_msg),
-                                    );
-                                }
-                            }
-                            res = &mut refresh_fut => break Some(res),
-                        }
-                    };
-                    if interrupted_r {
-                        break;
-                    }
-                    if let Some(res) = refresh_res {
-                        let proxy_prefix =
-                            format_tui_proxy_warning_prefix(&proxy_warnings_r.lock().unwrap());
-                        let done_at = Instant::now();
-                        match res {
-                            Ok(acc) => transient_status.set_info(
-                                format!(
-                                    "{proxy_prefix}Refreshed quota for {}.",
-                                    terminal_text(&acc.email)
-                                ),
-                                done_at,
-                            ),
-                            Err(e) => transient_status.set_error(
-                                format!(
-                                    "{proxy_prefix}Refresh error: {}",
-                                    terminal_text(&e.message)
-                                ),
-                                done_at,
-                            ),
-                        }
-                    }
+                let interrupted = run_r_refresh_in_tui(
+                    repo,
+                    backend,
+                    cli_proxy,
+                    &snap,
+                    &cur_policy,
+                    &session_id,
+                    &runtime_st,
+                    daemon_state.as_ref(),
+                    &marked_ids,
+                    false,
+                    &mut detail_scroll,
+                    cursor_idx,
+                    &mut scroll_offset,
+                    &mut transient_status,
+                    &mut sigterm,
+                    &mut sigint,
+                    &mut sighup,
+                )
+                .await;
+                if interrupted {
+                    break;
                 }
             }
             KeyCode::Char('R') => {
@@ -632,22 +1233,31 @@ pub async fn run_interactive_tui(
                 } else {
                     let total = targets.len();
                     let init_msg = format!("Refreshing {total} enabled account(s) (0/{total})...");
-                    let _ = render_dashboard(
-                        &snap.accounts,
-                        snap.index.selected_account_id.as_deref(),
-                        &cur_policy,
-                        &session_id,
-                        &runtime_st,
-                        backend.name(),
+                    let _ = render_dashboard_full(&mut TuiFrameView {
+                        accounts: &snap.accounts,
+                        selected_id: snap.index.selected_account_id.as_deref(),
+                        policy: &cur_policy,
+                        session_id: &session_id,
+                        runtime_st: &runtime_st,
+                        backend_tag: backend.name(),
+                        daemon_state: daemon_state.as_ref(),
+                        marked_ids: &marked_ids,
+                        detail_view: false,
+                        detail_scroll: &mut detail_scroll,
                         cursor_idx,
-                        &mut scroll_offset,
-                        Some(&init_msg),
-                    );
+                        scroll_offset: &mut scroll_offset,
+                        transient_notice: Some(&init_msg),
+                        now_unix: crate::domain::clock::current_unix_seconds(),
+                    });
                     let interrupted = run_batch_refresh_in_tui(
                         repo,
                         backend,
                         cli_proxy,
                         &targets,
+                        "enabled",
+                        &marked_ids,
+                        false,
+                        &mut detail_scroll,
                         cursor_idx,
                         &mut scroll_offset,
                         &mut transient_status,
@@ -662,7 +1272,17 @@ pub async fn run_interactive_tui(
                 }
             }
             KeyCode::Char('c') => {
-                if let Some(target) = snap.accounts.get(cursor_idx) {
+                let (targets, from_marked) =
+                    resolve_tui_targets(&snap.accounts, cursor_idx, &marked_ids);
+                if from_marked && targets.len() >= 2 {
+                    let ids: Vec<String> = targets.iter().map(|a| a.id.clone()).collect();
+                    toggle_marked_policy_candidates_in_tui(
+                        repo,
+                        backend,
+                        &ids,
+                        &mut transient_status,
+                    );
+                } else if let Some(target) = targets.first().copied() {
                     toggle_policy_candidate_in_tui(repo, backend, target, &mut transient_status);
                 }
             }
@@ -678,7 +1298,12 @@ pub async fn run_interactive_tui(
                 toggle_policy_enabled_in_tui(repo, backend, &mut transient_status);
             }
             KeyCode::Char('e') => {
-                if let Some(target) = snap.accounts.get(cursor_idx) {
+                let (targets, from_marked) =
+                    resolve_tui_targets(&snap.accounts, cursor_idx, &marked_ids);
+                if from_marked && targets.len() >= 2 {
+                    let ids: Vec<String> = targets.iter().map(|a| a.id.clone()).collect();
+                    enable_marked_accounts_in_tui(repo, backend, &ids, &mut transient_status);
+                } else if let Some(target) = targets.first().copied() {
                     let now_unix = crate::domain::clock::current_unix_seconds();
                     let res = reconcile_pending_journal_before_write(repo, backend, now_unix)
                         .and_then(|_| {
@@ -703,7 +1328,12 @@ pub async fn run_interactive_tui(
                 }
             }
             KeyCode::Char('d') => {
-                if let Some(target) = snap.accounts.get(cursor_idx) {
+                let (targets, from_marked) =
+                    resolve_tui_targets(&snap.accounts, cursor_idx, &marked_ids);
+                if from_marked && targets.len() >= 2 {
+                    let ids: Vec<String> = targets.iter().map(|a| a.id.clone()).collect();
+                    pending_confirm = Some(PendingTuiConfirm::DisableMarked { account_ids: ids });
+                } else if let Some(target) = targets.first().copied() {
                     let now_unix = crate::domain::clock::current_unix_seconds();
                     let res = reconcile_pending_journal_before_write(repo, backend, now_unix)
                         .and_then(|_| {
@@ -741,9 +1371,25 @@ pub async fn run_interactive_tui(
                 }
             }
             KeyCode::Char('x') | KeyCode::Delete => {
-                if snap.accounts.is_empty() {
+                let (targets, from_marked) =
+                    resolve_tui_targets(&snap.accounts, cursor_idx, &marked_ids);
+                if targets.is_empty() {
                     transient_status.set_info("No accounts to delete.".into(), Instant::now());
-                } else if let Some(target) = snap.accounts.get(cursor_idx) {
+                } else if from_marked && targets.len() >= 2 {
+                    let includes_active = targets.iter().any(|t| {
+                        snap.index.selected_account_id.as_deref() == Some(t.id.as_str())
+                            || matches!(
+                                &session_id,
+                                crate::domain::account::SessionIdentity::Matched { account_id, .. }
+                                    | crate::domain::account::SessionIdentity::DriftedKnown { account_id, .. }
+                                    if account_id == &t.id
+                            )
+                    });
+                    pending_confirm = Some(PendingTuiConfirm::DeleteMarked {
+                        account_ids: targets.iter().map(|a| a.id.clone()).collect(),
+                        includes_active,
+                    });
+                } else if let Some(target) = targets.first().copied() {
                     let is_active_or_selected = snap.index.selected_account_id.as_deref()
                         == Some(target.id.as_str())
                         || matches!(
@@ -766,6 +1412,512 @@ pub async fn run_interactive_tui(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_single_switch_in_tui(
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    cli_proxy: Option<&str>,
+    snap: &crate::store::repository::StoreSnapshot,
+    cur_policy: &SwitchPolicy,
+    session_id: &crate::domain::account::SessionIdentity,
+    runtime_st: &crate::domain::account::RuntimeState,
+    daemon_state: Option<&DaemonPersistentState>,
+    marked_ids: &HashSet<String>,
+    detail_view: bool,
+    detail_scroll: &mut usize,
+    cursor_idx: usize,
+    scroll_offset: &mut usize,
+    target: &crate::domain::account::AccountRecord,
+    transient_status: &mut TransientStatus,
+) {
+    let switching_msg = format!("Switching to {}...", terminal_text(&target.email));
+    let _ = render_dashboard_full(&mut TuiFrameView {
+        accounts: &snap.accounts,
+        selected_id: snap.index.selected_account_id.as_deref(),
+        policy: cur_policy,
+        session_id,
+        runtime_st,
+        backend_tag: backend.name(),
+        daemon_state,
+        marked_ids,
+        detail_view,
+        detail_scroll,
+        cursor_idx,
+        scroll_offset,
+        transient_notice: Some(&switching_msg),
+        now_unix: crate::domain::clock::current_unix_seconds(),
+    });
+    let now_unix = crate::domain::clock::current_unix_seconds();
+    let mut proxy_warnings = Vec::new();
+    let res = async {
+        let cfg = repo.read_config()?;
+        let registry = OAuthClientRegistry::load(repo.paths())?;
+        let (proxy_mode, warns) =
+            ProxyMode::resolve_with_config_and_warnings(cli_proxy, Some(&cfg.network))?;
+        proxy_warnings = warns;
+        let transport = ReqwestTransport::build(proxy_mode)?;
+        let ua = resolve_native_oauth_user_agent(repo.paths(), &transport, false, now_unix).await;
+        execute_switch(
+            repo,
+            backend,
+            &transport,
+            &OAuthEndpoints::default(),
+            &registry,
+            &ua,
+            &target.id,
+            &SwitchOptions {
+                dry_run: false,
+                allow_running: false,
+            },
+            crate::domain::clock::current_unix_seconds(),
+        )
+        .await
+    }
+    .await;
+    let proxy_prefix = format_tui_proxy_warning_prefix(&proxy_warnings);
+    let done_at = Instant::now();
+    match res {
+        Ok(out) => {
+            let msg = format_tui_switch_status_notice(&proxy_prefix, &out);
+            transient_status.set_info(msg, done_at);
+        }
+        Err(e) => transient_status.set_error(
+            format!("{proxy_prefix}Switch error: {}", terminal_text(&e.message)),
+            done_at,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_single_refresh_in_tui(
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    cli_proxy: Option<&str>,
+    snap: &crate::store::repository::StoreSnapshot,
+    cur_policy: &SwitchPolicy,
+    session_id: &crate::domain::account::SessionIdentity,
+    runtime_st: &crate::domain::account::RuntimeState,
+    daemon_state: Option<&DaemonPersistentState>,
+    marked_ids: &HashSet<String>,
+    detail_view: bool,
+    detail_scroll: &mut usize,
+    cursor_idx: usize,
+    scroll_offset: &mut usize,
+    target: &crate::domain::account::AccountRecord,
+    transient_status: &mut TransientStatus,
+    sigterm: &mut Option<tokio::signal::unix::Signal>,
+    sigint: &mut Option<tokio::signal::unix::Signal>,
+    sighup: &mut Option<tokio::signal::unix::Signal>,
+) -> bool {
+    let refreshing_msg = format!("Refreshing quota for {}...", terminal_text(&target.email));
+    let _ = render_dashboard_full(&mut TuiFrameView {
+        accounts: &snap.accounts,
+        selected_id: snap.index.selected_account_id.as_deref(),
+        policy: cur_policy,
+        session_id,
+        runtime_st,
+        backend_tag: backend.name(),
+        daemon_state,
+        marked_ids,
+        detail_view,
+        detail_scroll,
+        cursor_idx,
+        scroll_offset,
+        transient_notice: Some(&refreshing_msg),
+        now_unix: crate::domain::clock::current_unix_seconds(),
+    });
+    let now_unix = crate::domain::clock::current_unix_seconds();
+    let proxy_warnings_r = std::sync::Mutex::new(Vec::new());
+    let mut refresh_fut = std::pin::pin!(async {
+        reconcile_pending_journal_before_write(repo, backend, now_unix)?;
+        let cfg = repo.read_config()?;
+        let registry = OAuthClientRegistry::load(repo.paths())?;
+        let (proxy_mode, warns) =
+            ProxyMode::resolve_with_config_and_warnings(cli_proxy, Some(&cfg.network))?;
+        *proxy_warnings_r.lock().unwrap() = warns;
+        let transport = ReqwestTransport::build(proxy_mode)?;
+        let ua = resolve_native_oauth_user_agent(repo.paths(), &transport, false, now_unix).await;
+        refresh_account_quota_locked(
+            repo,
+            &transport,
+            &OAuthEndpoints::default(),
+            &CloudCodeEndpoints::default(),
+            &registry,
+            &ua,
+            &target.id,
+            crate::domain::clock::current_unix_seconds(),
+        )
+        .await
+    });
+    let mut interrupted_r = false;
+    let refresh_res = loop {
+        tokio::select! {
+            _ = async {
+                if let Some(ref mut s) = sigterm { let _ = s.recv().await; }
+                else { std::future::pending::<()>().await; }
+            } => {
+                interrupted_r = true;
+                break None;
+            }
+            _ = async {
+                if let Some(ref mut s) = sigint { let _ = s.recv().await; }
+                else { std::future::pending::<()>().await; }
+            } => {
+                interrupted_r = true;
+                break None;
+            }
+            _ = async {
+                if let Some(ref mut s) = sighup { let _ = s.recv().await; }
+                else { std::future::pending::<()>().await; }
+            } => {
+                interrupted_r = true;
+                break None;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                let (should_exit, saw_resize) = poll_raw_tty_interrupt_or_resize();
+                if should_exit {
+                    interrupted_r = true;
+                    break None;
+                }
+                if saw_resize {
+                    let _ = render_dashboard_full(&mut TuiFrameView {
+                        accounts: &snap.accounts,
+                        selected_id: snap.index.selected_account_id.as_deref(),
+                        policy: cur_policy,
+                        session_id,
+                        runtime_st,
+                        backend_tag: backend.name(),
+                        daemon_state,
+                        marked_ids,
+                        detail_view,
+                        detail_scroll,
+                        cursor_idx,
+                        scroll_offset,
+                        transient_notice: Some(&refreshing_msg),
+                        now_unix: crate::domain::clock::current_unix_seconds(),
+                    });
+                }
+            }
+            res = &mut refresh_fut => break Some(res),
+        }
+    };
+    if interrupted_r {
+        return true;
+    }
+    if let Some(res) = refresh_res {
+        let proxy_prefix = format_tui_proxy_warning_prefix(&proxy_warnings_r.lock().unwrap());
+        let done_at = Instant::now();
+        match res {
+            Ok(acc) => transient_status.set_info(
+                format!(
+                    "{proxy_prefix}Refreshed quota for {}.",
+                    terminal_text(&acc.email)
+                ),
+                done_at,
+            ),
+            Err(e) => transient_status.set_error(
+                format!("{proxy_prefix}Refresh error: {}", terminal_text(&e.message)),
+                done_at,
+            ),
+        }
+    }
+    false
+}
+
+fn reset_cooldown_in_tui(repo: &StoreRepository, transient_status: &mut TransientStatus) {
+    let now_unix = crate::domain::clock::current_unix_seconds();
+    let res = reset_daemon_cooldown(repo, now_unix);
+    let done_at = Instant::now();
+    match res {
+        Ok(out) if out.cooldown_was_active => transient_status.set_info(
+            format!(
+                "Cleared active daemon cooldown (was active until {}).",
+                format_daemon_local_ts(out.previous_cooldown_until)
+            ),
+            done_at,
+        ),
+        Ok(_) => transient_status.set_info("No active daemon cooldown to clear.".into(), done_at),
+        Err(e) => transient_status.set_error(
+            format!("Cooldown reset error: {}", terminal_text(&e.message)),
+            done_at,
+        ),
+    }
+}
+
+fn update_label_in_tui(
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    account_id: &str,
+    email: &str,
+    raw_label: &str,
+    transient_status: &mut TransientStatus,
+) {
+    let now_unix = crate::domain::clock::current_unix_seconds();
+    let res = reconcile_pending_journal_before_write(repo, backend, now_unix).and_then(|_| {
+        repo.with_write_lock(|tx| tx.set_account_custom_label(account_id, Some(raw_label)))
+    });
+    let done_at = Instant::now();
+    match res {
+        Ok(updated) => {
+            if let Some(ref lbl) = updated.custom_label {
+                transient_status.set_info(
+                    format!(
+                        "Updated label for {} to \"{}\".",
+                        terminal_text(email),
+                        terminal_text(lbl)
+                    ),
+                    done_at,
+                );
+            } else {
+                transient_status.set_info(
+                    format!("Cleared label for {}.", terminal_text(email)),
+                    done_at,
+                );
+            }
+        }
+        Err(e) => transient_status.set_error(
+            format!("Label error: {}", terminal_text(&e.message)),
+            done_at,
+        ),
+    }
+}
+
+fn export_accounts_in_tui(
+    repo: &StoreRepository,
+    output_path: &Path,
+    account_ids: &[String],
+    transient_status: &mut TransientStatus,
+) {
+    let res = export_transfer_bundle_file(repo, output_path, true, false, account_ids);
+    let done_at = Instant::now();
+    match res {
+        Ok(count) => transient_status.set_info(
+            format!(
+                "Exported {count} account(s) to {} (0600).",
+                terminal_text(&output_path.to_string_lossy())
+            ),
+            done_at,
+        ),
+        Err(e) => transient_status.set_error(
+            format!("Export error: {}", terminal_text(&e.message)),
+            done_at,
+        ),
+    }
+}
+
+fn enable_marked_accounts_in_tui(
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    account_ids: &[String],
+    transient_status: &mut TransientStatus,
+) {
+    let now_unix = crate::domain::clock::current_unix_seconds();
+    let res: CliResult<(usize, usize)> = (|| {
+        reconcile_pending_journal_before_write(repo, backend, now_unix)?;
+        repo.with_write_lock(|tx| {
+            let mut changed = 0usize;
+            let mut found = 0usize;
+            for id in account_ids {
+                if let Some(acc) = tx.load_account_opt(id)? {
+                    found += 1;
+                    if acc.disabled {
+                        tx.mark_account_enabled(id)?;
+                        changed += 1;
+                    }
+                }
+            }
+            Ok((changed, found))
+        })
+    })();
+    let done_at = Instant::now();
+    match res {
+        Ok((0, total)) => transient_status.set_info(
+            format!("All {total} marked account(s) are already enabled."),
+            done_at,
+        ),
+        Ok((changed, total)) => transient_status.set_info(
+            format!("Enabled {changed} of {total} marked account(s)."),
+            done_at,
+        ),
+        Err(e) => {
+            transient_status.set_error(format!("Error: {}", terminal_text(&e.message)), done_at)
+        }
+    }
+}
+
+fn disable_marked_accounts_in_tui(
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    account_ids: &[String],
+    transient_status: &mut TransientStatus,
+) {
+    let now_unix = crate::domain::clock::current_unix_seconds();
+    let res: CliResult<(usize, usize)> = (|| {
+        reconcile_pending_journal_before_write(repo, backend, now_unix)?;
+        repo.with_write_lock(|tx| {
+            let mut changed = 0usize;
+            let mut found = 0usize;
+            for id in account_ids {
+                if let Some(acc) = tx.load_account_opt(id)? {
+                    found += 1;
+                    if !acc.disabled {
+                        tx.mark_account_disabled(
+                            id,
+                            crate::domain::account::DisableReasonCode::Manual,
+                            Some("Disabled marked in TUI".into()),
+                            now_unix,
+                        )?;
+                        changed += 1;
+                    }
+                }
+            }
+            Ok((changed, found))
+        })
+    })();
+    let done_at = Instant::now();
+    match res {
+        Ok((0, total)) => transient_status.set_info(
+            format!("All {total} marked account(s) are already disabled."),
+            done_at,
+        ),
+        Ok((changed, total)) => transient_status.set_info(
+            format!("Disabled {changed} of {total} marked account(s)."),
+            done_at,
+        ),
+        Err(e) => {
+            transient_status.set_error(format!("Error: {}", terminal_text(&e.message)), done_at)
+        }
+    }
+}
+
+fn delete_marked_accounts_in_tui(
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    account_ids: &[String],
+    cursor_idx: &mut usize,
+    transient_status: &mut TransientStatus,
+) -> Vec<String> {
+    let mut deleted_ids = Vec::new();
+    let mut cleared_any_slot = false;
+    let mut first_error: Option<String> = None;
+
+    for id in account_ids {
+        let now_unix = crate::domain::clock::current_unix_seconds();
+        let is_active = repo.read_snapshot().ok().is_some_and(|snap| {
+            let slot_state = backend.inspect_slot(repo.paths());
+            let sess = resolve_session_identity(&slot_state, &snap);
+            snap.index.selected_account_id.as_deref() == Some(id.as_str())
+                || matches!(
+                    &sess,
+                    crate::domain::account::SessionIdentity::Matched { account_id, .. }
+                        | crate::domain::account::SessionIdentity::DriftedKnown { account_id, .. }
+                        if account_id == id
+                )
+        });
+        match execute_account_delete(repo, backend, id, is_active, is_active, now_unix) {
+            Ok((_deleted, cleared_slot)) => {
+                deleted_ids.push(id.clone());
+                if cleared_slot {
+                    cleared_any_slot = true;
+                }
+            }
+            Err(e) => {
+                first_error = Some(e.message);
+                break;
+            }
+        }
+    }
+
+    let remaining = repo.read_snapshot().map(|s| s.accounts.len()).unwrap_or(0);
+    *cursor_idx = if remaining == 0 {
+        0
+    } else {
+        (*cursor_idx).min(remaining - 1)
+    };
+    let done_at = Instant::now();
+    if let Some(err_msg) = first_error {
+        transient_status.set_error(
+            format!(
+                "Deleted {}/{} marked account(s); stopped on error: {}",
+                deleted_ids.len(),
+                account_ids.len(),
+                terminal_text(&err_msg)
+            ),
+            done_at,
+        );
+    } else {
+        transient_status.set_info(
+            format!(
+                "Deleted {} marked account(s){}.",
+                deleted_ids.len(),
+                if cleared_any_slot {
+                    " and cleared active slot"
+                } else {
+                    ""
+                }
+            ),
+            done_at,
+        );
+    }
+    deleted_ids
+}
+
+fn toggle_marked_policy_candidates_in_tui(
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    account_ids: &[String],
+    transient_status: &mut TransientStatus,
+) {
+    let now_unix = crate::domain::clock::current_unix_seconds();
+    let res: CliResult<String> = (|| {
+        reconcile_pending_journal_before_write(repo, backend, now_unix)?;
+        let mut policy = repo.read_policy()?;
+        let prev_rev = policy.revision;
+        let all_present = account_ids
+            .iter()
+            .all(|id| policy.candidate_account_ids.contains(id));
+        let msg = if all_present {
+            let remove_set: HashSet<&str> = account_ids.iter().map(String::as_str).collect();
+            let before = policy.candidate_account_ids.len();
+            policy
+                .candidate_account_ids
+                .retain(|id| !remove_set.contains(id.as_str()));
+            let removed = before.saturating_sub(policy.candidate_account_ids.len());
+            if policy.candidate_account_ids.is_empty() && policy.enabled {
+                policy.enabled = false;
+                format!(
+                    "Removed {removed} marked account(s) from candidates (auto-switch turned off: 0 candidates)."
+                )
+            } else {
+                format!("Removed {removed} marked account(s) from policy candidates.")
+            }
+        } else {
+            let mut added = 0usize;
+            for id in account_ids {
+                if !policy.candidate_account_ids.contains(id) {
+                    policy.candidate_account_ids.push(id.clone());
+                    added += 1;
+                }
+            }
+            format!("Added {added} marked account(s) to policy candidates.")
+        };
+        repo.with_write_lock(|tx| {
+            tx.save_policy(&mut policy, Some(prev_rev), now_unix)?;
+            clear_daemon_pause_in_tx(tx.paths(), now_unix)?;
+            Ok(())
+        })?;
+        Ok(msg)
+    })();
+    let done_at = Instant::now();
+    match res {
+        Ok(msg) => transient_status.set_info(msg, done_at),
+        Err(e) => transient_status.set_error(
+            format!("Policy error: {}", terminal_text(&e.message)),
+            done_at,
+        ),
+    }
 }
 
 fn enable_all_accounts_in_tui(
@@ -861,7 +2013,7 @@ fn delete_account_in_tui(
     clear_active_slot: bool,
     cursor_idx: &mut usize,
     transient_status: &mut TransientStatus,
-) {
+) -> bool {
     let now_unix = crate::domain::clock::current_unix_seconds();
     let res = execute_account_delete(
         repo,
@@ -892,12 +2044,14 @@ fn delete_account_in_tui(
                 ),
                 done_at,
             );
+            true
         }
         Err(e) => {
             transient_status.set_error(
                 format!("Delete error: {}", terminal_text(&e.message)),
                 done_at,
             );
+            false
         }
     }
 }
@@ -1033,9 +2187,102 @@ fn poll_raw_tty_interrupt_or_resize() -> (bool, bool) {
     (false, saw_resize)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_r_refresh_in_tui(
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    cli_proxy: Option<&str>,
+    snap: &crate::store::repository::StoreSnapshot,
+    cur_policy: &SwitchPolicy,
+    session_id: &crate::domain::account::SessionIdentity,
+    runtime_st: &crate::domain::account::RuntimeState,
+    daemon_state: Option<&DaemonPersistentState>,
+    marked_ids: &HashSet<String>,
+    detail_view: bool,
+    detail_scroll: &mut usize,
+    cursor_idx: usize,
+    scroll_offset: &mut usize,
+    transient_status: &mut TransientStatus,
+    sigterm: &mut Option<tokio::signal::unix::Signal>,
+    sigint: &mut Option<tokio::signal::unix::Signal>,
+    sighup: &mut Option<tokio::signal::unix::Signal>,
+) -> bool {
+    let (targets, from_marked) = resolve_tui_targets(&snap.accounts, cursor_idx, marked_ids);
+    if targets.len() >= 2 {
+        let pairs: Vec<(String, String)> = targets
+            .iter()
+            .map(|a| (a.id.clone(), a.email.clone()))
+            .collect();
+        let total = pairs.len();
+        let init_msg = format!("Refreshing {total} marked account(s) (0/{total})...");
+        let _ = render_dashboard_full(&mut TuiFrameView {
+            accounts: &snap.accounts,
+            selected_id: snap.index.selected_account_id.as_deref(),
+            policy: cur_policy,
+            session_id,
+            runtime_st,
+            backend_tag: backend.name(),
+            daemon_state,
+            marked_ids,
+            detail_view,
+            detail_scroll,
+            cursor_idx,
+            scroll_offset,
+            transient_notice: Some(&init_msg),
+            now_unix: crate::domain::clock::current_unix_seconds(),
+        });
+        run_batch_refresh_in_tui(
+            repo,
+            backend,
+            cli_proxy,
+            &pairs,
+            if from_marked { "marked" } else { "enabled" },
+            marked_ids,
+            detail_view,
+            detail_scroll,
+            cursor_idx,
+            scroll_offset,
+            transient_status,
+            sigterm,
+            sigint,
+            sighup,
+        )
+        .await
+    } else if let Some(target) = targets.first().copied() {
+        run_single_refresh_in_tui(
+            repo,
+            backend,
+            cli_proxy,
+            snap,
+            cur_policy,
+            session_id,
+            runtime_st,
+            daemon_state,
+            marked_ids,
+            detail_view,
+            detail_scroll,
+            cursor_idx,
+            scroll_offset,
+            target,
+            transient_status,
+            sigterm,
+            sigint,
+            sighup,
+        )
+        .await
+    } else {
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_live_batch_progress(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
+    scope_label: &str,
+    marked_ids: &HashSet<String>,
+    detail_view: bool,
+    detail_scroll: &mut usize,
     cursor_idx: usize,
     scroll_offset: &mut usize,
     completed: usize,
@@ -1045,23 +2292,30 @@ fn render_live_batch_progress(
         let slot_st = backend.inspect_slot(repo.paths());
         let sess_id = resolve_session_identity(&slot_st, &live_snap);
         let run_st = observe_runtime_state(repo.paths());
+        let daemon_st = read_daemon_state_readonly(repo.paths()).ok();
         let cur_bounded = if live_snap.accounts.is_empty() {
             0
         } else {
             cursor_idx.min(live_snap.accounts.len() - 1)
         };
-        let prog_msg = format!("Refreshing {total} enabled account(s) ({completed}/{total})...");
-        let _ = render_dashboard(
-            &live_snap.accounts,
-            live_snap.index.selected_account_id.as_deref(),
-            &live_pol,
-            &sess_id,
-            &run_st,
-            backend.name(),
-            cur_bounded,
+        let prog_msg =
+            format!("Refreshing {total} {scope_label} account(s) ({completed}/{total})...");
+        let _ = render_dashboard_full(&mut TuiFrameView {
+            accounts: &live_snap.accounts,
+            selected_id: live_snap.index.selected_account_id.as_deref(),
+            policy: &live_pol,
+            session_id: &sess_id,
+            runtime_st: &run_st,
+            backend_tag: backend.name(),
+            daemon_state: daemon_st.as_ref(),
+            marked_ids,
+            detail_view,
+            detail_scroll,
+            cursor_idx: cur_bounded,
             scroll_offset,
-            Some(&prog_msg),
-        );
+            transient_notice: Some(&prog_msg),
+            now_unix: crate::domain::clock::current_unix_seconds(),
+        });
     }
 }
 
@@ -1084,6 +2338,10 @@ async fn run_batch_refresh_in_tui(
     backend: &dyn CredentialBackend,
     cli_proxy: Option<&str>,
     targets: &[(String, String)],
+    scope_label: &str,
+    marked_ids: &HashSet<String>,
+    detail_view: bool,
+    detail_scroll: &mut usize,
     cursor_idx: usize,
     scroll_offset: &mut usize,
     transient_status: &mut TransientStatus,
@@ -1128,6 +2386,10 @@ async fn run_batch_refresh_in_tui(
                     render_live_batch_progress(
                         repo,
                         backend,
+                        scope_label,
+                        marked_ids,
+                        detail_view,
+                        detail_scroll,
                         cursor_idx,
                         scroll_offset,
                         0,
@@ -1157,10 +2419,14 @@ async fn run_batch_refresh_in_tui(
     let oauth_ep = Arc::new(OAuthEndpoints::default());
     let quota_ep = Arc::new(CloudCodeEndpoints::default());
     let transport_dyn: Arc<dyn HttpTransport> = transport;
-    let outcome = run_tui_batch_refresh_loop(
+    let outcome = run_tui_batch_refresh_loop_with_marks(
         repo,
         backend,
         targets.to_vec(),
+        scope_label,
+        marked_ids,
+        detail_view,
+        detail_scroll,
         transport_dyn,
         registry,
         oauth_ep,
@@ -1195,7 +2461,7 @@ async fn run_batch_refresh_in_tui(
     } else if outcome.failures.is_empty() {
         transient_status.set_info(
             format!(
-                "{proxy_prefix}Refreshed {}/{total} enabled account(s).",
+                "{proxy_prefix}Refreshed {}/{total} {scope_label} account(s).",
                 outcome.ok_count
             ),
             done_at,
@@ -1224,11 +2490,60 @@ struct TuiBatchRefreshLoopOutcome {
     skipped_after_recovery: usize,
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_tui_batch_refresh_loop(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
     targets: Vec<(String, String)>,
+    transport: Arc<dyn HttpTransport>,
+    registry: Arc<OAuthClientRegistry>,
+    oauth_ep: Arc<OAuthEndpoints>,
+    quota_ep: Arc<CloudCodeEndpoints>,
+    ua: String,
+    concurrency: usize,
+    cursor_idx: usize,
+    scroll_offset: &mut usize,
+    render_tty_progress: bool,
+    sigterm: &mut Option<tokio::signal::unix::Signal>,
+    sigint: &mut Option<tokio::signal::unix::Signal>,
+    sighup: &mut Option<tokio::signal::unix::Signal>,
+) -> TuiBatchRefreshLoopOutcome {
+    let empty_marks = HashSet::new();
+    let mut dummy_detail_scroll = 0usize;
+    run_tui_batch_refresh_loop_with_marks(
+        repo,
+        backend,
+        targets,
+        "enabled",
+        &empty_marks,
+        false,
+        &mut dummy_detail_scroll,
+        transport,
+        registry,
+        oauth_ep,
+        quota_ep,
+        ua,
+        concurrency,
+        cursor_idx,
+        scroll_offset,
+        render_tty_progress,
+        sigterm,
+        sigint,
+        sighup,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_tui_batch_refresh_loop_with_marks(
+    repo: &StoreRepository,
+    backend: &dyn CredentialBackend,
+    targets: Vec<(String, String)>,
+    scope_label: &str,
+    marked_ids: &HashSet<String>,
+    detail_view: bool,
+    detail_scroll: &mut usize,
     transport: Arc<dyn HttpTransport>,
     registry: Arc<OAuthClientRegistry>,
     oauth_ep: Arc<OAuthEndpoints>,
@@ -1319,6 +2634,10 @@ async fn run_tui_batch_refresh_loop(
                         render_live_batch_progress(
                             repo,
                             backend,
+                            scope_label,
+                            marked_ids,
+                            detail_view,
+                            detail_scroll,
                             cursor_idx,
                             scroll_offset,
                             completed,
@@ -1357,7 +2676,18 @@ async fn run_tui_batch_refresh_loop(
             }
         }
         if render_tty_progress && completed < total && recovery_error.is_none() {
-            render_live_batch_progress(repo, backend, cursor_idx, scroll_offset, completed, total);
+            render_live_batch_progress(
+                repo,
+                backend,
+                scope_label,
+                marked_ids,
+                detail_view,
+                detail_scroll,
+                cursor_idx,
+                scroll_offset,
+                completed,
+                total,
+            );
         }
     }
 
@@ -1571,39 +2901,42 @@ fn current_terminal_size() -> (u16, u16) {
     terminal::size().unwrap_or((120, 24))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_dashboard(
-    accounts: &[crate::domain::account::AccountRecord],
-    selected_id: Option<&str>,
-    policy: &SwitchPolicy,
-    session_id: &crate::domain::account::SessionIdentity,
-    runtime_st: &crate::domain::account::RuntimeState,
-    backend_tag: &str,
+struct TuiFrameView<'a> {
+    accounts: &'a [crate::domain::account::AccountRecord],
+    selected_id: Option<&'a str>,
+    policy: &'a SwitchPolicy,
+    session_id: &'a crate::domain::account::SessionIdentity,
+    runtime_st: &'a crate::domain::account::RuntimeState,
+    backend_tag: &'a str,
+    daemon_state: Option<&'a DaemonPersistentState>,
+    marked_ids: &'a HashSet<String>,
+    detail_view: bool,
+    detail_scroll: &'a mut usize,
     cursor_idx: usize,
-    scroll_offset: &mut usize,
-    transient_notice: Option<&str>,
-) -> CliResult<()> {
+    scroll_offset: &'a mut usize,
+    transient_notice: Option<&'a str>,
+    now_unix: i64,
+}
+
+fn render_dashboard_full(view: &mut TuiFrameView<'_>) -> CliResult<String> {
     let (term_cols, term_rows) = current_terminal_size();
-    let rendered = build_dashboard_frame_with_backend(
-        accounts,
-        selected_id,
-        policy,
-        session_id,
-        runtime_st,
-        backend_tag,
-        cursor_idx,
-        scroll_offset,
-        transient_notice,
-        term_cols,
-        term_rows,
-    );
+    render_dashboard_full_with_size(view, term_cols, term_rows)
+}
+
+fn render_dashboard_full_with_size(
+    view: &mut TuiFrameView<'_>,
+    term_cols: u16,
+    term_rows: u16,
+) -> CliResult<String> {
+    let rendered = build_dashboard_frame_full(view, term_cols, term_rows);
 
     let mut out = io::stdout();
     execute!(out, cursor::MoveTo(0, 0), Clear(ClearType::All))
         .map_err(|e| CliError::io("tui_draw_error", format!("TUI draw error: {e}")))?;
     out.write_all(rendered.as_bytes())
         .and_then(|_| out.flush())
-        .map_err(|e| CliError::io("tui_write_error", format!("TUI write error: {e}")))
+        .map_err(|e| CliError::io("tui_write_error", format!("TUI write error: {e}")))?;
+    Ok(rendered)
 }
 
 #[cfg(test)]
@@ -1635,6 +2968,42 @@ fn build_dashboard_frame(
     )
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn build_dashboard_frame_with_backend(
+    accounts: &[crate::domain::account::AccountRecord],
+    selected_id: Option<&str>,
+    policy: &SwitchPolicy,
+    session_id: &crate::domain::account::SessionIdentity,
+    runtime_st: &crate::domain::account::RuntimeState,
+    backend_tag: &str,
+    cursor_idx: usize,
+    scroll_offset: &mut usize,
+    transient_notice: Option<&str>,
+    term_cols: u16,
+    term_rows: u16,
+) -> String {
+    let empty_marks = HashSet::new();
+    let mut detail_scroll = 0usize;
+    let mut view = TuiFrameView {
+        accounts,
+        selected_id,
+        policy,
+        session_id,
+        runtime_st,
+        backend_tag,
+        daemon_state: None,
+        marked_ids: &empty_marks,
+        detail_view: false,
+        detail_scroll: &mut detail_scroll,
+        cursor_idx,
+        scroll_offset,
+        transient_notice,
+        now_unix: crate::domain::clock::current_unix_seconds(),
+    };
+    build_dashboard_frame_full(&mut view, term_cols, term_rows)
+}
+
 fn format_tui_switch_status_notice(
     proxy_prefix: &str,
     out: &crate::switching::executor::SwitchOutcome,
@@ -1656,20 +3025,542 @@ fn format_tui_switch_status_notice(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_dashboard_frame_with_backend(
+fn format_account_email_with_label(acc: &crate::domain::account::AccountRecord) -> String {
+    let email = terminal_text(&acc.email);
+    if let Some(ref lbl) = acc.custom_label {
+        let clean = terminal_text(lbl)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !clean.is_empty() {
+            return format!("{email} ({clean})");
+        }
+    }
+    email
+}
+
+fn format_daemon_policy_suffix(
+    daemon_state: Option<&DaemonPersistentState>,
+    now_unix: i64,
+) -> String {
+    let Some(ds) = daemon_state else {
+        return String::new();
+    };
+    if ds.paused_on_failure {
+        return " · PAUSED (run status)".into();
+    }
+    if ds.cooldown_until > now_unix {
+        let rem = ds.cooldown_until - now_unix;
+        if rem >= 3600 {
+            return format!(" · cooldown {}h {:02}m", rem / 3600, (rem % 3600) / 60);
+        }
+        if rem >= 60 {
+            return format!(" · cooldown {}m", rem / 60);
+        }
+        return format!(" · cooldown {rem}s");
+    }
+    String::new()
+}
+
+fn format_marked_footer_summary(
     accounts: &[crate::domain::account::AccountRecord],
-    selected_id: Option<&str>,
+    marked_ids: &HashSet<String>,
+    max_cols: usize,
+) -> Option<String> {
+    let marked_emails: Vec<String> = accounts
+        .iter()
+        .filter(|a| marked_ids.contains(&a.id))
+        .map(|a| terminal_text(&a.email))
+        .collect();
+    let total = marked_emails.len();
+    if total == 0 || max_cols == 0 {
+        return None;
+    }
+
+    let prefix = format!("Marked ({total}): ");
+    let suffix = "  [Esc to clear]";
+    let overhead = display_width(&prefix) + display_width(suffix);
+    if overhead >= max_cols {
+        return Some(truncate_to_cols(
+            &format!("Marked ({total}) [Esc clears]"),
+            max_cols,
+        ));
+    }
+
+    let budget = max_cols - overhead;
+    let mut shown = String::new();
+    let mut shown_count = 0usize;
+    for (idx, email) in marked_emails.iter().enumerate() {
+        let rem_after = total - idx - 1;
+        let more_tag = if rem_after > 0 {
+            format!(" +{rem_after} more")
+        } else {
+            String::new()
+        };
+        let sep = if shown.is_empty() { "" } else { ", " };
+        let cand_width = display_width(&shown) + display_width(sep) + display_width(email);
+        if cand_width + display_width(&more_tag) <= budget {
+            shown.push_str(sep);
+            shown.push_str(email);
+            shown_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    if shown_count == 0 {
+        let fallback_more = format!("+{total} account(s)");
+        let combined = format!("{prefix}{fallback_more}{suffix}");
+        if display_width(&combined) <= max_cols {
+            return Some(combined);
+        }
+        return Some(truncate_to_cols(
+            &format!("Marked ({total}) [Esc clears]"),
+            max_cols,
+        ));
+    }
+
+    let remaining = total - shown_count;
+    let body = if remaining > 0 {
+        format!("{prefix}{shown} +{remaining} more{suffix}")
+    } else {
+        format!("{prefix}{shown}{suffix}")
+    };
+    Some(truncate_to_cols(&body, max_cols))
+}
+
+fn format_token_expiry_countdown(expiry_unix: i64, now_unix: i64) -> String {
+    if expiry_unix <= 0 {
+        return "unknown".into();
+    }
+    let local_str = format_unix_local_minute(expiry_unix);
+    let rem = expiry_unix - now_unix;
+    if rem <= 0 {
+        format!("{local_str} (expired)")
+    } else if rem >= 3600 {
+        format!("{local_str} (in {}h {:02}m)", rem / 3600, (rem % 3600) / 60)
+    } else {
+        format!("{local_str} (in {}m)", (rem / 60).max(1))
+    }
+}
+
+fn split_grapheme_chunks(s: &str, max_cols: usize) -> Vec<String> {
+    let budget = max_cols.max(1);
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for g in UnicodeSegmentation::graphemes(s, true) {
+        let gw = display_width(g);
+        if !cur.is_empty() && cur_w + gw > budget {
+            chunks.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push_str(g);
+        cur_w += gw;
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+fn wrap_family_models_lines(family_label: &str, items: &[&str], max_cols: usize) -> Vec<String> {
+    if items.is_empty() || max_cols == 0 {
+        return Vec::new();
+    }
+    let inline_prefix = format!("  {:<10} : ", family_label);
+    let inline_prefix_w = display_width(&inline_prefix);
+    let mut out = Vec::new();
+    let (first_prefix, cont_indent, content_budget) = if max_cols >= inline_prefix_w + 8 {
+        (
+            inline_prefix,
+            " ".repeat(inline_prefix_w),
+            max_cols - inline_prefix_w,
+        )
+    } else {
+        out.push(truncate_to_cols(&format!("  {family_label}:"), max_cols));
+        let indent = if max_cols >= 6 { "    " } else { "" };
+        let indent_w = display_width(indent);
+        (
+            indent.to_string(),
+            indent.to_string(),
+            max_cols.saturating_sub(indent_w).max(1),
+        )
+    };
+
+    let mut cur_line = String::new();
+    let mut first = true;
+    let push_line = |out: &mut Vec<String>, first: &mut bool, text: String| {
+        if *first {
+            out.push(format!("{first_prefix}{text}"));
+            *first = false;
+        } else {
+            out.push(format!("{cont_indent}{text}"));
+        }
+    };
+
+    for (idx, item) in items.iter().enumerate() {
+        let token = if idx + 1 < items.len() {
+            format!("{item},")
+        } else {
+            (*item).to_string()
+        };
+        if !cur_line.is_empty()
+            && display_width(&cur_line) + 1 + display_width(&token) <= content_budget
+        {
+            cur_line.push(' ');
+            cur_line.push_str(&token);
+        } else {
+            if !cur_line.is_empty() {
+                push_line(&mut out, &mut first, std::mem::take(&mut cur_line));
+            }
+            if display_width(&token) <= content_budget {
+                cur_line = token;
+            } else {
+                let mut chunks = split_grapheme_chunks(&token, content_budget);
+                if let Some(last) = chunks.pop() {
+                    for chunk in chunks {
+                        push_line(&mut out, &mut first, chunk);
+                    }
+                    cur_line = last;
+                }
+            }
+        }
+    }
+    if !cur_line.is_empty() {
+        push_line(&mut out, &mut first, cur_line);
+    }
+    out
+}
+
+fn build_account_detail_lines(
+    acc: &crate::domain::account::AccountRecord,
     policy: &SwitchPolicy,
-    session_id: &crate::domain::account::SessionIdentity,
-    runtime_st: &crate::domain::account::RuntimeState,
-    backend_tag: &str,
-    cursor_idx: usize,
-    scroll_offset: &mut usize,
-    transient_notice: Option<&str>,
+    is_selected: bool,
+    is_marked: bool,
+    now_unix: i64,
+    inner_width: usize,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::with_capacity(24);
+    let mut badges = Vec::new();
+    if is_selected {
+        badges.push("[active]");
+    }
+    if is_marked {
+        badges.push("[marked]");
+    }
+    let badge_suffix = if badges.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", badges.join(" "))
+    };
+    lines.push(format!(
+        "Account : {}{badge_suffix}",
+        format_account_email_with_label(acc)
+    ));
+    lines.push(format!("ID      : {}", terminal_text(&acc.id)));
+
+    let plan_raw = acc
+        .quota
+        .as_ref()
+        .and_then(|q| q.subscription_tier.as_deref())
+        .map(terminal_text)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "—".into());
+    let state_str = if acc.disabled {
+        "disabled"
+    } else if acc.is_validation_blocked_at(now_unix) {
+        "verify-blocked"
+    } else {
+        "ok"
+    };
+    let policy_str = policy
+        .candidate_account_ids
+        .iter()
+        .position(|cid| cid == &acc.id)
+        .map(|p| {
+            if acc.disabled {
+                format!("cand #{} (skip)", p + 1)
+            } else {
+                format!("cand #{}", p + 1)
+            }
+        })
+        .unwrap_or_else(|| "—".into());
+    lines.push(format!(
+        "Plan    : {plan_raw} · State: {state_str} · Policy: {policy_str}"
+    ));
+
+    if acc.disabled {
+        let reason_line = match acc.disabled_code {
+            Some(DisableReasonCode::RevokedOrExpiredGrant) => {
+                "RevokedOrExpiredGrant (run `auth reauthorize`)"
+            }
+            Some(DisableReasonCode::ScopeReauthRequired) => {
+                "ScopeReauthRequired (run `auth reauthorize`)"
+            }
+            Some(DisableReasonCode::AccountSuspended) => "AccountSuspended",
+            Some(DisableReasonCode::Manual) | None => "Manual (disabled by user)",
+        };
+        lines.push(format!("Reason  : {reason_line}"));
+    } else if acc.is_validation_blocked_at(now_unix) {
+        lines.push(
+            "Reason  : Google 403 VALIDATION_REQUIRED — switch in, open agy to verify, press r."
+                .into(),
+        );
+    }
+
+    let oauth_client = acc
+        .token
+        .oauth_client_key
+        .as_deref()
+        .map(terminal_text)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "antigravity_enterprise".into());
+    lines.push(format!(
+        "OAuth   : {oauth_client} · Token expires: {}",
+        format_token_expiry_countdown(acc.token.expiry_timestamp, now_unix)
+    ));
+
+    if let Some(ref q) = acc.quota {
+        let eval_tag = match evaluate_account_quota(
+            acc,
+            &policy.monitored_model,
+            now_unix,
+            DEFAULT_QUOTA_MAX_AGE_SECS,
+        ) {
+            QuotaEval::Known {
+                remaining_percentage,
+            } => format!(
+                "known ({remaining_percentage:.0}% on {})",
+                terminal_text(&policy.monitored_model)
+            ),
+            QuotaEval::Stale { reason } => format!("stale ({})", terminal_text(&reason)),
+            QuotaEval::Unknown { reason } => format!("unknown ({})", terminal_text(&reason)),
+            QuotaEval::Unavailable { reason } => {
+                format!("unavailable ({})", terminal_text(&reason))
+            }
+        };
+        lines.push(format!(
+            "Updated : {} ({} · source: {:?} · {eval_tag})",
+            format_unix_local_minute(q.last_updated),
+            format_relative_age(q.last_updated, now_unix),
+            q.source_env,
+        ));
+    } else {
+        lines.push("Updated : never refreshed (press r to fetch)".into());
+    }
+
+    lines.push(String::new());
+    lines.push("Quotas  :".into());
+    let mut rendered_any_bucket = false;
+    if let Some(ref q) = acc.quota {
+        if let Some(ref groups) = q.quota_groups {
+            for (target_pool, pool_label) in [
+                (QuotaPool::Gemini, "Gemini"),
+                (QuotaPool::ThirdParty, "Claude/GPT"),
+                (QuotaPool::Argon, "Argon"),
+            ] {
+                let mut rows_for_pool: Vec<(u8, String, Option<i32>, String)> = Vec::new();
+                for g in groups {
+                    for b in &g.buckets {
+                        if quota_pool(&b.bucket_id, &g.display_name) != Some(target_pool) {
+                            continue;
+                        }
+                        let win = format_window_label(&b.window, &b.bucket_id);
+                        let sort_key = if win == "Weekly" {
+                            0
+                        } else if win == "5h" {
+                            1
+                        } else {
+                            2
+                        };
+                        let pct = observed_quota_percentage(
+                            b.remaining_fraction,
+                            b.remaining_fraction_known,
+                        );
+                        let reset_str = format_reset_local(&b.reset_time, now_unix);
+                        rows_for_pool.push((sort_key, win, pct, reset_str));
+                    }
+                }
+                rows_for_pool.sort_by_key(|r| r.0);
+                for (i, (_, win, pct, reset_str)) in rows_for_pool.into_iter().enumerate() {
+                    rendered_any_bucket = true;
+                    let prefix = if i == 0 {
+                        format!("  {pool_label:<11}")
+                    } else {
+                        "             ".to_string()
+                    };
+                    let bar = format_bar_and_pct(pct);
+                    lines.push(format!("{prefix}  {win:<6}  {bar}   resets {reset_str}"));
+                }
+            }
+        }
+    }
+    if !rendered_any_bucket {
+        lines.push("  (no cached quota buckets — press r to refresh)".into());
+    }
+
+    lines.push(String::new());
+    match acc.quota.as_ref().map(extract_supported_models) {
+        None => {
+            lines.push("Models  : unknown (press r to refresh)".into());
+        }
+        Some(models) if models.is_empty() => {
+            lines.push("Models  : none reported".into());
+        }
+        Some(models) => {
+            lines.push(format!("Models ({} available):", models.len()));
+            let mut gemini = Vec::new();
+            let mut third_party = Vec::new();
+            let mut other = Vec::new();
+            for m in &models {
+                let lower = m.to_ascii_lowercase();
+                if lower.starts_with("gemini") {
+                    gemini.push(m.as_str());
+                } else if lower.starts_with("claude") || lower.starts_with("gpt") {
+                    third_party.push(m.as_str());
+                } else {
+                    other.push(m.as_str());
+                }
+            }
+            for (family, items) in [
+                ("Gemini", gemini),
+                ("Claude/GPT", third_party),
+                ("Other", other),
+            ] {
+                lines.extend(wrap_family_models_lines(family, &items, inner_width));
+            }
+        }
+    }
+
+    lines
+}
+
+fn slice_detail_lines_with_scroll(
+    logical_lines: &[String],
+    detail_scroll: &mut usize,
+    inner_rows: usize,
+) -> Vec<String> {
+    if inner_rows == 0 {
+        *detail_scroll = 0;
+        return Vec::new();
+    }
+    let total = logical_lines.len();
+    if total <= inner_rows {
+        *detail_scroll = 0;
+        return logical_lines.to_vec();
+    }
+    if inner_rows <= 2 {
+        let max_scroll = total.saturating_sub(inner_rows);
+        *detail_scroll = (*detail_scroll).min(max_scroll);
+        let end = (*detail_scroll + inner_rows).min(total);
+        return logical_lines[*detail_scroll..end].to_vec();
+    }
+
+    let edge_cap = inner_rows - 1;
+    let max_scroll = total.saturating_sub(edge_cap);
+    *detail_scroll = (*detail_scroll).min(max_scroll);
+    let scroll = *detail_scroll;
+
+    let mut out = Vec::with_capacity(inner_rows);
+    if scroll == 0 {
+        out.extend_from_slice(&logical_lines[0..edge_cap]);
+        let below = total - edge_cap;
+        out.push(format!(
+            "  ... ({below} more line(s) below — press ↓ to scroll)"
+        ));
+    } else if scroll >= max_scroll {
+        out.push(format!(
+            "  ... ({scroll} more line(s) above — press ↑ to scroll)"
+        ));
+        out.extend_from_slice(&logical_lines[max_scroll..total]);
+    } else {
+        let mid_cap = inner_rows - 2;
+        let end = (scroll + mid_cap).min(total);
+        let below = total.saturating_sub(end);
+        out.push(format!(
+            "  ... ({scroll} more line(s) above — press ↑ to scroll)"
+        ));
+        out.extend_from_slice(&logical_lines[scroll..end]);
+        out.push(format!(
+            "  ... ({below} more line(s) below — press ↓ to scroll)"
+        ));
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_detail_card_lines(
+    acc: &crate::domain::account::AccountRecord,
+    policy: &SwitchPolicy,
+    is_selected: bool,
+    is_marked: bool,
+    detail_scroll: &mut usize,
+    now_unix: i64,
+    cols: usize,
+    avail_rows: usize,
+) -> Vec<String> {
+    if avail_rows == 0 || cols == 0 {
+        return Vec::new();
+    }
+    let use_box = cols >= 40 && avail_rows >= 5;
+    if use_box {
+        let inner_w = cols - 4; // `│ <inner_w> │`
+        let inner_rows = avail_rows - 2;
+        let logical =
+            build_account_detail_lines(acc, policy, is_selected, is_marked, now_unix, inner_w);
+        let visible = slice_detail_lines_with_scroll(&logical, detail_scroll, inner_rows);
+        let mut out = Vec::with_capacity(visible.len() + 2);
+        out.push(format!("┌{}┐", "─".repeat(cols - 2)));
+        for line in visible {
+            let clipped = truncate_to_cols(&line, inner_w);
+            let pad = inner_w.saturating_sub(display_width(&clipped));
+            out.push(format!("│ {clipped}{} │", " ".repeat(pad)));
+        }
+        out.push(format!("└{}┘", "─".repeat(cols - 2)));
+        out
+    } else {
+        let logical =
+            build_account_detail_lines(acc, policy, is_selected, is_marked, now_unix, cols);
+        let visible = slice_detail_lines_with_scroll(&logical, detail_scroll, avail_rows);
+        visible
+            .into_iter()
+            .map(|line| truncate_to_cols(&line, cols))
+            .collect()
+    }
+}
+
+fn detail_keys_help_for_width(cols: usize) -> String {
+    let candidate = if cols >= display_width(TUI_DETAIL_KEYS_LINE) {
+        TUI_DETAIL_KEYS_LINE
+    } else if cols >= 80 {
+        "Keys   : ←/→ account · ↑/↓ scroll · Space mark · l lbl · r ref · k cd · s sw · i/Esc back"
+    } else if cols >= 56 {
+        "Keys   : ←/→ acc · ↑/↓ scr · Spc · l · r · k · s · i/Esc"
+    } else {
+        "Keys: ←/→ · ↑/↓ · l · r · s · i/Esc back"
+    };
+    truncate_to_cols(candidate, cols)
+}
+
+fn build_dashboard_frame_full(
+    view: &mut TuiFrameView<'_>,
     term_cols: u16,
     term_rows: u16,
 ) -> String {
+    let accounts = view.accounts;
+    let selected_id = view.selected_id;
+    let policy = view.policy;
+    let session_id = view.session_id;
+    let runtime_st = view.runtime_st;
+    let backend_tag = view.backend_tag;
+    let daemon_state = view.daemon_state;
+    let marked_ids = view.marked_ids;
+    let detail_view = view.detail_view;
+    let cursor_idx = view.cursor_idx;
+    let transient_notice = view.transient_notice;
+    let now_unix = view.now_unix;
+
     let cols = term_cols as usize;
     let rows = term_rows as usize;
     let cur = if accounts.is_empty() {
@@ -1678,7 +3569,7 @@ fn build_dashboard_frame_with_backend(
         cursor_idx.min(accounts.len() - 1)
     };
     if cols == 0 || rows == 0 {
-        *scroll_offset = cur;
+        *view.scroll_offset = cur;
         return String::new();
     }
 
@@ -1694,8 +3585,9 @@ fn build_dashboard_frame_with_backend(
     let compact_cols = cols < 116;
 
     let state_tag = if policy.enabled { "ON" } else { "off" };
+    let daemon_suffix = format_daemon_policy_suffix(daemon_state, now_unix);
     let policy_header = format!(
-        "{state_tag} (reserve {}% / min {}%, {:?}, {:?}, model={})",
+        "{state_tag} (reserve {}% / min {}%, {:?}, {:?}, model={}){daemon_suffix}",
         policy.reserve_percentage,
         policy.candidate_min_percentage,
         policy.mode,
@@ -1737,7 +3629,9 @@ fn build_dashboard_frame_with_backend(
         vec![compact_session_line.clone()]
     };
     let keys_line = keys_help_for_width(cols);
-    let footer_help_lines: Vec<String> = if rows >= 14 {
+    let footer_help_lines: Vec<String> = if detail_view && !accounts.is_empty() {
+        vec![detail_keys_help_for_width(cols)]
+    } else if rows >= 14 {
         keys_help_two_lines_for_width(cols).to_vec()
     } else {
         vec![keys_line.clone()]
@@ -1746,27 +3640,126 @@ fn build_dashboard_frame_with_backend(
         Some(msg) if !msg.is_empty() => {
             truncate_to_cols(&format!("Status: {}", terminal_text(msg)), cols)
         }
-        _ => String::new(),
+        _ => match format_marked_footer_summary(
+            accounts,
+            marked_ids,
+            cols.saturating_sub("Status: ".len()),
+        ) {
+            Some(marked_summary) => truncate_to_cols(&format!("Status: {marked_summary}"), cols),
+            None => String::new(),
+        },
     };
+
+    let marked_count = accounts
+        .iter()
+        .filter(|a| marked_ids.contains(&a.id))
+        .count();
+    let marked_title_part = if marked_count > 0 {
+        format!(" · {marked_count} marked")
+    } else {
+        String::new()
+    };
+
+    if detail_view && !accounts.is_empty() {
+        let acc = &accounts[cur];
+        let is_sel = selected_id == Some(acc.id.as_str());
+        let is_marked = marked_ids.contains(&acc.id);
+        let mut frame_lines: Vec<String> = Vec::with_capacity(rows);
+        if rows < 5 {
+            let title = truncate_to_cols(
+                &format!(
+                    "Detail [{}/{}]: {}",
+                    cur + 1,
+                    accounts.len(),
+                    format_account_email_with_label(acc)
+                ),
+                cols,
+            );
+            let footer_or_status = if !status_line.is_empty() {
+                status_line
+            } else {
+                detail_keys_help_for_width(cols)
+            };
+            frame_lines.push(title);
+            if rows >= 2 {
+                let body_rows = rows.saturating_sub(2);
+                if body_rows > 0 {
+                    frame_lines.extend(render_detail_card_lines(
+                        acc,
+                        policy,
+                        is_sel,
+                        is_marked,
+                        view.detail_scroll,
+                        now_unix,
+                        cols,
+                        body_rows,
+                    ));
+                }
+                frame_lines.push(footer_or_status);
+            }
+            frame_lines.truncate(rows);
+            return frame_lines.join("\r\n");
+        }
+
+        let title = format!(
+            "agy-switch-cli Headless SSH Dashboard  [Account Detail {}/{}{marked_title_part} — ←/→ account · ↑/↓ scroll · i/Esc back]",
+            cur + 1,
+            accounts.len()
+        );
+        let reserved_status = usize::from(!status_line.is_empty());
+        let fixed_chrome =
+            1 + status_header_lines.len() + footer_help_lines.len() + reserved_status;
+        let avail_rows = rows.saturating_sub(fixed_chrome).max(1);
+        frame_lines.push(truncate_to_cols(&title, cols));
+        frame_lines.extend(status_header_lines);
+        frame_lines.extend(render_detail_card_lines(
+            acc,
+            policy,
+            is_sel,
+            is_marked,
+            view.detail_scroll,
+            now_unix,
+            cols,
+            avail_rows,
+        ));
+        frame_lines.extend(footer_help_lines);
+        if !status_line.is_empty() {
+            frame_lines.push(status_line);
+        }
+        frame_lines.truncate(rows);
+        return frame_lines.join("\r\n");
+    }
 
     let format_compact_row = |idx: usize| -> String {
         let acc = &accounts[idx];
         let sum = &summaries[idx];
         let is_sel = selected_id == Some(acc.id.as_str());
+        let is_marked = marked_ids.contains(&acc.id);
         if cols == 1 {
             return if idx == cur {
                 ">".into()
             } else if is_sel {
                 "*".into()
+            } else if is_marked {
+                "+".into()
             } else {
                 " ".into()
             };
         }
-        let marker = match (idx == cur, is_sel) {
-            (true, true) => ">*",
-            (true, false) => "> ",
-            (false, true) => " *",
-            (false, false) => "  ",
+        let marker = if is_marked {
+            match (idx == cur, is_sel) {
+                (true, true) => ">*+",
+                (true, false) => "> +",
+                (false, true) => " *+",
+                (false, false) => "  +",
+            }
+        } else {
+            match (idx == cur, is_sel) {
+                (true, true) => ">*",
+                (true, false) => "> ",
+                (false, true) => " *",
+                (false, false) => "  ",
+            }
         };
         if cols <= 3 {
             return truncate_to_cols(marker.trim_end(), cols);
@@ -1800,7 +3793,7 @@ fn build_dashboard_frame_with_backend(
             &format!(
                 "{marker} #{} {}{} | Gem {} | 3P {}{}{}",
                 idx + 1,
-                terminal_text(&acc.email),
+                format_account_email_with_label(acc),
                 state_tag,
                 sum.gemini.format_dual_compact(),
                 sum.third_party.format_dual_compact(),
@@ -1813,7 +3806,7 @@ fn build_dashboard_frame_with_backend(
 
     // Ultra-short physical terminals (1..=4 rows): stay strictly within `rows` without elevating budget.
     if rows < 5 {
-        *scroll_offset = cur;
+        *view.scroll_offset = cur;
         let mut tiny: Vec<String> = Vec::with_capacity(rows);
         let footer_or_status = if !status_line.is_empty() {
             status_line
@@ -1857,7 +3850,7 @@ fn build_dashboard_frame_with_backend(
             let focus_line = format_compact_row(cur);
             let title_line = truncate_to_cols(
                 &format!(
-                    "agy-switch-cli Headless SSH Dashboard  [{}/{}]",
+                    "agy-switch-cli Headless SSH Dashboard  [{}/{}{marked_title_part}]",
                     cur + 1,
                     accounts.len()
                 ),
@@ -1906,7 +3899,7 @@ fn build_dashboard_frame_with_backend(
     let table_border_overhead = 3 * num_table_cols + 1;
 
     let idx_col_w = accounts.len().to_string().len().max(3); // fits `"..."` and `"12"`
-    let sel_col_w = 3usize; // `"Sel"` / `">*"`
+    let sel_col_w = 3usize; // `"Sel"` / `">*+"`
     let id_col_w = if show_id_col {
         accounts
             .iter()
@@ -2050,12 +4043,22 @@ fn build_dashboard_frame_with_backend(
                 let acc = &accounts[idx];
                 let sum = &summaries[idx];
                 let dto = AccountViewDto::from_record(acc, selected_id == Some(acc.id.as_str()));
+                let is_marked = marked_ids.contains(&acc.id);
                 let row_no = format!("{}", idx + 1);
-                let pointer = match (idx == cur, dto.is_selected) {
-                    (true, true) => ">*",
-                    (true, false) => "> ",
-                    (false, true) => " *",
-                    (false, false) => "  ",
+                let pointer = if is_marked {
+                    match (idx == cur, dto.is_selected) {
+                        (true, true) => ">*+",
+                        (true, false) => "> +",
+                        (false, true) => " *+",
+                        (false, false) => "  +",
+                    }
+                } else {
+                    match (idx == cur, dto.is_selected) {
+                        (true, true) => ">* ",
+                        (true, false) => ">  ",
+                        (false, true) => " * ",
+                        (false, false) => "   ",
+                    }
                 };
                 let plan_str = truncate_to_cols(&short_plan_label(&sum.plan), plan_col_w);
                 let policy_str = truncate_to_cols(&policy_str_for(acc), policy_col_w);
@@ -2071,7 +4074,7 @@ fn build_dashboard_frame_with_backend(
                     )));
                 }
                 cells.push(Cell::new(truncate_to_cols(
-                    &terminal_text(&dto.email),
+                    &format_account_email_with_label(acc),
                     effective_email_cap,
                 )));
                 cells.push(Cell::new(plan_str));
@@ -2113,7 +4116,7 @@ fn build_dashboard_frame_with_backend(
     let mut frame_lines: Vec<String> = Vec::with_capacity(rows);
 
     if accounts.is_empty() {
-        *scroll_offset = 0;
+        *view.scroll_offset = 0;
         frame_lines.push(truncate_to_cols(
             "agy-switch-cli Headless SSH Dashboard  [0 accounts]",
             cols,
@@ -2146,7 +4149,7 @@ fn build_dashboard_frame_with_backend(
             let (start, end, show_top, show_bottom) = compute_viewport_with_indicators(
                 accounts.len(),
                 cur,
-                *scroll_offset,
+                *view.scroll_offset,
                 max_rows_upper,
             );
             let expected_visual_rows = (end - start)
@@ -2163,15 +4166,15 @@ fn build_dashboard_frame_with_backend(
         }
 
         if let Some((start, end, tbl_str)) = table_choice {
-            *scroll_offset = start;
+            *view.scroll_offset = start;
             let title = if start == 0 && end == accounts.len() {
                 format!(
-                    "agy-switch-cli Headless SSH Dashboard  [{} account(s)]",
+                    "agy-switch-cli Headless SSH Dashboard  [{} account(s){marked_title_part}]",
                     accounts.len()
                 )
             } else {
                 format!(
-                    "agy-switch-cli Headless SSH Dashboard  [Showing {}-{} of {} — ↑/↓ scroll]",
+                    "agy-switch-cli Headless SSH Dashboard  [Showing {}-{} of {}{marked_title_part} — ↑/↓ scroll]",
                     start + 1,
                     end,
                     accounts.len()
@@ -2193,19 +4196,19 @@ fn build_dashboard_frame_with_backend(
             let (start, end, show_top, show_bottom) = compute_viewport_with_indicators(
                 accounts.len(),
                 cur,
-                *scroll_offset,
+                *view.scroll_offset,
                 max_table_lines.max(1),
             );
-            *scroll_offset = start;
+            *view.scroll_offset = start;
 
             let title = if start == 0 && end == accounts.len() {
                 format!(
-                    "agy-switch-cli Headless SSH Dashboard  [{} account(s)]",
+                    "agy-switch-cli Headless SSH Dashboard  [{} account(s){marked_title_part}]",
                     accounts.len()
                 )
             } else {
                 format!(
-                    "agy-switch-cli Headless SSH Dashboard  [Showing {}-{} of {} — ↑/↓ scroll]",
+                    "agy-switch-cli Headless SSH Dashboard  [Showing {}-{} of {}{marked_title_part} — ↑/↓ scroll]",
                     start + 1,
                     end,
                     accounts.len()
@@ -2347,17 +4350,21 @@ fn compute_viewport_with_indicators(
 fn keys_help_two_lines_for_width(cols: usize) -> [String; 2] {
     let l1 = if cols >= display_width(TUI_KEYS_LINE_1) {
         TUI_KEYS_LINE_1
+    } else if cols >= 80 {
+        "Keys   : ↑/↓ select · g/G top/end · [/] reorder · Space · s sw · i info · q quit"
     } else if cols >= 62 {
-        "Keys   : ↑/↓ sel · g/G top/end · [/] order · s switch · q quit"
+        "Keys   : ↑/↓ sel · g/G end · [/] ord · Spc · s · i · q quit"
     } else {
-        "Keys   : ↑/↓ sel · g/G end · [/] ord · s sw · q quit"
+        "Keys   : ↑/↓ · g/G · [/] · Spc · s · i · q"
     };
     let l2 = if cols >= display_width(TUI_KEYS_LINE_2) {
         TUI_KEYS_LINE_2
+    } else if cols >= 80 {
+        "Manage : r/R refresh · c/C cand · p · k cd · e/E · d/D · l lbl · o/O exp · x del"
     } else if cols >= 62 {
-        "Manage : r/R ref · c/C cand · p pol · e/E en · d/D dis · x del"
+        "Manage : r/R · c/C · p · k · e/E · d/D · l · o/O · x del"
     } else {
-        "Manage : r/R · c/C · p pol · e/E · d/D · x del"
+        "Manage : r/R · c/C · p · k · e/E · d/D · l · o/O · x"
     };
     [truncate_to_cols(l1, cols), truncate_to_cols(l2, cols)]
 }
@@ -2365,14 +4372,16 @@ fn keys_help_two_lines_for_width(cols: usize) -> [String; 2] {
 fn keys_help_for_width(cols: usize) -> String {
     let candidate = if cols >= display_width(TUI_KEYS_HELP_LINE) {
         TUI_KEYS_HELP_LINE
+    } else if cols >= 148 {
+        "Keys: ↑/↓ sel · g/G top/end · [/] order · Space mark · s sw · i info · r/R ref · c/C cand · p · k cd · e/E en · d/D dis · l lbl · o/O exp · x del"
     } else if cols >= 116 {
-        "Keys: ↑/↓ sel · g/G top/end · [/] order · s switch · r/R ref · c/C cand · p pol · e/E en · d/D dis · x del · q quit"
+        "Keys: ↑/↓ sel · g/G end · [/] ord · Spc · s sw · i · r/R ref · c/C · p · k · e/E en · d/D dis · l · o/O exp · x del"
     } else if cols >= 96 {
-        "Keys: ↑/↓ sel · g/G end · [/] ord · s sw · r/R ref · c/C · p · e/E en · d/D dis · x del · q quit"
+        "Keys: ↑/↓ · g/G end · [/] ord · Spc/s/i · r/R · c/C · p/k · e/E en · d/D dis · l · o/O · x del"
     } else if cols >= 86 {
-        "Keys: ↑/↓ · g/G end · [/] ord · s sw · r/R · c/C · p · e/E en · d/D dis · x del · q"
+        "Keys: ↑/↓ · g/G end · [/] ord · Spc/s/i · r/R/c/p/k · e/E en · d/D dis · l/o · x del"
     } else {
-        "Keys: ↑/↓ · g/G · [/] · s sw · r/R · c/C · p · e/E · d/D · x del · q quit"
+        "Keys: ↑/↓ · g/G · [/] · Spc/s/i · r/R/c/C/p/k · e/E · d/D · l/o/O · x · q"
     };
     truncate_to_cols(candidate, cols)
 }
@@ -3339,11 +5348,18 @@ mod tests {
         );
         assert!(display_width(&help_74) <= 74);
 
+        let two_120 = keys_help_two_lines_for_width(120);
+        assert_eq!(two_120[0], TUI_KEYS_LINE_1);
+        assert_eq!(two_120[1], TUI_KEYS_LINE_2);
+        assert_eq!(two_120[0].find(" : "), two_120[1].find(" : "));
         let two_80 = keys_help_two_lines_for_width(80);
-        assert_eq!(two_80[0], TUI_KEYS_LINE_1);
-        assert_eq!(two_80[1], TUI_KEYS_LINE_2);
-        assert_eq!(two_80[0].find(" : "), two_80[1].find(" : "));
-        for cols in [56usize, 60, 62, 70, 78, 120] {
+        assert!(two_80[0].contains("Keys   : ↑/↓ select · g/G top/end · [/] reorder"));
+        assert!(two_80[0].contains("Space") && two_80[0].contains("i info"));
+        assert!(two_80[1].contains("Manage : r/R refresh · c/C cand"));
+        assert!(
+            two_80[1].contains("k cd") && two_80[1].contains("l lbl") && two_80[1].contains("o/O")
+        );
+        for cols in [56usize, 60, 62, 70, 78, 80, 120] {
             let two = keys_help_two_lines_for_width(cols);
             assert_eq!(
                 two[0].find(" : "),
@@ -3615,7 +5631,7 @@ mod tests {
         repo.with_write_lock(|tx| tx.upsert_account(a3.clone(), false, 100))
             .unwrap();
         assert_eq!(
-            PendingTuiConfirm::DisableAll { enabled_count: 2 }.prompt_message(),
+            PendingTuiConfirm::DisableAll { enabled_count: 2 }.prompt_message_for_cols(120),
             "Disable all 2 account(s)? Press 'y' to confirm (any other key cancels)."
         );
         let mut st_batch = TransientStatus::default();
@@ -4005,5 +6021,588 @@ mod tests {
             ),
             "160-col TUI frame must include full email and account ID: {frame_running_160}"
         );
+    }
+
+    #[test]
+    fn synthetic_v124_tui_marked_selection_export_label_daemon_and_detail_m2() {
+        use crate::domain::account::{TransferBundle, STORE_SCHEMA_VERSION};
+        use crate::domain::quota::ModelQuota;
+        use crate::paths::HeadlessPaths;
+        use crate::session::backend::FileSessionBackend;
+        use crate::store::locks::DaemonInstanceLock;
+        use crate::switching::daemon::save_daemon_state_in_tx;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = HeadlessPaths::with_explicit(home.clone(), data, cache);
+        std::fs::create_dir_all(&paths.active_slot_dir).unwrap();
+        let repo = StoreRepository::new(paths.clone());
+        let now = 1_800_000_000i64;
+
+        let mut acc1 = make_synthetic_account(1);
+        acc1.email = "alice@example.com".into();
+        acc1.custom_label = Some("primary".into());
+        if let Some(ref mut q) = acc1.quota {
+            q.models = (1..=14)
+                .map(|m| ModelQuota {
+                    name: if m <= 9 {
+                        format!("gemini-3.{m}-pro-preview-ultra")
+                    } else if m <= 12 {
+                        format!("claude-sonnet-4-{m}")
+                    } else {
+                        format!("other-custom-model-{m}")
+                    },
+                    percentage: 80,
+                    percentage_known: Some(true),
+                    observed_remaining_fraction: Some(0.8),
+                    primary_quota: None,
+                    quota_bucket_id: Some("gemini-weekly".into()),
+                    reset_time: "2099-01-01T00:00:00Z".into(),
+                    display_name: None,
+                    supports_images: None,
+                    supports_thinking: None,
+                    thinking_budget: None,
+                    recommended: None,
+                    max_tokens: None,
+                    max_output_tokens: None,
+                    supported_mime_types: None,
+                })
+                .collect();
+        }
+        let mut acc2 = make_synthetic_account(2);
+        acc2.email = "bob@example.com".into();
+        let mut acc3 = make_synthetic_account(3);
+        acc3.email = "charlie@example.com".into();
+        acc3.custom_label = Some("backup".into());
+
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(acc1.clone(), true, now)?;
+            tx.upsert_account(acc2.clone(), false, now)?;
+            tx.upsert_account(acc3.clone(), false, now)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let accounts = vec![acc1.clone(), acc2.clone(), acc3.clone()];
+        let policy = SwitchPolicy {
+            enabled: true,
+            candidate_account_ids: vec![acc1.id.clone()],
+            ..SwitchPolicy::default()
+        };
+        let sess = SessionIdentity::Matched {
+            account_id: acc1.id.clone(),
+            email: acc1.email.clone(),
+            expiry: "2099-01-01T00:00:00Z".into(),
+        };
+        let runtime = RuntimeState::Idle;
+
+        // 1. Scheme L1 label display + Strategy B persistent marked footer + daemon cooldown header.
+        let mut marks = HashSet::new();
+        marks.insert(acc1.id.clone());
+        marks.insert(acc3.id.clone());
+        let ds_cooldown = DaemonPersistentState {
+            schema_version: STORE_SCHEMA_VERSION,
+            cooldown_until: now + 3_900, // 1h 05m
+            ..DaemonPersistentState::default()
+        };
+        let mut scroll = 0usize;
+        let mut detail_scroll = 0usize;
+        let frame_main = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&acc1.id),
+                policy: &policy,
+                session_id: &sess,
+                runtime_st: &runtime,
+                backend_tag: "dual",
+                daemon_state: Some(&ds_cooldown),
+                marked_ids: &marks,
+                detail_view: false,
+                detail_scroll: &mut detail_scroll,
+                cursor_idx: 2,
+                scroll_offset: &mut scroll,
+                transient_notice: None,
+                now_unix: now,
+            },
+            120,
+            22,
+        );
+        assert!(
+            frame_main.contains("2 marked"),
+            "missing marked title: {frame_main}"
+        );
+        assert!(
+            frame_main.contains("· cooldown 1h 05m"),
+            "missing daemon cooldown suffix: {frame_main}"
+        );
+        assert!(
+            frame_main.contains("alice@example.com (primary)"),
+            "missing Scheme L1 label in table: {frame_main}"
+        );
+        assert!(
+            frame_main.contains("charlie@example.com (backup)"),
+            "missing second Scheme L1 label in table: {frame_main}"
+        );
+        assert!(
+            frame_main.contains(" *+") && frame_main.contains("> +"),
+            "missing + mark indicator in Sel column: {frame_main}"
+        );
+        assert!(
+            frame_main.contains(
+                "Status: Marked (2): alice@example.com, charlie@example.com  [Esc to clear]"
+            ),
+            "missing Strategy B persistent footer: {frame_main}"
+        );
+        for line in frame_main.split("\r\n") {
+            assert!(
+                display_width(line) <= 120,
+                "line overflowed 120 cols: {line}"
+            );
+        }
+
+        // Narrow footer overflow folds cleanly with `+N more` and stays within width.
+        let narrow_footer = format_marked_footer_summary(&accounts, &marks, 52).unwrap();
+        assert!(display_width(&narrow_footer) <= 52);
+        assert!(narrow_footer.contains("Marked (2)"));
+
+        // Paused daemon shows `· PAUSED (run status)`.
+        let ds_paused = DaemonPersistentState {
+            schema_version: STORE_SCHEMA_VERSION,
+            paused_on_failure: true,
+            ..DaemonPersistentState::default()
+        };
+        assert_eq!(
+            format_daemon_policy_suffix(Some(&ds_paused), now),
+            " · PAUSED (run status)"
+        );
+
+        // 2. Label editing (English primary flow + multi-byte UTF-8 grapheme Backspace safety) + persistence + clearing.
+        let mut inp = PendingTuiInput::EditLabel {
+            account_id: acc2.id.clone(),
+            email: acc2.email.clone(),
+            buffer: "work-mainX".into(),
+        };
+        inp.pop_grapheme();
+        inp.push_char('1');
+        inp.push_char('\x1b'); // control char ignored
+        assert_eq!(inp.buffer_mut().as_str(), "work-main1");
+
+        // Multi-byte UTF-8 boundary check: Backspace removes one complete grapheme without slicing mid-codepoint.
+        let mut utf8_inp = PendingTuiInput::EditLabel {
+            account_id: acc2.id.clone(),
+            email: acc2.email.clone(),
+            buffer: "tag-中".into(),
+        };
+        utf8_inp.pop_grapheme();
+        assert_eq!(utf8_inp.buffer_mut().as_str(), "tag-");
+
+        let mut status = TransientStatus::default();
+        update_label_in_tui(
+            &repo,
+            &FileSessionBackend,
+            &acc2.id,
+            &acc2.email,
+            "work-main1",
+            &mut status,
+        );
+        assert_eq!(
+            repo.read_snapshot()
+                .unwrap()
+                .accounts
+                .iter()
+                .find(|a| a.id == acc2.id)
+                .unwrap()
+                .custom_label
+                .as_deref(),
+            Some("work-main1")
+        );
+        update_label_in_tui(
+            &repo,
+            &FileSessionBackend,
+            &acc2.id,
+            &acc2.email,
+            "   ",
+            &mut status,
+        );
+        assert_eq!(
+            repo.read_snapshot()
+                .unwrap()
+                .accounts
+                .iter()
+                .find(|a| a.id == acc2.id)
+                .unwrap()
+                .custom_label,
+            None
+        );
+
+        // 3. Export marked subset (`0600`, exact accounts, refuses overwrite, `~/` expands to `home_dir`).
+        let expanded = expand_tui_export_path("~/exports/subset.json", &home).unwrap();
+        assert_eq!(expanded, home.join("exports/subset.json"));
+        assert!(expand_tui_export_path("   ", &home).is_err());
+        assert!(expand_tui_export_path("~", &home).is_err());
+
+        let export_ids = vec![acc1.id.clone(), acc3.id.clone()];
+        export_accounts_in_tui(&repo, &expanded, &export_ids, &mut status);
+        assert!(
+            status
+                .active_text()
+                .unwrap_or("")
+                .contains("Exported 2 account(s)"),
+            "status={:?}",
+            status.active_text()
+        );
+        let mode = std::fs::metadata(&expanded).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let exported_bytes = std::fs::read(&expanded).unwrap();
+        let bundle: TransferBundle = serde_json::from_slice(&exported_bytes).unwrap();
+        let emails: Vec<&str> = bundle.accounts.iter().map(|a| a.email.as_str()).collect();
+        assert_eq!(emails, vec!["alice@example.com", "charlie@example.com"]);
+
+        // Re-exporting to same path MUST refuse overwrite without modifying file bytes!
+        export_accounts_in_tui(&repo, &expanded, &export_ids, &mut status);
+        assert!(
+            status
+                .active_text()
+                .unwrap_or("")
+                .contains("already exists"),
+            "expected overwrite refusal, got {:?}",
+            status.active_text()
+        );
+        assert_eq!(std::fs::read(&expanded).unwrap(), exported_bytes);
+
+        // 4. `reset_cooldown_in_tui` works even while `DaemonInstanceLock` is actively held!
+        let future_cd = crate::domain::clock::current_unix_seconds() + 3_600;
+        let active_ds = DaemonPersistentState {
+            schema_version: STORE_SCHEMA_VERSION,
+            cooldown_until: future_cd,
+            last_phase: "cooldown".into(),
+            ..DaemonPersistentState::default()
+        };
+        repo.with_write_lock(|tx| save_daemon_state_in_tx(tx.paths(), &active_ds))
+            .unwrap();
+        let _daemon_lock = DaemonInstanceLock::try_acquire(&paths).unwrap();
+        reset_cooldown_in_tui(&repo, &mut status);
+        assert!(
+            status
+                .active_text()
+                .unwrap_or("")
+                .contains("Cleared active daemon cooldown"),
+            "status={:?}",
+            status.active_text()
+        );
+        assert_eq!(
+            read_daemon_state_readonly(&paths).unwrap().cooldown_until,
+            0
+        );
+        drop(_daemon_lock);
+
+        // 5. Batch marked operations (candidates, disable, enable).
+        toggle_marked_policy_candidates_in_tui(
+            &repo,
+            &FileSessionBackend,
+            &export_ids,
+            &mut status,
+        );
+        assert_eq!(
+            repo.read_policy().unwrap().candidate_account_ids,
+            vec![acc1.id.clone(), acc3.id.clone()]
+        );
+        disable_marked_accounts_in_tui(&repo, &FileSessionBackend, &export_ids, &mut status);
+        let snap_dis = repo.read_snapshot().unwrap();
+        assert!(
+            snap_dis
+                .accounts
+                .iter()
+                .find(|a| a.id == acc1.id)
+                .unwrap()
+                .disabled
+        );
+        assert!(
+            snap_dis
+                .accounts
+                .iter()
+                .find(|a| a.id == acc3.id)
+                .unwrap()
+                .disabled
+        );
+        assert!(
+            !snap_dis
+                .accounts
+                .iter()
+                .find(|a| a.id == acc2.id)
+                .unwrap()
+                .disabled
+        );
+        enable_marked_accounts_in_tui(&repo, &FileSessionBackend, &export_ids, &mut status);
+        let snap_en = repo.read_snapshot().unwrap();
+        assert!(
+            !snap_en
+                .accounts
+                .iter()
+                .find(|a| a.id == acc1.id)
+                .unwrap()
+                .disabled
+        );
+        assert!(
+            !snap_en
+                .accounts
+                .iter()
+                .find(|a| a.id == acc3.id)
+                .unwrap()
+                .disabled
+        );
+
+        // 6. Scheme M2 detail view: full wrapped `Models` + top/bottom internal scroll + strict bounds!
+        let mut d_scroll = 0usize;
+        let top_detail = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&acc1.id),
+                policy: &policy,
+                session_id: &sess,
+                runtime_st: &runtime,
+                backend_tag: "file",
+                daemon_state: Some(&ds_cooldown),
+                marked_ids: &marks,
+                detail_view: true,
+                detail_scroll: &mut d_scroll,
+                cursor_idx: 0,
+                scroll_offset: &mut scroll,
+                transient_notice: None,
+                now_unix: now,
+            },
+            96,
+            18,
+        );
+        let top_lines: Vec<&str> = top_detail.split("\r\n").collect();
+        assert!(top_lines.len() <= 18);
+        for l in &top_lines {
+            assert!(display_width(l) <= 96, "detail line > 96 cols: {l}");
+        }
+        assert!(top_detail.contains("Account : alice@example.com (primary)"));
+        assert!(top_detail.contains("Quotas  :"));
+        assert!(top_detail.contains("resets "));
+        assert!(
+            top_detail.contains("more line(s) below — press ↓ to scroll"),
+            "expected bottom scroll indicator on 18-row detail card:\n{top_detail}"
+        );
+
+        // Jump to end (`usize::MAX`) clamps cleanly and exposes the final `Other` model without truncation!
+        let mut d_scroll_end = usize::MAX;
+        let bot_detail = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&acc1.id),
+                policy: &policy,
+                session_id: &sess,
+                runtime_st: &runtime,
+                backend_tag: "file",
+                daemon_state: Some(&ds_cooldown),
+                marked_ids: &marks,
+                detail_view: true,
+                detail_scroll: &mut d_scroll_end,
+                cursor_idx: 0,
+                scroll_offset: &mut scroll,
+                transient_notice: None,
+                now_unix: now,
+            },
+            96,
+            18,
+        );
+        assert!(bot_detail.contains("more line(s) above — press ↑ to scroll"));
+        assert!(
+            bot_detail.contains("other-custom-model-14"),
+            "final wrapped model must be reachable at bottom of M2 scroll:\n{bot_detail}"
+        );
+        assert_eq!(
+            top_lines.len(),
+            bot_detail.split("\r\n").count(),
+            "M2 detail frame height must stay constant between top and bottom scroll"
+        );
+
+        // Tiny/narrow fallback (`30x4`) still respects physical bounds without panicking.
+        let mut tiny_scroll = 0usize;
+        let tiny_detail = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&acc1.id),
+                policy: &policy,
+                session_id: &sess,
+                runtime_st: &runtime,
+                backend_tag: "file",
+                daemon_state: None,
+                marked_ids: &marks,
+                detail_view: true,
+                detail_scroll: &mut tiny_scroll,
+                cursor_idx: 0,
+                scroll_offset: &mut scroll,
+                transient_notice: None,
+                now_unix: now,
+            },
+            30,
+            4,
+        );
+        let tiny_lines: Vec<&str> = tiny_detail.split("\r\n").collect();
+        assert!(tiny_lines.len() <= 4);
+        for l in &tiny_lines {
+            assert!(display_width(l) <= 30, "tiny detail line > 30 cols: {l}");
+        }
+
+        // 7. P1-01: Accidental credential pasted into export path is masked immediately and rejected pre-confirm.
+        let secret_samples = [
+            "1//0gSyntheticRefreshSecretTokenValue999",
+            "ya29.SyntheticAccessTokenValue999",
+            "GOCSPX-SyntheticClientSecret999",
+            "https://example.com/callback?code=SyntheticCode999",
+            "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+            "~/1//0gSyntheticRefreshSecretTokenValue999",
+        ];
+        for raw_secret in secret_samples {
+            let inp = PendingTuiInput::ExportPath {
+                account_ids: vec![acc1.id.clone()],
+                scope_label: "1 account".into(),
+                buffer: raw_secret.into(),
+            };
+            let edit_prompt = inp.prompt_message(&home);
+            assert!(
+                edit_prompt.contains("[REDACTED]"),
+                "expected [REDACTED] for {raw_secret}, got {edit_prompt}"
+            );
+            assert!(
+                !edit_prompt.contains("Synthetic") && !edit_prompt.contains("AbCdEf"),
+                "edit prompt leaked secret: {edit_prompt}"
+            );
+
+            let mut confirm_slot: Option<PendingTuiConfirm> = None;
+            let mut warn_rendered = false;
+            let mut st_secret = TransientStatus::default();
+            let outcome = apply_pending_input_key(
+                inp,
+                crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &repo,
+                &FileSessionBackend,
+                &mut confirm_slot,
+                &mut warn_rendered,
+                &mut st_secret,
+            );
+            assert!(matches!(outcome, InputKeyOutcome::Finished));
+            assert!(
+                confirm_slot.is_none(),
+                "secret-like path must NEVER enter PendingTuiConfirm"
+            );
+            let err_msg = st_secret.active_text().unwrap_or("");
+            assert!(
+                err_msg.contains("redacted"),
+                "expected sanitized error, got {err_msg}"
+            );
+            assert!(
+                !err_msg.contains("Synthetic") && !err_msg.contains("AbCdEf"),
+                "error leaked secret: {err_msg}"
+            );
+        }
+        // Normal paths keep full editing visibility and normalize `~//` safely under `home`.
+        let normal_inp = PendingTuiInput::ExportPath {
+            account_ids: vec![acc1.id.clone()],
+            scope_label: "1 account".into(),
+            buffer: "~/exports/my-backup-2026-11-21.json".into(),
+        };
+        assert!(normal_inp
+            .prompt_message(&home)
+            .contains("~/exports/my-backup-2026-11-21.json"));
+        assert_eq!(
+            expand_tui_export_path("~//exports/subset.json", &home).unwrap(),
+            home.join("exports/subset.json")
+        );
+
+        // 8. P2-01: Plaintext export warning sits ahead of path and stays visible at 30x16 & 120x24,
+        //    while ultra-narrow (<23 cols) or 1-row screens refuse confirmation.
+        let confirm_exp = PendingTuiConfirm::ExportBundle {
+            account_ids: vec![acc1.id.clone(), acc3.id.clone()],
+            output_path: home.join("exports/my-very-long-backup-file-name.json"),
+        };
+        for (cols, rows, must_show) in [
+            (120u16, 24u16, true),
+            (80, 24, true),
+            (30, 16, true),
+            (23, 16, true),
+            (22, 16, false),
+            (20, 16, false),
+            (80, 1, false),
+        ] {
+            let msg = confirm_exp.prompt_message_for_cols(cols as usize);
+            let mut scr = 0usize;
+            let mut dscr = 0usize;
+            let frame = build_dashboard_frame_full(
+                &mut TuiFrameView {
+                    accounts: &accounts,
+                    selected_id: Some(&acc1.id),
+                    policy: &policy,
+                    session_id: &sess,
+                    runtime_st: &runtime,
+                    backend_tag: "file",
+                    daemon_state: None,
+                    marked_ids: &marks,
+                    detail_view: false,
+                    detail_scroll: &mut dscr,
+                    cursor_idx: 0,
+                    scroll_offset: &mut scr,
+                    transient_notice: Some(&msg),
+                    now_unix: now,
+                },
+                cols,
+                rows,
+            );
+            let fits = export_confirm_warning_fits(cols as usize, rows as usize)
+                && rendered_frame_shows_export_plaintext_warning(&frame);
+            assert_eq!(
+                fits, must_show,
+                "unexpected plaintext warning visibility for {cols}x{rows}:\n{frame}"
+            );
+            for line in frame.split("\r\n") {
+                assert!(
+                    display_width(line) <= cols as usize,
+                    "export confirm frame line exceeded {cols} cols: {line}"
+                );
+            }
+        }
+
+        // 9. P2-04: Target resolution when viewing unmarked cursor account with marked set present.
+        let (detail_r_targets, from_marked) = resolve_tui_targets(&accounts, 1, &marks);
+        assert!(from_marked);
+        let detail_r_ids: Vec<&str> = detail_r_targets.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(detail_r_ids, vec![acc1.id.as_str(), acc3.id.as_str()]);
+
+        // 10. P2-05: Narrow-screen single long model name wraps cleanly across lines by grapheme.
+        let long_model = "claude-opus-4-6-thinking-preview-superlong";
+        for width in [30usize, 20usize] {
+            let wrapped = wrap_family_models_lines("Claude/GPT", &[long_model], width);
+            assert!(
+                wrapped.len() >= 2,
+                "expected multi-line wrap at width {width}: {wrapped:?}"
+            );
+            for l in &wrapped {
+                assert!(
+                    display_width(l) <= width,
+                    "wrapped model line exceeded {width} cols: {l}"
+                );
+            }
+            let joined_tail: String = wrapped
+                .iter()
+                .map(|l| {
+                    l.strip_prefix("  Claude/GPT : ")
+                        .or_else(|| l.strip_prefix("  Claude/GPT:"))
+                        .unwrap_or(l)
+                        .trim()
+                })
+                .collect();
+            assert_eq!(
+                joined_tail, long_model,
+                "wrapped chunks lost characters at width {width}: {wrapped:?}"
+            );
+        }
     }
 }

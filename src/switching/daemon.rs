@@ -25,7 +25,7 @@ use crate::store::fs_atomic::{
     ensure_no_symlink_components_under, ensure_private_dir, read_regular_file_opt_bounded,
     write_atomic_durable, MAX_STORE_FILE_BYTES,
 };
-use crate::store::locks::{ActiveSlotLock, DaemonInstanceLock};
+use crate::store::locks::{ActiveSlotLock, DaemonInstanceLock, DaemonLockProbe};
 use crate::store::repository::StoreRepository;
 use crate::switching::executor::{execute_switch_with_slot_lock_and_guard, RunningGuardMode};
 use crate::switching::notify::{
@@ -33,6 +33,7 @@ use crate::switching::notify::{
     send_daemon_notification_best_effort, DaemonNotificationEvent,
 };
 use crate::switching::runner::ordered_candidate_ids;
+use crate::switching::systemd::DaemonSystemdProbe;
 use crate::transport::client::{BoxFuture, HttpTransport};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -314,6 +315,148 @@ pub fn reset_daemon_cooldown_in_tx(
         cooldown_was_active: was_active,
         previous_cooldown_until: previous,
     })
+}
+
+/// Strictly read-only runtime & service status summary reported by `agy-switch-cli status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DaemonRuntimeStatusDto {
+    pub mode: &'static str,
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub systemd_unit_installed: bool,
+    pub systemd_active_state: Option<String>,
+    pub systemd_unit_file_state: Option<String>,
+    pub cooldown_active: bool,
+    pub cooldown_remaining_secs: i64,
+}
+
+fn format_compact_cooldown_remaining(rem_secs: i64) -> String {
+    if rem_secs >= 3600 {
+        format!("{}h {:02}m", rem_secs / 3600, (rem_secs % 3600) / 60)
+    } else if rem_secs >= 60 {
+        format!("{}m", rem_secs / 60)
+    } else {
+        "<1m".into()
+    }
+}
+
+pub fn build_daemon_runtime_status(
+    lock: DaemonLockProbe,
+    systemd: &DaemonSystemdProbe,
+    state: Option<&DaemonPersistentState>,
+    now_unix: i64,
+) -> DaemonRuntimeStatusDto {
+    let (systemd_unit_installed, systemd_active_state, systemd_unit_file_state, systemd_main_pid) =
+        match systemd {
+            DaemonSystemdProbe::NotInstalled | DaemonSystemdProbe::InstalledForOtherDataDir => {
+                (false, None, None, None)
+            }
+            DaemonSystemdProbe::InstalledManagerUnreachable => (true, None, None, None),
+            DaemonSystemdProbe::Installed {
+                active_state,
+                unit_file_state,
+                main_pid,
+            } => (
+                true,
+                active_state.clone(),
+                unit_file_state.clone(),
+                *main_pid,
+            ),
+        };
+
+    let systemd_is_active = matches!(
+        systemd_active_state.as_deref(),
+        Some("active" | "activating" | "reloading")
+    );
+
+    let (mode, running, pid) = if lock.running {
+        match (systemd_is_active, lock.pid, systemd_main_pid) {
+            (true, Some(lp), Some(sp)) if lp == sp => ("systemd_service", true, Some(lp)),
+            _ => ("manual", true, lock.pid),
+        }
+    } else if systemd_unit_installed {
+        ("systemd_stopped", false, None)
+    } else {
+        ("not_running", false, None)
+    };
+
+    let cooldown_remaining_secs = state
+        .map(|s| s.cooldown_until.saturating_sub(now_unix).max(0))
+        .unwrap_or(0);
+
+    DaemonRuntimeStatusDto {
+        mode,
+        running,
+        pid,
+        systemd_unit_installed,
+        systemd_active_state,
+        systemd_unit_file_state,
+        cooldown_active: cooldown_remaining_secs > 0,
+        cooldown_remaining_secs,
+    }
+}
+
+impl DaemonRuntimeStatusDto {
+    pub fn format_human(&self, state: Option<&DaemonPersistentState>) -> String {
+        let mut out = match self.mode {
+            "systemd_service" => match self.pid {
+                Some(p) => format!("running (systemd service, pid={p})"),
+                None => "running (systemd service)".into(),
+            },
+            "manual" => {
+                let pid_part = self.pid.map(|p| format!(", pid={p}")).unwrap_or_default();
+                if self.systemd_unit_installed {
+                    let svc = self
+                        .systemd_active_state
+                        .as_deref()
+                        .map(terminal_text)
+                        .unwrap_or_else(|| "manager unreachable".into());
+                    format!("running (manual/foreground{pid_part}; systemd service {svc})")
+                } else {
+                    format!("running (manual/foreground{pid_part})")
+                }
+            }
+            "systemd_stopped" => match self.systemd_active_state.as_deref() {
+                Some(st) if matches!(st, "active" | "activating" | "reloading") => format!(
+                    "stopped (systemd service {}, no lock held here; ready for --once)",
+                    terminal_text(st)
+                ),
+                Some(st) => format!(
+                    "stopped (systemd service {}; ready for --once)",
+                    terminal_text(st)
+                ),
+                None => {
+                    "stopped (systemd unit installed, manager unreachable; ready for --once)".into()
+                }
+            },
+            _ => "not running (no service; ready for daemon / --once)".into(),
+        };
+
+        if self.cooldown_active {
+            out.push_str(&format!(
+                " · cooldown {}",
+                format_compact_cooldown_remaining(self.cooldown_remaining_secs)
+            ));
+        }
+
+        if let Some(st) = state.filter(|s| s.paused_on_failure) {
+            if st.consecutive_commit_failures > 0 {
+                let noun = if st.consecutive_commit_failures == 1 {
+                    "failure"
+                } else {
+                    "failures"
+                };
+                out.push_str(&format!(
+                    " · PAUSED: {} consecutive {noun}",
+                    st.consecutive_commit_failures
+                ));
+            } else {
+                out.push_str(" · PAUSED (run switch or policy set to resume)");
+            }
+        }
+
+        out
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2783,5 +2926,198 @@ mod tests {
         std::os::unix::fs::symlink(&victim, paths.daemon_state_file()).unwrap();
         assert!(reset_daemon_cooldown(&repo, 9_000).is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), b"do-not-touch");
+    }
+
+    #[test]
+    fn synthetic_daemon_runtime_status_distinguishes_all_modes_and_suffixes() {
+        let now = 1_800_000_000i64;
+        let clean = DaemonPersistentState::default();
+
+        // 1. Not running, no service installed.
+        let s_none = build_daemon_runtime_status(
+            DaemonLockProbe {
+                running: false,
+                pid: None,
+            },
+            &DaemonSystemdProbe::NotInstalled,
+            Some(&clean),
+            now,
+        );
+        assert_eq!(s_none.mode, "not_running");
+        assert!(!s_none.running);
+        assert_eq!(
+            s_none.format_human(Some(&clean)),
+            "not running (no service; ready for daemon / --once)"
+        );
+
+        // 2. Running via systemd service with active cooldown & paused failure.
+        let paused_cd = DaemonPersistentState {
+            cooldown_until: now + 2_520, // 42m
+            paused_on_failure: true,
+            consecutive_commit_failures: 3,
+            ..DaemonPersistentState::default()
+        };
+        let s_svc = build_daemon_runtime_status(
+            DaemonLockProbe {
+                running: true,
+                pid: Some(12345),
+            },
+            &DaemonSystemdProbe::Installed {
+                active_state: Some("active".into()),
+                unit_file_state: Some("enabled".into()),
+                main_pid: Some(12345),
+            },
+            Some(&paused_cd),
+            now,
+        );
+        assert_eq!(s_svc.mode, "systemd_service");
+        assert!(s_svc.running);
+        assert_eq!(s_svc.pid, Some(12345));
+        assert!(s_svc.cooldown_active);
+        assert_eq!(
+            s_svc.format_human(Some(&paused_cd)),
+            "running (systemd service, pid=12345) · cooldown 42m · PAUSED: 3 consecutive failures"
+        );
+
+        // 3. Running manually/foreground with no service, and with inactive service.
+        let s_manual = build_daemon_runtime_status(
+            DaemonLockProbe {
+                running: true,
+                pid: Some(23456),
+            },
+            &DaemonSystemdProbe::NotInstalled,
+            Some(&clean),
+            now,
+        );
+        assert_eq!(s_manual.mode, "manual");
+        assert_eq!(
+            s_manual.format_human(Some(&clean)),
+            "running (manual/foreground, pid=23456)"
+        );
+        let s_manual_svc = build_daemon_runtime_status(
+            DaemonLockProbe {
+                running: true,
+                pid: Some(23456),
+            },
+            &DaemonSystemdProbe::Installed {
+                active_state: Some("inactive".into()),
+                unit_file_state: Some("disabled".into()),
+                main_pid: None,
+            },
+            Some(&clean),
+            now,
+        );
+        assert_eq!(s_manual_svc.mode, "manual");
+        assert_eq!(
+            s_manual_svc.format_human(Some(&clean)),
+            "running (manual/foreground, pid=23456; systemd service inactive)"
+        );
+
+        // 4. Installed systemd service stopped / failed / unreachable.
+        let s_stopped = build_daemon_runtime_status(
+            DaemonLockProbe {
+                running: false,
+                pid: None,
+            },
+            &DaemonSystemdProbe::Installed {
+                active_state: Some("failed".into()),
+                unit_file_state: Some("enabled".into()),
+                main_pid: None,
+            },
+            Some(&clean),
+            now,
+        );
+        assert_eq!(s_stopped.mode, "systemd_stopped");
+        assert!(!s_stopped.running);
+        assert_eq!(
+            s_stopped.format_human(Some(&clean)),
+            "stopped (systemd service failed; ready for --once)"
+        );
+
+        // 5. Unit installed for a different `--data-dir` must not claim ownership.
+        let s_other = build_daemon_runtime_status(
+            DaemonLockProbe {
+                running: false,
+                pid: None,
+            },
+            &DaemonSystemdProbe::InstalledForOtherDataDir,
+            Some(&clean),
+            now,
+        );
+        assert_eq!(s_other.mode, "not_running");
+        assert!(!s_other.systemd_unit_installed);
+
+        // 6. P2-02: Manager reports active PID (e.g. old data dir A still running after re-install to B),
+        //    but THIS data dir holds NO lock -> must report stopped / running=false / pid=None while
+        //    preserving manager observation in `systemd_active_state`.
+        let s_active_no_lock = build_daemon_runtime_status(
+            DaemonLockProbe {
+                running: false,
+                pid: None,
+            },
+            &DaemonSystemdProbe::Installed {
+                active_state: Some("active".into()),
+                unit_file_state: Some("enabled".into()),
+                main_pid: Some(12345),
+            },
+            Some(&clean),
+            now,
+        );
+        assert_eq!(s_active_no_lock.mode, "systemd_stopped");
+        assert!(!s_active_no_lock.running);
+        assert_eq!(s_active_no_lock.pid, None);
+        assert_eq!(
+            s_active_no_lock.systemd_active_state.as_deref(),
+            Some("active")
+        );
+        assert_eq!(
+            s_active_no_lock.format_human(Some(&clean)),
+            "stopped (systemd service active, no lock held here; ready for --once)"
+        );
+
+        // 7. Lock is held in THIS data dir with unknown PID while manager reports active MainPID ->
+        //    must NOT attribute unverified MainPID; degrades cleanly to manual with pid=None.
+        let s_unknown_lock_pid = build_daemon_runtime_status(
+            DaemonLockProbe {
+                running: true,
+                pid: None,
+            },
+            &DaemonSystemdProbe::Installed {
+                active_state: Some("active".into()),
+                unit_file_state: Some("enabled".into()),
+                main_pid: Some(12345),
+            },
+            Some(&clean),
+            now,
+        );
+        assert_eq!(s_unknown_lock_pid.mode, "manual");
+        assert!(s_unknown_lock_pid.running);
+        assert_eq!(s_unknown_lock_pid.pid, None);
+        assert_eq!(
+            s_unknown_lock_pid.format_human(Some(&clean)),
+            "running (manual/foreground; systemd service active)"
+        );
+
+        // 8. Lock held by a DIFFERENT PID than systemd MainPID -> manual with actual lock PID.
+        let s_pid_mismatch = build_daemon_runtime_status(
+            DaemonLockProbe {
+                running: true,
+                pid: Some(99999),
+            },
+            &DaemonSystemdProbe::Installed {
+                active_state: Some("active".into()),
+                unit_file_state: Some("enabled".into()),
+                main_pid: Some(12345),
+            },
+            Some(&clean),
+            now,
+        );
+        assert_eq!(s_pid_mismatch.mode, "manual");
+        assert!(s_pid_mismatch.running);
+        assert_eq!(s_pid_mismatch.pid, Some(99999));
+        assert_eq!(
+            s_pid_mismatch.format_human(Some(&clean)),
+            "running (manual/foreground, pid=99999; systemd service active)"
+        );
     }
 }

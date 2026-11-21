@@ -8,8 +8,10 @@ use crate::transport::client::{HttpRequest, HttpTransport, TimeoutClass};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -375,9 +377,275 @@ pub fn resolve_agy_executable() -> Option<PathBuf> {
     None
 }
 
+pub const ANTIGRAVITY_APP_DIR_ENV: &str = "AGY_SWITCH_CLI_ANTIGRAVITY_APP_DIR";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalAntigravityAppProbeOutcome {
+    NotFound,
+    Detected { path: PathBuf, version: String },
+}
+
+fn open_regular_file_readonly_nonblock(path: &Path) -> Option<(fs::File, u64)> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    Some((file, meta.len()))
+}
+
+fn read_json_object_bounded(path: &Path, max_bytes: u64) -> Option<serde_json::Value> {
+    let (file, len) = open_regular_file_readonly_nonblock(path)?;
+    if len == 0 || len > max_bytes {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(len as usize);
+    file.take(max_bytes + 1).read_to_end(&mut buf).ok()?;
+    if (buf.len() as u64) > max_bytes {
+        return None;
+    }
+    serde_json::from_slice(&buf).ok()
+}
+
+fn is_antigravity_app_manifest(val: &serde_json::Value) -> bool {
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    [
+        "name",
+        "productName",
+        "applicationName",
+        "nameShort",
+        "nameLong",
+        "dataFolderName",
+    ]
+    .iter()
+    .any(|key| {
+        obj.get(*key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.to_ascii_lowercase().contains("antigravity"))
+    })
+}
+
+fn extract_manifest_semver(val: &serde_json::Value) -> Option<String> {
+    let obj = val.as_object()?;
+    if !is_antigravity_app_manifest(val) {
+        return None;
+    }
+    for key in ["antigravityVersion", "ideVersion", "version"] {
+        if let Some(raw) = obj.get(key).and_then(|v| v.as_str()) {
+            if let Some(ver) = parse_semver_triplet(raw) {
+                return Some(ver);
+            }
+        }
+    }
+    None
+}
+
+/// Strictly read-only, bounded ASAR reader extracting `product.json` / `package.json` from an
+/// Electron `resources/app.asar` archive without executing the desktop binary.
+pub(crate) fn extract_antigravity_version_from_asar(asar_path: &Path) -> Option<String> {
+    const MAX_ASAR_HEADER_BYTES: u32 = 8 * 1024 * 1024;
+    const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+
+    let (mut file, file_len) = open_regular_file_readonly_nonblock(asar_path)?;
+    if file_len < 16 {
+        return None;
+    }
+    let mut prefix = [0u8; 16];
+    file.read_exact(&mut prefix).ok()?;
+    let p1 = u32::from_le_bytes(prefix[0..4].try_into().ok()?);
+    let header_size = u32::from_le_bytes(prefix[4..8].try_into().ok()?);
+    let inner_size = u32::from_le_bytes(prefix[8..12].try_into().ok()?);
+    let json_len = u32::from_le_bytes(prefix[12..16].try_into().ok()?);
+
+    if p1 != 4
+        || header_size < 8
+        || inner_size < 4
+        || inner_size > header_size.saturating_sub(4)
+        || json_len == 0
+        || json_len > inner_size.saturating_sub(4)
+        || json_len > MAX_ASAR_HEADER_BYTES
+    {
+        return None;
+    }
+    let data_base = 8u64.checked_add(header_size as u64)?;
+    if 16u64.checked_add(json_len as u64)? > data_base || data_base > file_len {
+        return None;
+    }
+
+    let mut hdr_bytes = vec![0u8; json_len as usize];
+    file.read_exact(&mut hdr_bytes).ok()?;
+    let header_val: serde_json::Value = serde_json::from_slice(&hdr_bytes).ok()?;
+    let files = header_val.get("files")?.as_object()?;
+
+    for name in ["product.json", "package.json"] {
+        let Some(entry) = files.get(name).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        let Some(size) = entry.get("size").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        if size == 0 || size > MAX_MANIFEST_BYTES {
+            continue;
+        }
+        let offset = match entry.get("offset") {
+            Some(serde_json::Value::String(s)) => s.parse::<u64>().ok(),
+            Some(serde_json::Value::Number(n)) => n.as_u64(),
+            _ => None,
+        };
+        let Some(rel_off) = offset else {
+            continue;
+        };
+        let Some(start) = data_base.checked_add(rel_off) else {
+            continue;
+        };
+        let Some(end) = start.checked_add(size) else {
+            continue;
+        };
+        if end > file_len {
+            continue;
+        }
+        if file.seek(SeekFrom::Start(start)).is_err() {
+            continue;
+        }
+        let mut manifest_bytes = vec![0u8; size as usize];
+        if file.read_exact(&mut manifest_bytes).is_err() {
+            continue;
+        }
+        if let Ok(manifest_val) = serde_json::from_slice::<serde_json::Value>(&manifest_bytes) {
+            if let Some(ver) = extract_manifest_semver(&manifest_val) {
+                return Some(ver);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn probe_antigravity_app_install_dir(install_dir: &Path) -> Option<String> {
+    const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+    let resources = install_dir.join("resources");
+    if let Some(ver) = extract_antigravity_version_from_asar(&resources.join("app.asar")) {
+        return Some(ver);
+    }
+    for rel in ["app/product.json", "app/package.json"] {
+        if let Some(val) = read_json_object_bounded(&resources.join(rel), MAX_MANIFEST_BYTES) {
+            if let Some(ver) = extract_manifest_semver(&val) {
+                return Some(ver);
+            }
+        }
+    }
+    None
+}
+
+fn display_path_for_install_dir(dir: &Path) -> PathBuf {
+    let bin = dir.join("antigravity");
+    if bin.is_file() {
+        bin
+    } else {
+        dir.to_path_buf()
+    }
+}
+
+/// Purely read-only, zero-subprocess detection of an installed Linux desktop Antigravity App.
+/// Never spawns Electron/GUI binaries and never fails `status` if the desktop app is absent.
+pub fn probe_local_antigravity_app_for_status() -> LocalAntigravityAppProbeOutcome {
+    if let Some(explicit_dir) = std::env::var_os(ANTIGRAVITY_APP_DIR_ENV).filter(|v| !v.is_empty())
+    {
+        let dir = PathBuf::from(explicit_dir);
+        return match probe_antigravity_app_install_dir(&dir) {
+            Some(version) => LocalAntigravityAppProbeOutcome::Detected {
+                path: display_path_for_install_dir(&dir),
+                version,
+            },
+            None => LocalAntigravityAppProbeOutcome::NotFound,
+        };
+    }
+
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("antigravity");
+            if !candidate.is_file() {
+                continue;
+            }
+            let resolved = fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+            if let Some(parent) = resolved.parent() {
+                if let Some(version) = probe_antigravity_app_install_dir(parent) {
+                    return LocalAntigravityAppProbeOutcome::Detected {
+                        path: candidate,
+                        version,
+                    };
+                }
+                if parent.file_name().and_then(|n| n.to_str()) == Some("bin") {
+                    if let Some(grandparent) = parent.parent() {
+                        if let Some(version) = probe_antigravity_app_install_dir(grandparent) {
+                            return LocalAntigravityAppProbeOutcome::Detected {
+                                path: candidate,
+                                version,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for fallback in [
+        "/opt/Antigravity",
+        "/opt/antigravity",
+        "/usr/share/antigravity",
+        "/usr/lib/antigravity",
+    ] {
+        let dir = Path::new(fallback);
+        if let Some(version) = probe_antigravity_app_install_dir(dir) {
+            return LocalAntigravityAppProbeOutcome::Detected {
+                path: display_path_for_install_dir(dir),
+                version,
+            };
+        }
+    }
+
+    LocalAntigravityAppProbeOutcome::NotFound
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_synthetic_asar(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut file_map = serde_json::Map::new();
+        let mut payload = Vec::new();
+        for (name, bytes) in files {
+            let offset = payload.len();
+            payload.extend_from_slice(bytes);
+            file_map.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "size": bytes.len(),
+                    "offset": offset.to_string(),
+                }),
+            );
+        }
+        let header_json = serde_json::to_vec(&serde_json::json!({ "files": file_map })).unwrap();
+        let json_len = header_json.len() as u32;
+        let pad = (4 - (header_json.len() % 4)) % 4;
+        let inner_size = 4u32 + json_len + (pad as u32);
+        let header_size = 4u32 + inner_size;
+
+        let mut out = Vec::with_capacity(8 + header_size as usize + payload.len());
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&header_size.to_le_bytes());
+        out.extend_from_slice(&inner_size.to_le_bytes());
+        out.extend_from_slice(&json_len.to_le_bytes());
+        out.extend_from_slice(&header_json);
+        out.resize(out.len() + pad, 0);
+        out.extend_from_slice(&payload);
+        out
+    }
 
     #[test]
     fn select_ua_version_computes_true_semver_upper_bound() {
@@ -403,5 +671,55 @@ mod tests {
         assert!(native_ua.starts_with("antigravity/hub/4.3.0 (os_type="));
         assert!(native_ua.contains("; arch="));
         assert!(native_ua.ends_with(')'));
+    }
+
+    #[test]
+    fn synthetic_antigravity_app_probe_reads_asar_and_unpacked_without_spawning() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // 1. Electron ASAR layout (`/opt/Antigravity/resources/app.asar`) — ignores Electron `version` file (`44.9.1`).
+        let asar_dir = tmp.path().join("electron_asar");
+        fs::create_dir_all(asar_dir.join("resources")).unwrap();
+        fs::write(asar_dir.join("version"), b"44.9.1\n").unwrap();
+        let pkg = br#"{"name":"antigravity","productName":"Antigravity","version":"2.33.0"}"#;
+        fs::write(
+            asar_dir.join("resources/app.asar"),
+            build_synthetic_asar(&[("package.json", pkg)]),
+        )
+        .unwrap();
+        assert_eq!(
+            probe_antigravity_app_install_dir(&asar_dir).as_deref(),
+            Some("2.33.0")
+        );
+
+        // 2. Unpacked VS Code-fork layout (`resources/app/product.json` with `ideVersion`).
+        let unpacked_dir = tmp.path().join("unpacked_ide");
+        fs::create_dir_all(unpacked_dir.join("resources/app")).unwrap();
+        fs::write(
+            unpacked_dir.join("resources/app/product.json"),
+            br#"{"applicationName":"antigravity","ideVersion":"1.19.4","version":"1.99.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            probe_antigravity_app_install_dir(&unpacked_dir).as_deref(),
+            Some("1.19.4")
+        );
+
+        // 3. Unrelated Electron app MUST be rejected even with valid ASAR.
+        let other_dir = tmp.path().join("other_electron");
+        fs::create_dir_all(other_dir.join("resources")).unwrap();
+        let other_pkg = br#"{"name":"some-other-editor","version":"9.9.9"}"#;
+        fs::write(
+            other_dir.join("resources/app.asar"),
+            build_synthetic_asar(&[("package.json", other_pkg)]),
+        )
+        .unwrap();
+        assert_eq!(probe_antigravity_app_install_dir(&other_dir), None);
+
+        // 4. Truncated/corrupt ASAR safely returns `None`.
+        let bad_dir = tmp.path().join("corrupt_asar");
+        fs::create_dir_all(bad_dir.join("resources")).unwrap();
+        fs::write(bad_dir.join("resources/app.asar"), b"\x04\x00\x00\x00\xff").unwrap();
+        assert_eq!(probe_antigravity_app_install_dir(&bad_dir), None);
     }
 }
