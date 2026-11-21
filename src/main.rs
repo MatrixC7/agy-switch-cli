@@ -71,12 +71,13 @@ async fn main() {
             .try_init();
     }
 
-    let cli = match Cli::command().try_get_matches_from(&raw_args) {
+    let mut cmd = Cli::command();
+    let cli = match cmd.try_get_matches_from_mut(&raw_args) {
         Ok(matches) => {
             let mut parsed = match Cli::from_arg_matches(&matches) {
                 Ok(p) => p,
                 Err(clap_err) => {
-                    let safe_msg = format_safe_clap_error(&raw_args, &clap_err);
+                    let safe_msg = format_safe_clap_error(&cmd, &raw_args, &clap_err);
                     if json_flag_present {
                         let structured = CliError::usage(safe_msg);
                         eprintln!("{}", structured.to_json_line());
@@ -102,7 +103,7 @@ async fn main() {
                 std::process::exit(ExitCode::Ok.as_i32());
             }
             _ => {
-                let safe_msg = format_safe_clap_error(&raw_args, &clap_err);
+                let safe_msg = format_safe_clap_error(&cmd, &raw_args, &clap_err);
                 if json_flag_present {
                     let structured = CliError::usage(safe_msg);
                     eprintln!("{}", structured.to_json_line());

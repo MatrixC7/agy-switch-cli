@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashSet;
 
 /// Stable CLI exit codes per Blueprint §8.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,209 +183,173 @@ fn is_canonical_nd_range_token(token: &str) -> bool {
             .unwrap_or(false)
 }
 
-fn is_known_cli_flag(token: &str) -> bool {
-    matches!(
-        token,
-        "--" | "-h"
-            | "--help"
-            | "-V"
-            | "--version"
-            | "--data-dir"
-            | "--proxy"
-            | "--backend"
-            | "--no-remote-version"
-            | "--json"
-            | "--resume"
-            | "--purge"
-            | "--client"
-            | "--ssh"
-            | "--port"
-            | "--open-browser"
-            | "--label"
-            | "--move"
-            | "--to"
-            | "--order"
-            | "--from-local"
-            | "--from-stdin"
-            | "--from-file"
-            | "--from-legacy"
-            | "--overwrite"
-            | "--force"
-            | "--output"
-            | "--include-secrets"
-            | "--accounts"
-            | "--clear-active-slot"
-            | "--dry-run"
-            | "--allow-running"
-            | "--require-idle"
-            | "--account"
-            | "--all"
-            | "--refresh"
-            | "--concurrency"
-            | "--enabled"
-            | "--strategy"
-            | "--mode"
-            | "--reserve"
-            | "--minimum"
-            | "--model"
-            | "--candidates"
-            | "--all-candidates"
-            | "--clear-candidates"
-            | "--interval"
-            | "--cooldown"
-            | "--once"
-            | "--install"
-            | "--uninstall"
-            | "--no-notify"
-            | "--reset-cooldown"
-            | "--source"
-            | "--range"
-            | "--date"
-            | "--from"
-            | "--recent"
-            | "--watch"
-    )
+#[derive(Debug, PartialEq, Eq)]
+struct StaticCliAllowlist {
+    flags: HashSet<String>,
+    words: HashSet<String>,
+    placeholders: HashSet<String>,
 }
 
-fn is_known_cli_word(token: &str) -> bool {
-    matches!(
-        token,
-        "agy-switch-cli"
-            | "help"
-            | "status"
-            | "auth"
-            | "login"
-            | "reauthorize"
-            | "clients"
-            | "pending"
-            | "accounts"
-            | "list"
-            | "add"
-            | "import"
-            | "export"
-            | "order"
-            | "enable"
-            | "disable"
-            | "delete"
-            | "current"
-            | "switch"
-            | "run"
-            | "quota"
-            | "refresh"
-            | "policy"
-            | "show"
-            | "set"
-            | "eval"
-            | "daemon"
-            | "stats"
-            | "summary"
-            | "tui"
-            | "cli"
-            | "app"
-            | "all"
-            | "today"
-            | "yesterday"
-            | "priority"
-            | "round-robin"
-            | "immediate"
-            | "wait"
-            | "auto"
-            | "dual"
-            | "file"
-            | "keyring"
-            | "true"
-            | "false"
-    )
-}
+impl StaticCliAllowlist {
+    /// Derive the public CLI token allowlist strictly by borrowing an already-constructed
+    /// `clap::Command`'s static metadata — never rebuilding `Cli::command()`, never querying
+    /// environment variables, and never reading `argv` or `bin_name`.
+    fn from_command(root: &clap::Command) -> Self {
+        let mut flags: HashSet<String> = ["--", "-h", "--help", "-V", "--version"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        // Public CLI syntax and non-`ValueEnum` custom-parser keywords only (never user argv/env).
+        let mut words: HashSet<String> = [
+            "help",
+            "true",
+            "false",
+            "today",
+            "yesterday",
+            "all",
+            "auto",
+            "dual",
+            "file",
+            "keyring",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut placeholders: HashSet<String> = HashSet::new();
 
-fn is_known_cli_placeholder(token: &str) -> bool {
-    matches!(
-        token,
-        "<PATH>"
-            | "<URL>"
-            | "<BACKEND>"
-            | "<KEY>"
-            | "<PORT>"
-            | "<TEXT>"
-            | "<ID|EMAIL>"
-            | "<ID|EMAIL>..."
-            | "<POSITION>"
-            | "<FILE>"
-            | "[<LEGACY_DIR>]"
-            | "[LEGACY_DIR]"
-            | "<LEGACY_DIR>"
-            | "<AGY_ARGS>"
-            | "<AGY_ARGS>..."
-            | "[<AGY_ARGS>...]"
-            | "<MODEL>"
-            | "<SOURCE>"
-            | "<RANGE>"
-            | "<YYYY-MM-DD>"
-            | "<N>"
-            | "<SECS>"
-            | "<INTERVAL>"
-            | "<COOLDOWN>"
-            | "<CONCURRENCY>"
-            | "<ENABLED>"
-            | "<STRATEGY>"
-            | "<MODE>"
-            | "<RESERVE>"
-            | "<MINIMUM>"
-    )
-}
+        fn collect_cmd(
+            cmd: &clap::Command,
+            flags: &mut HashSet<String>,
+            words: &mut HashSet<String>,
+            placeholders: &mut HashSet<String>,
+        ) {
+            words.insert(cmd.get_name().to_string());
+            for arg in cmd.get_arguments() {
+                if let Some(long) = arg.get_long() {
+                    flags.insert(format!("--{long}"));
+                }
+                if let Some(short) = arg.get_short() {
+                    flags.insert(format!("-{short}"));
+                }
+                for pv in arg.get_possible_values() {
+                    if !pv.is_hide_set() {
+                        words.insert(pv.get_name().to_string());
+                    }
+                }
+                if arg.get_action().takes_values() {
+                    let optional_val = arg.get_num_args().is_some_and(|r| r.min_values() == 0);
+                    let multi_val =
+                        arg.get_num_args().is_some_and(|r| r.max_values() > 1) || arg.is_last_set();
+                    let mut insert_vn = |vn: &str| {
+                        placeholders.insert(format!("<{vn}>"));
+                        if optional_val {
+                            placeholders.insert(format!("[<{vn}>]"));
+                            placeholders.insert(format!("[{vn}]"));
+                        }
+                        if multi_val {
+                            placeholders.insert(format!("<{vn}>..."));
+                            placeholders.insert(format!("[<{vn}>...]"));
+                        }
+                    };
+                    if let Some(vals) = arg.get_value_names() {
+                        if !vals.is_empty() {
+                            for vn in vals {
+                                insert_vn(vn.as_str());
+                            }
+                        } else {
+                            let fallback = arg.get_id().as_str().to_ascii_uppercase();
+                            insert_vn(&fallback);
+                        }
+                    } else {
+                        let fallback = arg.get_id().as_str().to_ascii_uppercase();
+                        insert_vn(&fallback);
+                    }
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                collect_cmd(sub, flags, words, placeholders);
+            }
+        }
 
-fn is_safe_public_cli_token(token: &str) -> bool {
-    let t = token.trim();
-    if t.is_empty() || t.contains('=') {
-        return false;
-    }
-    is_known_cli_flag(t) || is_known_cli_word(t) || is_canonical_nd_range_token(t)
-}
-
-fn is_safe_public_option_spec(spec: &str) -> bool {
-    // Strictly allow-lists actual clap option specs built ONLY from registered flags and placeholders
-    let trimmed = spec.trim();
-    if trimmed.is_empty() || trimmed.len() > 64 || trimmed.contains('=') {
-        return false;
-    }
-    trimmed.split_whitespace().all(|part| {
-        is_known_cli_flag(part) || is_known_cli_word(part) || is_known_cli_placeholder(part)
-    })
-}
-
-fn format_safe_unknown_token(raw_token: &str) -> String {
-    let trimmed = raw_token.trim();
-    if (is_known_cli_flag(trimmed) || is_known_cli_word(trimmed))
-        && !looks_like_secret_argument(trimmed)
-    {
-        return format!("'{trimmed}'");
-    }
-    if let Some((lhs, _rhs)) = trimmed.split_once('=') {
-        if is_known_cli_flag(lhs) {
-            return format!("'{lhs}=[REDACTED]'");
+        collect_cmd(root, &mut flags, &mut words, &mut placeholders);
+        Self {
+            flags,
+            words,
+            placeholders,
         }
     }
-    "'[REDACTED]'".to_string()
-}
 
-fn format_safe_arg_token(raw_token: &str) -> String {
-    let trimmed = raw_token.trim();
-    if is_safe_public_option_spec(trimmed) && !looks_like_secret_argument(trimmed) {
-        return format!("'{trimmed}'");
+    fn is_known_flag(&self, token: &str) -> bool {
+        self.flags.contains(token)
     }
-    if let Some((lhs, _rhs)) = trimmed.split_once('=') {
-        if is_known_cli_flag(lhs) {
-            return format!("'{lhs}=[REDACTED]'");
+
+    fn is_known_word(&self, token: &str) -> bool {
+        self.words.contains(token)
+    }
+
+    fn is_known_placeholder(&self, token: &str) -> bool {
+        self.placeholders.contains(token)
+    }
+
+    fn is_safe_public_token(&self, token: &str) -> bool {
+        let t = token.trim();
+        if t.is_empty() || t.contains('=') {
+            return false;
         }
+        self.is_known_flag(t) || self.is_known_word(t) || is_canonical_nd_range_token(t)
     }
-    "'[REDACTED]'".to_string()
+
+    fn is_safe_public_option_spec(&self, spec: &str) -> bool {
+        // Strictly allow-lists actual clap option specs built ONLY from registered flags and placeholders
+        let trimmed = spec.trim();
+        if trimmed.is_empty() || trimmed.len() > 64 || trimmed.contains('=') {
+            return false;
+        }
+        trimmed.split_whitespace().all(|part| {
+            self.is_known_flag(part) || self.is_known_word(part) || self.is_known_placeholder(part)
+        })
+    }
+
+    fn format_safe_unknown_token(&self, raw_token: &str) -> String {
+        let trimmed = raw_token.trim();
+        if (self.is_known_flag(trimmed) || self.is_known_word(trimmed))
+            && !looks_like_secret_argument(trimmed)
+        {
+            return format!("'{trimmed}'");
+        }
+        if let Some((lhs, _rhs)) = trimmed.split_once('=') {
+            if self.is_known_flag(lhs) {
+                return format!("'{lhs}=[REDACTED]'");
+            }
+        }
+        "'[REDACTED]'".to_string()
+    }
+
+    fn format_safe_arg_token(&self, raw_token: &str) -> String {
+        let trimmed = raw_token.trim();
+        if self.is_safe_public_option_spec(trimmed) && !looks_like_secret_argument(trimmed) {
+            return format!("'{trimmed}'");
+        }
+        if let Some((lhs, _rhs)) = trimmed.split_once('=') {
+            if self.is_known_flag(lhs) {
+                return format!("'{lhs}=[REDACTED]'");
+            }
+        }
+        "'[REDACTED]'".to_string()
+    }
 }
 
 /// Sanitize `clap` argument parse errors STRUCTURALLY using `clap_err.kind()` + `clap_err.context()`
+/// while borrowing static CLI metadata directly from the caller's already-constructed `cmd`
+/// (zero secondary `Cli::command()` construction and zero additional environment variable reads),
 /// so accidental secret positional/flag/env values (`accounts ... add <TOKEN>`, `4/...` OAuth codes,
 /// embedded single quotes `'`, callback URLs, `--flag=<SECRET>`, or `AGY_SWITCH_CLI_*=<SECRET>`)
 /// are NEVER formatted into strings or echoed back to `stderr` or JSON error envelopes.
-pub fn format_safe_clap_error(raw_args: &[String], clap_err: &clap::Error) -> String {
+pub fn format_safe_clap_error(
+    cmd: &clap::Command,
+    raw_args: &[String],
+    clap_err: &clap::Error,
+) -> String {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
 
     let pre_passthrough: Vec<&str> = raw_args
@@ -407,11 +372,16 @@ pub fn format_safe_clap_error(raw_args: &[String], clap_err: &clap::Error) -> St
         return "Plaintext token positional arguments are forbidden on `accounts add` to prevent process-table and log exposure. Use the hidden-echo TTY prompt, `--from-local`, `--from-stdin`, or `--from-file <PATH>`.".to_string();
     }
 
+    let allowlist = StaticCliAllowlist::from_command(cmd);
+
     let safe_ctx_arg = |kind: ContextKind| -> Option<String> {
         match clap_err.get(kind)? {
-            ContextValue::String(s) => Some(format_safe_arg_token(s)),
+            ContextValue::String(s) => Some(allowlist.format_safe_arg_token(s)),
             ContextValue::Strings(list) => {
-                let items: Vec<String> = list.iter().map(|s| format_safe_arg_token(s)).collect();
+                let items: Vec<String> = list
+                    .iter()
+                    .map(|s| allowlist.format_safe_arg_token(s))
+                    .collect();
                 (!items.is_empty()).then(|| items.join(", "))
             }
             _ => None,
@@ -424,7 +394,7 @@ pub fn format_safe_clap_error(raw_args: &[String], clap_err: &clap::Error) -> St
                 let allowed: Vec<&str> = vals
                     .iter()
                     .map(String::as_str)
-                    .filter(|v| is_safe_public_cli_token(v))
+                    .filter(|v| allowlist.is_safe_public_token(v))
                     .collect();
                 if allowed.is_empty() {
                     String::new()
@@ -438,10 +408,12 @@ pub fn format_safe_clap_error(raw_args: &[String], clap_err: &clap::Error) -> St
 
     let safe_unknown_ctx = |kind: ContextKind| -> Option<String> {
         match clap_err.get(kind)? {
-            ContextValue::String(s) => Some(format_safe_unknown_token(s)),
+            ContextValue::String(s) => Some(allowlist.format_safe_unknown_token(s)),
             ContextValue::Strings(list) => {
-                let items: Vec<String> =
-                    list.iter().map(|s| format_safe_unknown_token(s)).collect();
+                let items: Vec<String> = list
+                    .iter()
+                    .map(|s| allowlist.format_safe_unknown_token(s))
+                    .collect();
                 (!items.is_empty()).then(|| items.join(", "))
             }
             _ => None,
@@ -795,10 +767,13 @@ mod tests {
             (&["agy-switch-cli", "stats", "summary", "-z"], "'-z'"),
         ];
 
+        use clap::CommandFactory;
+        let base_cmd = Cli::command();
         for (argv, forbidden) in cases {
             let args: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
-            let err = Cli::try_parse_from(&args).unwrap_err();
-            let safe = format_safe_clap_error(&args, &err);
+            let mut cmd = base_cmd.clone();
+            let err = cmd.try_get_matches_from_mut(&args).unwrap_err();
+            let safe = format_safe_clap_error(&cmd, &args, &err);
             assert!(
                 !safe.contains(forbidden),
                 "Leaked '{forbidden}' in safe clap error for {argv:?}: {safe}"
@@ -814,8 +789,9 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect();
-        let src_err = Cli::try_parse_from(&bad_src).unwrap_err();
-        let src_msg = format_safe_clap_error(&bad_src, &src_err);
+        let mut src_cmd = base_cmd.clone();
+        let src_err = src_cmd.try_get_matches_from_mut(&bad_src).unwrap_err();
+        let src_msg = format_safe_clap_error(&src_cmd, &bad_src, &src_err);
         assert!(
             src_msg.contains("possible values: all, cli, app"),
             "{src_msg}"
@@ -825,8 +801,9 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect();
-        let rng_err = Cli::try_parse_from(&bad_rng).unwrap_err();
-        let rng_msg = format_safe_clap_error(&bad_rng, &rng_err);
+        let mut rng_cmd = base_cmd.clone();
+        let rng_err = rng_cmd.try_get_matches_from_mut(&bad_rng).unwrap_err();
+        let rng_msg = format_safe_clap_error(&rng_cmd, &bad_rng, &rng_err);
         assert!(
             rng_msg.contains("expected: today, yesterday, all, or <N>d with 1 <= N <= 36500"),
             "{rng_msg}"
@@ -836,8 +813,9 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect();
-        let rec_err = Cli::try_parse_from(&bad_recent).unwrap_err();
-        let rec_msg = format_safe_clap_error(&bad_recent, &rec_err);
+        let mut rec_cmd = base_cmd.clone();
+        let rec_err = rec_cmd.try_get_matches_from_mut(&bad_recent).unwrap_err();
+        let rec_msg = format_safe_clap_error(&rec_cmd, &bad_recent, &rec_err);
         assert!(rec_msg.contains("expected integer 1..=500"), "{rec_msg}");
 
         // Verify removed legacy flags/subcommands/aliases are strictly rejected
@@ -909,25 +887,35 @@ mod tests {
     #[test]
     fn literal_cli_allowlist_covers_all_registered_commands_and_flags() {
         use clap::CommandFactory;
-        fn verify_cmd(cmd: &clap::Command) {
+        let unbuilt_cmd = Cli::command();
+        let mut built_cmd = unbuilt_cmd.clone();
+        built_cmd.build();
+        let allowlist = StaticCliAllowlist::from_command(&unbuilt_cmd);
+        let built_allowlist = StaticCliAllowlist::from_command(&built_cmd);
+        assert_eq!(
+            allowlist, built_allowlist,
+            "StaticCliAllowlist must derive identical sets from unbuilt and built Commands without rebuilding"
+        );
+
+        fn verify_cmd(cmd: &clap::Command, allowlist: &StaticCliAllowlist) {
             assert!(
-                is_known_cli_word(cmd.get_name()),
-                "Missing command '{}' in is_known_cli_word",
+                allowlist.is_known_word(cmd.get_name()),
+                "Missing command '{}' in StaticCliAllowlist::words",
                 cmd.get_name()
             );
             for arg in cmd.get_arguments() {
                 if let Some(long) = arg.get_long() {
                     let flag = format!("--{long}");
                     assert!(
-                        is_known_cli_flag(&flag),
-                        "Missing long flag '{flag}' in is_known_cli_flag"
+                        allowlist.is_known_flag(&flag),
+                        "Missing long flag '{flag}' in StaticCliAllowlist::flags"
                     );
                 }
                 if let Some(short) = arg.get_short() {
                     let flag = format!("-{short}");
                     assert!(
-                        is_known_cli_flag(&flag),
-                        "Missing short flag '{flag}' in is_known_cli_flag"
+                        allowlist.is_known_flag(&flag),
+                        "Missing short flag '{flag}' in StaticCliAllowlist::flags"
                     );
                 }
                 if arg.get_action().takes_values() {
@@ -935,17 +923,105 @@ mod tests {
                         for vn in vals {
                             let angle = format!("<{vn}>");
                             assert!(
-                                is_known_cli_placeholder(&angle),
-                                "Missing placeholder '{angle}' in is_known_cli_placeholder"
+                                allowlist.is_known_placeholder(&angle),
+                                "Missing placeholder '{angle}' in StaticCliAllowlist::placeholders"
                             );
                         }
                     }
                 }
             }
             for sub in cmd.get_subcommands() {
-                verify_cmd(sub);
+                verify_cmd(sub, allowlist);
             }
         }
-        verify_cmd(&Cli::command());
+        verify_cmd(&built_cmd, &allowlist);
+
+        // Verify derived enum words and multi/optional placeholder variants remain covered.
+        for word in [
+            "priority",
+            "round-robin",
+            "immediate",
+            "wait",
+            "all",
+            "cli",
+            "app",
+            "auto",
+            "dual",
+            "file",
+            "keyring",
+            "today",
+            "yesterday",
+            "true",
+            "false",
+        ] {
+            assert!(
+                allowlist.is_known_word(word),
+                "Expected public word '{word}'"
+            );
+        }
+        for ph in [
+            "<CONCURRENCY>",
+            "<ENABLED>",
+            "<STRATEGY>",
+            "<MODE>",
+            "<RESERVE>",
+            "<MINIMUM>",
+            "<ID|EMAIL>...",
+            "[<LEGACY_DIR>]",
+            "[LEGACY_DIR]",
+            "<AGY_ARGS>...",
+            "[<AGY_ARGS>...]",
+            "[<SECS>]",
+        ] {
+            assert!(
+                allowlist.is_known_placeholder(ph),
+                "Expected derived placeholder '{ph}'"
+            );
+        }
+
+        // Verify removed/unknown flags, fake placeholders, and secret shapes are strictly excluded.
+        for bad_flag in ["--reason", "--manual", "--stdin", "--ids", "-z", "--secret"] {
+            assert!(
+                !allowlist.is_known_flag(bad_flag),
+                "Removed/unknown flag '{bad_flag}' must not be allowlisted"
+            );
+        }
+        for bad_ph in ["<FAKE_PLACEHOLDER_SECRET>", "[FAKE_BRACKET_SECRET]"] {
+            assert!(
+                !allowlist.is_known_placeholder(bad_ph),
+                "Fake placeholder '{bad_ph}' must not be allowlisted"
+            );
+        }
+        for bad_word in ["1//0gSyntheticSecret", "alice@example.com", "doctor"] {
+            assert!(
+                !allowlist.is_known_word(bad_word),
+                "Unknown/secret token '{bad_word}' must not be allowlisted"
+            );
+        }
+
+        // Prove `format_safe_clap_error` strictly borrows the passed `&clap::Command` without
+        // ever calling `Cli::command()` (which would otherwise read `#[arg(env = ...)]` vars):
+        let mut isolated_cmd = clap::Command::new("isolated-test-cmd").arg(
+            clap::Arg::new("alpha")
+                .long("alpha")
+                .value_name("VAL")
+                .action(clap::ArgAction::Set),
+        );
+        let isolated_args: Vec<String> = ["isolated-test-cmd", "--data-dir=1//0gSecretValue"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let isolated_err = isolated_cmd
+            .try_get_matches_from_mut(&isolated_args)
+            .unwrap_err();
+        let isolated_msg = format_safe_clap_error(&isolated_cmd, &isolated_args, &isolated_err);
+        assert!(
+            !isolated_msg.contains("--data-dir") && !isolated_msg.contains("SecretValue"),
+            "format_safe_clap_error must borrow only the passed Command (not rebuild Cli::command()): {isolated_msg}"
+        );
+        assert!(
+            isolated_msg.contains("'[REDACTED]'"),
+            "expected redacted unknown arg in isolated command test: {isolated_msg}"
+        );
     }
 }

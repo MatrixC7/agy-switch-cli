@@ -565,8 +565,10 @@ pub fn read_regular_file_bounded(path: &Path, max_bytes: usize, label: &str) -> 
     }
 }
 
-/// Fault-injection hook used strictly in automated fault-injection tests via `AGY_SWITCH_CLI_FAULT_SPEC`.
-/// Format: `<stage>:<filename_substr>:<action>` where action is `enospc`, `erofs`, `io`, `corrupt_after_rename`, or `abort`.
+/// Fault-injection hook used strictly in automated debug/test fault-injection builds via `AGY_SWITCH_CLI_FAULT_SPEC`.
+/// Format: `<stage>:<filename_substr>:<action>` where action is `enospc`, `erofs`, `io`, `corrupt_after_rename`, `corrupt_once`, or `abort`.
+/// Compiled out completely (`Ok(())` no-op) in release binaries (`not(any(test, debug_assertions))`).
+#[cfg(any(test, debug_assertions))]
 pub fn check_fault_injection(stage: &str, target: &Path) -> CliResult<()> {
     let Ok(spec) = std::env::var("AGY_SWITCH_CLI_FAULT_SPEC") else {
         return Ok(());
@@ -615,6 +617,13 @@ pub fn check_fault_injection(stage: &str, target: &Path) -> CliResult<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Production release no-op: fault-injection hooks and `AGY_SWITCH_CLI_FAULT_SPEC` are compiled out.
+#[cfg(not(any(test, debug_assertions)))]
+#[inline(always)]
+pub fn check_fault_injection(_stage: &str, _target: &Path) -> CliResult<()> {
     Ok(())
 }
 

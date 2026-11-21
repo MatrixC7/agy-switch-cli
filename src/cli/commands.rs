@@ -1408,10 +1408,19 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 if cli.json {
                     print_json(&outcome)?;
                 } else {
-                    println!(
-                        "Installed and started user service `{}`.",
-                        outcome.service_name
-                    );
+                    if outcome.enabled_and_started {
+                        println!(
+                            "Installed and started user service `{}`.",
+                            outcome.service_name
+                        );
+                    } else {
+                        println!(
+                            "Installed and enabled user service `{}` (currently `{}`; inspect progress with `agy-switch-cli status` or `journalctl --user -u {}`).",
+                            outcome.service_name,
+                            outcome.active_state,
+                            outcome.service_name
+                        );
+                    }
                     println!(
                         "  Unit file : {}",
                         terminal_text(&outcome.unit_path.to_string_lossy())
@@ -1458,7 +1467,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                     print_json(&outcome)?;
                 } else if outcome.removed_unit_file {
                     println!(
-                        "Stopped, disabled, and removed user service `{}` ({}).",
+                        "Removed user service `{}` ({}).",
                         outcome.service_name,
                         terminal_text(&outcome.unit_path.to_string_lossy())
                     );

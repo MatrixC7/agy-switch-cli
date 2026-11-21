@@ -5103,7 +5103,8 @@ fn synthetic_v120_signoff_round2_exact_backend_literals_tui_json_and_uninstall_d
 
     let swap_systemctl = env._tmp.path().join("swap_systemctl.sh");
     let script = format!(
-        "#!/bin/sh\nif [ \"$2\" = \"disable\" ]; then\n  mv \"{real}\" \"{real}.moved\"\n  ln -s \"{victim}\" \"{real}\"\nfi\nexit 0\n",
+        "#!/bin/sh\nif [ \"$2\" = \"show\" ]; then\n  printf 'FragmentPath={unit}\\nLoadState=loaded\\nUnitFileState=enabled\\nActiveState=active\\n'\nelif [ \"$2\" = \"disable\" ]; then\n  mv \"{real}\" \"{real}.moved\"\n  ln -s \"{victim}\" \"{real}\"\nfi\nexit 0\n",
+        unit = real_unit.display(),
         real = real_user_dir.display(),
         victim = victim_dir.display(),
     );
@@ -5124,6 +5125,10 @@ fn synthetic_v120_signoff_round2_exact_backend_literals_tui_json_and_uninstall_d
         "Directory-to-symlink swap during disable --now MUST fail with exit 1: stdout={} stderr={}",
         String::from_utf8_lossy(&swap_uninst.stdout),
         String::from_utf8_lossy(&swap_uninst.stderr)
+    );
+    assert!(
+        cfg_home.join("systemd/user.moved").exists(),
+        "Expected mock `disable` step to execute and perform the directory swap before unlink guard ran"
     );
     assert!(
         victim_unit.exists(),
@@ -9810,4 +9815,235 @@ fn synthetic_v124_status_daemon_runtime_app_probe_and_disable_without_reason() {
             .unwrap()
             .disabled
     );
+}
+
+#[test]
+fn synthetic_v125_r405_systemd_edge_states_and_install_active_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = IsolatedEnv::new();
+    let marker_dir = env._tmp.path().join("r405_run_systemd_system");
+    let cfg_home = env._tmp.path().join("r405_xdg_cfg");
+    fs::create_dir_all(&marker_dir).unwrap();
+    fs::create_dir_all(&cfg_home).unwrap();
+    let unit_file = cfg_home.join("systemd/user/agy-switch-cli.service");
+
+    let write_mock_ctl = |name: &str, script: String| -> PathBuf {
+        let path = env._tmp.path().join(name);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+
+    // 1. Install reporting `UnitFileState=linked` + `ActiveState=active` MUST fail closed (`systemctl_verify_failed`).
+    let linked_ctl = write_mock_ctl(
+        "systemctl_linked",
+        "#!/bin/sh\n\
+         UNIT_FILE=\"$XDG_CONFIG_HOME/systemd/user/agy-switch-cli.service\"\n\
+         if [ \"$2\" = \"show\" ]; then\n\
+           printf 'FragmentPath=%s\\nLoadState=loaded\\nUnitFileState=linked\\nActiveState=active\\n' \"$UNIT_FILE\"\n\
+         fi\n\
+         exit 0\n"
+            .into(),
+    );
+    let linked_out = env
+        .cli_cmd()
+        .env("XDG_CONFIG_HOME", &cfg_home)
+        .env("AGY_SWITCH_CLI_SYSTEMD_MARKER_DIR", &marker_dir)
+        .env("AGY_SWITCH_CLI_SYSTEMCTL_BIN", &linked_ctl)
+        .args(["--json", "daemon", "--install"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        linked_out.status.code(),
+        Some(1),
+        "UnitFileState=linked must be rejected; stdout={} stderr={}",
+        String::from_utf8_lossy(&linked_out.stdout),
+        String::from_utf8_lossy(&linked_out.stderr)
+    );
+    let linked_err: serde_json::Value = serde_json::from_slice(&linked_out.stderr).unwrap();
+    assert_eq!(linked_err["error_code"], "systemctl_verify_failed");
+
+    // 2. Install reporting `UnitFileState=enabled` + `ActiveState=activating` succeeds cleanly
+    //    WITHOUT falsely reporting `enabled_and_started=true`, distinguishing `activating` in JSON & text.
+    let activating_ctl = write_mock_ctl(
+        "systemctl_activating",
+        "#!/bin/sh\n\
+         UNIT_FILE=\"$XDG_CONFIG_HOME/systemd/user/agy-switch-cli.service\"\n\
+         if [ \"$2\" = \"show\" ]; then\n\
+           printf 'FragmentPath=%s\\nLoadState=loaded\\nUnitFileState=enabled\\nActiveState=activating\\n' \"$UNIT_FILE\"\n\
+         fi\n\
+         exit 0\n"
+            .into(),
+    );
+    let act_json = env
+        .cli_cmd()
+        .env("XDG_CONFIG_HOME", &cfg_home)
+        .env("AGY_SWITCH_CLI_SYSTEMD_MARKER_DIR", &marker_dir)
+        .env("AGY_SWITCH_CLI_SYSTEMCTL_BIN", &activating_ctl)
+        .args(["--json", "daemon", "--install"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        act_json.status.code(),
+        Some(0),
+        "activating install json failed: stderr={}",
+        String::from_utf8_lossy(&act_json.stderr)
+    );
+    let act_v: serde_json::Value = serde_json::from_slice(&act_json.stdout).unwrap();
+    assert_eq!(act_v["enabled_and_started"], false);
+    assert_eq!(act_v["active_state"], "activating");
+
+    let act_text = env
+        .cli_cmd()
+        .env("XDG_CONFIG_HOME", &cfg_home)
+        .env("AGY_SWITCH_CLI_SYSTEMD_MARKER_DIR", &marker_dir)
+        .env("AGY_SWITCH_CLI_SYSTEMCTL_BIN", &activating_ctl)
+        .args(["daemon", "--install"])
+        .output()
+        .unwrap();
+    assert_eq!(act_text.status.code(), Some(0));
+    let act_stdout = String::from_utf8_lossy(&act_text.stdout);
+    assert!(
+        !act_stdout.contains("Installed and started"),
+        "activating human output must not claim started: {act_stdout}"
+    );
+    assert!(
+        act_stdout.contains("Installed and enabled")
+            && act_stdout.contains("currently `activating`"),
+        "activating human output must clarify starting state: {act_stdout}"
+    );
+
+    // 3. Normal `UnitFileState=enabled` + `ActiveState=active` keeps `enabled_and_started=true` & `active_state="active"`.
+    let active_ctl = write_mock_ctl(
+        "systemctl_active_ok",
+        "#!/bin/sh\n\
+         UNIT_FILE=\"$XDG_CONFIG_HOME/systemd/user/agy-switch-cli.service\"\n\
+         if [ \"$2\" = \"show\" ]; then\n\
+           printf 'FragmentPath=%s\\nLoadState=loaded\\nUnitFileState=enabled\\nActiveState=active\\n' \"$UNIT_FILE\"\n\
+         fi\n\
+         exit 0\n"
+            .into(),
+    );
+    let ok_json = env
+        .cli_cmd()
+        .env("XDG_CONFIG_HOME", &cfg_home)
+        .env("AGY_SWITCH_CLI_SYSTEMD_MARKER_DIR", &marker_dir)
+        .env("AGY_SWITCH_CLI_SYSTEMCTL_BIN", &active_ctl)
+        .args(["--json", "daemon", "--install"])
+        .output()
+        .unwrap();
+    assert_eq!(ok_json.status.code(), Some(0));
+    let ok_v: serde_json::Value = serde_json::from_slice(&ok_json.stdout).unwrap();
+    assert_eq!(ok_v["enabled_and_started"], true);
+    assert_eq!(ok_v["active_state"], "active");
+    assert!(unit_file.exists());
+
+    // 4. Uninstall with local unit PRESENT, `LoadState=not-found`, empty `FragmentPath`, and `ActiveState=active`/`activating`
+    //    MUST refuse without invoking `disable --now` or deleting the local unit file.
+    for (tag, load_state, active_state) in [
+        ("notfound_active", "not-found", "active"),
+        ("notfound_activating", "not-found", "activating"),
+        ("loaded_nofrag_inactive", "loaded", "inactive"),
+        ("empty_show_output", "", ""),
+    ] {
+        let disable_marker = env._tmp.path().join(format!("r405_disable_called_{tag}"));
+        let ctl = write_mock_ctl(
+            &format!("systemctl_uninst_{tag}"),
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$2\" = \"disable\" ]; then\n\
+                   echo called > \"{}\"\n\
+                 elif [ \"$2\" = \"show\" ]; then\n\
+                   printf 'FragmentPath=\\nLoadState={load_state}\\nUnitFileState=\\nActiveState={active_state}\\n'\n\
+                 fi\n\
+                 exit 0\n",
+                disable_marker.display()
+            ),
+        );
+        let res = env
+            .cli_cmd()
+            .env("XDG_CONFIG_HOME", &cfg_home)
+            .env("AGY_SWITCH_CLI_SYSTEMD_MARKER_DIR", &marker_dir)
+            .env("AGY_SWITCH_CLI_SYSTEMCTL_BIN", &ctl)
+            .args(["--json", "daemon", "--uninstall"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            res.status.code(),
+            Some(1),
+            "uninstall ({tag}) must fail closed when unit identity is unverified; stdout={} stderr={}",
+            String::from_utf8_lossy(&res.stdout),
+            String::from_utf8_lossy(&res.stderr)
+        );
+        assert!(
+            !disable_marker.exists(),
+            "uninstall ({tag}) must NEVER invoke `disable --now` on an unverified unit"
+        );
+        assert!(
+            unit_file.exists(),
+            "uninstall ({tag}) must keep local unit file intact on refusal"
+        );
+    }
+
+    // 5. Uninstall with local unit PRESENT, `LoadState=not-found`, empty `FragmentPath`, and `ActiveState=inactive`
+    //    skips blind `disable --now`, safely removes the pinned local unit file, and runs `daemon-reload`.
+    let cleanup_log = env._tmp.path().join("r405_cleanup_calls.log");
+    let cleanup_ctl = write_mock_ctl(
+        "systemctl_uninst_notfound_inactive",
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{}\"\n\
+             if [ \"$2\" = \"show\" ]; then\n\
+               printf 'FragmentPath=\\nLoadState=not-found\\nUnitFileState=\\nActiveState=inactive\\n'\n\
+             fi\n\
+             exit 0\n",
+            cleanup_log.display()
+        ),
+    );
+    let clean_out = env
+        .cli_cmd()
+        .env("XDG_CONFIG_HOME", &cfg_home)
+        .env("AGY_SWITCH_CLI_SYSTEMD_MARKER_DIR", &marker_dir)
+        .env("AGY_SWITCH_CLI_SYSTEMCTL_BIN", &cleanup_ctl)
+        .args(["--json", "daemon", "--uninstall"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        clean_out.status.code(),
+        Some(0),
+        "idempotent uninstall of inactive not-found unit failed: stderr={}",
+        String::from_utf8_lossy(&clean_out.stderr)
+    );
+    let clean_v: serde_json::Value = serde_json::from_slice(&clean_out.stdout).unwrap();
+    assert_eq!(clean_v["removed_unit_file"], true);
+    assert!(!unit_file.exists());
+    let calls = fs::read_to_string(&cleanup_log).unwrap();
+    assert!(
+        !calls.contains("disable --now"),
+        "not-found+inactive uninstall must skip blind `disable --now`: {calls}"
+    );
+    assert!(
+        calls.contains("--user daemon-reload"),
+        "not-found+inactive uninstall must still run `daemon-reload`: {calls}"
+    );
+
+    // Human text mode for `not-found + inactive` states factual removal without claiming stop/disable ran.
+    fs::write(&unit_file, "[Unit]\nDescription=SyntheticLeftover\n").unwrap();
+    let clean_human = env
+        .cli_cmd()
+        .env("XDG_CONFIG_HOME", &cfg_home)
+        .env("AGY_SWITCH_CLI_SYSTEMD_MARKER_DIR", &marker_dir)
+        .env("AGY_SWITCH_CLI_SYSTEMCTL_BIN", &cleanup_ctl)
+        .args(["daemon", "--uninstall"])
+        .output()
+        .unwrap();
+    assert_eq!(clean_human.status.code(), Some(0));
+    let clean_stdout = String::from_utf8_lossy(&clean_human.stdout);
+    assert!(
+        clean_stdout.contains("Removed user service `agy-switch-cli.service`")
+            && !clean_stdout.contains("Stopped, disabled"),
+        "human uninstall output must state factual removal without claiming stop/disable: {clean_stdout}"
+    );
+    assert!(!unit_file.exists());
 }

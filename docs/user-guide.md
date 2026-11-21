@@ -664,7 +664,7 @@ agy-switch-cli daemon --once --reset-cooldown
 
 - **服务管理与运行模式**
   - `--install`（默认关闭，与 `--uninstall`、`--once` 互斥）：检测系统 `systemd --user` 可用性，原子生成 `~/.config/systemd/user/agy-switch-cli.service` 并自动执行 `daemon-reload` 与 `enable --now`（在无 `systemd` 的 Docker 容器中会给出清晰提示并引导参见第 `7.2` 节）。若服务当时已在运行且本次修改了 `--interval`、`--cooldown` 或可执行文件路径，请随后再执行一次 `systemctl --user restart agy-switch-cli.service` 使新启动参数生效。
-  - `--uninstall`（默认关闭，与 `--install`、`--once`、`--no-notify`、`--reset-cooldown` 互斥）：自动执行 `disable --now`、防符号链接安全删除 `agy-switch-cli.service` 并重载 `daemon-reload`。
+  - `--uninstall`（默认关闭，与 `--install`、`--once`、`--no-notify`、`--reset-cooldown` 互斥）：先核验 `systemd --user` 管理器加载的服务单元身份；确认指向当前用户的 `agy-switch-cli.service` 时执行 `disable --now`，若服务处于未加载且非活跃态则跳过 `disable --now`，随后防符号链接安全删除本地服务文件并重载 `daemon-reload`。
   - `--once`（默认关闭，与 `--install`、`--uninstall` 互斥）：执行单轮实时评估与按需切换后立即退出，非 `--json` 模式向 `stdout` 输出单行状态结论，`--json` 模式输出标准 JSON 结果信封，适合 `cron` 或单次验证排障。
 - **巡检周期、冷却时间与桌面通知**
   - `--interval <秒>`（环境变量 `AGY_SWITCH_CLI_INTERVAL`，默认值 `180` 即 3 分钟，最小 `1`）：后台巡检间隔秒数（常驻模式内置 `±10%` 随机时间抖动，每次合资格的定时唤醒均会直接联网复核当前活跃账号，`Wait` 模式挂起计划的复验保鲜期自动收紧为有效间隔的 `80%`、范围 `1..=3600` 秒）。配合 `daemon --install` 传入时写入服务单元长期生效。
@@ -895,7 +895,7 @@ Requests (newest first, showing 5)
 - **特殊命令与 `daemon` 三类输出说明**
   - **`tui` 与 `stats ... --watch`**：全屏交互终端界面，均与 `--json` 互斥并直接返回退出码 `2`。
   - **`run -- agy ...`**：在前置凭据准备、锁检查或进程检查失败时向 `stderr` 输出结构化错误信封；前置准备成功后直接将标准输入输出交给 `agy` 子进程并原样透传其退出码。
-  - **`daemon --install --json`、`daemon --uninstall --json` 与 `daemon --reset-cooldown --json`**：属于一次性单目标管理命令，成功时向 `stdout` 输出包含 `"schema_version": 1, "ok": true` 的结果信封并返回退出码 `0`（其中独立 `daemon --reset-cooldown --json` 返回 `cooldown_reset`、`cooldown_was_active`、`previous_cooldown_until` 字段，且 `daemon --install --reset-cooldown --json` 亦附加该三项字段；不传 `--reset-cooldown` 时安装 JSON 保持原结构不变），失败或参数非法时向 `stderr` 输出结构化错误信封并返回非零退出码。
+  - **`daemon --install --json`、`daemon --uninstall --json` 与 `daemon --reset-cooldown --json`**：属于一次性单目标管理命令，成功时向 `stdout` 输出包含 `"schema_version": 1, "ok": true` 的结果信封并返回退出码 `0`（其中 `daemon --install --json` 返回 `enabled_and_started` 与 `active_state` 以准确区分已启动 `active` 与启动中 `activating`；独立 `daemon --reset-cooldown --json` 返回 `cooldown_reset`、`cooldown_was_active`、`previous_cooldown_until` 字段，且 `daemon --install --reset-cooldown --json` 亦附加该三项字段），失败或参数非法时向 `stderr` 输出结构化错误信封并返回非零退出码。
   - **`daemon --once --json`**：单轮巡检完成后向 `stdout` 输出包含 `"schema_version": 1, "ok": true, "daemon": { ... }` 的结构化结果信封（包含 `outcome`、`phase`、不含本机路径的固定结构化 `reason`、`source_account_id`、`source_remaining_percentage`、`source_refreshed`、`target_account_id` 等字段）并返回退出码 `0`（仅当收到外部终止信号提前取消时静默返回 `0`）。
   - **前台常驻 `daemon --json`**：为避免多轮循环向 `stdout` 连续输出多个根 JSON 对象破坏单 JSON 解析，常驻模式在 `--json` 下保持正常轮次静默，仅在启动校验失败、单实例锁冲突或致命错误时向 `stderr` 输出错误信封并返回非零退出码；需要查看逐轮巡检日志时请在非 `--json` 模式下运行（或通过 `journalctl --user -u agy-switch-cli.service -f` 查看标准输出记录）。
 

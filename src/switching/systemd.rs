@@ -50,6 +50,7 @@ pub struct DaemonServiceInstallOutcome {
     pub interval_secs: u64,
     pub cooldown_secs: i64,
     pub enabled_and_started: bool,
+    pub active_state: String,
     pub linger_hint: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_reset: Option<bool>,
@@ -633,6 +634,40 @@ fn stat_regular_path_nofollow(path: &Path) -> CliResult<Option<(u64, u64)>> {
     Ok(Some((st.st_dev as u64, st.st_ino as u64)))
 }
 
+fn verify_manager_loaded_unit_identity(
+    mgr: &ManagerUnitShow,
+    unit_path: &Path,
+    unit_dev: u64,
+    unit_ino: u64,
+    phase: &str,
+) -> CliResult<()> {
+    let Some(ref frag_path) = mgr.fragment_path else {
+        return Err(CliError::io(
+            "systemctl_verify_failed",
+            format!(
+                "systemd manager did not report FragmentPath {phase}; cannot verify installed unit identity."
+            ),
+        ));
+    };
+    if stat_regular_path_nofollow(frag_path)? != Some((unit_dev, unit_ino)) {
+        return Err(CliError::data(format!(
+            "systemd manager resolved `{SYSTEMD_SERVICE_NAME}` to a different unit file ('{}') instead of '{}' {phase} (inode mismatch).",
+            frag_path.display(),
+            unit_path.display()
+        )));
+    }
+    if mgr.load_state.as_deref() != Some("loaded") {
+        return Err(CliError::io(
+            "systemctl_verify_failed",
+            format!(
+                "systemd manager reported unexpected LoadState `{}` {phase} (expected `loaded`).",
+                mgr.load_state.as_deref().unwrap_or("unknown")
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn verify_user_systemd_manager_active(
     systemctl_bin: &Path,
     paths: &HeadlessPaths,
@@ -743,28 +778,13 @@ pub async fn install_systemd_user_service_with_reset(
         unit_body.as_bytes(),
     )?;
     let pre_enable_mgr = query_manager_unit_identity(&systemctl_bin, paths).await?;
-    let Some(ref pre_frag_path) = pre_enable_mgr.fragment_path else {
-        return Err(CliError::io(
-            "systemctl_verify_failed",
-            "systemd manager did not report FragmentPath after `daemon-reload`; refusing to enable unverified unit.",
-        ));
-    };
-    if stat_regular_path_nofollow(pre_frag_path)? != Some((unit_dev, unit_ino)) {
-        return Err(CliError::data(format!(
-            "systemd manager resolved `{SYSTEMD_SERVICE_NAME}` to a different unit file ('{}') instead of '{}' after `daemon-reload`; refusing to run `enable --now`.",
-            pre_frag_path.display(),
-            unit_path.display()
-        )));
-    }
-    if pre_enable_mgr.load_state.as_deref() != Some("loaded") {
-        return Err(CliError::io(
-            "systemctl_verify_failed",
-            format!(
-                "systemd manager reported unexpected LoadState `{}` after `daemon-reload` (expected `loaded`).",
-                pre_enable_mgr.load_state.as_deref().unwrap_or("unknown")
-            ),
-        ));
-    }
+    verify_manager_loaded_unit_identity(
+        &pre_enable_mgr,
+        &unit_path,
+        unit_dev,
+        unit_ino,
+        "after `daemon-reload`",
+    )?;
 
     let (enable_rc, enable_msg) = run_systemctl_user(
         &systemctl_bin,
@@ -802,47 +822,42 @@ pub async fn install_systemd_user_service_with_reset(
     )?;
 
     let mgr_state = query_manager_unit_identity(&systemctl_bin, paths).await?;
-    let Some(ref frag_path) = mgr_state.fragment_path else {
-        return Err(CliError::io(
-            "systemctl_verify_failed",
-            "systemd manager did not report FragmentPath after `enable --now`; cannot verify installed unit identity.",
-        ));
-    };
-    let frag_id = stat_regular_path_nofollow(frag_path)?;
-    if frag_id != Some((unit_dev, unit_ino)) {
-        return Err(CliError::data(format!(
-            "systemd manager loaded a different unit file ('{}') instead of the newly installed '{}' (inode mismatch).",
-            frag_path.display(),
-            unit_path.display()
-        )));
-    }
-    if mgr_state.load_state.as_deref() != Some("loaded") {
-        return Err(CliError::io(
-            "systemctl_verify_failed",
-            format!(
-                "systemd manager reported unexpected LoadState `{}` after installation (expected `loaded`).",
-                mgr_state.load_state.as_deref().unwrap_or("unknown")
-            ),
-        ));
-    }
+    verify_manager_loaded_unit_identity(
+        &mgr_state,
+        &unit_path,
+        unit_dev,
+        unit_ino,
+        "after `enable --now`",
+    )?;
     let is_enabled = matches!(
         mgr_state.unit_file_state.as_deref(),
-        Some("enabled" | "enabled-runtime" | "linked")
+        Some("enabled" | "enabled-runtime")
     );
-    let is_active = matches!(
-        mgr_state.active_state.as_deref(),
-        Some("active" | "activating")
-    );
-    if !is_enabled || !is_active {
+    let active_state = match mgr_state.active_state.as_deref() {
+        Some("active") => "active",
+        Some("activating") => "activating",
+        _ => {
+            return Err(CliError::io(
+                "systemctl_verify_failed",
+                format!(
+                    "systemd manager did not confirm enabled+active state after `enable --now` (UnitFileState=`{}`, ActiveState=`{}`).",
+                    mgr_state.unit_file_state.as_deref().unwrap_or("unknown"),
+                    mgr_state.active_state.as_deref().unwrap_or("unknown"),
+                ),
+            ));
+        }
+    };
+    if !is_enabled {
         return Err(CliError::io(
             "systemctl_verify_failed",
             format!(
-                "systemd manager did not confirm enabled+active state after `enable --now` (UnitFileState=`{}`, ActiveState=`{}`).",
+                "systemd manager did not confirm enabled state after `enable --now` (UnitFileState=`{}`, ActiveState=`{}`).",
                 mgr_state.unit_file_state.as_deref().unwrap_or("unknown"),
-                mgr_state.active_state.as_deref().unwrap_or("unknown"),
+                active_state,
             ),
         ));
     }
+    let enabled_and_started = active_state == "active";
 
     verify_pinned_unit_inode_after_wait(
         &pinned_user_fd,
@@ -870,7 +885,8 @@ pub async fn install_systemd_user_service_with_reset(
         cooldown_secs: opts
             .explicit_cooldown_secs
             .unwrap_or(DEFAULT_DAEMON_COOLDOWN_SECS),
-        enabled_and_started: true,
+        enabled_and_started,
+        active_state: active_state.to_string(),
         linger_hint: "sudo loginctl enable-linger $USER",
         cooldown_reset: reset_outcome.as_ref().map(|r| r.cooldown_reset),
         cooldown_was_active: reset_outcome.as_ref().map(|r| r.cooldown_was_active),
@@ -958,21 +974,46 @@ pub async fn uninstall_systemd_user_service(
                     "Refusing to disable `{SYSTEMD_SERVICE_NAME}` because systemd manager reports it as `masked`."
                 )));
             }
-            if pre_mgr.load_state.as_deref() == Some("not-found") || pre_mgr.fragment_path.is_none()
-            {
-                true
-            } else if let Some(ref frag_path) = pre_mgr.fragment_path {
-                let frag_id = stat_regular_path_nofollow(frag_path)?;
-                if frag_id != Some((*target_dev, *target_ino)) {
-                    return Err(CliError::data(format!(
-                        "Refusing to disable `{SYSTEMD_SERVICE_NAME}` because systemd manager loaded a different unit file ('{}') than '{}'.",
-                        frag_path.display(),
-                        unit_path.display()
-                    )));
+            let manager_active = matches!(
+                pre_mgr.active_state.as_deref(),
+                Some("active" | "activating")
+            );
+            match pre_mgr.fragment_path.as_deref() {
+                None => {
+                    let safely_unloaded = matches!(
+                        pre_mgr.load_state.as_deref(),
+                        Some("not-found" | "error" | "bad-setting")
+                    );
+                    if manager_active || !safely_unloaded {
+                        return Err(CliError::data(format!(
+                            "Refusing to disable `{SYSTEMD_SERVICE_NAME}` because systemd manager reports LoadState=`{}` / ActiveState=`{}` without a verifiable FragmentPath matching '{}'.",
+                            pre_mgr.load_state.as_deref().unwrap_or("unknown"),
+                            pre_mgr.active_state.as_deref().unwrap_or("unknown"),
+                            unit_path.display()
+                        )));
+                    }
+                    false
                 }
-                true
-            } else {
-                true
+                Some(_) if pre_mgr.load_state.as_deref() == Some("not-found") => {
+                    if manager_active {
+                        return Err(CliError::data(format!(
+                            "Refusing to disable `{SYSTEMD_SERVICE_NAME}` because systemd manager reports LoadState=`not-found` while ActiveState=`{}`.",
+                            pre_mgr.active_state.as_deref().unwrap_or("unknown")
+                        )));
+                    }
+                    false
+                }
+                Some(frag_path) => {
+                    let frag_id = stat_regular_path_nofollow(frag_path)?;
+                    if frag_id != Some((*target_dev, *target_ino)) {
+                        return Err(CliError::data(format!(
+                            "Refusing to disable `{SYSTEMD_SERVICE_NAME}` because systemd manager loaded a different unit file ('{}') than '{}'.",
+                            frag_path.display(),
+                            unit_path.display()
+                        )));
+                    }
+                    true
+                }
             }
         }
         None => {

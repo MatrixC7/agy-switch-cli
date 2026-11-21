@@ -70,7 +70,7 @@ flowchart TD
 | `domain/quota.rs` | 配额池分类（`Gemini` / `ThirdParty` / `Argon`）、四态配额评估纯函数 `evaluate_account_quota`（默认 `3600s` 保鲜期，识别 `Free` 与 `Antigravity Starter Quota` 免 `5h` 桶评估） |
 | `domain/policy.rs` / `config.rs` / `clock.rs` | 自动切号策略模型与逐字段校验器、`config.json` 配置解析（`Debug` 自动脱敏密钥与代理口令）、基于纯 Rust `jiff` 的严格 RFC 3339 / 本地时区 / `YYYY-MM-DD` 自然日工具与测试时钟 |
 | `store/locks.rs` | 基于 POSIX `flock` + 线程级顺序守卫的四级单向锁实现（`L1`、`PendingAuthLock`、`L2`、`L3`）与 `DaemonInstanceLock` |
-| `store/fs_atomic.rs` | 全深度祖先符号链接拦截、`O_NOFOLLOW \| O_NONBLOCK` 有界普通文件读取、临时文件与父目录双 `fsync` 原子写入及故障注入钩子 |
+| `store/fs_atomic.rs` | 全深度祖先符号链接拦截、`O_NOFOLLOW \| O_NONBLOCK` 有界普通文件读取、临时文件与父目录双 `fsync` 原子写入及仅在测试/调试构建启用的故障注入钩子（Release 构建编译为空操作） |
 | `store/repository.rs` / `transfer.rs` | 账号库事务读写、单调授权序号 `auth_sequence.json`、两级轮换指纹谱系归档、备份包导入导出与旧桌面端只读迁移 |
 | `session/backend.rs` / `payload.rs` | 官方凭据 JSON 序列化校验、`auto` 自适应探测、`file` 纯文件后端、`dual` 钥匙串+文件事务性双写后端、`keyring` 纯钥匙串零磁盘写入后端，以及 `--from-local` 本机已登录凭据提取器 |
 | `session/journal.rs` / `process.rs` | 三阶段崩溃恢复日志 `switch_journal.json` 内置写前自愈 CAS 对账机、`/proc` 故障关闭进程扫描与双因子（`pid + starttime`）进程租约 |
@@ -246,7 +246,7 @@ Google OAuth 刷新令牌在轮换或重新授权时，一旦服务端 `/token` 
 
 - **命令行与错误通道精确白名单脱敏**：
   - `accounts add` 物理上不设明文 Token 位置参数；程序入口使用 `std::env::args_os()`，遇到非法非 UTF-8 字节参数时直接返回脱敏用法错误（退出码 `2`）而不会触发 panic 或回显原始字节。
-  - 自定义 `clap` 错误格式化器严格比对实际已注册的字面子命令词、选项旗标与占位符白名单，任何未知参数、未注册选项或 `--flag=secret` 内联值一律固定替换为 `[REDACTED]`；所有含环境变量绑定的参数均启用 `hide_env_values = true`，防止 `--help` 把当前环境变量中的值打印到终端。
+  - 自定义 `clap` 错误格式化器直接借用入口已构建的 `Command` 静态元数据派生已注册的子命令词、选项旗标、枚举值与占位符白名单（错误路径不再重建命令树或额外读取环境变量），任何未知参数、未注册选项或 `--flag=secret` 内联值一律固定替换为 `[REDACTED]`；所有含环境变量绑定的参数均启用 `hide_env_values = true`，防止 `--help` 把当前环境变量中的值打印到终端。
   - JSON 反序列化错误仅提取行号、列号与分类描述，D-Bus 未分类异常映射为固定错误类别，避免直接透传外部错误正文。
 - **DTO 字段白名单与动态文本归一化**：
   - 所有对外展示与 `--json` 序列化均通过独立的只读视图结构体（`AccountViewDto`、`QuotaViewDto`、`SelectedAccountBriefDto`、`StatsViewDto`、`StatsListViewDto`）转换，结构体字段层面不包含 `access_token`、`refresh_token`、`id_token`、`client_secret` 或本机文件路径；对于源自本地数据库的 `StatsViewDto.models[].model` 与 `StatsListViewDto.items[].model`，仅放行严格匹配已知公共模型 ID 或公开家族标签语法的值，其余任何本地自然语言文本、无扩展名文件名、路径、邮箱、URL 或凭据前缀均统一回退为 `"Unknown"`。

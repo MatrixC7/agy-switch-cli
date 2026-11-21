@@ -3436,57 +3436,51 @@ fn build_account_detail_lines(
     lines
 }
 
-fn slice_detail_lines_with_scroll(
-    logical_lines: &[String],
+struct DetailViewportSlice<'a> {
+    visible: &'a [String],
+    above: usize,
+    below: usize,
+}
+
+fn slice_detail_lines_with_scroll<'a>(
+    logical_lines: &'a [String],
     detail_scroll: &mut usize,
     inner_rows: usize,
-) -> Vec<String> {
-    if inner_rows == 0 {
+) -> DetailViewportSlice<'a> {
+    if inner_rows == 0 || logical_lines.is_empty() {
         *detail_scroll = 0;
-        return Vec::new();
+        return DetailViewportSlice {
+            visible: &[],
+            above: 0,
+            below: 0,
+        };
     }
     let total = logical_lines.len();
-    if total <= inner_rows {
-        *detail_scroll = 0;
-        return logical_lines.to_vec();
-    }
-    if inner_rows <= 2 {
-        let max_scroll = total.saturating_sub(inner_rows);
-        *detail_scroll = (*detail_scroll).min(max_scroll);
-        let end = (*detail_scroll + inner_rows).min(total);
-        return logical_lines[*detail_scroll..end].to_vec();
-    }
-
-    let edge_cap = inner_rows - 1;
-    let max_scroll = total.saturating_sub(edge_cap);
+    let max_scroll = total.saturating_sub(inner_rows);
     *detail_scroll = (*detail_scroll).min(max_scroll);
     let scroll = *detail_scroll;
-
-    let mut out = Vec::with_capacity(inner_rows);
-    if scroll == 0 {
-        out.extend_from_slice(&logical_lines[0..edge_cap]);
-        let below = total - edge_cap;
-        out.push(format!(
-            "  ... ({below} more line(s) below — press ↓ to scroll)"
-        ));
-    } else if scroll >= max_scroll {
-        out.push(format!(
-            "  ... ({scroll} more line(s) above — press ↑ to scroll)"
-        ));
-        out.extend_from_slice(&logical_lines[max_scroll..total]);
-    } else {
-        let mid_cap = inner_rows - 2;
-        let end = (scroll + mid_cap).min(total);
-        let below = total.saturating_sub(end);
-        out.push(format!(
-            "  ... ({scroll} more line(s) above — press ↑ to scroll)"
-        ));
-        out.extend_from_slice(&logical_lines[scroll..end]);
-        out.push(format!(
-            "  ... ({below} more line(s) below — press ↓ to scroll)"
-        ));
+    let end = (scroll + inner_rows).min(total);
+    DetailViewportSlice {
+        visible: &logical_lines[scroll..end],
+        above: scroll,
+        below: total.saturating_sub(end),
     }
-    out
+}
+
+fn format_detail_card_border(left: char, right: char, label: Option<&str>, cols: usize) -> String {
+    let inner_cols = cols.saturating_sub(2);
+    let Some(raw_label) = label else {
+        return format!("{left}{}{right}", "─".repeat(inner_cols));
+    };
+    // Embed `─ <label> ─...─` into the border while guaranteeing total display width == `cols`.
+    let decorated_budget = inner_cols.saturating_sub(4);
+    if decorated_budget == 0 {
+        return format!("{left}{}{right}", "─".repeat(inner_cols));
+    }
+    let clipped = truncate_to_cols(raw_label, decorated_budget);
+    let clipped_w = display_width(&clipped);
+    let trailing_dashes = inner_cols.saturating_sub(2 + clipped_w + 1);
+    format!("{left}─ {clipped} {}{right}", "─".repeat(trailing_dashes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3509,23 +3503,36 @@ fn render_detail_card_lines(
         let inner_rows = avail_rows - 2;
         let logical =
             build_account_detail_lines(acc, policy, is_selected, is_marked, now_unix, inner_w);
-        let visible = slice_detail_lines_with_scroll(&logical, detail_scroll, inner_rows);
-        let mut out = Vec::with_capacity(visible.len() + 2);
-        out.push(format!("┌{}┐", "─".repeat(cols - 2)));
-        for line in visible {
-            let clipped = truncate_to_cols(&line, inner_w);
+        let slice = slice_detail_lines_with_scroll(&logical, detail_scroll, inner_rows);
+        let top_label = (slice.above > 0).then(|| format!("↑ {} more line(s) above", slice.above));
+        let bot_label = (slice.below > 0).then(|| format!("↓ {} more line(s) below", slice.below));
+        let mut out = Vec::with_capacity(slice.visible.len() + 2);
+        out.push(format_detail_card_border(
+            '┌',
+            '┐',
+            top_label.as_deref(),
+            cols,
+        ));
+        for line in slice.visible {
+            let clipped = truncate_to_cols(line, inner_w);
             let pad = inner_w.saturating_sub(display_width(&clipped));
             out.push(format!("│ {clipped}{} │", " ".repeat(pad)));
         }
-        out.push(format!("└{}┘", "─".repeat(cols - 2)));
+        out.push(format_detail_card_border(
+            '└',
+            '┘',
+            bot_label.as_deref(),
+            cols,
+        ));
         out
     } else {
         let logical =
             build_account_detail_lines(acc, policy, is_selected, is_marked, now_unix, cols);
-        let visible = slice_detail_lines_with_scroll(&logical, detail_scroll, avail_rows);
-        visible
-            .into_iter()
-            .map(|line| truncate_to_cols(&line, cols))
+        let slice = slice_detail_lines_with_scroll(&logical, detail_scroll, avail_rows);
+        slice
+            .visible
+            .iter()
+            .map(|line| truncate_to_cols(line, cols))
             .collect()
     }
 }
@@ -6386,9 +6393,110 @@ mod tests {
         assert!(top_detail.contains("Account : alice@example.com (primary)"));
         assert!(top_detail.contains("Quotas  :"));
         assert!(top_detail.contains("resets "));
+        let top_border_0 = top_lines
+            .iter()
+            .copied()
+            .find(|l| l.starts_with('┌'))
+            .expect("missing top card border at scroll=0");
+        let bot_border_0 = top_lines
+            .iter()
+            .copied()
+            .find(|l| l.starts_with('└'))
+            .expect("missing bottom card border at scroll=0");
+        assert_eq!(display_width(top_border_0), 96);
+        assert_eq!(display_width(bot_border_0), 96);
         assert!(
-            top_detail.contains("more line(s) below — press ↓ to scroll"),
-            "expected bottom scroll indicator on 18-row detail card:\n{top_detail}"
+            !top_border_0.contains("more line(s) above"),
+            "top border at scroll=0 must not show above indicator: {top_border_0}"
+        );
+        assert!(
+            bot_border_0.contains("└─ ↓ ") && bot_border_0.contains("more line(s) below"),
+            "expected border-embedded bottom scroll indicator on 18-row detail card:\n{top_detail}"
+        );
+        let below_0: usize = bot_border_0
+            .split("└─ ↓ ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .expect("parsable below count at scroll=0");
+        assert!(
+            below_0 >= 2,
+            "expected multiple scrollable lines below at scroll=0, got {below_0}"
+        );
+        let body_0: Vec<&str> = top_lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with('│'))
+            .collect();
+        assert!(body_0
+            .first()
+            .unwrap()
+            .contains("Account : alice@example.com (primary)"));
+
+        // First `↓` press (`scroll = 0 -> 1`) MUST shift content 1:1 immediately:
+        // row 0 scrolls off, top border embeds `↑ 1 more line(s) above`, and 1 new line appears at bottom!
+        let mut d_scroll_1 = 1usize;
+        let step1_detail = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&acc1.id),
+                policy: &policy,
+                session_id: &sess,
+                runtime_st: &runtime,
+                backend_tag: "file",
+                daemon_state: Some(&ds_cooldown),
+                marked_ids: &marks,
+                detail_view: true,
+                detail_scroll: &mut d_scroll_1,
+                cursor_idx: 0,
+                scroll_offset: &mut scroll,
+                transient_notice: None,
+                now_unix: now,
+            },
+            96,
+            18,
+        );
+        let step1_lines: Vec<&str> = step1_detail.split("\r\n").collect();
+        assert_eq!(
+            top_lines.len(),
+            step1_lines.len(),
+            "M2 detail frame height must stay constant between scroll=0 and scroll=1"
+        );
+        let top_border_1 = step1_lines
+            .iter()
+            .copied()
+            .find(|l| l.starts_with('┌'))
+            .expect("missing top card border at scroll=1");
+        let bot_border_1 = step1_lines
+            .iter()
+            .copied()
+            .find(|l| l.starts_with('└'))
+            .expect("missing bottom card border at scroll=1");
+        assert_eq!(display_width(top_border_1), 96);
+        assert_eq!(display_width(bot_border_1), 96);
+        assert!(
+            top_border_1.contains("┌─ ↑ 1 more line(s) above "),
+            "expected border-embedded above indicator at scroll=1: {top_border_1}"
+        );
+        assert!(
+            bot_border_1.contains(&format!("└─ ↓ {} more line(s) below ", below_0 - 1)),
+            "first ↓ press must strictly reduce remaining below lines by 1 (expected {}, got {bot_border_1})",
+            below_0 - 1
+        );
+        let body_1: Vec<&str> = step1_lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with('│'))
+            .collect();
+        assert_eq!(body_0.len(), body_1.len());
+        assert_eq!(
+            body_1[0], body_0[1],
+            "scroll=1 must shift line 1 into top visible row immediately"
+        );
+        assert_ne!(
+            body_1.last(),
+            body_0.last(),
+            "scroll=1 must reveal 1 brand-new line at bottom of detail card"
         );
 
         // Jump to end (`usize::MAX`) clamps cleanly and exposes the final `Other` model without truncation!
@@ -6413,18 +6521,68 @@ mod tests {
             96,
             18,
         );
-        assert!(bot_detail.contains("more line(s) above — press ↑ to scroll"));
+        let bot_lines: Vec<&str> = bot_detail.split("\r\n").collect();
+        let top_border_end = bot_lines
+            .iter()
+            .copied()
+            .find(|l| l.starts_with('┌'))
+            .expect("missing top card border at scroll=end");
+        let bot_border_end = bot_lines
+            .iter()
+            .copied()
+            .find(|l| l.starts_with('└'))
+            .expect("missing bottom card border at scroll=end");
+        assert_eq!(display_width(top_border_end), 96);
+        assert_eq!(display_width(bot_border_end), 96);
+        assert!(top_border_end.contains("┌─ ↑ ") && top_border_end.contains("more line(s) above"));
+        assert!(
+            !bot_border_end.contains("more line(s) below"),
+            "bottom border at max scroll must not show below indicator: {bot_border_end}"
+        );
         assert!(
             bot_detail.contains("other-custom-model-14"),
             "final wrapped model must be reachable at bottom of M2 scroll:\n{bot_detail}"
         );
         assert_eq!(
             top_lines.len(),
-            bot_detail.split("\r\n").count(),
+            bot_lines.len(),
             "M2 detail frame height must stay constant between top and bottom scroll"
         );
 
-        // Tiny/narrow fallback (`30x4`) still respects physical bounds without panicking.
+        // Minimum boxed width (`40x12`) embeds both border indicators cleanly without overflowing 40 cols.
+        let mut narrow_box_scroll = 1usize;
+        let narrow_box_detail = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&acc1.id),
+                policy: &policy,
+                session_id: &sess,
+                runtime_st: &runtime,
+                backend_tag: "file",
+                daemon_state: Some(&ds_cooldown),
+                marked_ids: &marks,
+                detail_view: true,
+                detail_scroll: &mut narrow_box_scroll,
+                cursor_idx: 0,
+                scroll_offset: &mut scroll,
+                transient_notice: None,
+                now_unix: now,
+            },
+            40,
+            12,
+        );
+        let narrow_box_lines: Vec<&str> = narrow_box_detail.split("\r\n").collect();
+        assert!(narrow_box_lines.len() <= 12);
+        for l in &narrow_box_lines {
+            assert!(
+                display_width(l) <= 40,
+                "40-col boxed detail line > 40 cols: {l}"
+            );
+        }
+        assert!(narrow_box_detail.contains("┌─ ↑ 1 more line(s) above "));
+        assert!(narrow_box_detail.contains("└─ ↓ "));
+
+        // Tiny/narrow unboxed fallback (`30x4`) still respects physical bounds without panicking.
         let mut tiny_scroll = 0usize;
         let tiny_detail = build_dashboard_frame_full(
             &mut TuiFrameView {
