@@ -237,6 +237,7 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "--install"
             | "--uninstall"
             | "--no-notify"
+            | "--reset-cooldown"
             | "--source"
             | "--range"
             | "--date"

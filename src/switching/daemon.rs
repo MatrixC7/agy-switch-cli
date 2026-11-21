@@ -29,7 +29,8 @@ use crate::store::locks::{ActiveSlotLock, DaemonInstanceLock};
 use crate::store::repository::StoreRepository;
 use crate::switching::executor::{execute_switch_with_slot_lock_and_guard, RunningGuardMode};
 use crate::switching::notify::{
-    resolve_effective_notify_enabled, send_daemon_notification_best_effort, DaemonNotificationEvent,
+    resolve_effective_notify_enabled, resolve_effective_notify_persistent,
+    send_daemon_notification_best_effort, DaemonNotificationEvent,
 };
 use crate::switching::runner::ordered_candidate_ids;
 use crate::transport::client::{BoxFuture, HttpTransport};
@@ -253,6 +254,68 @@ pub fn repair_or_clear_daemon_state_in_tx(
     }
 }
 
+/// Outcome returned by `reset_daemon_cooldown` (`daemon --reset-cooldown`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResetCooldownOutcome {
+    pub cooldown_reset: bool,
+    pub cooldown_was_active: bool,
+    pub previous_cooldown_until: i64,
+}
+
+/// Clear any persisted post-switch cooldown (`cooldown_until = 0`) in `state/daemon_state.json`
+/// strictly under `L3` (`StoreWriteLock`) without acquiring `DaemonInstanceLock`.
+/// Safe to invoke concurrently while a `systemd --user` or foreground `daemon` is running.
+/// Preserves `last_rotated_candidate_id`, `paused_on_failure`, `consecutive_commit_failures`,
+/// and `paused_reason`; idempotent when the state file is absent or already has `cooldown_until == 0`.
+pub fn reset_daemon_cooldown(
+    repo: &StoreRepository,
+    now_unix: i64,
+) -> CliResult<ResetCooldownOutcome> {
+    repo.with_write_lock(|tx| reset_daemon_cooldown_in_tx(tx.paths(), now_unix))
+}
+
+pub fn reset_daemon_cooldown_in_tx(
+    paths: &HeadlessPaths,
+    now_unix: i64,
+) -> CliResult<ResetCooldownOutcome> {
+    let ds_path = paths.daemon_state_file();
+    ensure_no_symlink_components_under(&paths.data_dir, &ds_path)?;
+    match std::fs::symlink_metadata(&ds_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ResetCooldownOutcome {
+                cooldown_reset: true,
+                cooldown_was_active: false,
+                previous_cooldown_until: 0,
+            });
+        }
+        Err(e) => {
+            return Err(crate::store::fs_atomic::map_io_error(
+                e,
+                &format!("Cannot inspect daemon state file '{}'", ds_path.display()),
+            ));
+        }
+    }
+
+    let mut st = read_daemon_state_readonly(paths)?;
+    let previous = st.cooldown_until;
+    let was_active = previous > now_unix;
+    if st.cooldown_until != 0 {
+        st.cooldown_until = 0;
+        if !st.paused_on_failure && st.last_phase == "cooldown" {
+            st.last_phase = "monitoring".into();
+            st.last_reason = Some("cooldown_reset_by_user".into());
+            st.last_checked_at = Some(now_unix);
+        }
+        save_daemon_state_in_tx(paths, &st)?;
+    }
+    Ok(ResetCooldownOutcome {
+        cooldown_reset: true,
+        cooldown_was_active: was_active,
+        previous_cooldown_until: previous,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingSwitchPlan {
     pub source_account_id: String,
@@ -282,6 +345,7 @@ pub struct DaemonConfigOverrides {
     pub cooldown_secs: i64,
     pub tick_timeout: Duration,
     pub once: bool,
+    pub reset_cooldown: bool,
     pub json_mode: bool,
     pub notify_override: Option<bool>,
     pub policy_overlay: DaemonPolicyOverlay,
@@ -294,6 +358,7 @@ impl Default for DaemonConfigOverrides {
             cooldown_secs: DEFAULT_DAEMON_COOLDOWN_SECS,
             tick_timeout: DEFAULT_TICK_HARD_TIMEOUT,
             once: false,
+            reset_cooldown: false,
             json_mode: false,
             notify_override: None,
             policy_overlay: DaemonPolicyOverlay::default(),
@@ -347,6 +412,7 @@ async fn notify_paused_on_failure(
             max_failures: MAX_CONSECUTIVE_COMMIT_FAILURES,
             reason: reason.to_string(),
         },
+        true,
         shutdown_rx,
     )
     .await;
@@ -531,7 +597,7 @@ impl TickReportCtx {
     }
 }
 
-fn format_local_ts(unix_secs: i64) -> String {
+pub(crate) fn format_local_ts(unix_secs: i64) -> String {
     if let Ok(ts) = jiff::Timestamp::from_second(unix_secs) {
         let zdt = ts.to_zoned(jiff::tz::TimeZone::system());
         return zdt.strftime("%Y-%m-%d %H:%M:%S").to_string();
@@ -1690,7 +1756,7 @@ impl DaemonEngine {
                 pstate.consecutive_commit_failures = 0;
                 pstate.paused_on_failure = false;
                 pstate.paused_reason = None;
-                self.persist_status(
+                self.persist_commit_status(
                     repo,
                     &mut pstate,
                     "cooldown",
@@ -1755,6 +1821,7 @@ impl DaemonEngine {
                             )
                         })
                         .unwrap_or_default();
+                    let persistent_switch = resolve_effective_notify_persistent(repo);
                     send_daemon_notification_best_effort(
                         &DaemonNotificationEvent::Switched {
                             from_account,
@@ -1764,6 +1831,7 @@ impl DaemonEngine {
                             target_5h_pct: target_windows.short_5h_pct,
                             target_weekly_pct: target_windows.weekly_pct,
                         },
+                        persistent_switch,
                         shutdown_rx,
                     )
                     .await;
@@ -2055,10 +2123,52 @@ impl DaemonEngine {
         reason: Option<&str>,
         now_unix: i64,
     ) -> CliResult<()> {
-        pstate.last_phase = phase.to_string();
-        pstate.last_reason = reason.map(str::to_owned);
-        pstate.last_checked_at = Some(now_unix);
-        repo.with_write_lock(|tx| save_daemon_state_in_tx(tx.paths(), pstate))
+        self.persist_status_inner(repo, pstate, phase, reason, now_unix, false)
+    }
+
+    fn persist_commit_status(
+        &self,
+        repo: &StoreRepository,
+        pstate: &mut DaemonPersistentState,
+        phase: &str,
+        reason: Option<&str>,
+        now_unix: i64,
+    ) -> CliResult<()> {
+        self.persist_status_inner(repo, pstate, phase, reason, now_unix, true)
+    }
+
+    fn persist_status_inner(
+        &self,
+        repo: &StoreRepository,
+        pstate: &mut DaemonPersistentState,
+        phase: &str,
+        reason: Option<&str>,
+        now_unix: i64,
+        commit_cooldown: bool,
+    ) -> CliResult<()> {
+        repo.with_write_lock(|tx| {
+            let mut preserve_reset_phase = false;
+            if !commit_cooldown {
+                // Guard against lost updates with concurrent `daemon --reset-cooldown`:
+                // never clobber an externally cleared `cooldown_until == 0` with a stale
+                // pre-tick in-memory `cooldown_until`.
+                let disk_state = read_daemon_state_readonly(tx.paths())?;
+                if disk_state.cooldown_until == 0 && pstate.cooldown_until != 0 {
+                    pstate.cooldown_until = 0;
+                    if phase == "cooldown" {
+                        pstate.last_phase = disk_state.last_phase;
+                        pstate.last_reason = disk_state.last_reason;
+                        preserve_reset_phase = true;
+                    }
+                }
+            }
+            if !preserve_reset_phase {
+                pstate.last_phase = phase.to_string();
+                pstate.last_reason = reason.map(str::to_owned);
+            }
+            pstate.last_checked_at = Some(now_unix);
+            save_daemon_state_in_tx(tx.paths(), pstate)
+        })
     }
 }
 
@@ -2312,6 +2422,9 @@ pub async fn run_foreground_daemon_with_shutdown(
     if overrides.once {
         use std::io::Write;
         let now = SystemClock.now_unix();
+        if overrides.reset_cooldown {
+            reset_daemon_cooldown(repo, now).map_err(sanitize_daemon_tick_error)?;
+        }
         let report = engine
             .run_single_tick_report_with_shutdown(
                 repo,
@@ -2496,5 +2609,179 @@ mod tests {
             elapsed_pos >= Duration::from_millis(865),
             "Positive +10% jitter must fire >= 865ms (> 800ms base), got {elapsed_pos:?}"
         );
+    }
+
+    #[test]
+    fn synthetic_v124_reset_cooldown_preserves_fields_and_persist_status_guards_race() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = HeadlessPaths::with_explicit(
+            tmp.path().join("home"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+        );
+        let repo = StoreRepository::new(paths.clone());
+
+        // 1. Absent `daemon_state.json` is idempotent and does not materialize a file.
+        let empty_out = reset_daemon_cooldown(&repo, 1_000).unwrap();
+        assert_eq!(
+            empty_out,
+            ResetCooldownOutcome {
+                cooldown_reset: true,
+                cooldown_was_active: false,
+                previous_cooldown_until: 0,
+            }
+        );
+        assert!(!paths.daemon_state_file().exists());
+
+        // 2. Active cooldown cleared while preserving round-robin cursor and paused_on_failure.
+        let seeded = DaemonPersistentState {
+            schema_version: STORE_SCHEMA_VERSION,
+            cooldown_until: 5_000,
+            last_rotated_candidate_id: Some("acc-b".into()),
+            consecutive_commit_failures: 2,
+            paused_on_failure: true,
+            paused_reason: Some("commit_failed: io_error".into()),
+            last_phase: "paused_on_failure".into(),
+            last_reason: Some("commit_failed: io_error".into()),
+            last_checked_at: Some(900),
+        };
+        repo.with_write_lock(|tx| save_daemon_state_in_tx(tx.paths(), &seeded))
+            .unwrap();
+
+        let cleared = reset_daemon_cooldown(&repo, 1_000).unwrap();
+        assert_eq!(
+            cleared,
+            ResetCooldownOutcome {
+                cooldown_reset: true,
+                cooldown_was_active: true,
+                previous_cooldown_until: 5_000,
+            }
+        );
+        let after = read_daemon_state_readonly(&paths).unwrap();
+        assert_eq!(after.cooldown_until, 0);
+        assert_eq!(after.last_rotated_candidate_id.as_deref(), Some("acc-b"));
+        assert!(after.paused_on_failure);
+        assert_eq!(after.consecutive_commit_failures, 2);
+        assert_eq!(
+            after.paused_reason.as_deref(),
+            Some("commit_failed: io_error")
+        );
+        assert_eq!(after.last_phase, "paused_on_failure");
+        let mode = std::fs::metadata(paths.daemon_state_file())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // 3. Second reset is idempotent (`cooldown_was_active = false`, `previous = 0`).
+        let second = reset_daemon_cooldown(&repo, 1_001).unwrap();
+        assert_eq!(
+            second,
+            ResetCooldownOutcome {
+                cooldown_reset: true,
+                cooldown_was_active: false,
+                previous_cooldown_until: 0,
+            }
+        );
+
+        // 4. `persist_status` race guard: simulate a running daemon holding stale in-memory
+        //    `pstate.cooldown_until = 8000` while external `--reset-cooldown` already cleared disk to 0.
+        let cooldown_state = DaemonPersistentState {
+            schema_version: STORE_SCHEMA_VERSION,
+            cooldown_until: 8_000,
+            last_rotated_candidate_id: Some("acc-c".into()),
+            consecutive_commit_failures: 0,
+            paused_on_failure: false,
+            paused_reason: None,
+            last_phase: "cooldown".into(),
+            last_reason: Some("switch_committed".into()),
+            last_checked_at: Some(4_400),
+        };
+        repo.with_write_lock(|tx| save_daemon_state_in_tx(tx.paths(), &cooldown_state))
+            .unwrap();
+        let mut stale_in_memory = read_daemon_state_readonly(&paths).unwrap();
+        // External reset clears cooldown on disk
+        let ext = reset_daemon_cooldown(&repo, 4_500).unwrap();
+        assert!(ext.cooldown_was_active);
+        let after_ext = read_daemon_state_readonly(&paths).unwrap();
+        assert_eq!(after_ext.cooldown_until, 0);
+        assert_eq!(after_ext.last_phase, "monitoring");
+        assert_eq!(
+            after_ext.last_reason.as_deref(),
+            Some("cooldown_reset_by_user")
+        );
+
+        // Ordinary `persist_status("cooldown", ...)` from the stale in-flight tick MUST NOT restore 8_000!
+        let engine = DaemonEngine::new();
+        engine
+            .persist_status(
+                &repo,
+                &mut stale_in_memory,
+                "cooldown",
+                Some("in_cooldown"),
+                4_501,
+            )
+            .unwrap();
+        let persisted_after_race = read_daemon_state_readonly(&paths).unwrap();
+        assert_eq!(persisted_after_race.cooldown_until, 0);
+        assert_eq!(persisted_after_race.last_phase, "monitoring");
+        assert_eq!(
+            persisted_after_race.last_reason.as_deref(),
+            Some("cooldown_reset_by_user")
+        );
+        assert_eq!(stale_in_memory.cooldown_until, 0);
+
+        // Ordinary `persist_status("monitoring", ...)` with another stale snapshot also preserves `0`.
+        let mut stale_other = DaemonPersistentState {
+            cooldown_until: 9_000,
+            ..cooldown_state.clone()
+        };
+        engine
+            .persist_status(
+                &repo,
+                &mut stale_other,
+                "hold",
+                Some("slot_lock_busy"),
+                4_502,
+            )
+            .unwrap();
+        let persisted_hold = read_daemon_state_readonly(&paths).unwrap();
+        assert_eq!(persisted_hold.cooldown_until, 0);
+        assert_eq!(persisted_hold.last_phase, "hold");
+        assert_eq!(
+            persisted_hold.last_reason.as_deref(),
+            Some("slot_lock_busy")
+        );
+
+        // Stage 7 `persist_commit_status` MUST write the new post-switch cooldown timestamp!
+        let mut new_commit = persisted_hold;
+        new_commit.cooldown_until = 12_000;
+        engine
+            .persist_commit_status(
+                &repo,
+                &mut new_commit,
+                "cooldown",
+                Some("switch_committed"),
+                8_400,
+            )
+            .unwrap();
+        let persisted_commit = read_daemon_state_readonly(&paths).unwrap();
+        assert_eq!(persisted_commit.cooldown_until, 12_000);
+        assert_eq!(persisted_commit.last_phase, "cooldown");
+        assert_eq!(
+            persisted_commit.last_reason.as_deref(),
+            Some("switch_committed")
+        );
+
+        // 5. Symlink `daemon_state.json` is rejected without following or overwriting target.
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, b"do-not-touch").unwrap();
+        std::fs::remove_file(paths.daemon_state_file()).unwrap();
+        std::os::unix::fs::symlink(&victim, paths.daemon_state_file()).unwrap();
+        assert!(reset_daemon_cooldown(&repo, 9_000).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do-not-touch");
     }
 }

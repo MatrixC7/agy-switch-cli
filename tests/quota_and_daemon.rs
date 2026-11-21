@@ -3572,3 +3572,224 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
     );
     assert!(!r2_paths.daemon_state_file().exists());
 }
+
+#[tokio::test]
+async fn synthetic_v124_daemon_reset_cooldown_wakes_running_engine_and_sanitizes_once_errors() {
+    use agy_switch_cli::store::locks::DaemonInstanceLock;
+    use agy_switch_cli::switching::daemon::reset_daemon_cooldown;
+
+    let _guard = PROC_ENV_MUTEX.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let fake_proc = tmp.path().join("fake_proc");
+    fs::create_dir_all(&fake_proc).unwrap();
+    let _proc_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc);
+
+    let paths = HeadlessPaths::with_explicit(
+        tmp.path().join("home"),
+        tmp.path().join("data"),
+        tmp.path().join("cache"),
+    );
+    fs::create_dir_all(&paths.active_slot_dir).unwrap();
+    let repo = StoreRepository::new(paths.clone());
+    let now = 1_800_000_000i64;
+    let future_reset = "2099-01-01T00:00:00Z";
+
+    let make_acc = |id: &str, email: &str, pct: f64| -> AccountRecord {
+        let mut a = AccountRecord::new(
+            id.into(),
+            email.into(),
+            TokenRecord {
+                access_token: format!("ya29.{id}"),
+                refresh_token: format!("1//RT_{id}"),
+                expires_in: 7200,
+                expiry_timestamp: now + 7200,
+                token_type: "Bearer".into(),
+                id_token: None,
+                oauth_client_key: Some("antigravity_enterprise".into()),
+                granted_scopes: None,
+                project_id: None,
+                is_gcp_tos: true,
+            },
+            now,
+        );
+        a.quota = Some(build_quota(
+            now,
+            Some("Pro"),
+            pct,
+            pct,
+            Some(pct),
+            future_reset,
+        ));
+        a
+    };
+    let acc_a = make_acc("acc-a", "alice@example.com", 0.04);
+    let acc_b = make_acc("acc-b", "bob@example.com", 0.90);
+
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc_a.clone(), true, now)?;
+        tx.upsert_account(acc_b.clone(), false, now)?;
+        let mut pol = SwitchPolicy {
+            enabled: true,
+            mode: PolicyMode::Immediate,
+            strategy: PolicyStrategy::Priority,
+            reserve_percentage: 10,
+            candidate_min_percentage: 30,
+            candidate_account_ids: vec!["acc-b".into(), "acc-a".into()],
+            ..SwitchPolicy::default()
+        };
+        tx.save_policy(&mut pol, None, now)?;
+        Ok(())
+    })
+    .unwrap();
+    FileSessionBackend
+        .write_slot(&paths, &serialize_session_payload(&acc_a.token).unwrap())
+        .unwrap();
+
+    // Hold `DaemonInstanceLock` across ticks (simulating a long-running foreground / systemd daemon).
+    let _daemon_lock = DaemonInstanceLock::try_acquire(&paths).unwrap();
+    let mut engine = DaemonEngine::new();
+    let transport = MockTransport::from_handler(|req| {
+        if req.url.ends_with(":loadCodeAssist") {
+            return Ok(MockTransport::json_response(
+                200,
+                serde_json::json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
+            ));
+        }
+        if req.url.ends_with(":fetchAvailableModels") {
+            return Ok(MockTransport::json_response(
+                200,
+                serde_json::json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.90, "resetTime": "2099-01-01T00:00:00Z"}}}}),
+            ));
+        }
+        Ok(MockTransport::json_response(
+            200,
+            serde_json::json!({"groups": [{"displayName": "Gemini Models", "buckets": [
+                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.90, "resetTime": "2099-01-01T00:00:00Z"},
+                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.90, "resetTime": "2099-01-07T00:00:00Z"}
+            ]}]}),
+        ))
+    });
+    let registry = OAuthClientRegistry::load(&paths).unwrap();
+    let overrides = DaemonConfigOverrides {
+        interval_secs: 180,
+        cooldown_secs: 3600,
+        once: true,
+        notify_override: Some(false),
+        ..DaemonConfigOverrides::default()
+    };
+
+    // Tick 1: switches `acc-a -> acc-b` and persists `cooldown_until = now + 3600`.
+    let t1 = engine
+        .run_single_tick(
+            &repo,
+            &FileSessionBackend,
+            &transport,
+            &OAuthEndpoints::default(),
+            &CloudCodeEndpoints::default(),
+            &registry,
+            "antigravity/test",
+            &overrides,
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        t1,
+        TickStageOutcome::CommittedSwitch {
+            source_id: "acc-a".into(),
+            target_id: "acc-b".into(),
+        }
+    );
+    let after_t1 = read_daemon_state_readonly(&paths).unwrap();
+    assert_eq!(after_t1.cooldown_until, now + 3600);
+
+    // Tick 2 (10s later): still blocked in cooldown.
+    let t2 = engine
+        .run_single_tick(
+            &repo,
+            &FileSessionBackend,
+            &transport,
+            &OAuthEndpoints::default(),
+            &CloudCodeEndpoints::default(),
+            &registry,
+            "antigravity/test",
+            &overrides,
+            now + 10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(t2, TickStageOutcome::InCooldown { until: now + 3600 });
+
+    // External `reset_daemon_cooldown` runs while `_daemon_lock` is STILL HELD!
+    let reset_res = reset_daemon_cooldown(&repo, now + 12).unwrap();
+    assert!(reset_res.cooldown_reset);
+    assert!(reset_res.cooldown_was_active);
+    assert_eq!(reset_res.previous_cooldown_until, now + 3600);
+
+    // Tick 3 (15s later): running daemon immediately wakes up out of cooldown without restart!
+    let t3 = engine
+        .run_single_tick(
+            &repo,
+            &FileSessionBackend,
+            &transport,
+            &OAuthEndpoints::default(),
+            &CloudCodeEndpoints::default(),
+            &registry,
+            "antigravity/test",
+            &overrides,
+            now + 15,
+        )
+        .await
+        .unwrap();
+    assert_eq!(t3, TickStageOutcome::IdleSufficientQuota);
+    drop(_daemon_lock);
+
+    // Also verify `daemon --once --reset-cooldown` sanitizes local paths if `daemon_state.json` is corrupt.
+    let bad_tmp = tempfile::tempdir().unwrap();
+    let bad_home = bad_tmp.path().join("home");
+    let bad_data = bad_tmp.path().join("secret_user_data_dir");
+    let bad_cache = bad_tmp.path().join("cache");
+    let bad_run = bad_tmp.path().join("run");
+    fs::create_dir_all(&bad_home).unwrap();
+    fs::create_dir_all(bad_data.join("state")).unwrap();
+    fs::create_dir_all(&bad_cache).unwrap();
+    fs::create_dir_all(&bad_run).unwrap();
+    fs::write(bad_data.join("state/daemon_state.json"), b"{bad-json").unwrap();
+
+    let once_err = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &bad_home)
+        .env("XDG_CACHE_HOME", &bad_cache)
+        .env("XDG_RUNTIME_DIR", &bad_run)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/no-dbus", bad_run.display()),
+        )
+        .env("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc)
+        .args([
+            "--data-dir",
+            bad_data.to_str().unwrap(),
+            "--backend",
+            "file",
+            "--no-remote-version",
+            "--json",
+            "daemon",
+            "--once",
+            "--reset-cooldown",
+            "--no-notify",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(once_err.status.code(), Some(1));
+    assert!(once_err.stdout.is_empty());
+    let err_str = String::from_utf8_lossy(&once_err.stderr);
+    assert!(
+        !err_str.contains("secret_user_data_dir") && !err_str.contains("daemon_state.json"),
+        "daemon --once --reset-cooldown leaked local path in stderr: {err_str}"
+    );
+    let ej: serde_json::Value = serde_json::from_str(&err_str).unwrap();
+    assert_eq!(ej["schema_version"], 1);
+    assert_eq!(ej["ok"], false);
+    assert_eq!(ej["error_code"], "data_error");
+}

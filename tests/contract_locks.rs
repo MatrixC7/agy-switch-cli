@@ -7631,6 +7631,338 @@ fn daemon_no_notify_install_flag_and_invalid_env_redaction() {
     );
 }
 
+#[test]
+fn synthetic_v124_daemon_reset_cooldown_boundary_2a_standalone_once_and_install() {
+    use agy_switch_cli::store::locks::DaemonInstanceLock;
+    use agy_switch_cli::switching::daemon::{
+        read_daemon_state_readonly, save_daemon_state_in_tx, DaemonPersistentState,
+    };
+
+    let make_acc = |id: &str, email: &str, pct: f64, now: i64| -> AccountRecord {
+        let mut rec = sample_account(id, email, now);
+        if let Some(ref mut q) = rec.quota {
+            for m in &mut q.models {
+                m.percentage = (pct * 100.0).round() as i32;
+                m.observed_remaining_fraction = Some(pct);
+            }
+            if let Some(ref mut groups) = q.quota_groups {
+                for g in groups {
+                    for b in &mut g.buckets {
+                        b.remaining_fraction = pct;
+                    }
+                }
+            }
+        }
+        rec
+    };
+
+    let seed_cooldown_store = |env: &IsolatedEnv, now: i64, cooldown_until: i64, paused: bool| {
+        env.init_agy_slot_dir();
+        let paths = env.paths();
+        let repo = StoreRepository::new(paths.clone());
+        let acc_a = make_acc("acc-a", "alice@example.com", 0.02, now);
+        let acc_b = make_acc("acc-b", "bob@example.com", 0.90, now);
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(acc_a.clone(), true, now)?;
+            tx.upsert_account(acc_b.clone(), false, now)?;
+            let mut pol = agy_switch_cli::domain::policy::SwitchPolicy {
+                enabled: true,
+                reserve_percentage: 10,
+                candidate_min_percentage: 30,
+                candidate_account_ids: vec!["acc-b".into()],
+                ..agy_switch_cli::domain::policy::SwitchPolicy::default()
+            };
+            tx.save_policy(&mut pol, None, now)?;
+            let dstate = DaemonPersistentState {
+                cooldown_until,
+                last_rotated_candidate_id: Some("acc-a".into()),
+                consecutive_commit_failures: if paused { 2 } else { 0 },
+                paused_on_failure: paused,
+                paused_reason: paused.then(|| "commit_failed: io_error".into()),
+                last_phase: if paused {
+                    "paused_on_failure".into()
+                } else {
+                    "cooldown".into()
+                },
+                last_reason: Some(if paused {
+                    "commit_failed: io_error".into()
+                } else {
+                    "switch_committed".into()
+                }),
+                last_checked_at: Some(now - 30),
+                ..DaemonPersistentState::default()
+            };
+            save_daemon_state_in_tx(tx.paths(), &dstate)?;
+            Ok(())
+        })
+        .unwrap();
+        FileSessionBackend
+            .write_slot(&paths, &serialize_session_payload(&acc_a.token).unwrap())
+            .unwrap();
+    };
+
+    let now = jiff::Timestamp::now().as_second();
+    let future_cd = now + 3_600;
+
+    // 1. Standalone `daemon --reset-cooldown` rejects foreground runtime override flags with exit 2
+    //    AND leaves existing cooldown_until untouched on disk.
+    let env_flags = IsolatedEnv::new();
+    seed_cooldown_store(&env_flags, now, future_cd, false);
+    for invalid_args in [
+        vec!["daemon", "--reset-cooldown", "--interval", "300"],
+        vec!["daemon", "--reset-cooldown", "--cooldown", "600"],
+        vec!["daemon", "--reset-cooldown", "--no-notify"],
+        vec!["daemon", "--reset-cooldown", "--mode", "wait"],
+        vec!["daemon", "--reset-cooldown", "--strategy", "priority"],
+        vec!["daemon", "--reset-cooldown", "--reserve", "15"],
+        vec!["daemon", "--reset-cooldown", "--minimum", "40"],
+        vec!["daemon", "--reset-cooldown", "--model", "claude"],
+        vec![
+            "--proxy",
+            "http://127.0.0.1:7890",
+            "daemon",
+            "--reset-cooldown",
+        ],
+        vec!["daemon", "--uninstall", "--reset-cooldown"],
+    ] {
+        let out = env_flags.cli_cmd().args(&invalid_args).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "Expected exit 2 for {invalid_args:?}, got {:?} stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert_eq!(
+        read_daemon_state_readonly(&env_flags.paths())
+            .unwrap()
+            .cooldown_until,
+        future_cd,
+        "Rejected standalone flag combinations must not mutate daemon_state.json"
+    );
+
+    // 2. Standalone `daemon --reset-cooldown` succeeds with exit 0 EVEN WHILE `DaemonInstanceLock`
+    //    is actively held (simulating live `systemd --user` or foreground daemon) AND EVEN WHEN
+    //    `AGY_SWITCH_CLI_INTERVAL` / `AGY_SWITCH_CLI_COOLDOWN` env vars are exported in shell!
+    let env_live = IsolatedEnv::new();
+    seed_cooldown_store(&env_live, now, future_cd, true);
+    let _running_daemon_lock = DaemonInstanceLock::try_acquire(&env_live.paths()).unwrap();
+    let reset_json_out = env_live
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_INTERVAL", "300")
+        .env("AGY_SWITCH_CLI_COOLDOWN", "1800")
+        .args(["--json", "daemon", "--reset-cooldown"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        reset_json_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&reset_json_out.stderr)
+    );
+    let rj: serde_json::Value = serde_json::from_slice(&reset_json_out.stdout).unwrap();
+    assert_eq!(rj["schema_version"], 1);
+    assert_eq!(rj["ok"], true);
+    assert_eq!(rj["cooldown_reset"], true);
+    assert_eq!(rj["cooldown_was_active"], true);
+    assert_eq!(rj["previous_cooldown_until"], future_cd);
+
+    let after_live = read_daemon_state_readonly(&env_live.paths()).unwrap();
+    assert_eq!(after_live.cooldown_until, 0);
+    assert_eq!(
+        after_live.last_rotated_candidate_id.as_deref(),
+        Some("acc-a")
+    );
+    assert!(after_live.paused_on_failure);
+    assert_eq!(after_live.consecutive_commit_failures, 2);
+    assert_eq!(
+        after_live.paused_reason.as_deref(),
+        Some("commit_failed: io_error")
+    );
+
+    // Idempotent second call while lock still held
+    let reset_again = env_live
+        .cli_cmd()
+        .args(["daemon", "--reset-cooldown"])
+        .output()
+        .unwrap();
+    assert_eq!(reset_again.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&reset_again.stdout).contains("No active daemon cooldown"),
+        "stdout={}",
+        String::from_utf8_lossy(&reset_again.stdout)
+    );
+    drop(_running_daemon_lock);
+
+    // 3. `daemon --once --reset-cooldown` breaks immediately out of active cooldown and switches,
+    //    whereas control `daemon --once` stays in cooldown.
+    let env_once = IsolatedEnv::new();
+    seed_cooldown_store(&env_once, now, future_cd, false);
+    let ctrl_once = env_once
+        .cli_cmd()
+        .args([
+            "--backend",
+            "file",
+            "--json",
+            "daemon",
+            "--once",
+            "--no-notify",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(ctrl_once.status.code(), Some(0));
+    let ctrl_j: serde_json::Value = serde_json::from_slice(&ctrl_once.stdout).unwrap();
+    assert_eq!(ctrl_j["daemon"]["phase"], "cooldown");
+    assert_eq!(
+        StoreRepository::new(env_once.paths())
+            .read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-a")
+    );
+
+    let break_once = env_once
+        .cli_cmd()
+        .args([
+            "--backend",
+            "file",
+            "--json",
+            "daemon",
+            "--once",
+            "--reset-cooldown",
+            "--no-notify",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        break_once.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&break_once.stderr)
+    );
+    let break_j: serde_json::Value = serde_json::from_slice(&break_once.stdout).unwrap();
+    assert_eq!(break_j["daemon"]["reason"], "switch_committed");
+    assert_eq!(
+        StoreRepository::new(env_once.paths())
+            .read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-b")
+    );
+
+    // 4. `daemon --install --reset-cooldown` clears active cooldown once BEFORE starting systemd unit
+    //    and NEVER persists `--reset-cooldown` into `ExecStart`.
+    let env_inst = IsolatedEnv::new();
+    seed_cooldown_store(&env_inst, now, future_cd, false);
+    let systemd_marker_dir = env_inst._tmp.path().join("systemd_marker");
+    fs::create_dir_all(&systemd_marker_dir).unwrap();
+    let mock_systemctl = env_inst._tmp.path().join("mock-systemctl");
+    let script = "#!/bin/sh\n\
+        if [ \"$1\" = \"--user\" ]; then shift; fi\n\
+        case \"$1\" in\n\
+          show-environment) exit 0 ;;\n\
+          daemon-reload) exit 0 ;;\n\
+          enable) exit 0 ;;\n\
+          show) echo \"FragmentPath=$XDG_CONFIG_HOME/systemd/user/agy-switch-cli.service\"; echo \"LoadState=loaded\"; echo \"UnitFileState=enabled\"; echo \"ActiveState=active\"; exit 0 ;;\n\
+          *) exit 0 ;;\n\
+        esac\n";
+    fs::write(&mock_systemctl, script).unwrap();
+    fs::set_permissions(&mock_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // 4a. Invalid `--interval 0` with `--install --reset-cooldown` must exit 2 without clearing cooldown!
+    let bad_inst = env_inst
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_SYSTEMD_MARKER_DIR", &systemd_marker_dir)
+        .env("AGY_SWITCH_CLI_SYSTEMCTL_BIN", &mock_systemctl)
+        .args(["daemon", "--install", "--reset-cooldown", "--interval", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(bad_inst.status.code(), Some(2));
+    assert_eq!(
+        read_daemon_state_readonly(&env_inst.paths())
+            .unwrap()
+            .cooldown_until,
+        future_cd
+    );
+
+    // 4b. Target unit dir preflight failure (`XDG_CONFIG_HOME/systemd/user` is a regular file) must
+    //     exit 1 (`data_error`) WITHOUT clearing cooldown or modifying `daemon_state.json` bytes!
+    let ds_before_dir_err = fs::read(env_inst.paths().daemon_state_file()).unwrap();
+    let systemd_parent = env_inst
+        ._tmp
+        .path()
+        .join("xdg_cfg")
+        .join("systemd")
+        .join("user");
+    fs::create_dir_all(systemd_parent.parent().unwrap()).unwrap();
+    fs::write(&systemd_parent, b"not-a-directory").unwrap();
+    let dir_err_inst = env_inst
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_SYSTEMD_MARKER_DIR", &systemd_marker_dir)
+        .env("AGY_SWITCH_CLI_SYSTEMCTL_BIN", &mock_systemctl)
+        .args(["--json", "daemon", "--install", "--reset-cooldown"])
+        .output()
+        .unwrap();
+    assert_eq!(dir_err_inst.status.code(), Some(1));
+    let dir_err_j: serde_json::Value = serde_json::from_slice(&dir_err_inst.stderr).unwrap();
+    assert_eq!(dir_err_j["error_code"], "data_error");
+    assert_eq!(
+        fs::read(env_inst.paths().daemon_state_file()).unwrap(),
+        ds_before_dir_err,
+        "Unit directory preflight failure must leave daemon_state.json byte-for-byte untouched"
+    );
+    fs::remove_file(&systemd_parent).unwrap();
+
+    // 4c. Valid `--install --reset-cooldown --interval 300 --cooldown 1800` clears cooldown and omits flag from ExecStart.
+    let ok_inst = env_inst
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_SYSTEMD_MARKER_DIR", &systemd_marker_dir)
+        .env("AGY_SWITCH_CLI_SYSTEMCTL_BIN", &mock_systemctl)
+        .args([
+            "--json",
+            "daemon",
+            "--install",
+            "--reset-cooldown",
+            "--interval",
+            "300",
+            "--cooldown",
+            "1800",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        ok_inst.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&ok_inst.stderr)
+    );
+    let ok_j: serde_json::Value = serde_json::from_slice(&ok_inst.stdout).unwrap();
+    assert_eq!(ok_j["cooldown_reset"], true);
+    assert_eq!(ok_j["cooldown_was_active"], true);
+    assert_eq!(ok_j["previous_cooldown_until"], future_cd);
+    let unit_path = PathBuf::from(ok_j["unit_path"].as_str().unwrap());
+    let unit_text = fs::read_to_string(&unit_path).unwrap();
+    assert!(
+        unit_text.contains(" daemon --interval 300 --cooldown 1800"),
+        "unit missing interval/cooldown:\n{unit_text}"
+    );
+    assert!(
+        !unit_text.contains("--reset-cooldown"),
+        "systemd unit ExecStart MUST NEVER persist --reset-cooldown:\n{unit_text}"
+    );
+    assert_eq!(
+        read_daemon_state_readonly(&env_inst.paths())
+            .unwrap()
+            .cooldown_until,
+        0
+    );
+}
+
 #[cfg(feature = "secret-service-backend")]
 #[test]
 fn daemon_desktop_notifications_dbus_lifecycle_headless_optout_pause_dedup_and_timeout() {
@@ -7865,12 +8197,17 @@ class NotificationsObj(dbus.service.Object):
         with open(LOG_PATH, "r", encoding="utf-8") as f:
             items = json.load(f)
         urgency = int(hints.get("urgency", 1)) if "urgency" in hints else 1
+        transient = bool(hints["transient"]) if "transient" in hints else None
+        resident = bool(hints["resident"]) if "resident" in hints else None
         items.append({
             "app_name": str(app_name),
             "app_icon": str(app_icon),
             "summary": str(summary),
             "body": str(body),
             "urgency": urgency,
+            "transient": transient,
+            "resident": resident,
+            "expire_timeout": int(expire_timeout),
         })
         with open(LOG_PATH, "w", encoding="utf-8") as f:
             json.dump(items, f)
@@ -7939,6 +8276,9 @@ GLib.MainLoop().run()
     assert_eq!(notes[0]["app_name"], "agy-switch-cli");
     assert_eq!(notes[0]["summary"], "Account Switched");
     assert_eq!(notes[0]["urgency"], 1);
+    assert_eq!(notes[0]["transient"], false);
+    assert_eq!(notes[0]["resident"], true);
+    assert_eq!(notes[0]["expire_timeout"], 0);
     let body0 = notes[0]["body"].as_str().unwrap();
     assert_eq!(
         body0,
@@ -7965,6 +8305,10 @@ GLib.MainLoop().run()
     let notes_plain = read_notifications();
     assert_eq!(notes_plain.len(), 2);
     assert_eq!(notes_plain[1]["summary"], "Account Switched");
+    assert_eq!(notes_plain[1]["urgency"], 1);
+    assert_eq!(notes_plain[1]["transient"], false);
+    assert_eq!(notes_plain[1]["resident"], true);
+    assert_eq!(notes_plain[1]["expire_timeout"], 0);
     assert_eq!(
         notes_plain[1]["body"].as_str().unwrap(),
         "↑ bob@example.com (label- [31mANSI [0m)\n5h 100% · Weekly 85%\n↓ alice@example.com (label- [31mANSI [0m)\n5h 2% · Weekly 40%"
@@ -7975,6 +8319,35 @@ GLib.MainLoop().run()
         r#"{"delay_ms": 0, "capabilities": ["body", "body-markup"]}"#,
     )
     .unwrap();
+
+    // 2a-auto-dismiss. When `config.json` sets `notifications.persistent = false`, `Account Switched`
+    // uses `expire_timeout = -1` (server default auto-dismiss) while still setting transient=false, resident=true.
+    let autodismiss_env = IsolatedEnv::new();
+    setup_switchable_store(&autodismiss_env, now);
+    fs::write(
+        autodismiss_env.paths().config_file(),
+        br#"{"schema_version":1,"notifications":{"persistent":false}}"#,
+    )
+    .unwrap();
+    fs::set_permissions(
+        autodismiss_env.paths().config_file(),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let ad_out = autodismiss_env
+        .cli_cmd()
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus_addr)
+        .args(["--backend", "file", "daemon", "--once"])
+        .output()
+        .unwrap();
+    assert_eq!(ad_out.status.code(), Some(0));
+    let notes_ad = read_notifications();
+    assert_eq!(notes_ad.len(), 3);
+    assert_eq!(notes_ad[2]["summary"], "Account Switched");
+    assert_eq!(notes_ad[2]["urgency"], 1);
+    assert_eq!(notes_ad[2]["transient"], false);
+    assert_eq!(notes_ad[2]["resident"], true);
+    assert_eq!(notes_ad[2]["expire_timeout"], -1);
 
     // 2b. Opt-outs: `--no-notify`, `AGY_SWITCH_CLI_NOTIFY=0`, and `config.json` `notifications.enabled = false`
     for mode in ["cli", "env", "config"] {
@@ -8021,14 +8394,25 @@ GLib.MainLoop().run()
         );
         assert_eq!(
             read_notifications().len(),
-            2,
+            3,
             "Opt-out `{mode}` must suppress notification"
         );
     }
 
-    // 2c. PausedOnFailure notifies ONCE on transition (urgency=2) and does NOT spam on subsequent ticks
+    // 2c. PausedOnFailure notifies ONCE on transition (urgency=2, persistent expire_timeout=0 even when
+    //     `notifications.persistent = false`) and does NOT spam on subsequent ticks
     let pause_env = IsolatedEnv::new();
     setup_switchable_store(&pause_env, now);
+    fs::write(
+        pause_env.paths().config_file(),
+        br#"{"schema_version":1,"notifications":{"persistent":false}}"#,
+    )
+    .unwrap();
+    fs::set_permissions(
+        pause_env.paths().config_file(),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
     fs::create_dir_all(pause_env.paths().state_dir()).unwrap();
     fs::write(pause_env.paths().switch_journal_file(), b"{not-valid-json").unwrap();
     let pause_out_1 = pause_env
@@ -8039,10 +8423,13 @@ GLib.MainLoop().run()
         .unwrap();
     assert_eq!(pause_out_1.status.code(), Some(0));
     let notes_after_pause1 = read_notifications();
-    assert_eq!(notes_after_pause1.len(), 3);
-    assert_eq!(notes_after_pause1[2]["summary"], "Auto-Switch Paused");
-    assert_eq!(notes_after_pause1[2]["urgency"], 2);
-    let pause_body = notes_after_pause1[2]["body"].as_str().unwrap();
+    assert_eq!(notes_after_pause1.len(), 4);
+    assert_eq!(notes_after_pause1[3]["summary"], "Auto-Switch Paused");
+    assert_eq!(notes_after_pause1[3]["urgency"], 2);
+    assert_eq!(notes_after_pause1[3]["transient"], false);
+    assert_eq!(notes_after_pause1[3]["resident"], true);
+    assert_eq!(notes_after_pause1[3]["expire_timeout"], 0);
+    let pause_body = notes_after_pause1[3]["body"].as_str().unwrap();
     let pause_lines: Vec<&str> = pause_body.lines().collect();
     assert_eq!(pause_lines.len(), 3, "pause_body={pause_body}");
     assert_eq!(pause_lines[0], "■ <b>Journal check</b> · 1/3 failed");
@@ -8069,7 +8456,7 @@ GLib.MainLoop().run()
     assert_eq!(pause_out_2.status.code(), Some(0));
     assert_eq!(
         read_notifications().len(),
-        3,
+        4,
         "Already-paused tick must not spam duplicate notifications"
     );
 

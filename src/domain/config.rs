@@ -65,6 +65,11 @@ pub struct NotificationsConfig {
     /// Defaults to `true` when omitted (auto-skips silently on headless systems).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Keep `Account Switched` desktop notifications on screen until manually dismissed (`expire_timeout = 0`).
+    /// Defaults to `true` when omitted; set to `false` to use the desktop's default auto-dismiss timeout (`-1`).
+    /// `Auto-Switch Paused` alerts always remain persistent (`expire_timeout = 0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent: Option<bool>,
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +177,7 @@ mod tests {
             },
             notifications: NotificationsConfig {
                 enabled: Some(false),
+                persistent: Some(true),
             },
             oauth: OAuthFileConfig {
                 active_client_key: Some("custom".into()),
@@ -196,15 +202,31 @@ mod tests {
     fn config_notifications_deserializes_explicit_and_defaults_to_none() {
         let legacy: HeadlessConfig = serde_json::from_str(r#"{"schema_version":1}"#).unwrap();
         assert_eq!(legacy.notifications.enabled, None);
+        assert_eq!(legacy.notifications.persistent, None);
 
         let disabled: HeadlessConfig =
             serde_json::from_str(r#"{"schema_version":1,"notifications":{"enabled":false}}"#)
                 .unwrap();
         assert_eq!(disabled.notifications.enabled, Some(false));
+        assert_eq!(disabled.notifications.persistent, None);
 
         let enabled: HeadlessConfig =
             serde_json::from_str(r#"{"schema_version":1,"notifications":{"enabled":true}}"#)
                 .unwrap();
         assert_eq!(enabled.notifications.enabled, Some(true));
+        assert_eq!(enabled.notifications.persistent, None);
+
+        let auto_dismiss: HeadlessConfig = serde_json::from_str(
+            r#"{"schema_version":1,"notifications":{"enabled":true,"persistent":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(auto_dismiss.notifications.enabled, Some(true));
+        assert_eq!(auto_dismiss.notifications.persistent, Some(false));
+
+        let persistent_explicit: HeadlessConfig =
+            serde_json::from_str(r#"{"schema_version":1,"notifications":{"persistent":true}}"#)
+                .unwrap();
+        assert_eq!(persistent_explicit.notifications.enabled, None);
+        assert_eq!(persistent_explicit.notifications.persistent, Some(true));
     }
 }

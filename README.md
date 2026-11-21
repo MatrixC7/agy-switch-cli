@@ -90,11 +90,15 @@ agy-switch-cli tui
 | `agy-switch-cli stats summary / list [--watch]`        | 纯本地只读聚合模型 Token 用量与 `TTFT`/`TPS` 分位统计（`summary`），或列出最近请求明细（`list`），支持 `--watch [秒数]` 实时看板刷新（默认 `2` 秒，按 `Tab` 切换视图） |
 | `agy-switch-cli switch <ID\|EMAIL>`                   | 手动切换生效账号（默认 `auto` 自动适配无头 `file` 与桌面钥匙串 `dual` 双写；写入前自动安全对账未完成切换日志） |
 | `agy-switch-cli policy set --all-candidates ...`       | 配置自动切号水位策略（默认 `reserve = 10%`、`minimum = 30%`，配合 `daemon` 后台自动巡检切号） |
-| `agy-switch-cli daemon [--install \| --uninstall]`     | 运行后台自动切号守护进程（默认每 `180` 秒巡检、切号冷却 `3600` 秒；桌面可自动推送切号/熔断通知，支持 `--no-notify` 关闭，无头环境自动静默），或安装/卸载 `systemd --user` 服务 |
+| `agy-switch-cli daemon [--install \| --uninstall \| --reset-cooldown]` | 运行后台自动切号守护进程（默认每 `180` 秒巡检、切号冷却 `3600` 秒；支持 `--reset-cooldown` 主动解除冷却期；桌面切号/熔断通知默认常驻，可在 `config.json` 调整或用 `--no-notify` 关闭，无头环境自动静默），或安装/卸载 `systemd --user` 服务 |
 | `agy-switch-cli [--backend file] run [--account ...] -- agy ...` | 可选方式：按指定账号或指定后端包装启动 `agy`；显式启用 `file` 后端时自动为子进程屏蔽桌面 D-Bus 钥匙串 |
 | `agy-switch-cli tui`                                   | 打开 SSH 交互式终端看板（支持 `↑/↓` 选行与内嵌 `...` 滚动提示、`g/G` 首末行、`[/]` 调序、`r/R` 刷新、`c/C/p` 策略、`e/E` 与 `d/D` 单条/全局启停、`x`+`y` 删号） |
 
-*(关于 `--json` 机器输出与 `0..=8` 稳定退出码的边界说明：全屏交互看板 `tui` 与实时刷新模式 `stats ... --watch` 均与 `--json` 互斥并返回退出码 `2`；包装器 `run` 在前置准备失败时向 `stderr` 输出错误信封，就绪后直接继承子进程标准输入输出并透传其退出码；`daemon --install --json`、`daemon --uninstall --json` 与单轮 `daemon --once --json` 向 `stdout` 输出标准 `schema_version: 1` JSON 信封（单轮被外部信号提前取消时静默返回 `0`），而常驻 `daemon --json` 正常轮次保持静默［仅在启动、策略、锁或运行期致命错误时向 `stderr` 输出错误信封］；其余子命令均输出标准 `schema_version: 1` JSON 信封。)*
+**关于 `--json` 机器输出与 `0..=8` 稳定退出码的边界说明**：
+- 全屏交互看板 `tui` 与实时刷新模式 `stats ... --watch` 均与 `--json` 互斥并返回退出码 `2`。
+- 可选包装器 `run` 在前置准备失败时向 `stderr` 输出错误信封，就绪后直接继承子进程标准输入输出并透传其退出码。
+- `daemon --install --json`、`daemon --uninstall --json`、`daemon --reset-cooldown --json` 与单轮 `daemon --once --json` 向 `stdout` 输出标准 `schema_version: 1` JSON 信封（单轮被外部信号提前取消时静默返回 `0`）；常驻 `daemon --json` 正常轮次保持静默，仅在启动、策略、锁或运行期致命错误时向 `stderr` 输出错误信封。
+- 其余子命令均按 `schema_version: 1` 契约向 `stdout` 输出标准 JSON 信封。
 
 ---
 
@@ -131,5 +135,5 @@ rm -rf ~/.local/share/agy-switch-cli ~/.cache/agy-switch-cli ~/.local/state/agy-
 - **上游项目致谢**：感谢 [`anglee0323/agy-switch`](https://github.com/anglee0323/agy-switch) 及其贡献者提供的原始领域探索与桌面端参考实现。
 - **AI 协同研发与独立安全审查致谢**：
   - **Gemini 4 Carbon/Neon**：负责本项目的独立无头架构重构、四级锁与防回退核心代码实现、全套自动化测试矩阵、跨架构纯静态构建及全中文工程文档编写；
-  - **GPT 6.1 Sol/6.2 Sol**：担任独立第三方首席发版签核审计师，对本项目执行了四轮零信任源码深审、并发交错与故障注入探针验证及合规放行签核；
+  - **GPT 6.1 Sol/6.2 Sol**：担任独立第三方首席发版签核审计师，对本项目执行了多轮零信任源码深审、并发交错与故障注入探针验证及合规放行签核；
   - 由项目维护者提供需求定义、构建验证环境与全流程统筹把关。

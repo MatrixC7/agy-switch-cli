@@ -425,6 +425,10 @@ pub struct DaemonArgs {
     #[arg(long, conflicts_with = "uninstall")]
     pub no_notify: bool,
 
+    /// Clear any active post-switch cooldown in `state/daemon_state.json` (works standalone while a daemon is running, or combined with `--once` / `--install`)
+    #[arg(long, conflicts_with = "uninstall")]
+    pub reset_cooldown: bool,
+
     /// In-memory override for active-process guard mode (`immediate` or `wait`; overrides AGY_SWITCH_CLI_MODE and `policy.json`)
     #[arg(long, value_enum)]
     pub mode: Option<CliMode>,
@@ -444,6 +448,14 @@ pub struct DaemonArgs {
     /// In-memory override for monitored model/pool (`all`, `gemini`, `claude`, `argon`, or `<MODEL_ID>`; overrides AGY_SWITCH_CLI_MODEL and `policy.json`)
     #[arg(long, value_name = "MODEL")]
     pub model: Option<String>,
+
+    /// Internal marker set by the CLI parser when `--interval` came solely from `AGY_SWITCH_CLI_INTERVAL`
+    #[arg(skip)]
+    pub interval_from_env: bool,
+
+    /// Internal marker set by the CLI parser when `--cooldown` came solely from `AGY_SWITCH_CLI_COOLDOWN`
+    #[arg(skip)]
+    pub cooldown_from_env: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]

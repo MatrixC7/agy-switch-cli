@@ -48,7 +48,7 @@
 ```mermaid
 flowchart TD
     CLI["交互入口层<br/>src/main.rs · src/cli/* · src/tui/mod.rs"]
-    APP["应用编排与只读分析层<br/>src/switching/* · src/quota/* · src/oauth/* · src/stats/mod.rs"]
+    APP["应用编排与只读分析层<br/>src/switching/* · src/quota/* · src/oauth/* · src/stats/*"]
     INFRA["存储、会话与传输基础设施层<br/>src/store/* · src/session/* · src/transport/*"]
     DOMAIN["纯函数领域模型层<br/>src/domain/* · src/paths.rs · src/error.rs"]
 
@@ -77,8 +77,8 @@ flowchart TD
 | `transport/client.rs` / `proxy.rs` / `user_agent.rs` | 基于 `reqwest` + `rustls` 的 HTTP 传输抽象、系统代理环境变量自动规范化与异常项容错隔离（支持 `socks5h`/`socks`、裸 `host:port` 与精确 `url::Host` 本地回环直连分流）、`antigravity/hub/<ver>` 请求标识管理与隔离沙盒下的本机官方 `agy` 版本探测 |
 | `oauth/registry.rs` / `flow.rs` / `refresh.rs` | 内置与自定义 OAuth 客户端注册表、PKCE（`S256`）授权流、全入口 `/token` 签发后立即 `0600` 落盘与并发防回退续期闭环 |
 | `quota/client.rs` / `fusion.rs` | 单环境隔离的 CloudCode 三步配额拉取（`Daily -> Sandbox -> Production`）、401 单次强刷重试与双窗口配额融合 |
-| `switching/executor.rs` / `runner.rs` / `daemon.rs` / `systemd.rs` | 切号与事务性删号核心执行器、指定凭据与显式 `file` 后端自动隔离 D-Bus 的 `run -- agy` 受管包装启动器、七阶段静默自动切号守护引擎，以及带沙盒安全转义与防符号链接保护的 `daemon --install` / `--uninstall` 用户级服务管理器 |
-| `stats/{mod,readonly_vfs}.rs` | 纯离线零写入的本地 SQLite 会话库扫描器（自定义 `"agy_pinned_ro"` VFS 绑定 `openat` 目录句柄）、有效归档优先与实时回退去重、逐片段独立 Protobuf 帧校验、自然日与 `--recent <N>` 有界最小堆（`O(500)`）窗口下的 `stats summary` 聚合与 `stats list` 十列明细渲染 |
+| `switching/executor.rs` / `runner.rs` / `daemon.rs` / `notify.rs` / `systemd.rs` | 切号与事务性删号核心执行器、指定凭据与显式 `file` 后端自动隔离 D-Bus 的 `run -- agy` 受管包装启动器、七阶段静默自动切号守护引擎（含 `--reset-cooldown` 与普通状态回写竞态防覆盖）、纯 Rust D-Bus 桌面通知分发器（无头零自动激活与默认常驻可选配置），以及带沙盒安全转义与防符号链接保护的 `daemon --install` / `--uninstall` 用户级服务管理器 |
+| `stats/{mod,readonly_vfs,watch}.rs` | 纯离线零写入的本地 SQLite 会话库扫描器（自定义 `"agy_pinned_ro"` VFS 绑定 `openat` 目录句柄）、有效归档优先与实时回退去重、逐片段独立 Protobuf 帧校验、自然日与 `--recent <N>` 有界最小堆（`O(500)`）窗口下的 `stats summary` 聚合与 `stats list` 十列明细渲染，以及基于只读 `stat` 元数据指纹跳过解码的 `--watch [SECS]` 实时终端看板 |
 | `cli/*` / `tui/mod.rs` | 规范化长选项参数定义（无短参数、无隐藏兼容别名、严格 `<ID\|EMAIL>` 选择器）、只读 `status` 巡检、流式 `[k/N]` 批量刷新、无回显私密令牌读取器、物理白名单 DTO 渲染器，以及支持 `↑/↓` 选行与内嵌定高 `...` 滚动提示、`[/]` 调序、`e/E` 与 `d/D` 单条/全局启停、`x`+`y` 事务删号及双行分组底栏的 SSH 交互式终端看板 |
 
 ---
@@ -101,7 +101,7 @@ flowchart TD
 ~/.local/share/agy-switch-cli/          (0700)
 ├── index.json                          (0600) 账号排列顺序、当前选中账号 ID 与单调版本号 revision
 ├── policy.json                         (0600) 自动切号开关、阈值、策略、候选账号列表与 revision
-├── config.json                         (0600, 可选) 固定网络代理与自定义 OAuth 客户端配置
+├── config.json                         (0600, 可选) 固定网络代理、凭据后端、桌面通知与自定义 OAuth 客户端配置
 ├── accounts/                           (0700)
 │   └── <account_id>.json               (0600) 单账号令牌、配额缓存、授权世代与近 512 条已淘汰令牌摘要
 └── state/                              (0700)
@@ -133,14 +133,14 @@ flowchart TD
 - **第二优先级：磁盘凭据文件回退层**
   - 当环境不存在桌面钥匙串（如纯无头 SSH 服务器、Docker 容器、无桌面 WSL2）、钥匙串中无对应条目，或显式指定 `file` 后端并通过可选的 `run` 自动将子进程 `DBUS_SESSION_BUS_ADDRESS` 定向至 `/dev/null` 时，`agy` CLI 回退读写 `~/.gemini/antigravity-cli/antigravity-oauth-token`（桌面端 Antigravity App 与 VS Code 中的 Antigravity 扩展插件则回退读写 `~/.gemini/jetski-standalone-oauth-token`；而常见的 `~/.gemini/oauth_creds.json` 并非官方 Antigravity App 或 `agy` CLI 读写的槽位）。
 - **统一全特性发行包与四种清晰后端模式（`auto` / `dual` / `file` / `keyring`）**
-  - 默认编译特性统一为 `default = ["tui", "stats", "secret-service-backend"]`，使每个目标架构仅提供单一完整的预编译纯静态二进制（`x86_64` `musl` 约 `12.4 MiB`，零外部 `.so` 共享库依赖），免去服务器版与桌面版的选包负担；从源码编译时仍可通过 `--no-default-features` 构建纯 Rust 最小无头核（约 `7.9 MiB`），或按需单独组合 `tui`、`stats`、`secret-service-backend` 特性。
+  - 默认编译特性统一为 `default = ["tui", "stats", "secret-service-backend"]`，使每个目标架构仅提供单一完整的预编译纯静态二进制（`x86_64` `musl` 约 `14.4 MiB`、`aarch64` `musl` 约 `11.8 MiB`，零外部 `.so` 共享库依赖），免去服务器版与桌面版的选包负担；从源码编译时仍可通过 `--no-default-features` 构建纯 Rust 最小无头核，或按需单独组合 `tui`、`stats`、`secret-service-backend` 特性。
   - 全局 `--backend`（以及 `AGY_SWITCH_CLI_BACKEND` 与 `config.json` `"backend"`）提供四种边界明确的模式：
     - `auto`（默认）：先解析并锚定父目录句柄校验本机真实 Unix 域套接字（拒绝 `tcp:`、`unixexec:` 等非本机端点，并在连接后核对套接字 inode 与内核 `SO_PEERCRED` 有效 UID 一致），再绑定该端点在严格 `1500ms` 墙钟上限内以只读不解锁方式探测 `org.freedesktop.secrets` 是否持有持久化集合——检测到活跃桌面钥匙串时自动启用 `dual`，无钥匙串服务器自动回退至 `file`。
     - `dual`：显式执行钥匙串与本地 `~/.gemini/antigravity-cli/antigravity-oauth-token` 事务性双写。
     - `file`：仅读写本地 `~/.gemini/antigravity-cli/antigravity-oauth-token`，全程不连接 D-Bus 系统钥匙串。
     - `keyring`：仅读写 D-Bus Secret Service 系统钥匙串，绝不创建、修改、读取或要求本地 `~/.gemini/antigravity-cli/antigravity-oauth-token` 存在，同时完整保留跨多个钥匙串集合（`login` / `default`）的日志对账与失败回滚保护。
   - 当通过 `--backend file`、`AGY_SWITCH_CLI_BACKEND=file` 或 `config.json` `"backend": "file"` **显式指定** `file` 后端且宿主存在桌面会话总线（`DBUS_SESSION_BUS_ADDRESS` 或 `$XDG_RUNTIME_DIR/bus`）时，可选包装器 `run` 会自动将拉起的 `agy` 子进程 `DBUS_SESSION_BUS_ADDRESS` 设为 `unix:path=/dev/null`；而默认 `--backend auto` 在无钥匙串服务器上回退至 `file` 时不会修改子进程的 `DBUS_SESSION_BUS_ADDRESS`，确保子进程内的 `systemctl --user` 不受影响。
-  - 执行切号写入时，`SecretServiceSessionBackend` 在持有全局 `L1` 槽位锁与 UID 级钥匙串锁的前提下记录各应有副本（各钥匙串集合及 `dual` 模式下的磁盘文件）的前置缺失状态与摘要，依次更新并回读校验；若任意阶段出错，按前置快照逐一回滚全部受管副本并核验，仅在全部应有副本确认一致后才清理 `switch_journal.json`，任何不确定或分叉状态均保留日志并返回退出码 `7`（后续任意交互式写命令会在安全 CAS 保护下自动完成多副本对账自愈）。
+  - 执行切号写入时，`SecretServiceSessionBackend` 在持有全局 `L1` 槽位锁与 UID 级钥匙串锁的前提下记录各应有副本（各钥匙串集合及 `dual` 模式下的磁盘文件）的前置缺失状态与摘要，依次更新并回读校验；若任意阶段出错，按前置快照逐一回滚全部受管副本并核验（在 `dual` 模式的本地文件回滚中，若既有文件耐久确认失败，执行原子覆盖写前会再次复验 D-Bus 墙钟取消门控 `MutationGate`，阻止超时后的晚写行为），仅在全部应有副本确认一致后才清理 `switch_journal.json`，任何不确定或分叉状态均保留日志并返回退出码 `7`（后续任意交互式写命令会在安全 CAS 保护下自动完成多副本对账自愈）。
 
 ### 3.4 本地会话 SQLite 零写入统计与明细边界防护（`stats/{mod,readonly_vfs}.rs`）
 
@@ -149,14 +149,17 @@ flowchart TD
 - **可信目录句柄绑定与自定义零写入 VFS（`"agy_pinned_ro"`）**：
   - 拒绝相对 `HOME` 输入，所有数据库路径严格基于规范化绝对路径 `HeadlessPaths.home_dir` 自顶向下通过链式 `openat` 绑定真实目录句柄（`~/.gemini/antigravity-cli/conversations/*.db`、`~/.gemini/antigravity/conversations/*.db` 与 `token_usage_archive.db`），确保自动化沙盒测试与宿主机真实会话目录完全物理隔离，且错误消息采用固定路径类别而不回显本机绝对路径。
   - 通过注册自定义只读 VFS `"agy_pinned_ro"`，将已通过 `openat(O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)` 核验普通文件身份的主库描述符直接交付给 SQLite，并使 `-wal`、`-shm`、`-journal` 的每次存在性检查、打开与只读共享内存映射（`PROT_READ`）全部约束在同一 `dir_fd` 下执行，同时关闭 URI 解释并将临时存储强制置于受界进程内存（`PRAGMA temp_store = MEMORY`）。
-  - 面对已正常关闭且目录中无伴生文件的 WAL 模式数据库（以及不支持 Linux OFD 锁的降级环境），VFS 提供零字节虚拟只读 WAL 与堆内存 WAL 索引（`SQLITE_READONLY_CANTINIT`），仅凭真实 Linux OFD 共享锁（`F_OFD_SETLK`）同时持有 DMS 与 `WAL_READ_LOCK` 才进入可靠 mmap 分支；在无 OFD 或无 `-shm` 锁定的读事务提交统计前，始终重验主库与伴生文件的 `(dev, ino, size, mtime, ctime)` 与头部字节一致性（若扫描中途有新写者挂载则自动退避重试），确保在普通回滚库、关闭态 WAL 库、崩溃残留 WAL 库与并发活跃写入/检查点 WAL 库上均实现 **100% 源目录零文件创建、零字节修改与单一快照一致性**。
+  - 面对已正常关闭且目录中无伴生文件的 WAL 模式数据库（以及不支持 Linux OFD 锁的降级环境），VFS 提供零字节虚拟只读 WAL 与堆内存 WAL 索引（`SQLITE_READONLY_CANTINIT`），仅凭真实 Linux OFD 共享锁（`F_OFD_SETLK`）同时持有 DMS 与 `WAL_READ_LOCK` 才进入可靠 mmap 分支；在无 OFD 或无 `-shm` 锁定的读事务提交统计前，始终重验主库与伴生文件的目录项、`(dev, ino, size, mtime, ctime)` 元数据以及主库、`-wal` 与 `-journal` 的有限文件头（不比较 `-shm` 内容；若扫描中途有新写者挂载则自动退避重试），确保在普通回滚库、关闭态 WAL 库、崩溃残留 WAL 库与并发活跃写入/检查点 WAL 库上均实现 **100% 源目录零文件创建、零字节修改与单一快照一致性**。
 - **锁步流式关联、索引归档点查、有界最小堆（`O(500)`）与异常无索引预算保护**：
   - 在标准带索引的官方库与归档库上，通过 `steps` / `gen_metadata` 双游标锁步扫描、索引归档点查（同时打开的数据库句柄恒定 `<= 2`，即 `O(1)` 描述符占用）与容量上限 `500` 的有界最小堆完成聚合与最近明细筛选，无需将全量步骤或归档事件驻留内存；遇到缺少索引的异常表结构时，先仅按 `(rowid, idx)` 在显式行数预算（默认 `50,000` 行）内排序再逐行按 `rowid` 读取（绝不将大 BLOB 投入 SQLite 内存排序器），超出预算时明确降级计入 `unreadable_databases`，并将目录迭代错误、损坏文件与权限/I/O 异常统一计入 `unreadable_databases`。
   - 在 SQL 层通过 `typeof(...)` 与 `octet_length(...)` 严格校验列类型与字节上限（过滤 `> 64 MiB` 的异常 `gen_metadata.data` 并区分显式 `NULL` 与超限/非 BLOB 的 `step_payload`）。
 - **逐片段 Protobuf 帧校验、有效归档优先去重、统一性能采样与十列响应式明细**：
   - 零外部生成代码的内联 Protobuf 解码器施加 29 位字段号上限（`1..=536,870,911`），区分“字段缺失”与“帧/编码损坏”，在重复子消息拼接前对每个独立片段先行完成帧完整性校验，并对标量字段遵循标准 `Last-One-Wins` 语义。
   - `--source` 默认设为 `all`（无桌面服务器自动等效扫描 `cli`，桌面环境合并汇总 `cli + app`；亦支持显式指定 `cli` 或 `app`）。扫描 `all` 或 `app` 时，按 `(source_key, generation_idx)` 执行有效归档优先去重（若归档行无效则自动回退采用同键有效实时记录，且归档总额仅由三项 Token 明细重算而不依赖可空的冗余 `total_tokens` 列），并按 `antigravity/*` 与 `antigravity-cli/*` 前缀严格隔离归档记录。
-  - `stats summary`（含 `--date` / `--range` / `--recent`）与 `stats list` 共用同一条记录解码、事件时间与 TPS 过滤谓词：严格要求已完成步骤 `steps.status == 3`、无非法/超限 `step_payload`、`retries == 0`、`output_tokens > 0`、`ttft > 0` 且 `streaming_duration >= 1.0s`（兼容含工具调用与常规流式回复），状态简码覆盖 `ok` / `err` / `canc` / `run` / `unk` / `arch`。`stats summary` 线性插值输出 `TTFT` 与 `TPS` 的 `P10 / P50 / P90` 分位值并在 `Models` 七列表中统一展示 `Input`（总输入）、`Cached` 与一位小数 `Hit%`（存在未缓存输入时封顶 `99.9%`）；`stats list` 输出十列紧凑明细表，常规窄屏保留十列并收紧时间与模型列宽，低于十列最小可读宽度的极窄终端自动切换紧凑多行块格式，避免截去 `TPS` 与 `St`。
+  - **统一性能采样与响应式渲染（`stats summary` 与 `stats list` 共用谓词）**：
+    - 两者共用同一条记录解码、事件时间与实测 `TPS`（`= live_output_tokens / live_streaming_duration`）过滤谓词：严格要求已完成步骤 `steps.status == 3`、`gen_metadata` 无错误字段、无非法或超限 `step_payload`、`retries == 0`、实时输出 `live_output_tokens > 0`、`ttft > 0` 且 `live_streaming_duration >= 1.0s`（兼容含工具调用与常规流式回复），状态简码覆盖 `ok` / `err` / `canc` / `run` / `unk` / `arch`。
+    - `stats summary` 线性插值输出 `TTFT` 与 `TPS` 的 `P10 / P50 / P90` 分位值，并在 `Models` 七列表中统一展示 `Input`（总输入）、`Cached` 与一位小数 `Hit%`（存在未缓存输入时封顶 `99.9%`）。
+    - `stats list` 输出十列紧凑明细表，常规窄屏保留十列并收紧时间与模型列宽，低于十列最小可读宽度的极窄终端自动切换紧凑多行块格式，避免截去 `TPS` 与 `St`。
   - 四组互斥窗口参数统一校验：`--recent <N>`（`1..=500`，`stats list` 默认 `10`）、`--range <today|yesterday|<N>d|all>`（`stats summary` 默认 `today`）、`--date <YYYY-MM-DD>` 与 `--from <YYYY-MM-DD> [--to <YYYY-MM-DD>]`。
 
 ---
@@ -188,7 +191,12 @@ flowchart LR
 
 **崩溃恢复与多副本外部漂移保护（CAS）**：
 - 若进程在阶段一刚写完、尚未改动槽位时遭遇 `SIGKILL` 或断电，下次对账时核实全部事务副本仍匹配各自的前置状态，直接清理未提交日志即可无损恢复。
-- 若进程在阶段二已完成全部副本写入、`index.json` 更新前崩溃，下次对账核实全部应有副本均等于 `target_slot_digest` 时，才会自动前滚补齐 `index.json` 并清理日志；若仅部分副本写入导致钥匙串与磁盘不一致，只读命令 `status` 返回退出码 `7`、无人值守后台 `daemon` 保留日志并进入持久故障暂停（`paused_on_failure`，单轮 `--once` 以固定原因码汇报并退出 `0`），而交互式写命令（`switch`、`policy set`、`accounts` 等）在满足同后端或超集后端且通过逐集合 CAS 保护与隐藏集合校验的前提下会自动同步修复双端副本（手动 `switch` 同时基于钉扎目录 FD 清理本工具已过期的残留临时文件并解除 `daemon` 暂停标记，若这两项辅助操作失败均明确报错而不伪装为已恢复）。若 `switch_journal.json` 内容损坏、schema 版本不符或副本元数据不完整，程序一律保留现场绝不在单后端下擅自清除（`status` 与交互式写命令返回退出码 `7`，后台 `daemon` 进入 `paused_on_failure` 并以固定 `corrupted_switch_journal` 原因码汇报）。
+- 若进程在阶段二已完成全部副本写入、`index.json` 更新前崩溃，下次对账核实全部应有副本均等于 `target_slot_digest` 时，才会自动前滚补齐 `index.json` 并清理日志。
+- 若仅部分副本写入导致钥匙串与磁盘不一致：
+  - 只读命令 `status` 返回退出码 `7`；
+  - 无人值守后台 `daemon` 保留日志并进入持久故障暂停（`paused_on_failure`，单轮 `--once` 以固定原因码汇报并退出 `0`）；
+  - 交互式写命令（`switch`、`policy set`、`accounts` 等）在满足同后端或超集后端且通过逐集合 CAS 保护与隐藏集合校验的前提下尝试同步修复双端副本（手动 `switch` 同时基于钉扎目录 FD 清理本工具已过期的残留临时文件并解除 `daemon` 暂停标记，若这两项辅助操作失败均明确报错而不伪装为已恢复）。
+- 若 `switch_journal.json` 内容损坏、schema 版本不符或副本元数据不完整/矛盾（含文件副本记录 `file.prev_uniform = false`），程序一律保留现场绝不在单后端下擅自清除（`status` 与交互式写命令返回退出码 `7`，后台 `daemon` 进入 `paused_on_failure` 并以固定 `corrupted_switch_journal` 或 `incomplete_switch_recovery` 原因码汇报）。
 - 若崩溃后用户在外部登录了第三个新账号，写前对账机不会盲目用旧快照覆盖用户刚在外部登录的新凭据，而是自动保护该外部凭据或遇到双外部冲突时保留现场返回退出码 `7`。
 
 ### 4.3 零丢码暂存、授权世代（`auth_seq`）与两级防回退谱系
@@ -220,14 +228,17 @@ Google OAuth 刷新令牌在轮换或重新授权时，一旦服务端 `/token` 
 ### 5.3 受管启动 `run` 与七阶段守护引擎 `daemon`
 
 - **双因子防 PID 复用租约（`session/process.rs`）**：`run -- agy` 启动子进程后，读取 `/proc/<pid>/stat`（反向定位最后一个 `)` 以抵御包含空格或括号的特殊进程名）提取第 22 字段内核启动时钟滴答 `starttime`，将 `(pid, proc_starttime_ticks, account_id)` 写入 `state/leases/<pid>.json`。即使子进程异常崩溃且 Linux 内核稍后将该 PID 分配给了其他无关进程，由于 `starttime` 不匹配，旧租约会被立即识别为已失效而不会阻塞守护进程；若容器完全屏蔽了 `/proc` 导致进程状态无法核实，系统按**故障关闭（Fail-Closed）**拒绝盲目切号。
-- **七阶段守护状态机（`switching/daemon.rs`）**：每轮巡检（默认间隔 `180s ± 10%`，切号冷却 `3600s`，默认策略水位 `reserve = 10%` / `minimum = 30%`；非 `--json` 模式每轮向 `stdout` 实时刷新输出带本地时间戳的单行决策日志，`daemon --once --json` 输出标准结果信封；轮次报告、`daemon_state.json` 新写原因及 `--once`/常驻单轮错误出口均收敛为不含本机路径的固定机器错误码并附 `agy-switch-cli status` 指引，历史遗留的带路径 `paused_reason` 在转述时仅清洗输出而不改写旧状态字节，桌面通知 `Auto-Switch Paused` 正文使用无路径短句而非底层错误正文）依次经历：
-  1. `Observe`（对账日志、检查冷却与暂停状态；常驻定时唤醒与 `--once` 对非 `Unavailable` 活跃账号均直接执行实时联网刷新，仅当本地处于短低水位宽限窗口内——`--once` 为 `<= 15s`、常驻模式为 `min(15s, source_max_age - 1)` 且已确认 `<= reserve` 并未跨重置点——或处于失败退避期时跳过重复查询；`--once` 源刷新遇到网络错误、必要摘要错误或源阶段预算超时时统一映射为 `source_refresh_failed: ...` 故障关闭，绝不回退旧缓存；`source_max_age = clamp(80% * max(interval, 5), 1, 3600)` 用于约束 `Wait` 模式挂起计划的源复验保鲜期）；
-  2. `Evaluate`（若当前账号额度已知且高于 `reserve_percentage`，直接进入下轮休眠；`validation_blocked` 账号保持 `UncertainHold` 不抢切，并继续严格排除在候选池与 Stage 5/6 提交外）；
-  3. `Prepare`（当前账号确已跌破 `reserve_percentage` 时，记录此刻的 `index.revision` 与 `policy.revision` 快照，按默认的 `round-robin` 或 `priority` 顺序受控刷新探测未禁用候选账号直至找到首个 `>= candidate_min_percentage` 的达标目标，闲置候选沿用 `3600s` 缓存）；
-  4. `Guard`（先核验 `/proc` 与版本快照：若在 `Prepare` 期间或跨轮等待期间 `index.revision`、`policy.revision` 或槽位指纹已发生变更则立即作废旧计划；随后在默认的 `immediate` 模式下不中断运行中的 `agy` 进程而直接进入重验与切槽供后续新终端使用，在 `wait` 模式下若检测到活跃 `agy` 进程则暂缓等待空闲；无论何种模式，若遇到 `/proc` 不可读即 `RuntimeState::Unverified`，均严格保持故障关闭绝不盲写）；
-  5. `Revalidate`（在持有 `L1` 锁后、提交槽位前重新核对未决日志、`index.revision`、`policy.revision`、槽位指纹、目标可用性及高优先级候选状态——若在网络探测期间用户手动切了号、改了策略或排在前面的候选号已被重新启用，立即取消过时切换计划）；
-  6. `Commit`（在 `L1` 锁下原子提交切号并写入冷却截止时间；连续 3 次提交失败自动置 `paused_on_failure = true` 保护停机）；
-  7. `Sleep`（可被 `SIGTERM` / `SIGINT` 毫秒级唤醒并优雅退出）。
+- **七阶段守护状态机（`switching/daemon.rs`）与桌面通知 / 冷却重置协同（`switching/notify.rs`、`switching/systemd.rs`）**：
+  - **基础节律、脱敏与通知**：每轮默认巡检间隔 `180s ± 10%`、切号冷却 `3600s`、默认策略水位 `reserve = 10%` / `minimum = 30%`。非 `--json` 模式每轮向 `stdout` 实时刷新带本地时间戳的单行决策日志，`daemon --once --json` 与 `daemon --reset-cooldown --json` 输出标准结果信封；轮次报告、`daemon_state.json` 新写原因及 `--once`/常驻单轮错误出口均收敛为不含本机路径的固定机器错误码并附 `agy-switch-cli status` 指引（历史遗留带路径 `paused_reason` 仅清洗输出而不改写旧状态字节）。桌面通知统一附带 `transient=false` 与 `resident=true`，切号通知（`urgency=1`）默认常驻（`expire_timeout=0`，可在 `config.json` 中设 `notifications.persistent = false` 切回 `-1`），熔断暂停警告（`urgency=2`）始终常驻（`expire_timeout=0`）且正文使用无路径短句。
+  - **全场景主动解除冷却（`--reset-cooldown`）与并发防覆盖**：独立 `daemon --reset-cooldown` 不请求 `DaemonInstanceLock` 与凭据后端、零网络请求，仅在 `L3` 锁内原子清零 `cooldown_until`（保留轮询游标与 `paused_on_failure`）；`--once --reset-cooldown` 在持实例锁后于单轮评估前清零；`--install --reset-cooldown` 在参数、管理器与目标 unit 目录预检均通过后一次性清零且永不写入 `ExecStart=`。普通状态回写 `persist_status` 在 `L3` 锁内重读磁盘，绝不以旧内存快照覆写外部已清零的 `cooldown_until = 0`（仅 Stage 7 专用 `persist_commit_status` 写入新冷却截止时间）。
+  - **单轮七阶段流转**：
+    1. `Observe`：对账日志、检查冷却与暂停状态；常驻定时唤醒与 `--once` 对非 `Unavailable` 活跃账号直接执行实时联网刷新（仅当本地处于短低水位宽限窗口——`--once` 为 `<= 15s`、常驻模式为 `min(15s, source_max_age - 1)` 且已确认 `<= reserve` 并未跨重置点——或处于失败退避期时跳过重复查询）；`--once` 源刷新失败或预算超时统一映射为 `source_refresh_failed: ...` 故障关闭，绝不回退旧缓存；`source_max_age = clamp(80% * max(interval, 5), 1, 3600)` 用于约束 `Wait` 模式挂起计划的源复验保鲜期。
+    2. `Evaluate`：若当前账号额度已知且高于 `reserve_percentage`，直接进入下轮休眠；`validation_blocked` 账号保持 `UncertainHold` 不抢切，并继续严格排除在候选池与 Stage 5/6 提交外。
+    3. `Prepare`：当前账号确已跌破 `reserve_percentage` 时，记录此刻的 `index.revision` 与 `policy.revision` 快照，按默认的 `round-robin` 或 `priority` 顺序受控刷新探测未禁用候选账号直至找到首个 `>= candidate_min_percentage` 的达标目标（闲置候选沿用 `3600s` 缓存）。
+    4. `Guard`：先核验 `/proc` 与版本快照（若期间 `index.revision`、`policy.revision` 或槽位指纹变更则立即作废旧计划）；随后在默认 `immediate` 模式下不中断运行中的 `agy` 进程而直接进入重验与切槽，在 `wait` 模式下检测到活跃 `agy` 时暂缓等待空闲；无论何种模式，遇 `/proc` 不可读（`RuntimeState::Unverified`）均严格故障关闭绝不盲写。
+    5. `Revalidate`：在持有 `L1` 锁后、提交槽位前重新核对未决日志、`index.revision`、`policy.revision`、槽位指纹、目标可用性及高优先级候选状态，若已过时则立即取消切换计划。
+    6. `Commit`：在 `L1` 锁下原子提交切号并通过 Stage 7 专用回写写入新冷却截止时间；连续 3 次提交失败自动置 `paused_on_failure = true` 保护停机。
+    7. `Sleep`：可被 `SIGTERM` / `SIGINT` 毫秒级唤醒并优雅退出。
 
 ---
 
@@ -248,13 +259,13 @@ Google OAuth 刷新令牌在轮换或重新授权时，一旦服务端 `/token` 
 
 ### 7.1 四目标 × 三特性档 Release 产物实测矩阵
 
-**基准测量环境**：Linux `x86_64`（EndeavourOS，`rustc 1.100.0` 主工具链 + 精确最低支持版本 `rustc 1.89.0` MSRV 工具链，`cargo-deny 0.21.0`，`zig 0.17.1` + `cargo-zigbuild`，`qemu-aarch64-static`；Release 编译配置为 `lto = "thin"`、`codegen-units = 1`、`strip = "symbols"`）。
+**基准测量环境**：Linux `x86_64`（EndeavourOS，`rustc 1.100.0` 主工具链 + 精确最低支持版本 `rustc 1.89.0` MSRV 工具链，`cargo-deny 0.22.0`，`zig 0.17.1` + `cargo-zigbuild`，`qemu-aarch64-static`；Release 编译配置为 `lto = "thin"`、`codegen-units = 1`、`strip = "symbols"`）。
 
 | 目标三元组 (`--target`) | 精简最小核 (`--no-default-features`) | 无钥匙串裁剪档 (`--no-default-features --features tui,stats`) | 默认统一发行版 (`default`: 全特性合一) | ELF 链接属性与 `readelf` 核验结果 |
 | :--- | :---: | :---: | :---: | :--- |
 | **`x86_64-unknown-linux-gnu`** | `~8.2 MiB` | `~10.8 MiB` | `~13.2 MiB` | 动态链接 glibc：仅依赖 `libc.so.6`、`libm.so.6`、`libgcc_s.so.1`、`ld-linux-x86-64.so.2`（**0 桌面/GUI/外部 SQLite 库**） |
-| **`x86_64-unknown-linux-musl`** | `~7.9 MiB` | `~10.0 MiB` | `~12.3 MiB` | **`static-pie` 完全静态 ELF**：无 `PT_INTERP`、**`0` 个 `NEEDED` 共享库**；本机原生三特性档全量测试通过 |
-| **`aarch64-unknown-linux-musl`** | `~6.9 MiB` | `~8.9 MiB` | `~10.9 MiB` | **`statically linked` 完全静态 ARM64 ELF**：无 `PT_INTERP`、**`0` 个 `NEEDED` 共享库**；通过 QEMU 用户态端到端冒烟 |
+| **`x86_64-unknown-linux-musl`** | `~7.9 MiB` | `~10.0 MiB` | `~14.4 MiB` | **`static-pie` 完全静态 ELF**：无 `PT_INTERP`、**`0` 个 `NEEDED` 共享库**；本机原生三特性档全量测试通过 |
+| **`aarch64-unknown-linux-musl`** | `~6.9 MiB` | `~8.9 MiB` | `~11.8 MiB` | **`statically linked` 完全静态 ARM64 ELF**：无 `PT_INTERP`、**`0` 个 `NEEDED` 共享库**；通过 QEMU 用户态端到端冒烟 |
 | **`aarch64-unknown-linux-gnu`** | `~7.2 MiB` | `~9.5 MiB` | `~11.6 MiB` | 动态链接 ARM64 glibc：仅依赖基础 C/数学运行库（**0 桌面/GUI/外部 SQLite 库**）；通过 QEMU 用户态端到端冒烟 |
 
 ### 7.2 本机原生运行性能指标（`x86_64`）

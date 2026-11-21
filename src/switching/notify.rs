@@ -5,6 +5,8 @@ use std::time::Duration;
 
 pub const NOTIFY_ENV_VAR: &str = "AGY_SWITCH_CLI_NOTIFY";
 pub const DESKTOP_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+pub const NOTIFY_EXPIRE_PERSISTENT_MS: i32 = 0;
+pub const NOTIFY_EXPIRE_SERVER_DEFAULT_MS: i32 = -1;
 
 const MAX_NOTIFY_ACCOUNT_CHARS: usize = 120;
 const MAX_NOTIFY_SHORT_FIELD_CHARS: usize = 80;
@@ -35,6 +37,7 @@ pub struct NotificationPayload {
     pub body: String,
     pub icon: &'static str,
     pub urgency: u8,
+    pub expire_timeout_ms: i32,
 }
 
 /// Parse `raw` as an optional boolean notification toggle without echoing raw values on error.
@@ -84,6 +87,15 @@ pub fn resolve_effective_notify_enabled(
     repo.read_config()
         .ok()
         .and_then(|cfg| cfg.notifications.enabled)
+        .unwrap_or(true)
+}
+
+/// Resolve whether `Account Switched` desktop notifications stay persistent (`expire_timeout = 0`).
+/// Reads `config.json` `notifications.persistent`, defaulting to `true` when omitted.
+pub fn resolve_effective_notify_persistent(repo: &StoreRepository) -> bool {
+    repo.read_config()
+        .ok()
+        .and_then(|cfg| cfg.notifications.persistent)
         .unwrap_or(true)
 }
 
@@ -137,9 +149,12 @@ fn format_window_line(short_5h_pct: Option<u8>, weekly_pct: Option<u8>) -> Strin
 /// Format an English FreeDesktop notification payload.
 /// When `supports_markup` is true (verified via `GetCapabilities` containing `"body-markup"`),
 /// applies per-line `<b>`/`<i>` hierarchy and XML-escapes dynamic fields; otherwise emits pure plain text.
+/// `persistent_switch` controls whether `Account Switched` uses `expire_timeout_ms = 0` (persistent
+/// until dismissed) or `-1` (desktop default auto-dismiss); `Auto-Switch Paused` always uses `0`.
 pub fn format_notification_payload(
     event: &DaemonNotificationEvent,
     supports_markup: bool,
+    persistent_switch: bool,
 ) -> NotificationPayload {
     match event {
         DaemonNotificationEvent::Switched {
@@ -178,6 +193,11 @@ pub fn format_notification_payload(
                 body: lines.join("\n"),
                 icon: "dialog-information",
                 urgency: 1,
+                expire_timeout_ms: if persistent_switch {
+                    NOTIFY_EXPIRE_PERSISTENT_MS
+                } else {
+                    NOTIFY_EXPIRE_SERVER_DEFAULT_MS
+                },
             }
         }
         DaemonNotificationEvent::PausedOnFailure {
@@ -229,6 +249,7 @@ pub fn format_notification_payload(
                 body: lines.join("\n"),
                 icon: "dialog-warning",
                 urgency: 2,
+                expire_timeout_ms: NOTIFY_EXPIRE_PERSISTENT_MS,
             }
         }
     }
@@ -251,7 +272,7 @@ fn is_dbus_no_owner_error(err: &zbus::Error) -> bool {
 }
 
 #[cfg(feature = "secret-service-backend")]
-async fn send_via_freedesktop_dbus(event: &DaemonNotificationEvent) {
+async fn send_via_freedesktop_dbus(event: &DaemonNotificationEvent, persistent_switch: bool) {
     use std::collections::HashMap;
     use zbus::proxy::{Builder as ProxyBuilder, CacheProperties, MethodFlags};
     use zbus::zvariant::Value;
@@ -350,10 +371,12 @@ async fn send_via_freedesktop_dbus(event: &DaemonNotificationEvent) {
         }
     };
 
-    let payload = format_notification_payload(event, supports_markup);
+    let payload = format_notification_payload(event, supports_markup, persistent_switch);
     let actions: Vec<&str> = Vec::new();
     let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
     hints.insert("urgency", Value::U8(payload.urgency));
+    hints.insert("transient", Value::Bool(false));
+    hints.insert("resident", Value::Bool(true));
 
     if let Err(e) = proxy
         .call_with_flags::<_, _, u32>(
@@ -367,7 +390,7 @@ async fn send_via_freedesktop_dbus(event: &DaemonNotificationEvent) {
                 payload.body.as_str(),
                 actions,
                 hints,
-                -1i32,
+                payload.expire_timeout_ms,
             ),
         )
         .await
@@ -386,6 +409,7 @@ async fn send_via_freedesktop_dbus(event: &DaemonNotificationEvent) {
 /// Never fails, never blocks shutdown, and skips silently when no desktop notification owner exists.
 pub async fn send_daemon_notification_best_effort(
     event: &DaemonNotificationEvent,
+    persistent_switch: bool,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) {
     if *shutdown_rx.borrow() {
@@ -396,13 +420,13 @@ pub async fn send_daemon_notification_best_effort(
     {
         tokio::select! {
             _ = shutdown_rx.changed() => {}
-            _ = tokio::time::timeout(DESKTOP_NOTIFY_TIMEOUT, send_via_freedesktop_dbus(event)) => {}
+            _ = tokio::time::timeout(DESKTOP_NOTIFY_TIMEOUT, send_via_freedesktop_dbus(event, persistent_switch)) => {}
         }
     }
 
     #[cfg(not(feature = "secret-service-backend"))]
     {
-        let _ = (event, shutdown_rx);
+        let _ = (event, persistent_switch, shutdown_rx);
     }
 }
 
@@ -440,10 +464,12 @@ mod tests {
 
         assert!(resolve_effective_notify_enabled(&repo, false, None));
         assert!(!resolve_effective_notify_enabled(&repo, false, Some(false)));
+        assert!(resolve_effective_notify_persistent(&repo));
 
         let cfg = HeadlessConfig {
             notifications: NotificationsConfig {
                 enabled: Some(false),
+                persistent: Some(false),
             },
             ..HeadlessConfig::default()
         };
@@ -451,6 +477,21 @@ mod tests {
         assert!(!resolve_effective_notify_enabled(&repo, false, None));
         assert!(resolve_effective_notify_enabled(&repo, false, Some(true)));
         assert!(!resolve_effective_notify_enabled(&repo, true, Some(true)));
+        assert!(!resolve_effective_notify_persistent(&repo));
+
+        let cfg_persist_true = HeadlessConfig {
+            notifications: NotificationsConfig {
+                enabled: Some(true),
+                persistent: Some(true),
+            },
+            ..HeadlessConfig::default()
+        };
+        fs::write(
+            paths.config_file(),
+            serde_json::to_vec(&cfg_persist_true).unwrap(),
+        )
+        .unwrap();
+        assert!(resolve_effective_notify_persistent(&repo));
     }
 
     #[test]
@@ -464,10 +505,11 @@ mod tests {
             target_weekly_pct: Some(85),
         };
 
-        let markup = format_notification_payload(&switched_event, true);
+        let markup = format_notification_payload(&switched_event, true, true);
         assert_eq!(markup.summary, "Account Switched");
         assert_eq!(markup.icon, "dialog-information");
         assert_eq!(markup.urgency, 1);
+        assert_eq!(markup.expire_timeout_ms, NOTIFY_EXPIRE_PERSISTENT_MS);
         assert_eq!(
             markup.body,
             "<b>↑ bob&amp;&lt;tag&gt;@example.com</b>\n\
@@ -478,7 +520,15 @@ mod tests {
         assert!(!markup.body.contains('\x1b'));
         assert!(!markup.body.contains("Restart"));
 
-        let plain = format_notification_payload(&switched_event, false);
+        let auto_dismiss = format_notification_payload(&switched_event, true, false);
+        assert_eq!(auto_dismiss.urgency, 1);
+        assert_eq!(
+            auto_dismiss.expire_timeout_ms,
+            NOTIFY_EXPIRE_SERVER_DEFAULT_MS
+        );
+
+        let plain = format_notification_payload(&switched_event, false, true);
+        assert_eq!(plain.expire_timeout_ms, NOTIFY_EXPIRE_PERSISTENT_MS);
         assert_eq!(
             plain.body,
             "↑ bob&<tag>@example.com\n\
@@ -499,14 +549,14 @@ mod tests {
             target_weekly_pct: None,
         };
         assert_eq!(
-            format_notification_payload(&switched_partial_windows_event, true).body,
+            format_notification_payload(&switched_partial_windows_event, true, true).body,
             "<b>↑ bob@example.com</b>\n\
              <b>5h — · Weekly —</b>\n\
              ↓ alice@example.com\n\
              5h — · Weekly 10%"
         );
         assert_eq!(
-            format_notification_payload(&switched_partial_windows_event, false).body,
+            format_notification_payload(&switched_partial_windows_event, false, true).body,
             "↑ bob@example.com\n\
              5h — · Weekly —\n\
              ↓ alice@example.com\n\
@@ -521,10 +571,12 @@ mod tests {
             max_failures: 3,
             reason: long_reason,
         };
-        let paused_markup = format_notification_payload(&paused_with_target_event, true);
+        // Even when `persistent_switch = false`, critical Auto-Switch Paused alerts remain persistent (`0`).
+        let paused_markup = format_notification_payload(&paused_with_target_event, true, false);
         assert_eq!(paused_markup.summary, "Auto-Switch Paused");
         assert_eq!(paused_markup.icon, "dialog-warning");
         assert_eq!(paused_markup.urgency, 2);
+        assert_eq!(paused_markup.expire_timeout_ms, NOTIFY_EXPIRE_PERSISTENT_MS);
         let paused_lines: Vec<&str> = paused_markup.body.lines().collect();
         assert_eq!(paused_lines.len(), 4);
         assert_eq!(paused_lines[0], "■ <b>bob@example.com (Work)</b>");
@@ -537,7 +589,8 @@ mod tests {
             "<i>Run agy-switch-cli status to inspect.</i>"
         );
 
-        let paused_plain = format_notification_payload(&paused_with_target_event, false);
+        let paused_plain = format_notification_payload(&paused_with_target_event, false, false);
+        assert_eq!(paused_plain.expire_timeout_ms, NOTIFY_EXPIRE_PERSISTENT_MS);
         assert!(paused_plain.body.starts_with("■ bob@example.com (Work)\n"));
         assert!(paused_plain
             .body
@@ -553,13 +606,13 @@ mod tests {
             reason: "Corrupt switch journal <raw>".into(),
         };
         assert_eq!(
-            format_notification_payload(&paused_no_target_event, true).body,
+            format_notification_payload(&paused_no_target_event, true, true).body,
             "■ <b>Journal check</b> · 1/3 failed\n\
              Corrupt switch journal &lt;raw&gt;\n\
              <i>Run agy-switch-cli status to inspect.</i>"
         );
         assert_eq!(
-            format_notification_payload(&paused_no_target_event, false).body,
+            format_notification_payload(&paused_no_target_event, false, true).body,
             "■ Journal check · 1/3 failed\n\
              Corrupt switch journal <raw>\n\
              Run agy-switch-cli status to inspect."

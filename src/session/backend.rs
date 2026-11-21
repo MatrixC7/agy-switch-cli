@@ -1955,18 +1955,29 @@ mod keyring_impl {
         ok
     }
 
-    fn restore_file_and_verify(
+    pub(super) fn restore_file_and_verify_with_hook<F>(
         paths: &HeadlessPaths,
         prev_file: Option<&[u8]>,
         gate: &MutationGate,
-    ) -> bool {
+        after_durability_check: F,
+    ) -> bool
+    where
+        F: FnOnce(),
+    {
         if gate.is_timed_out() {
             return false;
         }
         let op_ok = match prev_file {
             Some(old) => {
-                confirm_existing_slot_file_and_parent_durable(paths, old)
-                    || write_atomic_durable(&paths.active_slot_file, old).is_ok()
+                if confirm_existing_slot_file_and_parent_durable(paths, old) {
+                    true
+                } else {
+                    after_durability_check();
+                    if gate.is_timed_out() {
+                        return false;
+                    }
+                    write_atomic_durable(&paths.active_slot_file, old).is_ok()
+                }
             }
             None => FileSessionBackend.remove_slot(paths).is_ok(),
         };
@@ -1977,6 +1988,14 @@ mod keyring_impl {
             Ok(actual) => actual.as_deref() == prev_file,
             Err(_) => false,
         }
+    }
+
+    fn restore_file_and_verify(
+        paths: &HeadlessPaths,
+        prev_file: Option<&[u8]>,
+        gate: &MutationGate,
+    ) -> bool {
+        restore_file_and_verify_with_hook(paths, prev_file, gate, || {})
     }
 
     fn verify_live_collections_match_cas(
@@ -3208,5 +3227,58 @@ mod tests {
             kr_absent_corrupt_file.effective_slot_state(),
             SlotInspectState::AbsentInInitializedDir
         ));
+    }
+
+    #[cfg(feature = "secret-service-backend")]
+    #[test]
+    fn synthetic_v124_r403_restore_file_aborts_overwrite_when_gate_times_out_after_durability_check(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        let cache = tmp.path().join("cache");
+        let paths = HeadlessPaths::with_explicit(home, data, cache);
+        fs::create_dir_all(&paths.active_slot_dir).unwrap();
+
+        let old_bytes = br#"{"refresh_token":"1//old-slot-token"}"#;
+        let newer_bytes = br#"{"refresh_token":"1//newer-slot-token"}"#;
+        fs::write(&paths.active_slot_file, newer_bytes).unwrap();
+
+        // 1. Mid-rollback timeout window (R4-03): gate is NOT timed out on entry,
+        //    `confirm_existing_slot_file_and_parent_durable` fails (disk has `newer_bytes`),
+        //    and wall-clock cancellation flips `gate` to timed-out BEFORE `write_atomic_durable`.
+        //    `restore_file_and_verify_with_hook` MUST return `false` and MUST NOT overwrite the file!
+        let gate_mid_timeout = keyring_impl::MutationGate::new();
+        gate_mid_timeout.enter_mutation().unwrap();
+        let ok = keyring_impl::restore_file_and_verify_with_hook(
+            &paths,
+            Some(old_bytes),
+            &gate_mid_timeout,
+            || {
+                let phase = gate_mid_timeout.cancel_on_timeout();
+                assert_eq!(phase, keyring_impl::GatePhase::TimedOutUncertain);
+            },
+        );
+        assert!(
+            !ok,
+            "restore_file_and_verify must return false once gate times out before atomic overwrite"
+        );
+        assert_eq!(
+            fs::read(&paths.active_slot_file).unwrap(),
+            newer_bytes,
+            "Timed-out rollback must never overwrite active slot file"
+        );
+
+        // 2. Control: when gate remains active through the durability check, rollback overwrites cleanly.
+        let gate_active = keyring_impl::MutationGate::new();
+        gate_active.enter_mutation().unwrap();
+        let restored = keyring_impl::restore_file_and_verify_with_hook(
+            &paths,
+            Some(old_bytes),
+            &gate_active,
+            || {},
+        );
+        assert!(restored);
+        assert_eq!(fs::read(&paths.active_slot_file).unwrap(), old_bytes);
     }
 }

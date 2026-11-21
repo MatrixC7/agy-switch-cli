@@ -1,7 +1,7 @@
-use agy_switch_cli::cli::args::Cli;
+use agy_switch_cli::cli::args::{Cli, Commands};
 use agy_switch_cli::cli::commands::dispatch;
 use agy_switch_cli::error::{format_safe_clap_error, CliError, ExitCode};
-use clap::{error::ErrorKind, Parser};
+use clap::{error::ErrorKind, parser::ValueSource, CommandFactory, FromArgMatches};
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -71,8 +71,31 @@ async fn main() {
             .try_init();
     }
 
-    let cli = match Cli::try_parse_from(&raw_args) {
-        Ok(parsed) => parsed,
+    let cli = match Cli::command().try_get_matches_from(&raw_args) {
+        Ok(matches) => {
+            let mut parsed = match Cli::from_arg_matches(&matches) {
+                Ok(p) => p,
+                Err(clap_err) => {
+                    let safe_msg = format_safe_clap_error(&raw_args, &clap_err);
+                    if json_flag_present {
+                        let structured = CliError::usage(safe_msg);
+                        eprintln!("{}", structured.to_json_line());
+                    } else {
+                        eprintln!("error: {}", safe_msg.trim());
+                    }
+                    std::process::exit(ExitCode::InvalidUsageOrAmbiguous.as_i32());
+                }
+            };
+            if let Commands::Daemon(ref mut daemon_args) = parsed.command {
+                if let Some(sub) = matches.subcommand_matches("daemon") {
+                    daemon_args.interval_from_env =
+                        sub.value_source("interval") == Some(ValueSource::EnvVariable);
+                    daemon_args.cooldown_from_env =
+                        sub.value_source("cooldown") == Some(ValueSource::EnvVariable);
+                }
+            }
+            parsed
+        }
         Err(clap_err) => match clap_err.kind() {
             ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
                 let _ = clap_err.print();

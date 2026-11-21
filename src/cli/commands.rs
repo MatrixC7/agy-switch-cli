@@ -38,16 +38,18 @@ use crate::store::transfer::{
     export_transfer_bundle_file, import_from_legacy_dir, import_transfer_bundle_file,
 };
 use crate::switching::daemon::{
-    read_daemon_state_readonly, repair_or_clear_daemon_state_in_tx,
-    run_foreground_daemon_with_shutdown, spawn_shutdown_signal_watcher, DaemonConfigOverrides,
-    DaemonPolicyOverlay, DEFAULT_DAEMON_COOLDOWN_SECS, DEFAULT_DAEMON_INTERVAL_SECS,
+    format_local_ts as format_daemon_local_ts, read_daemon_state_readonly,
+    repair_or_clear_daemon_state_in_tx, reset_daemon_cooldown, run_foreground_daemon_with_shutdown,
+    spawn_shutdown_signal_watcher, DaemonConfigOverrides, DaemonPolicyOverlay,
+    DEFAULT_DAEMON_COOLDOWN_SECS, DEFAULT_DAEMON_INTERVAL_SECS,
 };
 use crate::switching::executor::{
     execute_account_delete, execute_switch_with_idle_policy, preview_switch_dry_run, SwitchOptions,
 };
 use crate::switching::runner::{ordered_candidate_ids, run_managed_agy};
 use crate::switching::systemd::{
-    install_systemd_user_service, uninstall_systemd_user_service, DaemonServiceInstallOptions,
+    install_systemd_user_service_with_reset, uninstall_systemd_user_service,
+    DaemonServiceInstallOptions,
 };
 use crate::transport::client::{HttpTransport, ReqwestTransport};
 use crate::transport::proxy::ProxyMode;
@@ -74,7 +76,9 @@ fn command_uses_backend(cmd: &Commands) -> bool {
         Commands::Accounts(AccountsCommand::Export(_)) => false,
         Commands::Quota(args) => args.refresh,
         Commands::Policy(PolicyCommand::Show | PolicyCommand::Eval) => false,
-        Commands::Daemon(args) => !(args.install || args.uninstall),
+        Commands::Daemon(args) => {
+            !(args.install || args.uninstall || (args.reset_cooldown && !args.once))
+        }
         Commands::Stats(_) => false,
         _ => true,
     }
@@ -1394,7 +1398,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 } else {
                     None
                 };
-                let outcome = install_systemd_user_service(
+                let outcome = install_systemd_user_service_with_reset(
                     &paths,
                     &DaemonServiceInstallOptions {
                         explicit_interval_secs: args.interval,
@@ -1402,6 +1406,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                         explicit_backend,
                         explicit_no_notify: args.no_notify,
                     },
+                    args.reset_cooldown,
                 )
                 .await?;
                 if cli.json {
@@ -1416,6 +1421,17 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                         terminal_text(&outcome.unit_path.to_string_lossy())
                     );
                     println!("  ExecStart : {}", terminal_text(&outcome.exec_start));
+                    if outcome.cooldown_reset == Some(true) {
+                        if outcome.cooldown_was_active == Some(true) {
+                            let prev = outcome.previous_cooldown_until.unwrap_or(0);
+                            println!(
+                                "  Cooldown  : cleared (was active until {})",
+                                format_daemon_local_ts(prev)
+                            );
+                        } else {
+                            println!("  Cooldown  : cleared (no active cooldown)");
+                        }
+                    }
                     println!(
                         "  Status    : systemctl --user status {}",
                         outcome.service_name
@@ -1432,9 +1448,13 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                 return Ok(ExitCode::Ok.as_i32());
             }
             if args.uninstall {
-                if has_temp_policy_flags || cli.proxy.is_some() || args.no_notify {
+                if has_temp_policy_flags
+                    || cli.proxy.is_some()
+                    || args.no_notify
+                    || args.reset_cooldown
+                {
                     return Err(CliError::usage(
-                        "Policy, `--proxy`, or `--no-notify` flags cannot be combined with `daemon --uninstall`.",
+                        "Policy, `--proxy`, `--no-notify`, or `--reset-cooldown` flags cannot be combined with `daemon --uninstall`.",
                     ));
                 }
                 let outcome = uninstall_systemd_user_service(&paths).await?;
@@ -1452,6 +1472,32 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                         outcome.service_name,
                         terminal_text(&outcome.unit_path.to_string_lossy())
                     );
+                }
+                return Ok(ExitCode::Ok.as_i32());
+            }
+            if args.reset_cooldown && !args.once {
+                let has_explicit_interval = args.interval.is_some() && !args.interval_from_env;
+                let has_explicit_cooldown = args.cooldown.is_some() && !args.cooldown_from_env;
+                if has_temp_policy_flags
+                    || has_explicit_interval
+                    || has_explicit_cooldown
+                    || args.no_notify
+                    || cli.proxy.is_some()
+                {
+                    return Err(CliError::usage(
+                        "Standalone `daemon --reset-cooldown` only clears the persisted cooldown and cannot be combined with runtime override flags (`--interval`, `--cooldown`, `--no-notify`, `--mode`, `--strategy`, `--reserve`, `--minimum`, `--model`, `--proxy`). Add `--once` to run a single tick immediately or `--install` to update the systemd service.",
+                    ));
+                }
+                let outcome = reset_daemon_cooldown(&repo, now_unix)?;
+                if cli.json {
+                    print_json(&outcome)?;
+                } else if outcome.cooldown_was_active {
+                    println!(
+                        "Cleared active daemon cooldown (was active until {}).",
+                        format_daemon_local_ts(outcome.previous_cooldown_until)
+                    );
+                } else {
+                    println!("No active daemon cooldown to clear.");
                 }
                 return Ok(ExitCode::Ok.as_i32());
             }
@@ -1516,6 +1562,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                     interval_secs,
                     cooldown_secs,
                     once: args.once,
+                    reset_cooldown: args.reset_cooldown,
                     json_mode: cli.json,
                     notify_override,
                     policy_overlay,

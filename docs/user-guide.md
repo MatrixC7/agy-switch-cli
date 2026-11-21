@@ -27,7 +27,7 @@
    - [4.9 SSH 交互式终端看板：`tui`（全键盘可视化操作）](#49-ssh-交互式终端看板tui全键盘可视化操作)
    - [4.10 本地 Token 用量统计与请求明细：`stats summary` / `stats list`](#410-本地-token-用量统计与请求明细stats-summary--stats-list)
 5. [标准退出码（`0..=8`）与 `--json` 脚本集成契约](#5-标准退出码08与---json-脚本集成契约)
-6. [可选配置文件（`config.json` 网络代理与自定义 OAuth 客户端）](#6-可选配置文件configjson-网络代理与自定义-oauth-客户端)
+6. [可选配置文件（`config.json` 代理、后端、通知与自定义 OAuth 客户端）](#6-可选配置文件configjson-代理后端通知与自定义-oauth-客户端)
 7. [后台常驻运行指南（`systemd --user` 与无 `systemd` 的 Docker 容器环境）](#7-后台常驻运行指南systemd---user-与无-systemd-的-docker-容器环境)
 8. [常见问题解答（FAQ）](#8-常见问题解答faq)
 9. [完整卸载与本地遗留文件清理清单](#9-完整卸载与本地遗留文件清理清单)
@@ -42,8 +42,8 @@
 
 | 预编译压缩包（按架构区分） | 适用硬件与系统环境 | 内置能力与体积说明 |
 | :--- | :--- | :--- |
-| **`agy-switch-cli-<版本>-x86_64-unknown-linux-musl.tar.gz`** | 常见 Intel / AMD 64 位云服务器、PC、WSL2 与 Docker 容器（`uname -m` 输出 `x86_64`） | **100% 纯静态单文件 ELF**（约 `12.3 MiB`，零外部 `.so` 动态库依赖），完整内置核心 CLI、`stats` 本地统计、`tui` 交互看板与纯 Rust D-Bus 系统钥匙串自适应后端 |
-| **`agy-switch-cli-<版本>-aarch64-unknown-linux-musl.tar.gz`** | ARM64 云服务器、树莓派与 ARM 容器（`uname -m` 输出 `aarch64`） | **100% 纯静态单文件 ELF**（约 `10.9 MiB`，零外部 `.so` 动态库依赖），内置与 `x86_64` 完全一致的全量功能 |
+| **`agy-switch-cli-<版本>-x86_64-unknown-linux-musl.tar.gz`** | 常见 Intel / AMD 64 位云服务器、PC、WSL2 与 Docker 容器（`uname -m` 输出 `x86_64`） | **100% 纯静态单文件 ELF**（约 `14.4 MiB`，压缩包约 `6.1 MiB`，零外部 `.so` 动态库依赖），完整内置核心 CLI、`stats` 本地统计、`tui` 交互看板与纯 Rust D-Bus 系统钥匙串自适应后端 |
+| **`agy-switch-cli-<版本>-aarch64-unknown-linux-musl.tar.gz`** | ARM64 云服务器、树莓派与 ARM 容器（`uname -m` 输出 `aarch64`） | **100% 纯静态单文件 ELF**（约 `11.8 MiB`，压缩包约 `5.7 MiB`，零外部 `.so` 动态库依赖），内置与 `x86_64` 完全一致的全量功能 |
 
 - **同一份二进制自动适配无头服务器与图形桌面**：
   - 在远程 SSH 服务器、Docker 容器、无桌面 WSL2 中运行时，默认的 `--backend auto` 会自动使用本地文件后端（`file`），零额外配置。
@@ -146,7 +146,7 @@ cargo build --release --locked --target x86_64-unknown-linux-musl    # 纯静态
 | `--proxy <代理地址\|direct>` | `AGY_SWITCH_CLI_PROXY` | 指定访问 Google 的网络代理，支持 `socks5h://127.0.0.1:1080`、`socks://127.0.0.1:1080`、`http://127.0.0.1:7890`、省略协议头的 `127.0.0.1:7890`，或填 `direct` 强制直连。不填时优先读取 `config.json`，其次自动读取并规范化终端环境变量 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`（注意 Linux 图形界面的“系统代理”不会自动注入终端，若不想每次传 `--proxy`，需在终端导出代理环境变量或写入 `config.json`）。 |
 | `--backend <auto\|dual\|file\|keyring>` | `AGY_SWITCH_CLI_BACKEND` | 指定凭据槽位后端模式（严格匹配这 4 个小写字面值，区分大小写且不接受空字符串或外围空白；亦可在 `config.json` 的 `"backend"` 字段持久化），默认为 **`auto`**。四种模式的具体区别见下表。 |
 | `--no-remote-version` | — | 关闭联网命令每 24 小时一次的客户端最新版本号缓存查询。 |
-| `--json` | — | 输出机器可读的标准 JSON 格式（供自动化脚本解析使用；全屏交互看板 `tui` 与 `json` 互斥，`run` 包装器在启动准备无误后直接透传 `agy` 子进程的标准输入输出）。 |
+| `--json` | — | 输出机器可读的标准 JSON 格式（供自动化脚本解析使用；全屏交互看板 `tui` 与实时监控 `stats ... --watch` 均与 `--json` 互斥，`run` 包装器在启动准备无误后直接透传 `agy` 子进程的标准输入输出）。 |
 
 #### `--backend` 四种凭据后端模式详解
 
@@ -614,6 +614,7 @@ agy-switch-cli run -- agy
       Keyring locked or unavailable.
       Run agy-switch-cli status to inspect.
       ```
+    - **默认常驻防漏看与可选自动消失**：所有桌面通知统一附加 `transient=false` 与 `resident=true`。`Account Switched`（普通级别 `urgency=1`）默认使用常驻模式（`expire_timeout=0`，停留在屏幕直至手动关闭，且不附带严重告警标识）；若更习惯桌面默认数秒后自动消失，可在 `config.json` 中设置 `"notifications": { "persistent": false }`（切换为 `expire_timeout=-1`）。`Auto-Switch Paused`（严重级别 `urgency=2`）始终保持常驻（`expire_timeout=0`）。
     - 在无图形界面的 SSH 服务器或容器环境中（即使开启了 `systemd --user` 与 `linger`，只要会话 D-Bus 上没有活跃的通知守护进程），`daemon` 会以只读检测自动静默跳过，不尝试拉起桌面服务也不报错。
     - 如需在桌面环境手动关闭推送，可使用 `--no-notify`（配合 `daemon --install --no-notify` 可持久化写入服务单元）、设置环境变量 `AGY_SWITCH_CLI_NOTIFY=0`，或在 `config.json` 中设置 `"notifications": { "enabled": false }`。
   - 由于官方 `agy` 仅在每次启动时读取一次登录凭据，当你在前台对话中注意到当前账号余量不足而退出重开 `agy`（或者后台脚本发起下一轮新的 `agy` 调用）时，若 `daemon` 已经提前完成了后台预切号，新启动的 `agy` 就会直接使用已经换好的新账号，省去退出后再手动打开 `tui` 刷新切号的步骤；平时也可随时通过 `agy-switch-cli current` 或 `journalctl --user -u agy-switch-cli.service` 查看切号记录。
@@ -623,6 +624,8 @@ agy-switch-cli run -- agy
 agy-switch-cli daemon --install
 # 如需自定义后台服务的固定巡检间隔与冷却秒数，可在 --install 时一并传入写入服务文件：
 agy-switch-cli daemon --install --interval 300 --cooldown 3600
+# 如需在安装/刷新服务时顺带清零历史冷却截止时间（不会将 --reset-cooldown 写入服务单元）：
+agy-switch-cli daemon --install --reset-cooldown
 
 # 2. 一键停止、取消自启并安全移除用户级 systemd 服务文件：
 agy-switch-cli daemon --uninstall
@@ -634,17 +637,27 @@ agy-switch-cli daemon --interval 300 --cooldown 3600
 # 4. 仅执行单轮实时核查与按需切换后立即退出（输出本轮结论；适合手动排查或配合 crontab 定时任务）：
 agy-switch-cli daemon --once
 agy-switch-cli --json daemon --once
+
+# 5. 主动解除当前生效中的切号冷却期（可直接对运行中的 systemd 服务或另一终端的前台 daemon 生效）：
+agy-switch-cli daemon --reset-cooldown
+agy-switch-cli --json daemon --reset-cooldown
+# 若未运行常驻服务，也可在单轮检查前一步清零冷却并立即评估切号：
+agy-switch-cli daemon --once --reset-cooldown
 ```
 
 #### 全部命令选项详解
 
 - **服务管理与运行模式**
-  - `--install`（默认关闭，与 `--uninstall`、`--once` 互斥）：检测系统 `systemd --user` 可用性，原子生成 `~/.config/systemd/user/agy-switch-cli.service` 并自动执行 `daemon-reload` 与 `enable --now`（在无 `systemd` 的 Docker 容器中会给出清晰提示并引导参见第 `7.2` 节）。若此前旧版安装时曾显式传入 `--interval 3600`，升级后重新执行一次 `agy-switch-cli daemon --install` 即可切回新默认 `180` 秒。
-  - `--uninstall`（默认关闭，与 `--install`、`--once`、`--no-notify` 互斥）：自动执行 `disable --now`、防符号链接安全删除 `agy-switch-cli.service` 并重载 `daemon-reload`。
+  - `--install`（默认关闭，与 `--uninstall`、`--once` 互斥）：检测系统 `systemd --user` 可用性，原子生成 `~/.config/systemd/user/agy-switch-cli.service` 并自动执行 `daemon-reload` 与 `enable --now`（在无 `systemd` 的 Docker 容器中会给出清晰提示并引导参见第 `7.2` 节）。若服务当时已在运行且本次修改了 `--interval`、`--cooldown` 或可执行文件路径，请随后再执行一次 `systemctl --user restart agy-switch-cli.service` 使新启动参数生效。
+  - `--uninstall`（默认关闭，与 `--install`、`--once`、`--no-notify`、`--reset-cooldown` 互斥）：自动执行 `disable --now`、防符号链接安全删除 `agy-switch-cli.service` 并重载 `daemon-reload`。
   - `--once`（默认关闭，与 `--install`、`--uninstall` 互斥）：执行单轮实时评估与按需切换后立即退出，非 `--json` 模式向 `stdout` 输出单行状态结论，`--json` 模式输出标准 JSON 结果信封，适合 `cron` 或单次验证排障。
 - **巡检周期、冷却时间与桌面通知**
   - `--interval <秒>`（环境变量 `AGY_SWITCH_CLI_INTERVAL`，默认值 `180` 即 3 分钟，最小 `1`）：后台巡检间隔秒数（常驻模式内置 `±10%` 随机时间抖动，每次合资格的定时唤醒均会直接联网复核当前活跃账号，`Wait` 模式挂起计划的复验保鲜期自动收紧为有效间隔的 `80%`、范围 `1..=3600` 秒）。配合 `daemon --install` 传入时写入服务单元长期生效。
-  - `--cooldown <秒>`（环境变量 `AGY_SWITCH_CLI_COOLDOWN`，默认值 `3600` 即 1 小时，要求 `>= 0`）：完成一次自动切号后的冷却保护秒数，冷却期内不再连续触发第二次切换。配合 `daemon --install` 传入时写入服务单元长期生效。
+  - `--cooldown <秒>`（环境变量 `AGY_SWITCH_CLI_COOLDOWN`，默认值 `3600` 即 1 小时，要求 `>= 0`）：完成一次自动切号后的冷却保护秒数，冷却期内不再连续触发第二次切换（仅对后续新触发的切号生效，不会追溯清除磁盘中尚未到期的旧冷却截止时间）。配合 `daemon --install` 传入时写入服务单元长期生效。
+  - `--reset-cooldown`（默认关闭，与 `--uninstall` 互斥）：显式清零 `state/daemon_state.json` 中已持久化的 `cooldown_until` 冷却截止时间（保持 `0600` 权限，保留 `round-robin` 轮询游标与 `paused_on_failure` 熔断暂停状态；状态文件不存在或本无冷却时幂等成功退出 `0`），支持三种入口：
+    - **独立执行 `daemon --reset-cooldown`（支持 `--json`）**：零网络请求、不争抢 `daemon.lock` 单实例锁，可在 `systemd --user` 服务或另一终端前台 `daemon` 正在运行时直接执行，运行中的守护进程会在下一次唤醒时自动脱离冷却（同时受 `L3` 锁重读保护，不会被并发巡检写回旧时间戳）；独立模式不允许与单次运行覆盖参数（`--interval`、`--cooldown`、`--no-notify`、`--mode`、`--strategy`、`--reserve`、`--minimum`、`--model`、`--proxy`）混用，混用会明确报错退出 `2`。
+    - **组合单轮 `daemon --once --reset-cooldown`**：获取单实例锁后先清零冷却，再立即执行本轮 7 阶段实时核查与按需切号。
+    - **组合安装 `daemon --install --reset-cooldown`**：在安装并启动用户服务前一次性清零历史冷却，且**绝不**将 `--reset-cooldown` 写入 `agy-switch-cli.service` 的 `ExecStart=`。
   - `--no-notify`（环境变量 `AGY_SWITCH_CLI_NOTIFY`，默认开启桌面推送并在无头环境自动静默跳过）：关闭 `daemon` 在切号成功或首次熔断暂停时的 Linux 桌面通知（`--install --no-notify` 会将该参数写入生成的 `systemd` 单元；环境变量支持 `1`/`true`/`yes`/`on` 或 `0`/`false`/`no`/`off`，优先级为 `--no-notify` > `AGY_SWITCH_CLI_NOTIFY` > `config.json` > 默认开启）。
 - **单次运行策略内存覆盖（仅对当前前台 `daemon` / `daemon --once` 生效，不会写回 `policy.json` 或 `systemd` 服务文件）**
   - `--mode <immediate|wait>`（环境变量 `AGY_SWITCH_CLI_MODE`，默认读取 `policy.json`）：临时覆盖活跃进程防护模式（`immediate` 允许在已核验的 `agy` 运行时更新槽位供后续新终端使用；`wait` 在检测到 `agy` 运行时推迟切换）。
@@ -653,8 +666,9 @@ agy-switch-cli --json daemon --once
   - `--minimum <2..=100>`（环境变量 `AGY_SWITCH_CLI_MINIMUM`，默认读取 `policy.json`）：临时覆盖目标候选账号必须达到的最低可用额度百分比（必须严格高于保留水位）。
   - `--model <MODEL>`（环境变量 `AGY_SWITCH_CLI_MODEL`，默认读取 `policy.json`）：临时覆盖监控目标（`all`、`gemini`、`claude`、`argon` 或指定模型 ID）。
 
-> **关于 `--interval`、`--cooldown` 及临时覆盖参数是否持久保存的重要说明**：
+> **关于 `--interval`、`--cooldown`、`--reset-cooldown` 及临时覆盖参数的重要说明**：
 > - 直接在前台运行 `agy-switch-cli daemon --interval 300 --cooldown 3600`（或附加 `--reserve`、`--mode` 等参数）时，这些命令行参数**仅对当前这一个 `daemon` 进程本次运行生效，不会修改磁盘上的 `policy.json` 或 `config.json`**；关掉该进程后下次裸跑 `daemon` 仍恢复默认巡检 `180` 秒、冷却 `3600` 秒。
+> - **为何修改 `--cooldown` 不会立即退出当前冷却期？** 每次自动切号成功后，程序会将绝对冷却截止时间戳（`切号时间 + cooldown`）持久化写入 `state/daemon_state.json`。如需提前解除尚未到期的冷却期，请运行 `agy-switch-cli daemon --reset-cooldown`（或 `daemon --once --reset-cooldown` / `daemon --install --reset-cooldown`）。
 > - **如何持久保存巡检间隔与冷却时间？**
 >   - 使用 `systemd` 后台服务时：执行 `agy-switch-cli daemon --install --interval 300 --cooldown 3600`，程序会将这两项参数直接写入 `~/.config/systemd/user/agy-switch-cli.service` 的启动命令中长期生效。
 >   - 在无 `systemd` 容器中使用 `nohup` / `supervisord` / `tmux` 时：在启动命令中带上 `--interval` / `--cooldown`，或配置环境变量 `AGY_SWITCH_CLI_INTERVAL` 与 `AGY_SWITCH_CLI_COOLDOWN`。
@@ -838,8 +852,10 @@ Requests (newest first, showing 5)
   - `St`：请求状态简码，实时库映射为 `ok`（已完成 `status=3`）、`err`（报错或无效）、`canc`（取消或中断）、`run`（进行中或排队中）、`unk`（缺失或未识别的状态值），仅存于历史归档库且原实时 `.db` 已移除的记录显示为 `arch`。
 - **上限截断说明**：按日期区间（`--range` / `--date` / `--from`）查询 `stats list` 时，最多输出最新的 `500` 条记录；若匹配总数超过 `500` 条，表头会自动注明 `(newest first, showing 500 of <总数> — capped at 500)`。
 - **`stats summary --json` 与 `stats list --json` 机器输出说明（`schema_version: 1`）**：
-  - 两者共享顶层 `source`、`range`（当使用 `--recent` 时为 `{"kind": "recent", "recent": N, "from": ..., "to": ...}`）、`databases_scanned`、`generations_scanned`、`skipped_large_records`、`unreadable_databases`、`last_activity`、`range_last_activity` 与 `generated_at`。
-  - `stats summary --json` 输出 `summary`、`performance` 与 `models`（每项含 `model`、`request_count`、`total_input_tokens`、`uncached_input_tokens`、`cached_input_tokens`、`cache_hit_ratio`、`cache_hit_percent`、`output_tokens`、`total_tokens`）；`stats list --json` 输出 `total_matching`、`shown_count`、`truncated` 与 `items` 数组（每项含 `timestamp`、`local_time`、`model`、`uncached_input_tokens`、`cached_input_tokens`、`total_input_tokens`、`cache_hit_ratio`、`cache_hit_percent`、`output_tokens`、`total_tokens`、`ttft_seconds`、`duration_seconds`、`output_tps`、`status`），结构中不导出 `source_key`、本机路径或账号邮箱，模型名经已知公共模型家族与受限语法过滤，仅保留符合公共模型命名规范的标签，其余统一回退为 `"Unknown"`。
+  - **共享顶层字段**：`source`、`range`（当使用 `--recent` 时为 `{"kind": "recent", "recent": N, "from": ..., "to": ...}`）、`databases_scanned`、`generations_scanned`、`skipped_large_records`、`unreadable_databases`、`last_activity`、`range_last_activity` 与 `generated_at`。
+  - **`stats summary --json` 专属字段**：输出 `summary`、`performance` 与 `models` 数组（每项含 `model`、`request_count`、`total_input_tokens`、`uncached_input_tokens`、`cached_input_tokens`、`cache_hit_ratio`、`cache_hit_percent`、`output_tokens`、`total_tokens`）。
+  - **`stats list --json` 专属字段**：输出 `total_matching`、`shown_count`、`truncated` 与 `items` 数组（每项含 `timestamp`、`local_time`、`model`、`uncached_input_tokens`、`cached_input_tokens`、`total_input_tokens`、`cache_hit_ratio`、`cache_hit_percent`、`output_tokens`、`total_tokens`、`ttft_seconds`、`duration_seconds`、`output_tps`、`status`）。
+  - **隐私与模型名过滤约束**：结构中不导出 `source_key`、本机路径或账号邮箱；模型名经已知公共模型家族与受限语法过滤，仅保留符合公共模型命名规范的标签，其余统一回退为 `"Unknown"`。
 
 ---
 
@@ -850,7 +866,7 @@ Requests (newest first, showing 5)
 - **特殊命令与 `daemon` 三类输出说明**
   - **`tui` 与 `stats ... --watch`**：全屏交互终端界面，均与 `--json` 互斥并直接返回退出码 `2`。
   - **`run -- agy ...`**：在前置凭据准备、锁检查或进程检查失败时向 `stderr` 输出结构化错误信封；前置准备成功后直接将标准输入输出交给 `agy` 子进程并原样透传其退出码。
-  - **`daemon --install --json` 与 `daemon --uninstall --json`**：服务安装与卸载属于一次性单目标管理命令，成功时向 `stdout` 输出包含 `"schema_version": 1, "ok": true` 的结果信封并返回退出码 `0`，失败时向 `stderr` 输出结构化错误信封并返回非零退出码。
+  - **`daemon --install --json`、`daemon --uninstall --json` 与 `daemon --reset-cooldown --json`**：属于一次性单目标管理命令，成功时向 `stdout` 输出包含 `"schema_version": 1, "ok": true` 的结果信封并返回退出码 `0`（其中独立 `daemon --reset-cooldown --json` 返回 `cooldown_reset`、`cooldown_was_active`、`previous_cooldown_until` 字段，且 `daemon --install --reset-cooldown --json` 亦附加该三项字段；不传 `--reset-cooldown` 时安装 JSON 保持原结构不变），失败或参数非法时向 `stderr` 输出结构化错误信封并返回非零退出码。
   - **`daemon --once --json`**：单轮巡检完成后向 `stdout` 输出包含 `"schema_version": 1, "ok": true, "daemon": { ... }` 的结构化结果信封（包含 `outcome`、`phase`、不含本机路径的固定结构化 `reason`、`source_account_id`、`source_remaining_percentage`、`source_refreshed`、`target_account_id` 等字段）并返回退出码 `0`（仅当收到外部终止信号提前取消时静默返回 `0`）。
   - **前台常驻 `daemon --json`**：为避免多轮循环向 `stdout` 连续输出多个根 JSON 对象破坏单 JSON 解析，常驻模式在 `--json` 下保持正常轮次静默，仅在启动校验失败、单实例锁冲突或致命错误时向 `stderr` 输出错误信封并返回非零退出码；需要查看逐轮巡检日志时请在非 `--json` 模式下运行（或通过 `journalctl --user -u agy-switch-cli.service -f` 查看标准输出记录）。
 
@@ -889,13 +905,13 @@ Requests (newest first, showing 5)
 
 ---
 
-## 6. 可选配置文件（`config.json` 网络代理与自定义 OAuth 客户端）
+## 6. 可选配置文件（`config.json` 代理、后端、通知与自定义 OAuth 客户端）
 
 `~/.local/share/agy-switch-cli/config.json` 是**完全可选**的配置文件。默认情况下该文件不存在，所有功能均可直接使用（程序已内置与官方 `agy` 一致的默认 OAuth 客户端 `antigravity_enterprise`）。只有当你遇到以下四类需求时，才需要手动创建它：
 
 - **固定网络代理**：在 Linux 环境下，图形界面的“系统代理”设置并不会自动注入命令行终端或后台 `daemon` 服务的环境变量中。如果你不想每次在命令行手敲 `--proxy`，也不想每次新开终端都手动执行 `export https_proxy=...`，可以将代理地址写入 `config.json` 实现跨终端与后台守护进程的永久生效（此外，若终端环境变量中的代理格式异常而被忽略，人类输出模式会在联网时打印仅含变量名的脱敏提示）。
 - **固定凭据后端模式**：希望跨所有终端与后台服务统一固定使用 `keyring`（纯钥匙串零本地文件）、`file`（纯本地文件）或 `dual`（强制双写），而非每次手动传 `--backend`。
-- **控制桌面切号通知**：在 Linux 图形桌面上关闭（或显式开启）`daemon` 自动切号与熔断暂停时的原生桌面通知推送（`notifications.enabled`）。
+- **控制桌面切号通知**：在 Linux 图形桌面上开关 `daemon` 的原生桌面通知推送（`notifications.enabled`），以及设置切号通知默认常驻屏幕或按桌面默认超时自动消失（`notifications.persistent`）。
 - **自定义 OAuth 客户端（进阶场景）**：你手头拥有由其他 Google Cloud OAuth 客户端签发的 `refresh_token`，或者希望使用自建 OAuth 客户端进行登录（详见下方 `6.2` 节零基础完整拆解）。
 
 > **文件权限要求**：由于 `config.json` 中可能包含带密码的代理地址或 `client_secret` 密钥，创建时请将文件权限设为仅当前用户可读写的 `0600`（若权限过宽如 `0644`，`status` 与联网命令会输出安全提示，执行 `chmod 600 ~/.local/share/agy-switch-cli/config.json` 即可收紧权限）：
@@ -916,7 +932,8 @@ Requests (newest first, showing 5)
     "no_proxy": "internal.corp,10.0.0.0/8"
   },
   "notifications": {
-    "enabled": true
+    "enabled": true,
+    "persistent": true
   }
 }
 ```
@@ -925,6 +942,7 @@ Requests (newest first, showing 5)
 - **`network.proxy_url`**：支持 `http://`、`https://`、`socks5://`、`socks5h://`（或 `socks://`，由代理端解析远端域名，可避免本地 DNS 污染）、省略协议头的 `127.0.0.1:1080`，以及 `"direct"`（强制直连，忽略系统代理环境变量）。代理生效优先级为：`命令行 --proxy > AGY_SWITCH_CLI_PROXY > config.json > 系统环境变量（HTTPS_PROXY / HTTP_PROXY / ALL_PROXY）`。
 - **`network.no_proxy`**：可选，逗号分隔的不走代理域名或网段列表。注意本机环回地址（`127.0.0.1`、`localhost`、`[::1]`，如 `--ssh` 登录回调监听端口）始终自动直连，不会被代理拦截。
 - **`notifications.enabled`**（可选，省略时默认为 `true`）：控制 `daemon` 是否发送 Linux 桌面通知（`org.freedesktop.Notifications`）。无头服务器或无活跃桌面通知服务时会自动静默跳过；若希望在图形桌面上彻底关闭推送，可设为 `false`。生效优先级为：`命令行 --no-notify > AGY_SWITCH_CLI_NOTIFY 环境变量 > config.json > 默认开启`。
+- **`notifications.persistent`**（可选，省略时默认为 `true`）：控制 `Account Switched` 切号成功通知（普通级别 `urgency=1`）的停留方式。设为 `true`（默认）时以 `expire_timeout=0` 常驻屏幕直至手动关闭，避免错过切号提醒；设为 `false` 时改为 `expire_timeout=-1`，交由桌面通知服务按默认数秒自动消失。`Auto-Switch Paused` 熔断暂停警告（严重级别 `urgency=2`）始终以 `expire_timeout=0` 常驻显示。
 
 ### 6.2 场景二：零基础读懂并注册自定义 OAuth 客户端（完整字段详解）
 
@@ -1002,7 +1020,10 @@ Requests (newest first, showing 5)
    agy-switch-cli accounts add --client my_custom_oauth
    ```
    绑定完成后，该账号档案会自动记住 `oauth_client_key = "my_custom_oauth"`，后续日常执行 `switch`、`quota --refresh`、`run` 或 `daemon` 自动续期时都会自动匹配这组客户端凭据，无需每次重复传入 `--client`（即使混用多个不同客户端签发的账号也能各自独立续期）。
-3. **无文件环境变量注入方式（适合 Docker 容器）**：除了写 `config.json`，也可以通过环境变量 `ANTIGRAVITY_OAUTH_CLIENTS="key|client_id|client_secret|label"`（多项之间用分号 `;` 分隔，优先级高于 `config.json`）与 `ANTIGRAVITY_OAUTH_CLIENT_KEY="<KEY>"` 动态注入。
+3. **无文件环境变量注入方式（适合 Docker 容器）**：除了写 `config.json`，也可以通过环境变量动态注入（优先级高于 `config.json`）：
+   - `ANTIGRAVITY_OAUTH_CLIENTS="key|client_id|client_secret|label"`（多项之间用分号 `;` 分隔）；
+   - `ANTIGRAVITY_OAUTH_CLIENT_KEY="<KEY>"`（指定默认客户端短名称）；
+   - `ANTIGRAVITY_REQUIRED_SCOPES="openid https://www.googleapis.com/auth/cloud-platform"`（全局最低必需 Scope 列表，支持空格、逗号 `,` 或分号 `;` 分隔）。
 
 ---
 
@@ -1039,9 +1060,9 @@ agy-switch-cli daemon --uninstall                     # 停止服务、取消开
 
 - **自动适配真实可执行文件路径（不写死 `~/.local/bin`）**：
   - 执行 `agy-switch-cli daemon --install` 时，程序通过 Linux 内核接口 `/proc/self/exe` 动态读取当前运行二进制的真实绝对路径并写入服务单元的 `ExecStart=` 字段。
-  - 在 Arch Linux / EndeavourOS 上通过 AUR 安装后，写入的启动命令为 `/usr/bin/agy-switch-cli daemon`；若通过预编译包或源码手动安装至 `~/.local/bin`，则写入 `~/.local/bin/agy-switch-cli daemon`（若安装时附加了 `--backend`、`--interval`、`--cooldown`、`--no-notify`，也会一并固化至 `ExecStart=`）。
-- **切换安装方式后的刷新方法**：
-  - 若你先前使用 `~/.local/bin/agy-switch-cli` 执行过 `daemon --install`，随后改用 AUR 安装并删除了 `~/.local/bin/agy-switch-cli`，只需在新安装环境再次运行一次 `agy-switch-cli daemon --install`，服务单元中的 `ExecStart=` 即会自动刷新为 `/usr/bin/agy-switch-cli` 并重启服务。
+  - 在 Arch Linux / EndeavourOS 上通过 AUR 安装后，写入的启动命令为 `/usr/bin/agy-switch-cli daemon`；若通过预编译包或源码手动安装至 `~/.local/bin`，则写入 `~/.local/bin/agy-switch-cli daemon`（若安装时附加了 `--backend`、`--interval`、`--cooldown`、`--no-notify`，也会一并固化至 `ExecStart=`；若附加 `--reset-cooldown`，仅在启动前一次性清零历史冷却，绝不写入 `ExecStart=`）。
+- **切换安装方式或修改启动参数后的刷新方法**：
+  - 若你先前使用 `~/.local/bin/agy-switch-cli` 执行过 `daemon --install`，随后改用 AUR 安装并删除了 `~/.local/bin/agy-switch-cli`，只需在新安装环境再次运行一次 `agy-switch-cli daemon --install`，服务单元中的 `ExecStart=` 即会自动刷新为 `/usr/bin/agy-switch-cli`；若旧服务当时仍在运行，随后补执行 `systemctl --user restart agy-switch-cli.service` 即可平滑切换至新二进制与新参数。
 - **内置最小权限沙盒与目录边界**：
   - 自动生成的单元文件内置 `UMask=0077`、`Restart=on-failure`（`RestartSec=10`）、`Environment="RUST_LOG=agy_switch_cli=info"`、数据目录 `AGY_SWITCH_CLI_DATA_DIR`（及自定义 `XDG_CACHE_HOME` 时的对齐环境变量），并启用 `NoNewPrivileges=true`、`PrivateTmp=true`（非 `/tmp` 环境时）、`ProtectSystem=strict` 与 `ReadWritePaths=`（仅放行官方槽位目录 `~/.gemini/antigravity-cli`、独立数据目录与全局锁/缓存目录）。
   - 如需查看本机当前实际生成的完整单元内容，可执行 `systemctl --user cat agy-switch-cli.service`。
@@ -1160,6 +1181,15 @@ supervisorctl stop agy-switch-cli      # 停止后台守护进程
     - **交互式看板或手动切号（`tui` / `switch`）**：适合日常按需查看额度并手动切换账号，切完直接运行 `agy` 即可。
     - **可选启动包装器 `run`**：适合单次临时指定某个账号（`run --account <ID|EMAIL> -- agy`），或在图形桌面上通过 `--backend file run -- agy` 将终端 `agy` 登录态与桌面端钥匙串隔离。
     - **后台守护进程 `daemon`**：适合已配置 `policy` 且希望后台静默监控额度、在触及保留线时提前换好凭据槽位，省去重开 `agy` 时手动进看板切号的步骤。
+- **问：为什么在命令里调小了 `--cooldown`，后台 `daemon` 仍然提示处于冷却期？如何立即解除冷却？**
+  - **答**：每次自动切号提交后，程序会将绝对冷却截止时间戳（`切号时间 + cooldown`）持久化保存在 `state/daemon_state.json` 中，调小 `--cooldown` 仅对之后新触发的切号生效，不会追溯改写尚未到期的旧截止时间。按运行场景任选以下方式即可立即解除冷却：
+    - **已有 `systemd --user` 服务或另一终端前台 `daemon` 正在运行**：直接执行 `agy-switch-cli daemon --reset-cooldown`（零网络请求、不冲突单实例锁，运行中的守护进程在下一次唤醒时自动脱离冷却）。
+    - **使用单次巡检或 `cron`**：执行 `agy-switch-cli daemon --once --reset-cooldown`，在单轮核查前一步清零冷却并立即评估切号。
+    - **重新部署或刷新 `systemd` 服务**：执行 `agy-switch-cli daemon --install --reset-cooldown`，在预检通过后一次性清零旧冷却（该参数不会写入 `ExecStart=`）。
+- **问：桌面切号成功通知默认会一直停留在屏幕上，能否改为数秒后自动消失或彻底关闭？**
+  - **答**：为防止在后台自动切号时错过提醒，`Account Switched` 默认采用常驻显示（`expire_timeout=0`，不附带严重告警标识）。你可以按习惯自由调整：
+    - **改为桌面默认数秒后自动消失**：在 `~/.local/share/agy-switch-cli/config.json`（权限 `0600`）中添加 `"notifications": { "persistent": false }`（切回 `expire_timeout=-1`；熔断暂停警告 `Auto-Switch Paused` 仍保持常驻）。
+    - **彻底关闭桌面通知**：在 `config.json` 中设置 `"notifications": { "enabled": false }`，或启动 `daemon` 时传入 `--no-notify`（也可执行 `agy-switch-cli daemon --install --no-notify` 后配合 `systemctl --user restart agy-switch-cli.service` 生效）。
 
 ---
 

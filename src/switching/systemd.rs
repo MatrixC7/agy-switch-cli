@@ -7,7 +7,10 @@ use crate::store::fs_atomic::{
     stat_dir_fd, unlink_pinned_regular_target_after_wait, verify_dir_still_pinned,
     write_atomic_durable_in_pinned_dir,
 };
-use crate::switching::daemon::{DEFAULT_DAEMON_COOLDOWN_SECS, DEFAULT_DAEMON_INTERVAL_SECS};
+use crate::store::repository::StoreRepository;
+use crate::switching::daemon::{
+    reset_daemon_cooldown, DEFAULT_DAEMON_COOLDOWN_SECS, DEFAULT_DAEMON_INTERVAL_SECS,
+};
 use serde::Serialize;
 use std::ffi::CString;
 use std::fs;
@@ -48,6 +51,12 @@ pub struct DaemonServiceInstallOutcome {
     pub cooldown_secs: i64,
     pub enabled_and_started: bool,
     pub linger_hint: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_reset: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_was_active: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_cooldown_until: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -655,6 +664,14 @@ pub async fn install_systemd_user_service(
     paths: &HeadlessPaths,
     opts: &DaemonServiceInstallOptions,
 ) -> CliResult<DaemonServiceInstallOutcome> {
+    install_systemd_user_service_with_reset(paths, opts, false).await
+}
+
+pub async fn install_systemd_user_service_with_reset(
+    paths: &HeadlessPaths,
+    opts: &DaemonServiceInstallOptions,
+    reset_cooldown: bool,
+) -> CliResult<DaemonServiceInstallOutcome> {
     // Validate parameters first so usage errors return exit code 2 immediately
     let exe_path = resolve_current_cli_executable()?;
     let (unit_body, exec_start_line) = render_systemd_user_unit(paths, &exe_path, opts)?;
@@ -672,6 +689,14 @@ pub async fn install_systemd_user_service(
     let c_unit_name = CString::new(SYSTEMD_SERVICE_NAME).unwrap();
     let (pinned_user_fd, user_dev, user_ino) =
         ensure_dir_chain_pinned_under(&paths.config_dir, &user_dir)?;
+
+    let reset_outcome = if reset_cooldown {
+        let repo = StoreRepository::new(paths.clone());
+        let now_unix = crate::domain::clock::current_unix_seconds();
+        Some(reset_daemon_cooldown(&repo, now_unix)?)
+    } else {
+        None
+    };
 
     let (pinned_unit_fd, unit_dev, unit_ino) = write_atomic_durable_in_pinned_dir(
         &pinned_user_fd,
@@ -847,6 +872,9 @@ pub async fn install_systemd_user_service(
             .unwrap_or(DEFAULT_DAEMON_COOLDOWN_SECS),
         enabled_and_started: true,
         linger_hint: "sudo loginctl enable-linger $USER",
+        cooldown_reset: reset_outcome.as_ref().map(|r| r.cooldown_reset),
+        cooldown_was_active: reset_outcome.as_ref().map(|r| r.cooldown_was_active),
+        previous_cooldown_until: reset_outcome.as_ref().map(|r| r.previous_cooldown_until),
     })
 }
 
