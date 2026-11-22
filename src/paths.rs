@@ -1,5 +1,6 @@
 use crate::error::{CliError, CliResult};
 use sha2::{Digest, Sha256};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 /// Resolved directory topology for `agy-switch-cli` per Blueprint §2.1.
@@ -194,6 +195,23 @@ impl HeadlessPaths {
         self.global_locks_dir().join(format!("slot-{digest}.lock"))
     }
 
+    /// Derive a path-scoped L1 lock file (`~/.cache/agy-switch-cli/locks/slot-<sha256>.lock`)
+    /// for an external pure-file credential slot, isolated from the official active slot lock.
+    pub fn slot_lock_file_for_path(&self, slot_file: &Path) -> PathBuf {
+        let canonical_file = match (slot_file.parent(), slot_file.file_name()) {
+            (Some(parent), Some(name)) => {
+                let canonical_parent =
+                    std::fs::canonicalize(parent).unwrap_or_else(|_| normalize_components(parent));
+                canonical_parent.join(name)
+            }
+            _ => normalize_components(slot_file),
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_file.as_os_str().as_bytes());
+        let digest = hex_encode(&hasher.finalize());
+        self.global_locks_dir().join(format!("slot-{digest}.lock"))
+    }
+
     /// Additional UID-scoped lock acquired SECOND (after `active_slot_lock_file`) when using a keyring backend (`dual` / `keyring`).
     pub fn keyring_lock_file(&self) -> PathBuf {
         let uid = unsafe { libc::geteuid() };
@@ -244,7 +262,7 @@ fn non_empty_env_path(var: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn normalize_lexical(path: &Path, base_if_relative: &Path) -> PathBuf {
+pub fn normalize_lexical(path: &Path, base_if_relative: &Path) -> PathBuf {
     if path.is_absolute() {
         normalize_components(path)
     } else {
@@ -281,4 +299,29 @@ pub fn hex_encode(bytes: &[u8]) -> String {
         let _ = write!(&mut s, "{b:02x}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn slot_lock_file_for_path_distinguishes_non_utf8_unix_bytes() {
+        let paths = HeadlessPaths::with_explicit(
+            PathBuf::from("/tmp/home"),
+            PathBuf::from("/tmp/data"),
+            PathBuf::from("/tmp/cache"),
+        );
+        let p1 = Path::new(OsStr::from_bytes(
+            b"/tmp/non_utf8_\x80/antigravity-oauth-token",
+        ));
+        let p2 = Path::new(OsStr::from_bytes(
+            b"/tmp/non_utf8_\x81/antigravity-oauth-token",
+        ));
+        assert_ne!(
+            paths.slot_lock_file_for_path(p1),
+            paths.slot_lock_file_for_path(p2)
+        );
+    }
 }

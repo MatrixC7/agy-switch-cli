@@ -925,10 +925,24 @@ pub enum BackendChoice {
     Keyring,
 }
 
-/// Strictly validate `--backend`, `AGY_SWITCH_CLI_BACKEND`, and `config.json` `backend` against the
-/// four exact literal values (`auto`, `dual`, `file`, `keyring`) without trimming or case-folding.
-/// Distinguishes omitted (`None`) from explicit empty or whitespace-padded strings (`Some("")`, `Some(" FILE ")`).
-pub fn validate_backend_choice(
+/// Strictly parse a credential backend literal (`auto`, `dual`, `file`, or `keyring`) without
+/// enforcing compile-time `secret-service-backend` feature availability.
+pub fn parse_backend_choice_literal(raw: &str) -> CliResult<BackendChoice> {
+    match raw {
+        "auto" => Ok(BackendChoice::Auto),
+        "file" => Ok(BackendChoice::File),
+        "dual" => Ok(BackendChoice::Dual),
+        "keyring" => Ok(BackendChoice::Keyring),
+        _ => Err(CliError::usage(
+            "Unsupported credential backend. Supported values: `auto`, `dual`, `file`, `keyring`.",
+        )),
+    }
+}
+
+/// Strictly validate `--backend`, `AGY_SWITCH_CLI_BACKEND`, and `config.json` `backend` syntax
+/// against the four exact literal values (`auto`, `dual`, `file`, `keyring`) without requiring
+/// compile-time `secret-service-backend` availability (for pure-file external target commands).
+pub fn validate_backend_choice_syntax(
     cli_backend: Option<&str>,
     cfg_backend: Option<&str>,
 ) -> CliResult<BackendChoice> {
@@ -947,10 +961,20 @@ pub fn validate_backend_choice(
         "auto"
     };
 
-    match chosen {
-        "auto" => Ok(BackendChoice::Auto),
-        "file" => Ok(BackendChoice::File),
-        "dual" => {
+    parse_backend_choice_literal(chosen)
+}
+
+/// Strictly validate `--backend`, `AGY_SWITCH_CLI_BACKEND`, and `config.json` `backend` against the
+/// four exact literal values (`auto`, `dual`, `file`, `keyring`) AND compile-time backend capability.
+/// Distinguishes omitted (`None`) from explicit empty or whitespace-padded strings (`Some("")`, `Some(" FILE ")`).
+pub fn validate_backend_choice(
+    cli_backend: Option<&str>,
+    cfg_backend: Option<&str>,
+) -> CliResult<BackendChoice> {
+    match validate_backend_choice_syntax(cli_backend, cfg_backend)? {
+        BackendChoice::Auto => Ok(BackendChoice::Auto),
+        BackendChoice::File => Ok(BackendChoice::File),
+        BackendChoice::Dual => {
             #[cfg(feature = "secret-service-backend")]
             {
                 Ok(BackendChoice::Dual)
@@ -962,7 +986,7 @@ pub fn validate_backend_choice(
                 ))
             }
         }
-        "keyring" => {
+        BackendChoice::Keyring => {
             #[cfg(feature = "secret-service-backend")]
             {
                 Ok(BackendChoice::Keyring)
@@ -974,9 +998,6 @@ pub fn validate_backend_choice(
                 ))
             }
         }
-        _ => Err(CliError::usage(
-            "Unsupported credential backend. Supported values: `auto`, `dual`, `file`, `keyring`.",
-        )),
     }
 }
 
@@ -3115,6 +3136,7 @@ mod tests {
                 expiry: Some("2026-11-20T00:00:00Z".into()),
                 auth_method: Some("consumer".into()),
                 email_hint: Some(format!("{tag}@example.com")),
+                user_tier: None,
             })
         };
         let make = |backend_name: &'static str,

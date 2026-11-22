@@ -6,7 +6,7 @@ use crate::domain::quota::{
 };
 use crate::error::{format_safe_json_error, CliError, CliResult};
 use crate::oauth::refresh::{
-    ensure_account_token_fresh_locked, persist_disable_or_report_io_error, OAuthEndpoints,
+    ensure_account_token_fresh_locked_with_hook, persist_disable_or_report_io_error, OAuthEndpoints,
 };
 use crate::oauth::registry::OAuthClientRegistry;
 use crate::quota::fusion::fuse_model_quotas;
@@ -939,8 +939,41 @@ pub(crate) async fn refresh_account_quota_locked_with_meta(
     account_id: &str,
     now_unix: i64,
 ) -> CliResult<(AccountRecord, Option<&'static str>)> {
+    refresh_account_quota_locked_with_token_hook(
+        repo,
+        transport,
+        oauth_endpoints,
+        quota_endpoints,
+        registry,
+        user_agent,
+        account_id,
+        now_unix,
+        |_| Ok(()),
+    )
+    .await
+}
+
+/// Same as `refresh_account_quota_locked_with_meta`, invoking `on_token_persisted` immediately after
+/// each durable pool token check/refresh (both initial and `401`-triggered forced refresh) BEFORE the
+/// subsequent CloudCode request runs, so decoupled external slot write-backs never lose rotated tokens
+/// when CloudCode fails.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn refresh_account_quota_locked_with_token_hook<F>(
+    repo: &StoreRepository,
+    transport: &dyn HttpTransport,
+    oauth_endpoints: &OAuthEndpoints,
+    quota_endpoints: &CloudCodeEndpoints,
+    registry: &OAuthClientRegistry,
+    user_agent: &str,
+    account_id: &str,
+    now_unix: i64,
+    mut on_token_persisted: F,
+) -> CliResult<(AccountRecord, Option<&'static str>)>
+where
+    F: FnMut(&AccountRecord) -> CliResult<()>,
+{
     let clock = AnchoredClock::new(now_unix);
-    let ensured = ensure_account_token_fresh_locked(
+    let ensured = ensure_account_token_fresh_locked_with_hook(
         repo,
         transport,
         oauth_endpoints,
@@ -949,8 +982,10 @@ pub(crate) async fn refresh_account_quota_locked_with_meta(
         account_id,
         false,
         clock.now_unix(),
+        &mut on_token_persisted,
     )
     .await?;
+    on_token_persisted(&ensured.account)?;
 
     let first_attempt = fetch_quota_once(
         transport,
@@ -985,8 +1020,8 @@ pub(crate) async fn refresh_account_quota_locked_with_meta(
             return Err(mark_scope_reauth(detail, clock.now_unix()))
         }
         Err(QuotaApiError::Unauthorized) => {
-            // Single locked forced refresh + single replay!
-            let forced = ensure_account_token_fresh_locked(
+            // Single locked forced refresh + immediate post-persist hook + single replay!
+            let forced = ensure_account_token_fresh_locked_with_hook(
                 repo,
                 transport,
                 oauth_endpoints,
@@ -995,8 +1030,10 @@ pub(crate) async fn refresh_account_quota_locked_with_meta(
                 account_id,
                 true,
                 clock.now_unix(),
+                &mut on_token_persisted,
             )
             .await?;
+            on_token_persisted(&forced.account)?;
 
             match fetch_quota_once(
                 transport,

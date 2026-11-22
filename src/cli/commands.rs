@@ -4,10 +4,11 @@ use crate::cli::secret_input::{
     read_bounded_line, read_secret_from_tty_with_mode, read_secrets_from_private_file,
     read_secrets_from_stdin, write_interactive_prompt, MAX_SECRET_BYTES,
 };
-use crate::domain::account::{DisableReasonCode, SessionIdentity};
-use crate::domain::clock::{Clock, SystemClock};
+use crate::domain::account::{AccountRecord, DisableReasonCode, RuntimeState, SessionIdentity};
+use crate::domain::clock::{format_unix_rfc3339_micros_utc, AnchoredClock, Clock, SystemClock};
 use crate::domain::policy::{PolicyMode, PolicyStrategy};
 use crate::domain::quota::{evaluate_account_quota, QuotaEval, DEFAULT_QUOTA_MAX_AGE_SECS};
+use crate::domain::token::{extract_email_hint_from_jwt, TokenRecord};
 use crate::error::{CliError, CliResult, ExitCode};
 use crate::oauth::flow::{
     bind_loopback_listener, build_authorization_session, validate_callback_url_with_port,
@@ -15,24 +16,33 @@ use crate::oauth::flow::{
 };
 use crate::oauth::refresh::{
     bootstrap_and_persist_refresh_token, complete_login_exchange_locked,
-    complete_reauthorize_exchange_locked, purge_all_pending_auth_records,
-    resume_pending_auth_records, OAuthEndpoints,
+    complete_reauthorize_exchange_locked, fetch_userinfo, purge_all_pending_auth_records,
+    refresh_standalone_refresh_token, resume_pending_auth_records, OAuthEndpoints,
+    TOKEN_REFRESH_SKEW_SECONDS,
 };
 use crate::oauth::registry::OAuthClientRegistry;
 use crate::paths::HeadlessPaths;
-use crate::quota::client::{refresh_account_quota_locked, CloudCodeEndpoints};
+use crate::quota::client::{
+    fetch_quota_once, refresh_account_quota_locked, refresh_account_quota_locked_with_token_hook,
+    CloudCodeEndpoints, QuotaApiError,
+};
 use crate::session::backend::{
     detect_dbus_session_socket_warning, read_local_active_refresh_token,
-    resolve_credential_backend_with_config, validate_backend_choice, BackendChoice,
-    CredentialBackend, FileSessionBackend, SlotInspectState,
+    resolve_credential_backend_with_config, validate_backend_choice,
+    validate_backend_choice_syntax, BackendChoice, CredentialBackend, FileSessionBackend,
+    SlotInspectState,
 };
+use crate::session::external_slot::ExternalSlotTarget;
 use crate::session::journal::{
     diagnose_journal_replicas_with_intent, read_journal_full_readonly,
     reconcile_pending_journal_before_write, JournalDiagnosis,
 };
-use crate::session::payload::resolve_session_identity;
-use crate::session::process::observe_runtime_state;
-use crate::store::locks::{probe_daemon_lock_readonly, DaemonInstanceLock};
+use crate::session::payload::{
+    bytes_sha256_hex, resolve_session_identity, serialize_session_payload,
+    serialize_standalone_session_payload,
+};
+use crate::session::process::{observe_runtime_state, observe_slot_runtime_state};
+use crate::store::locks::{probe_daemon_lock_readonly, ActiveSlotLock, DaemonInstanceLock};
 use crate::store::repository::StoreRepository;
 use crate::store::transfer::{
     export_transfer_bundle_file, import_from_legacy_dir, import_transfer_bundle_file,
@@ -44,7 +54,8 @@ use crate::switching::daemon::{
     DaemonPolicyOverlay, DEFAULT_DAEMON_COOLDOWN_SECS, DEFAULT_DAEMON_INTERVAL_SECS,
 };
 use crate::switching::executor::{
-    execute_account_delete, execute_switch_with_idle_policy, preview_switch_dry_run, SwitchOptions,
+    execute_account_delete, execute_external_switch, execute_switch_with_idle_policy,
+    preview_external_switch_dry_run, preview_switch_dry_run, SwitchOptions,
 };
 use crate::switching::runner::{ordered_candidate_ids, run_managed_agy};
 use crate::switching::systemd::{
@@ -67,6 +78,39 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+fn external_slot_args_for_command(
+    cmd: &Commands,
+) -> Option<(Option<&str>, Option<&std::path::Path>, bool)> {
+    let (target, target_dir, enforce_pure_file_backend) = match cmd {
+        Commands::Current(args) => (args.target.as_deref(), args.target_dir.as_deref(), true),
+        Commands::Switch(args) => (args.target.as_deref(), args.target_dir.as_deref(), true),
+        Commands::Quota(args) => (args.target.as_deref(), args.target_dir.as_deref(), true),
+        Commands::Refresh(args) => (args.target.as_deref(), args.target_dir.as_deref(), true),
+        Commands::Accounts(AccountsCommand::Add(args)) => {
+            (args.target.as_deref(), args.target_dir.as_deref(), true)
+        }
+        Commands::Stats(StatsCommand::Summary(args) | StatsCommand::List(args)) => {
+            (args.target.as_deref(), args.target_dir.as_deref(), false)
+        }
+        _ => return None,
+    };
+    if target.is_some() || target_dir.is_some() {
+        Some((target, target_dir, enforce_pure_file_backend))
+    } else {
+        None
+    }
+}
+
+fn ensure_no_pending_official_journal_readonly(paths: &HeadlessPaths) -> CliResult<()> {
+    match read_journal_full_readonly(paths)? {
+        None => Ok(()),
+        Some(_) => Err(CliError::partial_commit(
+            "pending_official_journal",
+            "An unresolved official `agy` switch journal is present on disk. External `--target` / `--target-dir` import will not touch official credentials or auto-reconcile it; inspect with `agy-switch-cli status` and reconcile via an official command first.",
+        )),
+    }
+}
+
 fn command_uses_backend(cmd: &Commands) -> bool {
     match cmd {
         Commands::Auth(AuthCommand::Clients) => false,
@@ -74,8 +118,16 @@ fn command_uses_backend(cmd: &Commands) -> bool {
         Commands::Accounts(AccountsCommand::List(args)) => {
             args.move_target.is_some() || args.order.is_some()
         }
+        Commands::Accounts(AccountsCommand::Add(args))
+            if args.target.is_some() || args.target_dir.is_some() =>
+        {
+            false
+        }
         Commands::Accounts(AccountsCommand::Export(_)) => false,
-        Commands::Quota(args) => args.refresh,
+        Commands::Current(args) if args.target.is_some() || args.target_dir.is_some() => false,
+        Commands::Switch(args) if args.target.is_some() || args.target_dir.is_some() => false,
+        Commands::Quota(args) => args.refresh && args.target.is_none() && args.target_dir.is_none(),
+        Commands::Refresh(args) if args.target.is_some() || args.target_dir.is_some() => false,
         Commands::Policy(PolicyCommand::Show | PolicyCommand::Eval) => false,
         Commands::Daemon(args) => {
             !(args.install || args.uninstall || (args.reset_cooldown && !args.once))
@@ -87,10 +139,40 @@ fn command_uses_backend(cmd: &Commands) -> bool {
 
 pub async fn dispatch(cli: Cli) -> CliResult<i32> {
     let paths = HeadlessPaths::resolve(cli.data_dir.as_deref())?;
+    let is_external_command = external_slot_args_for_command(&cli.command).is_some();
     if cli.backend.is_some() || std::env::var_os("AGY_SWITCH_CLI_BACKEND").is_some() {
-        validate_backend_choice(cli.backend.as_deref(), None)?;
+        if is_external_command {
+            validate_backend_choice_syntax(cli.backend.as_deref(), None)?;
+        } else {
+            validate_backend_choice(cli.backend.as_deref(), None)?;
+        }
     }
     let repo = StoreRepository::new(paths.clone());
+    // Resolve and validate external target directories BEFORE connecting to any desktop Secret Service
+    // or reconciling any official slot journal.
+    let external_slot_target: Option<ExternalSlotTarget> =
+        if let Some((target_name, target_dir_arg, enforce_pure_file)) =
+            external_slot_args_for_command(&cli.command)
+        {
+            let cfg = if target_name.is_some() || enforce_pure_file {
+                repo.read_config()?
+            } else {
+                repo.read_config().unwrap_or_default()
+            };
+            if enforce_pure_file {
+                validate_backend_choice_syntax(cli.backend.as_deref(), cfg.backend.as_deref())?;
+            }
+            ExternalSlotTarget::resolve(
+                &paths,
+                &cfg,
+                cli.backend.as_deref(),
+                target_name,
+                target_dir_arg,
+                enforce_pure_file,
+            )?
+        } else {
+            None
+        };
     let mut explicit_file_backend = false;
     let backend_box: Box<dyn CredentialBackend> = if matches!(cli.command, Commands::Status) {
         let cfg_backend = repo.read_config().ok().and_then(|c| c.backend);
@@ -100,6 +182,25 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
         let choice = validate_backend_choice(cli.backend.as_deref(), cfg.backend.as_deref())?;
         explicit_file_backend = choice == BackendChoice::File;
         resolve_credential_backend_with_config(cli.backend.as_deref(), cfg.backend.as_deref())?
+    } else if external_slot_target.is_some() {
+        // Pure-file external target commands (including `stats --target/--target-dir`) never depend
+        // on compile-time desktop keyring availability, while still validating config backend syntax.
+        if matches!(cli.command, Commands::Stats(_)) {
+            match repo.read_config() {
+                Ok(cfg) => {
+                    validate_backend_choice_syntax(cli.backend.as_deref(), cfg.backend.as_deref())?;
+                }
+                Err(e) if e.message.contains("Unsupported `backend` setting") => {
+                    return Err(CliError::data(
+                        "Unsupported `backend` setting in `config.json`. Supported values: `auto`, `dual`, `file`, `keyring`.",
+                    ));
+                }
+                Err(_) => {
+                    validate_backend_choice_syntax(cli.backend.as_deref(), None)?;
+                }
+            }
+        }
+        Box::new(FileSessionBackend)
     } else if matches!(cli.command, Commands::Stats(_)) {
         match repo.read_config() {
             Ok(cfg) => {
@@ -385,12 +486,22 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                     ));
                 }
             }
-            reconcile_pending_journal_before_write(&repo, backend, SystemClock.now_unix())?;
+            if external_slot_target.is_some() {
+                ensure_no_pending_official_journal_readonly(&paths)?;
+            } else {
+                reconcile_pending_journal_before_write(&repo, backend, SystemClock.now_unix())?;
+            }
             let mut local_source_tag: Option<&'static str> = None;
             let token_entries: Vec<(String, Option<String>)> = if args.from_local {
-                let (secret, src_tag) = read_local_active_refresh_token(&paths, backend)?;
-                local_source_tag = Some(src_tag);
-                vec![(secret, None)]
+                if let Some(ref ext) = external_slot_target {
+                    let secret = ext.read_raw_refresh_token(&paths)?;
+                    local_source_tag = Some("external-file");
+                    vec![(secret, None)]
+                } else {
+                    let (secret, src_tag) = read_local_active_refresh_token(&paths, backend)?;
+                    local_source_tag = Some(src_tag);
+                    vec![(secret, None)]
+                }
             } else if args.from_stdin {
                 read_secrets_from_stdin()?
             } else if let Some(ref file_path) = args.from_file {
@@ -417,7 +528,11 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             if token_entries.len() == 1 {
                 let (secret, inline_label) = &token_entries[0];
                 let effective_label = inline_label.as_deref().or(args.label.as_deref());
-                reconcile_pending_journal_before_write(&repo, backend, SystemClock.now_unix())?;
+                if external_slot_target.is_some() {
+                    ensure_no_pending_official_journal_readonly(&paths)?;
+                } else {
+                    reconcile_pending_journal_before_write(&repo, backend, SystemClock.now_unix())?;
+                }
                 let (saved, created) = bootstrap_and_persist_refresh_token(
                     &repo,
                     &transport,
@@ -443,7 +558,18 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                     if let Some(src_tag) = local_source_tag {
                         out_obj["local_source"] = serde_json::Value::String(src_tag.to_string());
                     }
+                    if let Some(ref ext) = external_slot_target {
+                        out_obj["target"] = serde_json::json!(ext.dto());
+                    }
                     print_json(&out_obj)?;
+                } else if let Some(ref ext) = external_slot_target {
+                    println!(
+                        "{} account {} ({}) from external {} (file)",
+                        if created { "Added" } else { "Updated" },
+                        terminal_text(&dto.id),
+                        terminal_text(&dto.email),
+                        terminal_text(&ext.display_label())
+                    );
                 } else if let Some(src_tag) = local_source_tag {
                     println!(
                         "{} account {} ({}) from local credential ({src_tag})",
@@ -713,12 +839,20 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
         }
 
         // ==================== 4. CURRENT / SWITCH / RUN ====================
-        Commands::Current => {
-            handle_current(&repo, backend, cli.json, now_unix)?;
+        Commands::Current(_args) => {
+            if let Some(ref ext) = external_slot_target {
+                handle_current_external(&repo, ext, cli.json, now_unix)?;
+            } else {
+                handle_current(&repo, backend, cli.json, now_unix)?;
+            }
             Ok(ExitCode::Ok.as_i32())
         }
         Commands::Switch(args) => {
             let registry = OAuthClientRegistry::load(&paths)?;
+            if let Some(ref ext) = external_slot_target {
+                handle_switch_external(&repo, ext, &registry, args, &cli, now_unix).await?;
+                return Ok(ExitCode::Ok.as_i32());
+            }
             if args.dry_run {
                 let outcome = preview_switch_dry_run(
                     &repo,
@@ -817,6 +951,9 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
 
         // ==================== 5. QUOTA (READ-ONLY OR `--refresh`) & REFRESH ====================
         Commands::Quota(args) => {
+            if let Some(ref ext) = external_slot_target {
+                return handle_quota_external(&repo, ext, args, &cli, now_unix).await;
+            }
             let mut effective_now = now_unix;
             let mut refresh_failures: Vec<(String, CliError)> = Vec::new();
             let mut streamed_batch = false;
@@ -998,6 +1135,9 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             Ok(ExitCode::Ok.as_i32())
         }
         Commands::Refresh(args) => {
+            if let Some(ref ext) = external_slot_target {
+                return handle_refresh_external(&repo, ext, &cli, now_unix).await;
+            }
             let (refreshed_views, failures, streamed_batch) = execute_quota_refresh_batch(
                 &repo,
                 backend,
@@ -1594,12 +1734,19 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                             crate::stats::watch::run_stats_watch(
                                 &paths,
                                 args,
+                                external_slot_target.as_ref(),
                                 crate::stats::watch::StatsWatchView::Summary,
                                 interval_secs,
                             )
                             .await?;
                         } else {
-                            let view = crate::stats::collect_token_stats(&paths, args)?;
+                            let view = if let Some(ref ext) = external_slot_target {
+                                crate::stats::collect_token_stats_for_external_target(
+                                    &paths, ext, args,
+                                )?
+                            } else {
+                                crate::stats::collect_token_stats(&paths, args)?
+                            };
                             if cli.json {
                                 print_json(&view)?;
                             } else {
@@ -1617,12 +1764,19 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                             crate::stats::watch::run_stats_watch(
                                 &paths,
                                 args,
+                                external_slot_target.as_ref(),
                                 crate::stats::watch::StatsWatchView::List,
                                 interval_secs,
                             )
                             .await?;
                         } else {
-                            let view = crate::stats::collect_token_stats_list(&paths, args)?;
+                            let view = if let Some(ref ext) = external_slot_target {
+                                crate::stats::collect_token_stats_list_for_external_target(
+                                    &paths, ext, args,
+                                )?
+                            } else {
+                                crate::stats::collect_token_stats_list(&paths, args)?
+                            };
                             if cli.json {
                                 print_json(&view)?;
                             } else {
@@ -2064,6 +2218,935 @@ fn handle_current(
         }
     }
     Ok(())
+}
+
+fn format_external_previous_clause(
+    prev_state: &str,
+    prev_id: Option<&str>,
+    prev_email: Option<&str>,
+) -> String {
+    match prev_state {
+        "matched_pool" => {
+            let email = prev_email.unwrap_or("unknown");
+            let id = prev_id.unwrap_or("unknown");
+            format!(" from {} ({})", terminal_text(email), terminal_text(id))
+        }
+        "external" => match prev_email {
+            Some(email) => format!(" [previous: external ({})]", terminal_text(email)),
+            None => " [previous: external account]".to_string(),
+        },
+        "absent" => " [previous: absent]".to_string(),
+        _ => String::new(),
+    }
+}
+
+async fn handle_switch_external(
+    repo: &StoreRepository,
+    ext: &ExternalSlotTarget,
+    registry: &OAuthClientRegistry,
+    args: &SwitchArgs,
+    cli: &Cli,
+    now_unix: i64,
+) -> CliResult<()> {
+    let paths = repo.paths();
+    let outcome = if args.dry_run {
+        preview_external_switch_dry_run(
+            repo,
+            ext,
+            registry,
+            &args.selector,
+            args.allow_running,
+            args.require_idle,
+            now_unix,
+        )?
+    } else {
+        let transport = build_network_transport(repo, cli.proxy.as_deref(), cli.json)?;
+        let ua =
+            resolve_native_oauth_user_agent(paths, &transport, !cli.no_remote_version, now_unix)
+                .await;
+        execute_external_switch(
+            repo,
+            ext,
+            &transport,
+            &OAuthEndpoints::default(),
+            registry,
+            &ua,
+            &args.selector,
+            &SwitchOptions {
+                dry_run: false,
+                allow_running: args.allow_running,
+            },
+            args.require_idle,
+            now_unix,
+        )
+        .await?
+    };
+
+    if cli.json {
+        print_json(&serde_json::json!({ "switch": outcome }))?;
+    } else {
+        if let Some(ref warn) = outcome.runtime_warning {
+            eprintln!("{}", terminal_text(warn));
+        }
+        if let Some(ref warn) = outcome.validation_warning {
+            eprintln!("{}", terminal_text(warn));
+        }
+        if outcome.dry_run {
+            println!(
+                "[dry-run] Ready to switch external {} to {} ({}). Official `agy` slot and daemon selection will remain unchanged.",
+                terminal_text(&ext.display_label()),
+                terminal_text(&outcome.target_account_id),
+                terminal_text(&outcome.target_email)
+            );
+        } else {
+            let prev_clause = format_external_previous_clause(
+                outcome.previous_slot_state,
+                outcome.previous_slot_account_id.as_deref(),
+                outcome.previous_slot_email.as_deref(),
+            );
+            println!(
+                "Switched external {}{} to {} ({}). Official `agy` slot and daemon selection are unchanged.",
+                terminal_text(&ext.display_label()),
+                prev_clause,
+                terminal_text(&outcome.target_email),
+                terminal_text(&outcome.target_account_id)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_current_external(
+    repo: &StoreRepository,
+    ext: &ExternalSlotTarget,
+    json_mode: bool,
+    now_unix: i64,
+) -> CliResult<()> {
+    let paths = repo.paths();
+    let snap = repo.read_snapshot()?;
+    let slot_state = ext.inspect_slot(paths);
+    let runtime_state = observe_slot_runtime_state(paths, &ext.slot_dir);
+
+    let mut matched_account: Option<AccountViewDto> = None;
+    let mut supported_models: Option<Vec<String>> = None;
+    let mut has_model_source_acc = false;
+
+    let (slot_json, slot_human) = match &slot_state {
+        SlotInspectState::Present(parsed) => {
+            if let Some(acc) = snap
+                .accounts
+                .iter()
+                .find(|a| a.token.refresh_token_fingerprint() == parsed.refresh_token_digest)
+            {
+                let is_sel = snap.index.selected_account_id.as_deref() == Some(acc.id.as_str());
+                let dto = AccountViewDto::from_record(acc, is_sel);
+                let plan_part = acc
+                    .quota
+                    .as_ref()
+                    .and_then(|q| q.subscription_tier.as_deref())
+                    .map(|t| format!("  [{}]", terminal_text(t)))
+                    .unwrap_or_default();
+                let label_part = dto
+                    .custom_label
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|l| format!("  ({})", terminal_text(l)))
+                    .unwrap_or_default();
+                let flag_part = if dto.disabled {
+                    "  [disabled]"
+                } else if dto.validation_blocked {
+                    "  [verification required]"
+                } else {
+                    ""
+                };
+                let exp_part = parsed
+                    .expiry
+                    .as_deref()
+                    .map(|e| format!("  expires {}", format_rfc3339_local_minute(e)))
+                    .unwrap_or_default();
+                let human = format!(
+                    "{}{}{}{}  ({}){}",
+                    terminal_text(&dto.email),
+                    plan_part,
+                    label_part,
+                    flag_part,
+                    terminal_text(&dto.id),
+                    exp_part
+                );
+                has_model_source_acc = true;
+                supported_models = acc.quota.as_ref().map(extract_supported_models);
+                let json = serde_json::json!({
+                    "status": "matched_pool",
+                    "account_id": dto.id,
+                    "email": dto.email,
+                    "expiry": parsed.expiry,
+                });
+                matched_account = Some(dto);
+                (json, human)
+            } else {
+                let exp_part = parsed
+                    .expiry
+                    .as_deref()
+                    .map(|e| format!(", expires {}", format_rfc3339_local_minute(e)))
+                    .unwrap_or_default();
+                let tier_part = parsed
+                    .user_tier
+                    .as_deref()
+                    .map(|t| format!(" [{}]", terminal_text(t)))
+                    .unwrap_or_default();
+                let same_email_pool_matches: Vec<(String, String, Option<String>)> = parsed
+                    .email_hint
+                    .as_deref()
+                    .map(|hint| {
+                        snap.accounts
+                            .iter()
+                            .filter(|a| a.email.eq_ignore_ascii_case(hint))
+                            .map(|a| (a.id.clone(), a.email.clone(), a.custom_label.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let same_email_pool_ids: Vec<String> = same_email_pool_matches
+                    .iter()
+                    .map(|(id, _, _)| id.clone())
+                    .collect();
+                let same_email_note = if same_email_pool_matches.is_empty() {
+                    String::new()
+                } else {
+                    let rendered: Vec<String> = same_email_pool_matches
+                        .iter()
+                        .map(|(id, email, label)| {
+                            match label.as_deref().filter(|l| !l.is_empty()) {
+                                Some(lbl) => format!(
+                                    "{} [{}] ({})",
+                                    terminal_text(email),
+                                    terminal_text(lbl),
+                                    terminal_text(id)
+                                ),
+                                None => format!("{} ({})", terminal_text(email), terminal_text(id)),
+                            }
+                        })
+                        .collect();
+                    format!(
+                        "; different refresh_token from pool account {}",
+                        rendered.join(", ")
+                    )
+                };
+                let human = match parsed.email_hint.as_deref() {
+                    Some(email) => {
+                        format!(
+                            "External account ({}{}, not in pool{}{})",
+                            terminal_text(email),
+                            tier_part,
+                            exp_part,
+                            same_email_note
+                        )
+                    }
+                    None => format!("External account{tier_part} (not in pool{exp_part})"),
+                };
+                let mut json = serde_json::json!({
+                    "status": "external",
+                    "email_hint": parsed.email_hint,
+                    "expiry": parsed.expiry,
+                });
+                if let Some(ref tier) = parsed.user_tier {
+                    json["user_tier"] = serde_json::Value::String(tier.clone());
+                }
+                if !same_email_pool_ids.is_empty() {
+                    json["same_email_pool_account_ids"] = serde_json::json!(same_email_pool_ids);
+                }
+                (json, human)
+            }
+        }
+        SlotInspectState::AbsentInInitializedDir => (
+            serde_json::json!({ "status": "absent" }),
+            "Absent (initialized directory, no `antigravity-oauth-token` file yet)".to_string(),
+        ),
+        SlotInspectState::Uninitialized => (
+            serde_json::json!({ "status": "uninitialized" }),
+            "Uninitialized (directory does not exist)".to_string(),
+        ),
+        SlotInspectState::Corrupt(detail) => (
+            serde_json::json!({ "status": "corrupt", "detail": detail }),
+            format!("Corrupt ({})", terminal_text(detail)),
+        ),
+        SlotInspectState::Unverified(detail) => (
+            serde_json::json!({ "status": "unverified", "detail": detail }),
+            format!("Unverified ({})", terminal_text(detail)),
+        ),
+    };
+
+    let _ = now_unix;
+    if json_mode {
+        print_json(&serde_json::json!({
+            "target": ext.dto(),
+            "matched_account": matched_account,
+            "slot_state": slot_json,
+            "runtime_state": runtime_state,
+            "supported_models": supported_models,
+        }))?;
+    } else {
+        println!(
+            "Target slot      : {}  [file]",
+            terminal_text(&ext.short_label())
+        );
+        println!("Credential slot  : {slot_human}");
+        let rt_suffix = match &runtime_state {
+            RuntimeState::UnmanagedRunning { .. } | RuntimeState::ManagedRunning { .. } => {
+                " [bound to target slot]"
+            }
+            _ => "",
+        };
+        println!(
+            "Live agy runtime : {}{}",
+            format_runtime_state_human(&runtime_state),
+            rt_suffix
+        );
+        if has_model_source_acc {
+            for line in format_supported_models_human(supported_models.as_deref()) {
+                println!("{line}");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) enum ExternalSlotRefreshResult {
+    Pooled {
+        account: Box<AccountRecord>,
+        is_selected_in_official_store: bool,
+        slot_file_updated: bool,
+    },
+    Standalone {
+        email: String,
+        expiry: Option<String>,
+        observation: Box<crate::domain::quota::QuotaObservation>,
+        validation_blocked: bool,
+        token_refreshed: bool,
+        refresh_token_rotated: bool,
+        slot_file_updated: bool,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn refresh_external_slot_core(
+    repo: &StoreRepository,
+    ext: &ExternalSlotTarget,
+    transport: &dyn HttpTransport,
+    oauth_endpoints: &OAuthEndpoints,
+    quota_endpoints: &CloudCodeEndpoints,
+    registry: &OAuthClientRegistry,
+    user_agent: &str,
+    now_unix: i64,
+) -> CliResult<ExternalSlotRefreshResult> {
+    let paths = repo.paths();
+    let clock = AnchoredClock::new(now_unix);
+
+    // Verify target directory is initialized BEFORE creating/acquiring any lock file, then
+    // acquire path-scoped L1 lock BEFORE any L2/L3 operations or file write-backs.
+    ext.ensure_slot_dir_initialized(paths)?;
+    let _slot_lock = ActiveSlotLock::try_acquire_for_slot_file(paths, ext.lock_file(paths))?;
+    let extracted = ext.read_extracted_token(paths)?;
+    let snap = repo.read_snapshot()?;
+
+    if let Some(matched_acc) = snap
+        .accounts
+        .iter()
+        .find(|a| a.token.refresh_token_fingerprint() == extracted.refresh_token_digest)
+    {
+        let matched_id = matched_acc.id.clone();
+        let mut current_pre_digest = extracted.raw_digest.clone();
+        let mut slot_file_updated = false;
+        let mut sync_external_slot = |acc: &AccountRecord| -> CliResult<()> {
+            let payload = serialize_session_payload(&acc.token)?;
+            let new_digest = bytes_sha256_hex(payload.as_bytes());
+            if new_digest != current_pre_digest {
+                ext.write_slot_cas(paths, &payload, Some(&current_pre_digest))?;
+                current_pre_digest = new_digest;
+                slot_file_updated = true;
+            }
+            Ok(())
+        };
+
+        let (updated, _) = refresh_account_quota_locked_with_token_hook(
+            repo,
+            transport,
+            oauth_endpoints,
+            quota_endpoints,
+            registry,
+            user_agent,
+            &matched_id,
+            clock.now_unix(),
+            &mut sync_external_slot,
+        )
+        .await?;
+
+        sync_external_slot(&updated)?;
+        let is_selected_in_official_store =
+            snap.index.selected_account_id.as_deref() == Some(updated.id.as_str());
+        return Ok(ExternalSlotRefreshResult::Pooled {
+            account: Box::new(updated),
+            is_selected_in_official_store,
+            slot_file_updated,
+        });
+    }
+
+    // Standalone / unpooled token file: refresh & probe directly without touching `accounts/` or `index.json`.
+    let client = registry.select_for_login(None)?;
+    let mut current_pre_digest = extracted.raw_digest.clone();
+    let mut current_refresh_token = extracted.refresh_token.clone();
+    let mut current_id_token = extracted.id_token.clone();
+    let mut current_expiry = extracted.expiry.clone();
+    let mut token_refreshed = false;
+    let mut refresh_token_rotated = false;
+    let mut slot_file_updated = false;
+
+    let needs_pre_refresh = extracted.access_token.is_none()
+        || extracted
+            .expiry_unix
+            .is_none_or(|exp| exp <= clock.now_unix().saturating_add(TOKEN_REFRESH_SKEW_SECONDS));
+
+    let mut active_access_token = if needs_pre_refresh {
+        let refreshed = refresh_standalone_refresh_token(
+            transport,
+            oauth_endpoints,
+            &client,
+            user_agent,
+            &current_refresh_token,
+            current_id_token.as_deref(),
+            clock.now_unix(),
+        )
+        .await?;
+        let payload = serialize_standalone_session_payload(
+            &refreshed.token,
+            extracted.auth_method.as_deref(),
+            extracted.id_token_email.as_deref(),
+            extracted.user_tier.as_deref(),
+        )?;
+        // Persist immediately after `/token` so a rotated refresh_token is never lost if CloudCode fails!
+        ext.write_slot_cas(paths, &payload, Some(&current_pre_digest))?;
+        current_pre_digest = bytes_sha256_hex(payload.as_bytes());
+        current_refresh_token = refreshed.token.refresh_token.clone();
+        current_id_token = refreshed.token.id_token.clone();
+        current_expiry = format_unix_rfc3339_micros_utc(refreshed.token.expiry_timestamp);
+        token_refreshed = true;
+        refresh_token_rotated |= refreshed.refresh_token_rotated;
+        slot_file_updated = true;
+        refreshed.token.access_token
+    } else {
+        extracted.access_token.unwrap_or_default()
+    };
+
+    let fetched = match fetch_quota_once(
+        transport,
+        quota_endpoints,
+        user_agent,
+        &active_access_token,
+        None,
+        clock.now_unix(),
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(QuotaApiError::Unauthorized) => {
+            let forced = refresh_standalone_refresh_token(
+                transport,
+                oauth_endpoints,
+                &client,
+                user_agent,
+                &current_refresh_token,
+                current_id_token.as_deref(),
+                clock.now_unix(),
+            )
+            .await?;
+            let payload = serialize_standalone_session_payload(
+                &forced.token,
+                extracted.auth_method.as_deref(),
+                extracted.id_token_email.as_deref(),
+                extracted.user_tier.as_deref(),
+            )?;
+            ext.write_slot_cas(paths, &payload, Some(&current_pre_digest))?;
+            current_id_token = forced.token.id_token.clone();
+            current_expiry = format_unix_rfc3339_micros_utc(forced.token.expiry_timestamp);
+            active_access_token = forced.token.access_token.clone();
+            token_refreshed = true;
+            refresh_token_rotated |= forced.refresh_token_rotated;
+            slot_file_updated = true;
+
+            fetch_quota_once(
+                transport,
+                quota_endpoints,
+                user_agent,
+                &active_access_token,
+                None,
+                clock.now_unix(),
+            )
+            .await
+            .map_err(QuotaApiError::into_cli_error)?
+        }
+        Err(other) => return Err(other.into_cli_error()),
+    };
+
+    let email = if let Some(hint) = current_id_token
+        .as_deref()
+        .and_then(extract_email_hint_from_jwt)
+    {
+        hint
+    } else if let Some(hint) = extracted.email_hint.as_deref() {
+        hint.to_string()
+    } else {
+        fetch_userinfo(transport, oauth_endpoints, user_agent, &active_access_token)
+            .await
+            .ok()
+            .map(|u| u.email)
+            .filter(|e| !e.trim().is_empty())
+            .unwrap_or_else(|| "external-account".to_string())
+    };
+
+    Ok(ExternalSlotRefreshResult::Standalone {
+        email,
+        expiry: current_expiry,
+        observation: Box::new(fetched.observation),
+        validation_blocked: fetched.validation_block.is_some(),
+        token_refreshed,
+        refresh_token_rotated,
+        slot_file_updated,
+    })
+}
+
+fn build_ephemeral_standalone_account(
+    email: &str,
+    observation: crate::domain::quota::QuotaObservation,
+    validation_blocked: bool,
+    now_unix: i64,
+) -> AccountRecord {
+    let dummy_token = TokenRecord {
+        access_token: String::new(),
+        refresh_token: String::new(),
+        expires_in: 3600,
+        expiry_timestamp: now_unix.saturating_add(3600).max(1),
+        token_type: "Bearer".into(),
+        id_token: None,
+        oauth_client_key: None,
+        granted_scopes: None,
+        project_id: None,
+        is_gcp_tos: true,
+    };
+    let mut acc = AccountRecord::new("external".into(), email.to_string(), dummy_token, now_unix);
+    acc.quota = Some(observation);
+    if validation_blocked {
+        acc.validation_blocked = true;
+    }
+    acc
+}
+
+async fn handle_quota_external(
+    repo: &StoreRepository,
+    ext: &ExternalSlotTarget,
+    args: &QuotaArgs,
+    cli: &Cli,
+    now_unix: i64,
+) -> CliResult<i32> {
+    let paths = repo.paths();
+    let policy = repo.read_policy()?;
+    let monitored_model = policy.monitored_model.as_str();
+
+    if !args.refresh {
+        let slot_state = ext.inspect_slot(paths);
+        let parsed = match slot_state {
+            SlotInspectState::Present(p) => p,
+            SlotInspectState::Uninitialized => {
+                return Err(CliError::env_not_ready(
+                    "slot_dir_uninitialized",
+                    format!(
+                        "External slot directory '{}' does not exist.",
+                        ext.slot_dir.display()
+                    ),
+                ));
+            }
+            SlotInspectState::AbsentInInitializedDir => {
+                return Err(CliError::env_not_ready(
+                    "external_credential_missing",
+                    format!(
+                        "No `antigravity-oauth-token` file found at '{}'.",
+                        ext.slot_file.display()
+                    ),
+                ));
+            }
+            SlotInspectState::Corrupt(detail) => {
+                return Err(CliError::data(format!(
+                    "External credential file '{}' is corrupt: {detail}",
+                    ext.slot_file.display()
+                )));
+            }
+            SlotInspectState::Unverified(detail) => {
+                return Err(CliError::io(
+                    "slot_unverified",
+                    format!(
+                        "Cannot verify external credential file '{}': {detail}",
+                        ext.slot_file.display()
+                    ),
+                ));
+            }
+        };
+
+        let snap = repo.read_snapshot()?;
+        let Some(target) = snap
+            .accounts
+            .iter()
+            .find(|a| a.token.refresh_token_fingerprint() == parsed.refresh_token_digest)
+        else {
+            return Err(CliError::quota_unavailable(
+                "no_cached_quota",
+                format!(
+                    "External credential in '{}' is not in the local account pool (no cached quota). Pass `--refresh` to probe live quota directly, or import it with `agy-switch-cli accounts add --from-local`.",
+                    ext.slot_file.display()
+                ),
+            ));
+        };
+
+        let eval = evaluate_account_quota(
+            target,
+            monitored_model,
+            now_unix,
+            DEFAULT_QUOTA_MAX_AGE_SECS,
+        );
+        let Some(ref q_obs) = target.quota else {
+            return Err(CliError::quota_unavailable(
+                "no_cached_quota",
+                format!(
+                    "Account '{}' ({}) in external {} has no cached quota. Run `agy-switch-cli quota --refresh` with this target first.",
+                    target.id,
+                    target.email,
+                    ext.display_label()
+                ),
+            ));
+        };
+        let q_dto = QuotaViewDto::from_observation(q_obs);
+        let is_human_stale_viewable = !cli.json && matches!(eval, QuotaEval::Stale { .. });
+        if !matches!(eval, QuotaEval::Known { .. }) && !is_human_stale_viewable {
+            return Err(CliError::quota_unavailable(
+                "quota_stale_or_unknown",
+                format!(
+                    "Cached quota for '{}' ({}) on model '{}' is {:?}. Pass `--refresh` for a fresh observation.",
+                    target.id, target.email, monitored_model, eval
+                ),
+            )
+            .with_details(serde_json::json!({
+                "target": ext.dto(),
+                "pooled": true,
+                "account_id": target.id,
+                "email": target.email,
+                "monitored_model": monitored_model,
+                "evaluation": eval,
+                "quota": q_dto,
+            })));
+        }
+
+        if cli.json {
+            print_json(&serde_json::json!({
+                "target": ext.dto(),
+                "pooled": true,
+                "account_id": target.id,
+                "email": target.email,
+                "monitored_model": monitored_model,
+                "evaluation": eval,
+                "quota": q_dto,
+            }))?;
+        } else {
+            println!("Target slot: {}  [file]", terminal_text(&ext.short_label()));
+            println!(
+                "{}",
+                q_dto.human_multiline_at(&target.email, Some((&eval, monitored_model)), now_unix)
+            );
+        }
+        return Ok(ExitCode::Ok.as_i32());
+    }
+
+    let transport = build_network_transport(repo, cli.proxy.as_deref(), cli.json)?;
+    let ua =
+        resolve_native_oauth_user_agent(paths, &transport, !cli.no_remote_version, now_unix).await;
+    let registry = OAuthClientRegistry::load(paths)?;
+    let result = refresh_external_slot_core(
+        repo,
+        ext,
+        &transport,
+        &OAuthEndpoints::default(),
+        &CloudCodeEndpoints::default(),
+        &registry,
+        &ua,
+        now_unix,
+    )
+    .await?;
+    let effective_now = SystemClock.now_unix();
+
+    match result {
+        ExternalSlotRefreshResult::Pooled {
+            account,
+            slot_file_updated,
+            ..
+        } => {
+            let eval = evaluate_account_quota(
+                &account,
+                monitored_model,
+                effective_now,
+                DEFAULT_QUOTA_MAX_AGE_SECS,
+            );
+            let Some(ref q_obs) = account.quota else {
+                return Err(CliError::quota_unavailable(
+                    "no_cached_quota",
+                    format!(
+                        "Account '{}' ({}) returned no quota observation.",
+                        account.id, account.email
+                    ),
+                ));
+            };
+            let q_dto = QuotaViewDto::from_observation(q_obs);
+            if !matches!(eval, QuotaEval::Known { .. }) {
+                return Err(CliError::quota_unavailable(
+                    "quota_stale_or_unknown",
+                    format!(
+                        "Quota for '{}' ({}) on model '{}' is {:?}.",
+                        account.id, account.email, monitored_model, eval
+                    ),
+                )
+                .with_details(serde_json::json!({
+                    "target": ext.dto(),
+                    "pooled": true,
+                    "slot_file_updated": slot_file_updated,
+                    "account_id": account.id,
+                    "email": account.email,
+                    "monitored_model": monitored_model,
+                    "evaluation": eval,
+                    "quota": q_dto,
+                })));
+            }
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "target": ext.dto(),
+                    "pooled": true,
+                    "slot_file_updated": slot_file_updated,
+                    "account_id": account.id,
+                    "email": account.email,
+                    "monitored_model": monitored_model,
+                    "evaluation": eval,
+                    "quota": q_dto,
+                }))?;
+            } else {
+                println!(
+                    "Target slot: {}  [file{}]",
+                    terminal_text(&ext.short_label()),
+                    if slot_file_updated {
+                        ", token synced"
+                    } else {
+                        ""
+                    }
+                );
+                println!(
+                    "{}",
+                    q_dto.human_multiline_at(
+                        &account.email,
+                        Some((&eval, monitored_model)),
+                        effective_now
+                    )
+                );
+            }
+            Ok(ExitCode::Ok.as_i32())
+        }
+        ExternalSlotRefreshResult::Standalone {
+            email,
+            observation,
+            validation_blocked,
+            token_refreshed,
+            refresh_token_rotated,
+            slot_file_updated,
+            ..
+        } => {
+            let ephemeral = build_ephemeral_standalone_account(
+                &email,
+                (*observation).clone(),
+                validation_blocked,
+                effective_now,
+            );
+            let eval = evaluate_account_quota(
+                &ephemeral,
+                monitored_model,
+                effective_now,
+                DEFAULT_QUOTA_MAX_AGE_SECS,
+            );
+            let q_dto = QuotaViewDto::from_observation(&observation);
+            if !matches!(eval, QuotaEval::Known { .. }) {
+                return Err(CliError::quota_unavailable(
+                    "quota_stale_or_unknown",
+                    format!(
+                        "Quota for standalone external account '{}' on model '{}' is {:?}.",
+                        email, monitored_model, eval
+                    ),
+                )
+                .with_details(serde_json::json!({
+                    "target": ext.dto(),
+                    "pooled": false,
+                    "email": email,
+                    "monitored_model": monitored_model,
+                    "evaluation": eval,
+                    "quota": q_dto,
+                    "validation_blocked": validation_blocked,
+                    "token_refreshed": token_refreshed,
+                    "refresh_token_rotated": refresh_token_rotated,
+                    "slot_file_updated": slot_file_updated,
+                })));
+            }
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "target": ext.dto(),
+                    "pooled": false,
+                    "email": email,
+                    "monitored_model": monitored_model,
+                    "evaluation": eval,
+                    "quota": q_dto,
+                    "validation_blocked": validation_blocked,
+                    "token_refreshed": token_refreshed,
+                    "refresh_token_rotated": refresh_token_rotated,
+                    "slot_file_updated": slot_file_updated,
+                }))?;
+            } else {
+                println!(
+                    "Target slot: {}  [file, standalone{}]",
+                    terminal_text(&ext.short_label()),
+                    if slot_file_updated {
+                        ", token updated"
+                    } else {
+                        ""
+                    }
+                );
+                println!(
+                    "{}",
+                    q_dto.human_multiline_at(&email, Some((&eval, monitored_model)), effective_now)
+                );
+            }
+            Ok(ExitCode::Ok.as_i32())
+        }
+    }
+}
+
+async fn handle_refresh_external(
+    repo: &StoreRepository,
+    ext: &ExternalSlotTarget,
+    cli: &Cli,
+    now_unix: i64,
+) -> CliResult<i32> {
+    let paths = repo.paths();
+    let policy = repo.read_policy()?;
+    let monitored_model = policy.monitored_model.as_str();
+    let transport = build_network_transport(repo, cli.proxy.as_deref(), cli.json)?;
+    let ua =
+        resolve_native_oauth_user_agent(paths, &transport, !cli.no_remote_version, now_unix).await;
+    let registry = OAuthClientRegistry::load(paths)?;
+
+    let result = refresh_external_slot_core(
+        repo,
+        ext,
+        &transport,
+        &OAuthEndpoints::default(),
+        &CloudCodeEndpoints::default(),
+        &registry,
+        &ua,
+        now_unix,
+    )
+    .await?;
+    let effective_now = SystemClock.now_unix();
+
+    match result {
+        ExternalSlotRefreshResult::Pooled {
+            account,
+            is_selected_in_official_store,
+            slot_file_updated,
+        } => {
+            let dto = AccountViewDto::from_record(&account, is_selected_in_official_store);
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "target": ext.dto(),
+                    "pooled": true,
+                    "slot_file_updated": slot_file_updated,
+                    "refreshed": [dto],
+                    "failures": [],
+                }))?;
+            } else {
+                println!(
+                    "Refreshed external {} -> {} ({}){}",
+                    terminal_text(&ext.display_label()),
+                    terminal_text(&dto.id),
+                    terminal_text(&dto.email),
+                    if slot_file_updated {
+                        " [slot file updated]"
+                    } else {
+                        " [slot file already up to date]"
+                    }
+                );
+            }
+            Ok(ExitCode::Ok.as_i32())
+        }
+        ExternalSlotRefreshResult::Standalone {
+            email,
+            expiry,
+            observation,
+            validation_blocked,
+            token_refreshed,
+            refresh_token_rotated,
+            slot_file_updated,
+        } => {
+            let ephemeral = build_ephemeral_standalone_account(
+                &email,
+                (*observation).clone(),
+                validation_blocked,
+                effective_now,
+            );
+            let eval = evaluate_account_quota(
+                &ephemeral,
+                monitored_model,
+                effective_now,
+                DEFAULT_QUOTA_MAX_AGE_SECS,
+            );
+            let q_dto = QuotaViewDto::from_observation(&observation);
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "target": ext.dto(),
+                    "pooled": false,
+                    "email": email,
+                    "expiry": expiry,
+                    "monitored_model": monitored_model,
+                    "evaluation": eval,
+                    "quota": q_dto,
+                    "validation_blocked": validation_blocked,
+                    "token_refreshed": token_refreshed,
+                    "refresh_token_rotated": refresh_token_rotated,
+                    "slot_file_updated": slot_file_updated,
+                }))?;
+            } else {
+                let exp_part = expiry
+                    .as_deref()
+                    .map(|e| format!(", expires {}", format_rfc3339_local_minute(e)))
+                    .unwrap_or_default();
+                let flag_part = if validation_blocked {
+                    " [verification required]"
+                } else {
+                    ""
+                };
+                println!(
+                    "Refreshed standalone external {} ({}{}){}{}",
+                    terminal_text(&ext.display_label()),
+                    terminal_text(&email),
+                    exp_part,
+                    flag_part,
+                    if slot_file_updated {
+                        " [slot file updated]"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok(ExitCode::Ok.as_i32())
+        }
+    }
 }
 
 async fn handle_status(
@@ -3267,5 +4350,682 @@ mod tests {
         kr_absent.reset_counts();
         handle_status(&repo, &kr_absent, true).await.unwrap();
         assert_eq!(kr_absent.counts(), (0, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn synthetic_v126_external_slot_refresh_pooled_standalone_durability_and_cas() {
+        use crate::domain::config::HeadlessConfig;
+        use crate::session::payload::extract_external_session_token_from_bytes;
+        use crate::transport::client::MockTransport;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        let cache = tmp.path().join("cache");
+        let official_dir = home.join(".gemini/antigravity-cli");
+        let ext_dir = home.join(".t3/userdata/providers/antigravity/synth/antigravity-acp");
+        fs::create_dir_all(&official_dir).unwrap();
+        fs::create_dir_all(&ext_dir).unwrap();
+
+        let paths = HeadlessPaths::with_explicit(home.clone(), data, cache);
+        let repo = StoreRepository::new(paths.clone());
+        let now = 1_900_000_000i64;
+
+        let tok1 = TokenRecord {
+            access_token: "ya29.acc1-fresh".into(),
+            refresh_token: "1//rt-acc1-official".into(),
+            expires_in: 3600,
+            expiry_timestamp: now + 3600,
+            token_type: "Bearer".into(),
+            id_token: None,
+            oauth_client_key: None,
+            granted_scopes: None,
+            project_id: None,
+            is_gcp_tos: true,
+        };
+        let tok2_stale = TokenRecord {
+            access_token: "ya29.acc2-expired".into(),
+            refresh_token: "1//rt-acc2-old".into(),
+            expires_in: 3600,
+            expiry_timestamp: now - 120, // expired -> forces OAuth refresh
+            token_type: "Bearer".into(),
+            id_token: None,
+            oauth_client_key: None,
+            granted_scopes: None,
+            project_id: None,
+            is_gcp_tos: true,
+        };
+        let acc1 = AccountRecord::new(
+            "acc-0001".into(),
+            "alice@example.com".into(),
+            tok1.clone(),
+            now,
+        );
+        let acc2 = AccountRecord::new(
+            "acc-0002".into(),
+            "bob@example.com".into(),
+            tok2_stale.clone(),
+            now,
+        );
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(acc1, true, now)?;
+            tx.upsert_account(acc2, false, now)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let official_payload = serialize_session_payload(&tok1).unwrap();
+        fs::write(&paths.active_slot_file, &official_payload).unwrap();
+
+        let ext_file = ext_dir.join("antigravity-oauth-token");
+        let stale_ext_payload = serialize_session_payload(&tok2_stale).unwrap();
+        fs::write(&ext_file, &stale_ext_payload).unwrap();
+
+        let ext = ExternalSlotTarget::resolve(
+            &paths,
+            &HeadlessConfig::default(),
+            None,
+            None,
+            Some(&ext_dir),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let registry = OAuthClientRegistry::load(&paths).unwrap();
+        let oauth_ep = OAuthEndpoints {
+            token_url: "https://oauth.example.invalid/token".into(),
+            userinfo_url: "https://oauth.example.invalid/userinfo".into(),
+            base_backoff: std::time::Duration::from_millis(1),
+        };
+        let quota_ep = CloudCodeEndpoints {
+            environments: vec![(
+                crate::domain::quota::QuotaSourceEnv::Daily,
+                "https://ccpa.example.invalid/v1internal".into(),
+            )],
+            fallback_delay: std::time::Duration::from_millis(1),
+        };
+
+        // 1. Pooled account in external slot: refreshes pool record AND syncs rotated token back to ext_file
+        let pooled_transport = MockTransport::from_handler(|req| {
+            if req.url.ends_with("/token") {
+                Ok(MockTransport::json_response(
+                    200,
+                    serde_json::json!({
+                        "access_token": "ya29.acc2-refreshed",
+                        "expires_in": 3600,
+                        "token_type": "Bearer",
+                        "refresh_token": "1//rt-acc2-rotated"
+                    }),
+                ))
+            } else if req.url.ends_with(":loadCodeAssist") {
+                Ok(MockTransport::json_response(
+                    200,
+                    serde_json::json!({
+                        "cloudaicompanionProject": "proj-bob",
+                        "paidTier": { "id": "pro", "name": "PRO" }
+                    }),
+                ))
+            } else if req.url.ends_with(":fetchAvailableModels") {
+                Ok(MockTransport::json_response(
+                    200,
+                    serde_json::json!({
+                        "models": {
+                            "claude-sonnet-4-6": {
+                                "displayName": "Claude Sonnet 4.6",
+                                "quotaInfo": { "remainingFraction": 0.85, "resetTime": "2099-01-01T00:00:00Z" }
+                            }
+                        }
+                    }),
+                ))
+            } else {
+                Ok(MockTransport::json_response(404, serde_json::json!({})))
+            }
+        });
+
+        let pooled_res = refresh_external_slot_core(
+            &repo,
+            &ext,
+            &pooled_transport,
+            &oauth_ep,
+            &quota_ep,
+            &registry,
+            "antigravity/test",
+            now,
+        )
+        .await
+        .unwrap();
+        match pooled_res {
+            ExternalSlotRefreshResult::Pooled {
+                account,
+                slot_file_updated,
+                ..
+            } => {
+                assert_eq!(account.id, "acc-0002");
+                assert!(slot_file_updated);
+                assert_eq!(account.token.refresh_token, "1//rt-acc2-rotated");
+            }
+            _ => panic!("expected Pooled refresh result"),
+        }
+        // External slot file has rotated token; official slot & index selection are untouched!
+        let ext_after_pooled =
+            extract_external_session_token_from_bytes(&fs::read(&ext_file).unwrap(), "ext")
+                .unwrap();
+        assert_eq!(ext_after_pooled.refresh_token, "1//rt-acc2-rotated");
+        assert_eq!(
+            ext_after_pooled.access_token.as_deref(),
+            Some("ya29.acc2-refreshed")
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.active_slot_file).unwrap(),
+            official_payload
+        );
+        assert_eq!(
+            repo.read_snapshot()
+                .unwrap()
+                .index
+                .selected_account_id
+                .as_deref(),
+            Some("acc-0001")
+        );
+
+        // 1b. P1-03 initial pooled rotation + CloudCode 503 across all envs:
+        //     BOTH pool account AND external file MUST already hold rotated refresh_token!
+        let mut a2_1b = repo
+            .read_snapshot()
+            .unwrap()
+            .accounts
+            .into_iter()
+            .find(|a| a.id == "acc-0002")
+            .unwrap();
+        a2_1b.token.expiry_timestamp = now - 60;
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(a2_1b, false, now)?;
+            Ok(())
+        })
+        .unwrap();
+        let pooled_503_transport = MockTransport::from_handler(|req| {
+            if req.url.ends_with("/token") {
+                Ok(MockTransport::json_response(
+                    200,
+                    serde_json::json!({
+                        "access_token": "ya29.acc2-rot2",
+                        "expires_in": 3600,
+                        "token_type": "Bearer",
+                        "refresh_token": "1//rt-acc2-rotated-2"
+                    }),
+                ))
+            } else {
+                Ok(MockTransport::json_response(503, serde_json::json!({})))
+            }
+        });
+        let err_1b = refresh_external_slot_core(
+            &repo,
+            &ext,
+            &pooled_503_transport,
+            &oauth_ep,
+            &quota_ep,
+            &registry,
+            "antigravity/test",
+            now,
+        )
+        .await
+        .err()
+        .expect("expected quota 503 error after initial pooled rotation");
+        assert_eq!(err_1b.error_code, "quota_network_error");
+        assert_eq!(
+            repo.read_snapshot()
+                .unwrap()
+                .accounts
+                .iter()
+                .find(|a| a.id == "acc-0002")
+                .unwrap()
+                .token
+                .refresh_token,
+            "1//rt-acc2-rotated-2"
+        );
+        let ext_after_1b =
+            extract_external_session_token_from_bytes(&fs::read(&ext_file).unwrap(), "ext")
+                .unwrap();
+        assert_eq!(ext_after_1b.refresh_token, "1//rt-acc2-rotated-2");
+        assert_eq!(ext_after_1b.access_token.as_deref(), Some("ya29.acc2-rot2"));
+
+        // 1c. P1-03 401 forced pooled rotation + CloudCode replay 503:
+        //     BOTH pool account AND external file MUST already hold second rotated refresh_token!
+        let c401 = Arc::new(AtomicUsize::new(0));
+        let c401_c = c401.clone();
+        let pooled_401_then_503 = MockTransport::from_handler(move |req| {
+            if req.url.ends_with("/token") {
+                Ok(MockTransport::json_response(
+                    200,
+                    serde_json::json!({
+                        "access_token": "ya29.acc2-rot3",
+                        "expires_in": 3600,
+                        "token_type": "Bearer",
+                        "refresh_token": "1//rt-acc2-rotated-3"
+                    }),
+                ))
+            } else if req.url.ends_with(":loadCodeAssist") {
+                if c401_c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(MockTransport::json_response(401, serde_json::json!({})))
+                } else {
+                    Ok(MockTransport::json_response(503, serde_json::json!({})))
+                }
+            } else {
+                Ok(MockTransport::json_response(503, serde_json::json!({})))
+            }
+        });
+        let err_1c = refresh_external_slot_core(
+            &repo,
+            &ext,
+            &pooled_401_then_503,
+            &oauth_ep,
+            &quota_ep,
+            &registry,
+            "antigravity/test",
+            now,
+        )
+        .await
+        .err()
+        .expect("expected quota 503 error after 401 forced pooled rotation");
+        assert_eq!(err_1c.error_code, "quota_network_error");
+        assert_eq!(
+            repo.read_snapshot()
+                .unwrap()
+                .accounts
+                .iter()
+                .find(|a| a.id == "acc-0002")
+                .unwrap()
+                .token
+                .refresh_token,
+            "1//rt-acc2-rotated-3"
+        );
+        let ext_after_1c =
+            extract_external_session_token_from_bytes(&fs::read(&ext_file).unwrap(), "ext")
+                .unwrap();
+        assert_eq!(ext_after_1c.refresh_token, "1//rt-acc2-rotated-3");
+
+        // 1d. P1-03 pooled sync CAS conflict: concurrent external write during `/token` await MUST NOT be clobbered!
+        let mut a2_1d = repo
+            .read_snapshot()
+            .unwrap()
+            .accounts
+            .into_iter()
+            .find(|a| a.id == "acc-0002")
+            .unwrap();
+        a2_1d.token.expiry_timestamp = now - 60;
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(a2_1d, false, now)?;
+            Ok(())
+        })
+        .unwrap();
+        let ext_file_1d = ext_file.clone();
+        let third_party_payload = r#"{"token":{"access_token":"ya29.third-party","token_type":"Bearer","refresh_token":"1//rt-third-party","expiry":"2099-01-01T00:00:00.000000Z"},"auth_method":"consumer"}"#;
+        let pooled_cas_conflict = MockTransport::from_handler(move |req| {
+            if req.url.ends_with("/token") {
+                fs::write(&ext_file_1d, third_party_payload).unwrap();
+                Ok(MockTransport::json_response(
+                    200,
+                    serde_json::json!({
+                        "access_token": "ya29.acc2-rot4",
+                        "expires_in": 3600,
+                        "token_type": "Bearer",
+                        "refresh_token": "1//rt-acc2-rotated-4"
+                    }),
+                ))
+            } else {
+                Ok(MockTransport::json_response(503, serde_json::json!({})))
+            }
+        });
+        let err_1d = refresh_external_slot_core(
+            &repo,
+            &ext,
+            &pooled_cas_conflict,
+            &oauth_ep,
+            &quota_ep,
+            &registry,
+            "antigravity/test",
+            now,
+        )
+        .await
+        .err()
+        .expect("expected CAS conflict on concurrent external write");
+        assert_eq!(err_1d.error_code, "external_slot_modified");
+        assert_eq!(fs::read_to_string(&ext_file).unwrap(), third_party_payload);
+        assert_eq!(
+            repo.read_snapshot()
+                .unwrap()
+                .accounts
+                .iter()
+                .find(|a| a.id == "acc-0002")
+                .unwrap()
+                .token
+                .refresh_token,
+            "1//rt-acc2-rotated-4"
+        );
+
+        // 1e. R2-01: Pooled rotation whose `/token` response lacks required scopes MUST STILL sync
+        //     the rotated refresh_token to `ext_file` BEFORE returning `6/scope_reauth_required` and disabling!
+        let mut a2_1e = repo
+            .read_snapshot()
+            .unwrap()
+            .accounts
+            .into_iter()
+            .find(|a| a.id == "acc-0002")
+            .unwrap();
+        a2_1e.token.expiry_timestamp = now - 60;
+        let payload_1e = serialize_session_payload(&a2_1e.token).unwrap();
+        fs::write(&ext_file, &payload_1e).unwrap();
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(a2_1e, false, now)?;
+            Ok(())
+        })
+        .unwrap();
+        fs::write(
+            paths.config_file(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "oauth": {
+                    "required_scopes": ["https://www.googleapis.com/auth/cloud-platform"]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let scoped_registry = OAuthClientRegistry::load(&paths).unwrap();
+        let cloudcode_calls_1e = Arc::new(AtomicUsize::new(0));
+        let cc_1e_c = cloudcode_calls_1e.clone();
+        let pooled_scope_reject = MockTransport::from_handler(move |req| {
+            if req.url.ends_with("/token") {
+                Ok(MockTransport::json_response(
+                    200,
+                    serde_json::json!({
+                        "access_token": "ya29.acc2-rot5-scoped",
+                        "expires_in": 3600,
+                        "token_type": "Bearer",
+                        "refresh_token": "1//rt-acc2-rotated-5",
+                        "scope": "openid email"
+                    }),
+                ))
+            } else {
+                cc_1e_c.fetch_add(1, Ordering::SeqCst);
+                Ok(MockTransport::json_response(503, serde_json::json!({})))
+            }
+        });
+        let err_1e = refresh_external_slot_core(
+            &repo,
+            &ext,
+            &pooled_scope_reject,
+            &oauth_ep,
+            &quota_ep,
+            &scoped_registry,
+            "antigravity/test",
+            now,
+        )
+        .await
+        .err()
+        .expect("expected scope_reauth_required after rotation");
+        assert_eq!(err_1e.exit_code, ExitCode::AuthOrClientError);
+        assert_eq!(err_1e.error_code, "scope_reauth_required");
+        assert_eq!(cloudcode_calls_1e.load(Ordering::SeqCst), 0);
+        let acc2_after_1e = repo
+            .read_snapshot()
+            .unwrap()
+            .accounts
+            .into_iter()
+            .find(|a| a.id == "acc-0002")
+            .unwrap();
+        assert!(acc2_after_1e.disabled);
+        assert_eq!(
+            acc2_after_1e.disabled_code,
+            Some(DisableReasonCode::ScopeReauthRequired)
+        );
+        assert_eq!(acc2_after_1e.token.refresh_token, "1//rt-acc2-rotated-5");
+        let ext_after_1e =
+            extract_external_session_token_from_bytes(&fs::read(&ext_file).unwrap(), "ext")
+                .unwrap();
+        assert_eq!(ext_after_1e.refresh_token, "1//rt-acc2-rotated-5");
+        assert_eq!(
+            ext_after_1e.access_token.as_deref(),
+            Some("ya29.acc2-rot5-scoped")
+        );
+
+        // 1f. R2-01 CAS conflict during scope-rejected rotation still MUST NOT overwrite third party!
+        let mut a2_1f = acc2_after_1e;
+        a2_1f.disabled = false;
+        a2_1f.disabled_code = None;
+        a2_1f.token.expiry_timestamp = now - 60;
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(a2_1f, false, now)?;
+            Ok(())
+        })
+        .unwrap();
+        let ext_file_1f = ext_file.clone();
+        let third_party_1f = r#"{"token":{"access_token":"ya29.third-party-1f","token_type":"Bearer","refresh_token":"1//rt-third-party-1f","expiry":"2099-01-01T00:00:00.000000Z"},"auth_method":"consumer"}"#;
+        let pooled_scope_cas = MockTransport::from_handler(move |req| {
+            if req.url.ends_with("/token") {
+                fs::write(&ext_file_1f, third_party_1f).unwrap();
+                Ok(MockTransport::json_response(
+                    200,
+                    serde_json::json!({
+                        "access_token": "ya29.acc2-rot6-scoped",
+                        "expires_in": 3600,
+                        "token_type": "Bearer",
+                        "refresh_token": "1//rt-acc2-rotated-6",
+                        "scope": "openid email"
+                    }),
+                ))
+            } else {
+                Ok(MockTransport::json_response(503, serde_json::json!({})))
+            }
+        });
+        let err_1f = refresh_external_slot_core(
+            &repo,
+            &ext,
+            &pooled_scope_cas,
+            &oauth_ep,
+            &quota_ep,
+            &scoped_registry,
+            "antigravity/test",
+            now,
+        )
+        .await
+        .err()
+        .expect("expected CAS conflict before overwriting third-party external slot");
+        assert_eq!(err_1f.error_code, "external_slot_modified");
+        assert_eq!(fs::read_to_string(&ext_file).unwrap(), third_party_1f);
+        let _ = fs::remove_file(paths.config_file());
+
+        // 2. Standalone unpooled token file: 401 triggers forced refresh + immediate CAS write-back, zero pool mutation!
+        let standalone_file = home.join(
+            ".t3/userdata/providers/antigravity/synth/antigravity-acp/antigravity-oauth-token",
+        );
+        let standalone_initial = r#"{"token":{"access_token":"ya29.standalone-stale401","token_type":"Bearer","refresh_token":"1//rt-standalone-v1","expiry":"2099-01-01T00:00:00.000000Z"},"auth_method":"consumer"}"#;
+        fs::write(&standalone_file, standalone_initial).unwrap();
+
+        let models_calls = Arc::new(AtomicUsize::new(0));
+        let models_calls_c = models_calls.clone();
+        let standalone_transport = MockTransport::from_handler(move |req| {
+            if req.url.ends_with("/token") {
+                Ok(MockTransport::json_response(
+                    200,
+                    serde_json::json!({
+                        "access_token": "ya29.standalone-fresh",
+                        "expires_in": 3600,
+                        "token_type": "Bearer",
+                        "refresh_token": "1//rt-standalone-v2"
+                    }),
+                ))
+            } else if req.url.ends_with("/userinfo") {
+                Ok(MockTransport::json_response(
+                    200,
+                    serde_json::json!({ "email": "charlie@example.com" }),
+                ))
+            } else if req.url.ends_with(":loadCodeAssist") {
+                let c = models_calls_c.fetch_add(1, Ordering::SeqCst);
+                if c == 0 {
+                    Ok(MockTransport::json_response(401, serde_json::json!({})))
+                } else {
+                    Ok(MockTransport::json_response(
+                        200,
+                        serde_json::json!({
+                            "cloudaicompanionProject": "proj-charlie",
+                            "paidTier": { "id": "ultra", "name": "ULTRA" }
+                        }),
+                    ))
+                }
+            } else if req.url.ends_with(":fetchAvailableModels") {
+                Ok(MockTransport::json_response(
+                    200,
+                    serde_json::json!({
+                        "models": {
+                            "gemini-3-pro": {
+                                "displayName": "Gemini 3 Pro",
+                                "quotaInfo": { "remainingFraction": 0.72, "resetTime": "2099-01-01T00:00:00Z" }
+                            }
+                        }
+                    }),
+                ))
+            } else {
+                Ok(MockTransport::json_response(404, serde_json::json!({})))
+            }
+        });
+
+        let standalone_res = refresh_external_slot_core(
+            &repo,
+            &ext,
+            &standalone_transport,
+            &oauth_ep,
+            &quota_ep,
+            &registry,
+            "antigravity/test",
+            now,
+        )
+        .await
+        .unwrap();
+        match standalone_res {
+            ExternalSlotRefreshResult::Standalone {
+                email,
+                token_refreshed,
+                refresh_token_rotated,
+                slot_file_updated,
+                observation,
+                ..
+            } => {
+                assert_eq!(email, "charlie@example.com");
+                assert!(token_refreshed);
+                assert!(refresh_token_rotated);
+                assert!(slot_file_updated);
+                assert_eq!(observation.subscription_tier.as_deref(), Some("ULTRA"));
+            }
+            _ => panic!("expected Standalone refresh result"),
+        }
+        // Rotated refresh_token persisted to standalone file; pool account count STILL 2!
+        let ext_after_standalone =
+            extract_external_session_token_from_bytes(&fs::read(&ext_file).unwrap(), "ext")
+                .unwrap();
+        assert_eq!(ext_after_standalone.refresh_token, "1//rt-standalone-v2");
+        assert_eq!(repo.read_snapshot().unwrap().accounts.len(), 2);
+
+        // 3. Standalone durability: if `/token` rotates refresh_token and subsequent CloudCode fails (503),
+        //    the rotated refresh_token MUST ALREADY be saved to `ext_file`!
+        let expired_standalone = r#"{"token":{"access_token":"ya29.old","token_type":"Bearer","refresh_token":"1//rt-standalone-v2","expiry":"2020-01-01T00:00:00.000000Z"},"auth_method":"consumer"}"#;
+        fs::write(&ext_file, expired_standalone).unwrap();
+        let fail_after_rotate = MockTransport::from_handler(|req| {
+            if req.url.ends_with("/token") {
+                Ok(MockTransport::json_response(
+                    200,
+                    serde_json::json!({
+                        "access_token": "ya29.standalone-v3",
+                        "expires_in": 3600,
+                        "token_type": "Bearer",
+                        "refresh_token": "1//rt-standalone-v3"
+                    }),
+                ))
+            } else {
+                Ok(MockTransport::json_response(503, serde_json::json!({})))
+            }
+        });
+        assert!(refresh_external_slot_core(
+            &repo,
+            &ext,
+            &fail_after_rotate,
+            &oauth_ep,
+            &quota_ep,
+            &registry,
+            "antigravity/test",
+            now,
+        )
+        .await
+        .is_err());
+        let persisted_v3 =
+            extract_external_session_token_from_bytes(&fs::read(&ext_file).unwrap(), "ext")
+                .unwrap();
+        assert_eq!(persisted_v3.refresh_token, "1//rt-standalone-v3");
+
+        // 4. External switch CAS conflict: if another writer mutates `ext_file` during OAuth refresh await,
+        //    `execute_external_switch` MUST abort with `external_slot_modified` without clobbering!
+        let tok_expiring = TokenRecord {
+            access_token: "ya29.acc3-old".into(),
+            refresh_token: "1//rt-acc3-old".into(),
+            expires_in: 3600,
+            expiry_timestamp: now - 60,
+            token_type: "Bearer".into(),
+            id_token: None,
+            oauth_client_key: None,
+            granted_scopes: None,
+            project_id: None,
+            is_gcp_tos: true,
+        };
+        let acc3 = AccountRecord::new(
+            "acc-0003".into(),
+            "dave@example.com".into(),
+            tok_expiring,
+            now,
+        );
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(acc3, false, now)?;
+            Ok(())
+        })
+        .unwrap();
+        let ext_file_c = ext_file.clone();
+        let concurrent_writer_payload = r#"{"token":{"access_token":"ya29.concurrent","token_type":"Bearer","refresh_token":"1//rt-concurrent","expiry":"2099-01-01T00:00:00.000000Z"},"auth_method":"consumer"}"#;
+        let race_transport = MockTransport::from_handler(move |req| {
+            if req.url.ends_with("/token") {
+                fs::write(&ext_file_c, concurrent_writer_payload).unwrap();
+                Ok(MockTransport::json_response(
+                    200,
+                    serde_json::json!({
+                        "access_token": "ya29.acc3-fresh",
+                        "expires_in": 3600,
+                        "token_type": "Bearer"
+                    }),
+                ))
+            } else {
+                Ok(MockTransport::json_response(404, serde_json::json!({})))
+            }
+        });
+        let cas_err = execute_external_switch(
+            &repo,
+            &ext,
+            &race_transport,
+            &oauth_ep,
+            &registry,
+            "antigravity/test",
+            "acc-0003",
+            &SwitchOptions {
+                dry_run: false,
+                allow_running: true,
+            },
+            false,
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cas_err.error_code, "external_slot_modified");
+        assert_eq!(
+            fs::read_to_string(&ext_file).unwrap(),
+            concurrent_writer_payload
+        );
     }
 }

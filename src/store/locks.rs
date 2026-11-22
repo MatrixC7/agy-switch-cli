@@ -189,6 +189,28 @@ pub struct ActiveSlotLock {
 }
 
 impl ActiveSlotLock {
+    pub fn try_acquire_for_slot_file(
+        paths: &HeadlessPaths,
+        slot_lock_path: PathBuf,
+    ) -> CliResult<Self> {
+        assert_not_holding_pending_or_l2_or_l3("L1 ActiveSlotLock")?;
+        let slot_file = open_lock_file_nofollow(&paths.cache_dir, &slot_lock_path)?;
+        match try_flock_exclusive(&slot_file) {
+            Ok(true) => Ok(Self {
+                slot_file,
+                keyring_file: None,
+                path: slot_lock_path,
+            }),
+            Ok(false) => Err(CliError::lock_busy(
+                "Another process is currently modifying this external credential slot file. Retry shortly.",
+            )),
+            Err(e) => Err(map_io_error(
+                e,
+                &format!("Cannot lock external slot '{}'", slot_lock_path.display()),
+            )),
+        }
+    }
+
     pub fn try_acquire(paths: &HeadlessPaths, include_keyring_scope: bool) -> CliResult<Self> {
         assert_not_holding_pending_or_l2_or_l3("L1 ActiveSlotLock")?;
         let slot_lock_path = paths.active_slot_lock_file();

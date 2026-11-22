@@ -8,6 +8,7 @@ use crate::cli::dto::terminal_text;
 use crate::domain::clock::parse_strict_ymd_date;
 use crate::error::{CliError, CliResult};
 use crate::paths::HeadlessPaths;
+use crate::session::external_slot::{ExternalSlotTarget, ExternalStatsTargetDto};
 use crate::stats::readonly_vfs::{
     is_transient_sqlite_err, open_pinned_readonly_sqlite, PinnedSqliteConnection, PinnedSqliteOpen,
 };
@@ -41,6 +42,7 @@ const MIN_HUMAN_MODEL_COL_WIDTH: usize = 32;
 const MAX_HUMAN_MODEL_COL_WIDTH: usize = 48;
 const WIDE_TERM_MIN_COLS: usize = 90;
 const WIDE_LIST_MIN_COLS: usize = 95;
+const MIN_EXTERNAL_PATH_COLS: usize = 16;
 const MIN_PERF_STREAMING_SECONDS: f64 = 1.0;
 const TRANSIENT_DB_RETRY_LIMIT: usize = 24;
 /// Explicit row-count budget for abnormal/unindexed SQLite tables (`steps`, `gen_metadata`, or
@@ -70,6 +72,7 @@ pub enum StatsSource {
     Cli,
     App,
     All,
+    External,
 }
 
 impl From<CliStatsSource> for StatsSource {
@@ -88,6 +91,7 @@ impl StatsSource {
             Self::Cli => "cli",
             Self::App => "app",
             Self::All => "all",
+            Self::External => "external",
         }
     }
 
@@ -96,6 +100,7 @@ impl StatsSource {
             Self::Cli => "cli (~/.gemini/antigravity-cli)",
             Self::App => "app (~/.gemini/antigravity)",
             Self::All => "all (~/.gemini/antigravity-cli + ~/.gemini/antigravity)",
+            Self::External => "external",
         }
     }
 }
@@ -444,13 +449,173 @@ pub struct StatsModelDto {
     hit_tenths: Option<u16>,
 }
 
+#[derive(Debug, Clone)]
+struct ExternalSourceHeader {
+    alias: Option<String>,
+    display_path: String,
+}
+
+fn format_home_tilde_path(path: &Path, home_dir: &Path) -> String {
+    match path.strip_prefix(home_dir) {
+        Ok(rel) if rel.as_os_str().is_empty() => "~".to_string(),
+        Ok(rel) => format!("~/{}", rel.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+impl ExternalSourceHeader {
+    fn from_target(ext: &ExternalSlotTarget, home_dir: &Path) -> Self {
+        Self {
+            alias: ext.target_name.as_deref().map(terminal_text),
+            display_path: terminal_text(&format_home_tilde_path(&ext.slot_dir, home_dir)),
+        }
+    }
+
+    fn compact_label(&self) -> &str {
+        self.alias.as_deref().unwrap_or("external")
+    }
+}
+
+fn ellipsize_grapheme_middle(value: &str, max_cols: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_cols {
+        return value.to_string();
+    }
+    if max_cols == 0 {
+        return String::new();
+    }
+    if max_cols == 1 {
+        return "…".to_string();
+    }
+    let graphemes: Vec<&str> = UnicodeSegmentation::graphemes(value, true).collect();
+    let inner_budget = max_cols - 1;
+    let left_budget = inner_budget / 2;
+    let right_budget = inner_budget - left_budget;
+
+    let mut left = String::new();
+    let mut left_w = 0usize;
+    let mut left_count = 0usize;
+    for &g in &graphemes {
+        let gw = UnicodeWidthStr::width(g);
+        if left_w.saturating_add(gw) > left_budget {
+            break;
+        }
+        left.push_str(g);
+        left_w += gw;
+        left_count += 1;
+    }
+
+    let mut right_rev: Vec<&str> = Vec::new();
+    let mut right_w = 0usize;
+    for idx in (left_count..graphemes.len()).rev() {
+        let g = graphemes[idx];
+        let gw = UnicodeWidthStr::width(g);
+        if right_w.saturating_add(gw) > right_budget {
+            break;
+        }
+        right_rev.push(g);
+        right_w += gw;
+    }
+    right_rev.reverse();
+
+    let mut out = String::with_capacity(value.len());
+    out.push_str(&left);
+    out.push('…');
+    for g in right_rev {
+        out.push_str(g);
+    }
+    out
+}
+
+fn ellipsize_path_middle(path: &str, max_cols: usize) -> Option<String> {
+    if UnicodeWidthStr::width(path) <= max_cols {
+        return Some(path.to_string());
+    }
+    if max_cols < MIN_EXTERNAL_PATH_COLS {
+        return None;
+    }
+
+    let root_prefix = if path.starts_with("~/") {
+        "~/"
+    } else if path.starts_with('/') {
+        "/"
+    } else {
+        ""
+    };
+    let rest = &path[root_prefix.len()..];
+    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+
+    if segments.len() >= 2 {
+        let tail = segments[segments.len() - 1];
+        for head_count in (1..=segments.len().saturating_sub(2)).rev() {
+            let candidate = format!("{root_prefix}{}/…/{tail}", segments[..head_count].join("/"));
+            if UnicodeWidthStr::width(candidate.as_str()) <= max_cols {
+                return Some(candidate);
+            }
+        }
+        if !root_prefix.is_empty() {
+            let root_tail = format!("{root_prefix}…/{tail}");
+            if UnicodeWidthStr::width(root_tail.as_str()) <= max_cols {
+                return Some(root_tail);
+            }
+        }
+        let bare_tail = format!("…/{tail}");
+        if UnicodeWidthStr::width(bare_tail.as_str()) <= max_cols {
+            return Some(bare_tail);
+        }
+    }
+
+    Some(ellipsize_grapheme_middle(path, max_cols))
+}
+
+fn format_source_header_line(
+    source: StatsSource,
+    external: Option<&ExternalSourceHeader>,
+    db_count_str: &str,
+    latest_str: &str,
+    max_cols: Option<usize>,
+) -> String {
+    let suffix = format!(" · {db_count_str} db(s) · latest {latest_str}");
+    if let Some(ext) = external {
+        let (prefix, close) = match ext.alias.as_deref() {
+            Some(alias) => (format!("Source : {alias} ("), ")"),
+            None => ("Source : ".to_string(), ""),
+        };
+        match max_cols {
+            None => format!("{prefix}{}{close}{suffix}", ext.display_path),
+            Some(cols) => {
+                let fixed_w = UnicodeWidthStr::width(prefix.as_str())
+                    + UnicodeWidthStr::width(close)
+                    + UnicodeWidthStr::width(suffix.as_str());
+                if cols >= fixed_w {
+                    let path_budget = cols - fixed_w;
+                    if let Some(fitted) = ellipsize_path_middle(&ext.display_path, path_budget) {
+                        return format!("{prefix}{fitted}{close}{suffix}");
+                    }
+                }
+                format!("Source : {}{suffix}", ext.compact_label())
+            }
+        }
+    } else {
+        let full_line = format!("Source : {}{suffix}", source.human_header_label());
+        if max_cols.is_some_and(|cols| UnicodeWidthStr::width(full_line.as_str()) > cols) {
+            format!("Source : {}{suffix}", source.as_str())
+        } else {
+            full_line
+        }
+    }
+}
+
 /// Structurally allow-listed DTO for `agy-switch-cli stats [--json]`.
-/// Excludes local filesystem paths, account emails, and conversation message payloads;
-/// `models[].model` is additionally validated and normalized (falling back to `"Unknown"`
-/// if a database record contains untrusted path, email, URL, or credential-like text).
+/// In default official modes (`all`, `cli`, `app`), excludes local filesystem paths, account emails,
+/// and conversation message payloads (`target` is omitted); when explicitly querying an external
+/// directory via `--target` / `--target-dir`, `source` is `"external"` and `target` includes the
+/// explicitly requested canonical `target_dir` path. `models[].model` is additionally validated and
+/// normalized (falling back to `"Unknown"` if a database record contains untrusted text).
 #[derive(Debug, Clone, Serialize)]
 pub struct StatsViewDto {
     pub source: StatsSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<ExternalStatsTargetDto>,
     pub range: StatsRangeDto,
     pub databases_scanned: u64,
     pub generations_scanned: u64,
@@ -466,6 +631,8 @@ pub struct StatsViewDto {
     range_human: String,
     #[serde(skip)]
     tz: jiff::tz::TimeZone,
+    #[serde(skip)]
+    source_human_override: Option<ExternalSourceHeader>,
 }
 
 fn detect_stdout_terminal_cols() -> Option<usize> {
@@ -500,24 +667,13 @@ impl StatsViewDto {
             .unwrap_or_else(|| "—".to_string());
 
         let db_count_str = format_u64_commas(self.databases_scanned);
-        let full_source_line = format!(
-            "Source : {} · {} db(s) · latest {}",
-            self.source.human_header_label(),
-            db_count_str,
-            latest_str
+        let source_line = format_source_header_line(
+            self.source,
+            self.source_human_override.as_ref(),
+            &db_count_str,
+            &latest_str,
+            max_cols,
         );
-        let source_line = if max_cols
-            .is_some_and(|cols| UnicodeWidthStr::width(full_source_line.as_str()) > cols)
-        {
-            format!(
-                "Source : {} · {} db(s) · latest {}",
-                self.source.as_str(),
-                db_count_str,
-                latest_str
-            )
-        } else {
-            full_source_line
-        };
 
         let mut lines = Vec::new();
         lines.push(source_line);
@@ -925,7 +1081,7 @@ pub(crate) fn collect_token_stats_with_now(
 ) -> CliResult<StatsViewDto> {
     verify_stats_root_dir_no_path_echo(&paths.home_dir, "Home")?;
     let range_spec = resolve_stats_range_spec(args, now.date())?;
-    let source = StatsSource::from(args.source);
+    let source = StatsSource::from(args.effective_source());
     Ok(collect_token_stats_at(
         &paths.home_dir,
         source,
@@ -939,6 +1095,35 @@ pub fn collect_token_stats(paths: &HeadlessPaths, args: &StatsArgs) -> CliResult
     collect_token_stats_with_now(paths, args, &now)
 }
 
+pub(crate) fn collect_token_stats_for_external_target_with_now(
+    paths: &HeadlessPaths,
+    ext: &ExternalSlotTarget,
+    args: &StatsArgs,
+    now: &jiff::Zoned,
+) -> CliResult<StatsViewDto> {
+    ext.ensure_slot_dir_initialized(paths)?;
+    let range_spec = resolve_stats_range_spec(args, now.date())?;
+    let mut dto = collect_token_stats_at_target(
+        &paths.home_dir,
+        StatsSource::External,
+        Some(&ext.slot_dir),
+        &range_spec,
+        now,
+    );
+    dto.target = Some(ext.stats_dto());
+    dto.source_human_override = Some(ExternalSourceHeader::from_target(ext, &paths.home_dir));
+    Ok(dto)
+}
+
+pub fn collect_token_stats_for_external_target(
+    paths: &HeadlessPaths,
+    ext: &ExternalSlotTarget,
+    args: &StatsArgs,
+) -> CliResult<StatsViewDto> {
+    let now = jiff::Zoned::now();
+    collect_token_stats_for_external_target_with_now(paths, ext, args, &now)
+}
+
 pub(crate) fn collect_token_stats_list_with_now(
     paths: &HeadlessPaths,
     args: &StatsArgs,
@@ -946,7 +1131,7 @@ pub(crate) fn collect_token_stats_list_with_now(
 ) -> CliResult<StatsListViewDto> {
     verify_stats_root_dir_no_path_echo(&paths.home_dir, "Home")?;
     let range_spec = resolve_stats_list_range_spec(args, now.date())?;
-    let source = StatsSource::from(args.source);
+    let source = StatsSource::from(args.effective_source());
     Ok(collect_token_stats_list_at(
         &paths.home_dir,
         source,
@@ -961,6 +1146,35 @@ pub fn collect_token_stats_list(
 ) -> CliResult<StatsListViewDto> {
     let now = jiff::Zoned::now();
     collect_token_stats_list_with_now(paths, args, &now)
+}
+
+pub(crate) fn collect_token_stats_list_for_external_target_with_now(
+    paths: &HeadlessPaths,
+    ext: &ExternalSlotTarget,
+    args: &StatsArgs,
+    now: &jiff::Zoned,
+) -> CliResult<StatsListViewDto> {
+    ext.ensure_slot_dir_initialized(paths)?;
+    let range_spec = resolve_stats_list_range_spec(args, now.date())?;
+    let mut dto = collect_token_stats_list_at_target(
+        &paths.home_dir,
+        StatsSource::External,
+        Some(&ext.slot_dir),
+        &range_spec,
+        now,
+    );
+    dto.target = Some(ext.stats_dto());
+    dto.source_human_override = Some(ExternalSourceHeader::from_target(ext, &paths.home_dir));
+    Ok(dto)
+}
+
+pub fn collect_token_stats_list_for_external_target(
+    paths: &HeadlessPaths,
+    ext: &ExternalSlotTarget,
+    args: &StatsArgs,
+) -> CliResult<StatsListViewDto> {
+    let now = jiff::Zoned::now();
+    collect_token_stats_list_for_external_target_with_now(paths, ext, args, &now)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1033,11 +1247,16 @@ pub struct StatsCallRecordDto {
 }
 
 /// Structurally allow-listed DTO for `agy-switch-cli stats list [--json]`.
-/// Excludes local filesystem paths (`source_key`), account emails, and message payloads;
-/// `items[].model` is strictly normalized via `classify_model_name` (`"Unknown"` fallback).
+/// In default official modes (`all`, `cli`, `app`), excludes local filesystem paths (`source_key`),
+/// account emails, and message payloads (`target` is omitted); when explicitly querying an external
+/// directory via `--target` / `--target-dir`, `source` is `"external"` and `target` includes the
+/// explicitly requested canonical `target_dir` path. `items[].model` is normalized via
+/// `classify_model_name` (`"Unknown"` fallback).
 #[derive(Debug, Clone, Serialize)]
 pub struct StatsListViewDto {
     pub source: StatsSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<ExternalStatsTargetDto>,
     pub range: StatsRangeDto,
     pub databases_scanned: u64,
     pub generations_scanned: u64,
@@ -1054,6 +1273,8 @@ pub struct StatsListViewDto {
     range_human: String,
     #[serde(skip)]
     tz: jiff::tz::TimeZone,
+    #[serde(skip)]
+    source_human_override: Option<ExternalSourceHeader>,
 }
 
 fn format_list_duration_cell(secs_opt: Option<f64>) -> String {
@@ -1082,24 +1303,13 @@ impl StatsListViewDto {
             .unwrap_or_else(|| "—".to_string());
 
         let db_count_str = format_u64_commas(self.databases_scanned);
-        let full_source_line = format!(
-            "Source : {} · {} db(s) · latest {}",
-            self.source.human_header_label(),
-            db_count_str,
-            latest_str
+        let source_line = format_source_header_line(
+            self.source,
+            self.source_human_override.as_ref(),
+            &db_count_str,
+            &latest_str,
+            max_cols,
         );
-        let source_line = if max_cols
-            .is_some_and(|cols| UnicodeWidthStr::width(full_source_line.as_str()) > cols)
-        {
-            format!(
-                "Source : {} · {} db(s) · latest {}",
-                self.source.as_str(),
-                db_count_str,
-                latest_str
-            )
-        } else {
-            full_source_line
-        };
 
         let mut lines = Vec::new();
         lines.push(source_line);
@@ -1619,77 +1829,115 @@ enum RawScanEarly {
 fn execute_stats_scan_core(
     home_dir: &Path,
     source: StatsSource,
+    external_target_dir: Option<&Path>,
     range_spec: &StatsRangeSpec,
     tz: &jiff::tz::TimeZone,
     sink_cap: Option<usize>,
 ) -> RawScanEarly {
-    if !is_strict_normalized_abs_path(home_dir) {
-        return RawScanEarly::Empty {
-            unreadable_databases: 0,
-        };
-    }
-
-    let home_fd = match open_existing_dir_nofollow(home_dir) {
-        Ok(Some(fd)) => fd,
-        Ok(None) => {
-            return RawScanEarly::Empty {
-                unreadable_databases: 0,
-            }
-        }
-        Err(e) if e.error_code == "data_error" => {
-            return RawScanEarly::Empty {
-                unreadable_databases: 0,
-            }
-        }
-        Err(_) => {
-            return RawScanEarly::Empty {
-                unreadable_databases: 1,
-            }
-        }
-    };
-
-    let gemini_fd = match open_child_dir_nofollow(&home_fd, GEMINI_DIR, false) {
-        ChildDirOpen::Opened(fd) => fd,
-        ChildDirOpen::Absent | ChildDirOpen::Unsafe => {
-            return RawScanEarly::Empty {
-                unreadable_databases: 0,
-            };
-        }
-        ChildDirOpen::IoError => {
-            return RawScanEarly::Empty {
-                unreadable_databases: 1,
-            };
-        }
-    };
-    drop(home_fd);
-
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
     let mut candidate_dbs: Vec<CandidateDb> = Vec::new();
     let mut unreadable_databases = 0_u64;
     let mut app_dir_fd_opt: Option<OwnedFd> = None;
 
-    if matches!(source, StatsSource::Cli | StatsSource::All) {
-        if let Some(cli_fd) = open_client_dir(&gemini_fd, CLI_DIR_NAME, &mut unreadable_databases) {
-            discover_client_db_candidates_in_fd(
-                &cli_fd,
-                CLI_DIR_NAME,
-                &mut candidate_dbs,
-                &mut unreadable_databases,
-            );
+    if let Some(ext_dir) = external_target_dir {
+        if !is_strict_normalized_abs_path(ext_dir) {
+            return RawScanEarly::Empty {
+                unreadable_databases: 0,
+            };
         }
-    }
-    if matches!(source, StatsSource::App | StatsSource::All) {
-        if let Some(app_fd) = open_client_dir(&gemini_fd, APP_DIR_NAME, &mut unreadable_databases) {
-            discover_client_db_candidates_in_fd(
-                &app_fd,
-                APP_DIR_NAME,
-                &mut candidate_dbs,
-                &mut unreadable_databases,
-            );
-            app_dir_fd_opt = Some(app_fd);
+        let ext_fd = match open_existing_dir_nofollow(ext_dir) {
+            Ok(Some(fd)) => fd,
+            Ok(None) => {
+                return RawScanEarly::Empty {
+                    unreadable_databases: 0,
+                }
+            }
+            Err(e) if e.error_code == "data_error" => {
+                return RawScanEarly::Empty {
+                    unreadable_databases: 0,
+                }
+            }
+            Err(_) => {
+                return RawScanEarly::Empty {
+                    unreadable_databases: 1,
+                }
+            }
+        };
+        discover_client_db_candidates_in_fd(
+            &ext_fd,
+            "external",
+            &mut candidate_dbs,
+            &mut unreadable_databases,
+        );
+        app_dir_fd_opt = Some(ext_fd);
+    } else {
+        if !is_strict_normalized_abs_path(home_dir) {
+            return RawScanEarly::Empty {
+                unreadable_databases: 0,
+            };
         }
+
+        let home_fd = match open_existing_dir_nofollow(home_dir) {
+            Ok(Some(fd)) => fd,
+            Ok(None) => {
+                return RawScanEarly::Empty {
+                    unreadable_databases: 0,
+                }
+            }
+            Err(e) if e.error_code == "data_error" => {
+                return RawScanEarly::Empty {
+                    unreadable_databases: 0,
+                }
+            }
+            Err(_) => {
+                return RawScanEarly::Empty {
+                    unreadable_databases: 1,
+                }
+            }
+        };
+
+        let gemini_fd = match open_child_dir_nofollow(&home_fd, GEMINI_DIR, false) {
+            ChildDirOpen::Opened(fd) => fd,
+            ChildDirOpen::Absent | ChildDirOpen::Unsafe => {
+                return RawScanEarly::Empty {
+                    unreadable_databases: 0,
+                };
+            }
+            ChildDirOpen::IoError => {
+                return RawScanEarly::Empty {
+                    unreadable_databases: 1,
+                };
+            }
+        };
+        drop(home_fd);
+
+        if matches!(source, StatsSource::Cli | StatsSource::All) {
+            if let Some(cli_fd) =
+                open_client_dir(&gemini_fd, CLI_DIR_NAME, &mut unreadable_databases)
+            {
+                discover_client_db_candidates_in_fd(
+                    &cli_fd,
+                    CLI_DIR_NAME,
+                    &mut candidate_dbs,
+                    &mut unreadable_databases,
+                );
+            }
+        }
+        if matches!(source, StatsSource::App | StatsSource::All) {
+            if let Some(app_fd) =
+                open_client_dir(&gemini_fd, APP_DIR_NAME, &mut unreadable_databases)
+            {
+                discover_client_db_candidates_in_fd(
+                    &app_fd,
+                    APP_DIR_NAME,
+                    &mut candidate_dbs,
+                    &mut unreadable_databases,
+                );
+                app_dir_fd_opt = Some(app_fd);
+            }
+        }
+        drop(gemini_fd);
     }
-    drop(gemini_fd);
 
     let live_source_keys: HashSet<String> =
         candidate_dbs.iter().map(|d| d.source_key.clone()).collect();
@@ -1908,6 +2156,16 @@ pub fn collect_token_stats_at(
     range_spec: &StatsRangeSpec,
     now: &jiff::Zoned,
 ) -> StatsViewDto {
+    collect_token_stats_at_target(home_dir, source, None, range_spec, now)
+}
+
+fn collect_token_stats_at_target(
+    home_dir: &Path,
+    source: StatsSource,
+    external_target_dir: Option<&Path>,
+    range_spec: &StatsRangeSpec,
+    now: &jiff::Zoned,
+) -> StatsViewDto {
     let tz = now.time_zone().clone();
     let generated_at = now.timestamp().as_second();
     let sink_cap = match range_spec {
@@ -1921,7 +2179,14 @@ pub fn collect_token_stats_at(
         skipped_large_records,
         unreadable_databases,
         mut agg,
-    } = match execute_stats_scan_core(home_dir, source, range_spec, &tz, sink_cap) {
+    } = match execute_stats_scan_core(
+        home_dir,
+        source,
+        external_target_dir,
+        range_spec,
+        &tz,
+        sink_cap,
+    ) {
         RawScanEarly::Empty {
             unreadable_databases,
         } => {
@@ -2026,6 +2291,7 @@ pub fn collect_token_stats_at(
 
     StatsViewDto {
         source,
+        target: None,
         range: range_spec.to_dto_with_observed(observed_bounds),
         databases_scanned: scanned_sources.len() as u64,
         generations_scanned,
@@ -2051,12 +2317,23 @@ pub fn collect_token_stats_at(
             &tz,
         ),
         tz,
+        source_human_override: None,
     }
 }
 
 pub fn collect_token_stats_list_at(
     home_dir: &Path,
     source: StatsSource,
+    range_spec: &StatsRangeSpec,
+    now: &jiff::Zoned,
+) -> StatsListViewDto {
+    collect_token_stats_list_at_target(home_dir, source, None, range_spec, now)
+}
+
+fn collect_token_stats_list_at_target(
+    home_dir: &Path,
+    source: StatsSource,
+    external_target_dir: Option<&Path>,
     range_spec: &StatsRangeSpec,
     now: &jiff::Zoned,
 ) -> StatsListViewDto {
@@ -2073,12 +2350,20 @@ pub fn collect_token_stats_list_at(
         skipped_large_records,
         unreadable_databases,
         mut agg,
-    } = match execute_stats_scan_core(home_dir, source, range_spec, &tz, Some(cap)) {
+    } = match execute_stats_scan_core(
+        home_dir,
+        source,
+        external_target_dir,
+        range_spec,
+        &tz,
+        Some(cap),
+    ) {
         RawScanEarly::Empty {
             unreadable_databases,
         } => {
             return StatsListViewDto {
                 source,
+                target: None,
                 range: range_spec.to_dto(),
                 databases_scanned: 0,
                 generations_scanned: 0,
@@ -2093,6 +2378,7 @@ pub fn collect_token_stats_list_at(
                 items: Vec::new(),
                 range_human: range_spec.human_label(),
                 tz,
+                source_human_override: None,
             };
         }
         RawScanEarly::Scanned(res) => *res,
@@ -2177,6 +2463,7 @@ pub fn collect_token_stats_list_at(
 
     StatsListViewDto {
         source,
+        target: None,
         range: range_spec.to_dto_with_observed(observed_bounds),
         databases_scanned: scanned_sources.len() as u64,
         generations_scanned,
@@ -2195,6 +2482,7 @@ pub fn collect_token_stats_list_at(
             &tz,
         ),
         tz,
+        source_human_override: None,
     }
 }
 
@@ -2207,6 +2495,7 @@ fn empty_stats_view(
 ) -> StatsViewDto {
     StatsViewDto {
         source,
+        target: None,
         range: range_spec.to_dto(),
         databases_scanned: 0,
         generations_scanned: 0,
@@ -2220,6 +2509,7 @@ fn empty_stats_view(
         models: Vec::new(),
         range_human: range_spec.human_label(),
         tz,
+        source_human_override: None,
     }
 }
 
@@ -2418,6 +2708,7 @@ fn archive_key_matches_source(source_key: &str, source: StatsSource) -> bool {
         StatsSource::All => {
             source_key.starts_with("antigravity/") || source_key.starts_with("antigravity-cli/")
         }
+        StatsSource::External => true,
     }
 }
 
@@ -4607,7 +4898,9 @@ mod tests {
         let today: jiff::civil::Date = "2026-11-17".parse().unwrap();
 
         let bad_date = StatsArgs {
-            source: CliStatsSource::Cli,
+            source: Some(CliStatsSource::Cli),
+            target: None,
+            target_dir: None,
             range: None,
             date: Some("1//0gSUPER_SECRET_DATE_TOKEN".into()),
             from: None,
@@ -4622,7 +4915,9 @@ mod tests {
         // Reject non-zero-padded or compact dates
         for invalid in ["2026-1-7", "20261117", "2026-02-29"] {
             let args = StatsArgs {
-                source: CliStatsSource::Cli,
+                source: Some(CliStatsSource::Cli),
+                target: None,
+                target_dir: None,
                 range: None,
                 date: Some(invalid.into()),
                 from: None,
@@ -4635,7 +4930,9 @@ mod tests {
 
         // Inverted `--from > --to` returns exit code 2
         let inverted = StatsArgs {
-            source: CliStatsSource::Cli,
+            source: Some(CliStatsSource::Cli),
+            target: None,
+            target_dir: None,
             range: None,
             date: None,
             from: Some("2026-11-18".into()),
@@ -4648,7 +4945,9 @@ mod tests {
 
         // Omitting `--to` defaults to `today`
         let open_to = StatsArgs {
-            source: CliStatsSource::Cli,
+            source: Some(CliStatsSource::Cli),
+            target: None,
+            target_dir: None,
             range: None,
             date: None,
             from: Some("2026-10-01".into()),
@@ -4664,7 +4963,9 @@ mod tests {
         let parsed_all = crate::cli::args::parse_cli_stats_range("all").unwrap();
         let all_spec = resolve_stats_range_spec(
             &StatsArgs {
-                source: CliStatsSource::All,
+                source: Some(CliStatsSource::All),
+                target: None,
+                target_dir: None,
                 range: Some(parsed_all),
                 date: None,
                 from: None,
@@ -4747,7 +5048,9 @@ mod tests {
             let parsed = crate::cli::args::parse_cli_stats_range(raw).unwrap();
             let spec = resolve_stats_range_spec(
                 &StatsArgs {
-                    source: CliStatsSource::Cli,
+                    source: Some(CliStatsSource::Cli),
+                    target: None,
+                    target_dir: None,
                     range: Some(parsed),
                     date: None,
                     from: None,
@@ -5476,7 +5779,9 @@ mod tests {
         let err = collect_token_stats(
             &paths,
             &StatsArgs {
-                source: CliStatsSource::Cli,
+                source: Some(CliStatsSource::Cli),
+                target: None,
+                target_dir: None,
                 range: None,
                 date: None,
                 from: None,
@@ -6936,7 +7241,9 @@ mod tests {
 
         let default_list_spec = resolve_stats_list_range_spec(
             &StatsArgs {
-                source: CliStatsSource::Cli,
+                source: Some(CliStatsSource::Cli),
+                target: None,
+                target_dir: None,
                 range: None,
                 date: None,
                 from: None,
@@ -7812,6 +8119,202 @@ mod tests {
                 UnicodeWidthStr::width(line) <= 100,
                 "rendered line > 100 cols: {line}"
             );
+        }
+    }
+
+    #[test]
+    fn synthetic_v126_external_stats_source_header_tilde_and_responsive_ellipsis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data = tmp.path().join("data");
+        let cache = tmp.path().join("cache");
+        let t3_dir = home.join(
+            ".t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32/antigravity-acp",
+        );
+        let outside_dir = tmp.path().join(
+            "opt/providers/antigravity/instance_0123456789abcdef0123456789abcdef/antigravity-acp",
+        );
+        let cjk_dir = home.join("文档/外部工具/超长实例标识符测试目录/antigravity-acp");
+        let long_leaf_dir =
+            home.join("ext/very_long_single_leaf_directory_name_beyond_standard_budget");
+        for dir in [&t3_dir, &outside_dir, &cjk_dir, &long_leaf_dir] {
+            fs::create_dir_all(dir.join("conversations")).unwrap();
+        }
+        let paths = HeadlessPaths::with_explicit(home.clone(), data, cache);
+        let now = "2026-11-22T19:43:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::UTC);
+        let args = StatsArgs {
+            source: None,
+            target: None,
+            target_dir: None,
+            range: Some(CliStatsRange::All),
+            date: None,
+            from: None,
+            to: None,
+            recent: None,
+            watch: None,
+        };
+
+        // Sibling path sharing string prefix with `home` must NOT be shortened to `~/`.
+        let home_sibling = tmp.path().join("home2/antigravity-acp");
+        assert_eq!(
+            format_home_tilde_path(&home_sibling, &home),
+            home_sibling.display().to_string()
+        );
+        assert_eq!(
+            format_home_tilde_path(&t3_dir, &home),
+            "~/.t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32/antigravity-acp"
+        );
+
+        let named_ext = ExternalSlotTarget {
+            target_name: Some("t3".to_string()),
+            slot_dir: t3_dir.clone(),
+            slot_file: t3_dir.join("antigravity-oauth-token"),
+        };
+        let unnamed_ext = ExternalSlotTarget {
+            target_name: None,
+            slot_dir: t3_dir.clone(),
+            slot_file: t3_dir.join("antigravity-oauth-token"),
+        };
+
+        let mut summary_named =
+            collect_token_stats_for_external_target_with_now(&paths, &named_ext, &args, &now)
+                .unwrap();
+        summary_named.databases_scanned = 8;
+        summary_named.last_activity = Some(now.timestamp().as_second());
+
+        let mut list_named =
+            collect_token_stats_list_for_external_target_with_now(&paths, &named_ext, &args, &now)
+                .unwrap();
+        list_named.databases_scanned = 8;
+        list_named.last_activity = Some(now.timestamp().as_second());
+
+        // JSON target metadata always keeps the exact canonical absolute path.
+        assert_eq!(
+            summary_named.target.as_ref().unwrap().target_dir,
+            t3_dir.to_string_lossy()
+        );
+        assert_eq!(
+            list_named.target.as_ref().unwrap().target_dir,
+            t3_dir.to_string_lossy()
+        );
+
+        // Both `summary` and `list` render identical responsive `Source :` headers.
+        for (kind, rendered_fn) in [
+            (
+                "summary",
+                Box::new(|w: Option<usize>| summary_named.render_human_for_width(w))
+                    as Box<dyn Fn(Option<usize>) -> String>,
+            ),
+            (
+                "list",
+                Box::new(|w: Option<usize>| list_named.render_human_for_width(w)),
+            ),
+        ] {
+            let piped = rendered_fn(None);
+            let piped_hdr = piped.lines().next().unwrap();
+            assert_eq!(
+                piped_hdr,
+                "Source : t3 (~/.t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32/antigravity-acp) · 8 db(s) · latest 2026-11-22 19:43",
+                "{kind} piped header mismatch"
+            );
+
+            let w120 = rendered_fn(Some(120));
+            let h120 = w120.lines().next().unwrap();
+            assert_eq!(
+                h120,
+                "Source : t3 (~/.t3/userdata/providers/antigravity/…/antigravity-acp) · 8 db(s) · latest 2026-11-22 19:43",
+                "{kind} 120-col header mismatch"
+            );
+
+            let w100 = rendered_fn(Some(100));
+            let h100 = w100.lines().next().unwrap();
+            assert_eq!(
+                h100,
+                "Source : t3 (~/.t3/userdata/providers/…/antigravity-acp) · 8 db(s) · latest 2026-11-22 19:43",
+                "{kind} 100-col header mismatch"
+            );
+
+            let w80 = rendered_fn(Some(80));
+            let h80 = w80.lines().next().unwrap();
+            assert_eq!(
+                h80, "Source : t3 (~/.t3/…/antigravity-acp) · 8 db(s) · latest 2026-11-22 19:43",
+                "{kind} 80-col header mismatch"
+            );
+
+            let w60 = rendered_fn(Some(60));
+            let h60 = w60.lines().next().unwrap();
+            assert_eq!(
+                h60, "Source : t3 · 8 db(s) · latest 2026-11-22 19:43",
+                "{kind} 60-col compact fallback mismatch"
+            );
+
+            for cols in [180usize, 120, 100, 90, 80, 72, 68, 60, 48] {
+                let out = rendered_fn(Some(cols));
+                for line in out.lines() {
+                    assert!(
+                        UnicodeWidthStr::width(line) <= cols,
+                        "{kind} line exceeded {cols} cols ({} > {cols}): {line}",
+                        UnicodeWidthStr::width(line)
+                    );
+                }
+            }
+        }
+
+        // Direct `--target-dir` (no alias) preserves ellipsized path at 100/80 cols instead of collapsing to `external`.
+        let mut list_unnamed = collect_token_stats_list_for_external_target_with_now(
+            &paths,
+            &unnamed_ext,
+            &args,
+            &now,
+        )
+        .unwrap();
+        list_unnamed.databases_scanned = 8;
+        list_unnamed.last_activity = Some(now.timestamp().as_second());
+        let u100 = list_unnamed.render_human_for_width(Some(100));
+        assert_eq!(
+            u100.lines().next().unwrap(),
+            "Source : ~/.t3/userdata/providers/antigravity/…/antigravity-acp · 8 db(s) · latest 2026-11-22 19:43"
+        );
+        let u55 = list_unnamed.render_human_for_width(Some(55));
+        assert_eq!(
+            u55.lines().next().unwrap(),
+            "Source : external · 8 db(s) · latest 2026-11-22 19:43"
+        );
+
+        // Paths outside `$HOME`, CJK paths, and single over-long leaf names stay strictly width-bounded.
+        for (alias, dir, expected_prefix) in [
+            (Some("ext"), &outside_dir, "/"),
+            (Some("cjk"), &cjk_dir, "~/"),
+            (None, &long_leaf_dir, "~/"),
+        ] {
+            let ext = ExternalSlotTarget {
+                target_name: alias.map(str::to_string),
+                slot_dir: dir.clone(),
+                slot_file: dir.join("antigravity-oauth-token"),
+            };
+            let mut dto =
+                collect_token_stats_for_external_target_with_now(&paths, &ext, &args, &now)
+                    .unwrap();
+            dto.databases_scanned = 2;
+            dto.last_activity = Some(now.timestamp().as_second());
+            let piped = dto.render_human_for_width(None);
+            assert!(
+                piped.lines().next().unwrap().contains(expected_prefix),
+                "expected prefix `{expected_prefix}` in:\n{piped}"
+            );
+            for cols in [140usize, 100, 80, 70, 60, 48] {
+                let out = dto.render_human_for_width(Some(cols));
+                for line in out.lines() {
+                    assert!(
+                        UnicodeWidthStr::width(line) <= cols,
+                        "line exceeded {cols} cols ({} > {cols}): {line}",
+                        UnicodeWidthStr::width(line)
+                    );
+                }
+            }
         }
     }
 }

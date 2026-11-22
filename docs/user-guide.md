@@ -27,7 +27,7 @@
    - [4.9 SSH 交互式终端看板：`tui`（全键盘可视化操作）](#49-ssh-交互式终端看板tui全键盘可视化操作)
    - [4.10 本地 Token 用量统计与请求明细：`stats summary` / `stats list`](#410-本地-token-用量统计与请求明细stats-summary--stats-list)
 5. [标准退出码（`0..=8`）与 `--json` 脚本集成契约](#5-标准退出码08与---json-脚本集成契约)
-6. [可选配置文件（`config.json` 代理、后端、通知与自定义 OAuth 客户端）](#6-可选配置文件configjson-代理后端通知与自定义-oauth-客户端)
+6. [可选配置文件（`config.json` 代理、后端、通知、外部槽位别名与自定义 OAuth 客户端）](#6-可选配置文件configjson-代理后端通知外部槽位别名与自定义-oauth-客户端)
 7. [后台常驻运行指南（`systemd --user` 与无 `systemd` 的 Docker 容器环境）](#7-后台常驻运行指南systemd---user-与无-systemd-的-docker-容器环境)
 8. [常见问题解答（FAQ）](#8-常见问题解答faq)
 9. [完整卸载与本地遗留文件清理清单](#9-完整卸载与本地遗留文件清理清单)
@@ -55,7 +55,7 @@
 
 ```bash
 # 第 1 步：在终端直接下载对应架构的压缩包与 SHA-256 校验文件（需要代理时可先 export https_proxy=... 或给 curl 加 -x）
-VER=v1.2.5
+VER=v1.2.6
 ARCH="$(uname -m)"   # x86_64 或 aarch64
 curl -fLO "https://github.com/MatrixC7/agy-switch-cli/releases/download/${VER}/agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz"
 curl -fLO "https://github.com/MatrixC7/agy-switch-cli/releases/download/${VER}/agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz.sha256"
@@ -184,7 +184,7 @@ agy-switch-cli status --json   # 输出结构化 JSON 巡检报告
 
 标准输出示例：
 ```text
-agy-switch-cli status (v1.2.5)
+agy-switch-cli status (v1.2.6)
   Backend:           dual
   Store status:      OK
   Journal status:    Clean
@@ -290,7 +290,7 @@ agy-switch-cli auth clients
     - 开头的 `*` 表示当前未传 `--client` 时默认使用的客户端；
     - `antigravity_enterprise` 是客户端短名称（`key`），`Antigravity Enterprise` 是显示备注名；
     - `(builtin)` 表示程序内置客户端，`(custom)` 表示你在 `config.json` 或环境变量中自行注册的自定义客户端。
-  - **什么情况下才会用到它？** Google OAuth 2.0 有一条严格规则：**由哪个 `client_id` 签发的 `refresh_token`，后续刷新续期时就必须继续配对同一个 `client_id` 和 `client_secret`**。如果你手头有通过自建 Google Cloud 项目或其他第三方工具签发的 Token，在按第 `6.2` 节写入 `config.json` 后，就可以运行 `auth clients` 核对自定义客户端是否已成功加载、有没有字段缺失警告。
+  - **什么情况下才会用到它？** Google OAuth 2.0 有一条严格规则：**由哪个 `client_id` 签发的 `refresh_token`，后续刷新续期时就必须继续配对同一个 `client_id` 和 `client_secret`**。如果你手头有通过自建 Google Cloud 项目或其他第三方工具签发的 Token，在按第 `6.3` 节写入 `config.json` 后，就可以运行 `auth clients` 核对自定义客户端是否已成功加载、有没有字段缺失警告。
 
 ---
 
@@ -325,11 +325,15 @@ agy-switch-cli accounts list --order bob@example.com charlie@example.com alice@e
 **场景 A：当前设备已登录官方 `agy`（或桌面端与 `agy` 在系统钥匙串中共用条目），一键抓入账号库（`--from-local`）**
 ```bash
 agy-switch-cli accounts add --from-local --label "local"
+# 也可指定独立的外部目标应用数据目录（例如第三方 ACP 宿主隔离的 antigravity-acp 目录）：
+agy-switch-cli accounts add --from-local --target t3 --label "t3-local"
+agy-switch-cli accounts add --from-local --target-dir ~/.t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32/antigravity-acp --label "t3-local"
 ```
 - **按当前生效的 `--backend` 模式自动选择读取源**：
   - 在默认的 **`auto`**（桌面有钥匙串时）或 **`dual`** 模式下：程序优先读取系统钥匙串（`Password for 'antigravity' on 'gemini'`，若集合处于锁定状态会按标准接口请求解锁，而日常只读探测 `auto` / `current` / `status` 绝不触发解锁）；若钥匙串中尚无记录，则自动回退读取 `~/.gemini/antigravity-cli/antigravity-oauth-token`。
   - 在 **`file`** 模式（或无桌面服务器 / 容器环境）下：程序仅读取 `~/.gemini/antigravity-cli/antigravity-oauth-token`。
   - 在 **`keyring`** 模式下：程序仅读取系统钥匙串，不会回退读取磁盘上的 `antigravity-oauth-token`。
+  - 当附加 **`--target <NAME>`** 或 **`--target-dir <DIR>`** 时：程序严格按纯文件只读方式从该外部目录下的 `antigravity-oauth-token` 提取 `refresh_token`，不解析官方钥匙串后端、不触碰系统钥匙串或官方 `~/.gemini/antigravity-cli`（若同时显式传入 `--backend keyring` 则返回用法错误退出码 `2`）；若磁盘上存在未解决的官方 `switch_journal.json`，程序仅做只读检测并保留现场返回退出码 `7`（`pending_official_journal`），要求先用官方入口恢复，绝不在外部导入中自动重放官方切号事务。
   - **支持范围边界**：`--from-local` 严格面向 `agy` CLI 生效凭据源设计，不会读取桌面端 App / VS Code 扩展专用的回退文件 `~/.gemini/jetski-standalone-oauth-token`。若桌面系统未启用钥匙串、且仅存在 `jetski-standalone-oauth-token` 而未登录过 `agy` CLI，请改用 `agy-switch-cli auth login` 登录。
 - 读取到 `refresh_token` 后，程序会先在本地预检并准备 `0700/0600` 私有暂存目录与单调授权序号，随后联网核验令牌有效性、拉取对应的真实邮箱并安全落盘（若该邮箱已在库中则自动刷新更新，不会重复建号）。
 
@@ -470,6 +474,42 @@ agy-switch-cli switch bob@example.com --allow-running   # 在 /proc 不可读（
     - **默认用法（`auto` 自动启用 `dual` 事务性双写）**：直接运行 `agy-switch-cli switch bob@example.com`（无需手传额外参数），程序自动对系统钥匙串集合与本地 `antigravity-oauth-token` 执行前置快照、加密更新、双 `fsync` 落盘与双副本一致性回读校验（任一步失败自动双端回滚；若遇到传输中断等不确定状态则保留切换日志并返回退出码 `7`，后续交互式写命令会在安全 CAS 保护下尝试对账，并在安全核实状态与耐久性检查通过后清理日志，详见 [4.1 节 `status`](#41-环境状态只读巡检status) 的 `Journal status` 恢复指引）。切完后在任意终端直接输入 `agy` 立即使用新账号。
     - **仅用钥匙串不留本地文件（`--backend keyring`）**：执行 `agy-switch-cli --backend keyring switch bob@example.com`（或在 `config.json` 中设 `"backend": "keyring"`），程序仅读写系统钥匙串，完全不创建或修改 `~/.gemini/antigravity-cli/antigravity-oauth-token`。
     - **桌面与 CLI 账号隔离（显式 `--backend file` + `run`）**：若希望桌面端 App 保持原钥匙串账号、仅让终端里的 `agy` 换用另一个账号，可执行 `agy-switch-cli --backend file switch bob@example.com` 只改本地文件，再通过可选方式 `agy-switch-cli --backend file run -- agy` 启动（显式选择 `file` 后端时，`run` 会自动为子进程屏蔽桌面钥匙串总线）。
+
+#### （3）管理外部目标目录（`--target` / `--target-dir`，如第三方 ACP 宿主隔离凭据与用量统计）
+
+某些通过 `agy acp --gemini-dir <隔离目录> --app-data-dir <目录名>` 启动本地 `agy` 的第三方工具（例如 `t3code`）会将 Google OAuth 凭据（`antigravity-oauth-token`）与会话数据库（`conversations/*.db`）独立保存在自己的应用数据目录中（格式与官方 `agy` 一致）。为在不耦合任何第三方工具路径的前提下独立管理这些外部目录，以下六个命令统一支持互斥选项 **`--target <NAME>`**（引用 `config.json` 中的 `targets` 别名，详见第 `6.2` 节）与 **`--target-dir <DIR>`**（显式传入目标应用数据目录路径）：
+
+```bash
+# 1. 查看外部目录当前挂接的账号身份、到期时间与绑定在该目录的运行中 agy 进程（纯只读）：
+agy-switch-cli current --target t3
+agy-switch-cli current --target-dir ~/.t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32/antigravity-acp
+
+# 2. 独立切换外部目录凭据（不修改官方 ~/.gemini/antigravity-cli、系统钥匙串、index.json 与 daemon 选中态）：
+agy-switch-cli switch bob@example.com --target t3 --dry-run
+agy-switch-cli switch bob@example.com --target t3 --require-idle
+agy-switch-cli switch bob@example.com --target t3 --allow-running
+
+# 3. 查看或联网刷新外部目录账号的双窗口配额（支持池内账号与未入池的纯游离凭据）：
+agy-switch-cli quota --target t3                # 池内账号直接读取本地缓存（零网络）；未入池游离文件提示加 --refresh
+agy-switch-cli quota --refresh --target t3      # 联网刷新并展示配额（如令牌续期或轮换，经 L1 锁与 CAS 同步回写该文件）
+agy-switch-cli refresh --target t3              # 刷新令牌与配额并按需 CAS 回写该文件（未入池游离文件不改动本地 accounts/）
+
+# 4. 将外部目录中已登录的账号反向导入本工具账号池：
+agy-switch-cli accounts add --from-local --target t3 --label "t3-account"
+
+# 5. 纯只读零写入统计外部目录中 conversations/*.db 的 Token 用量与 TTFT/TPS（支持 --watch 实时看板）：
+agy-switch-cli stats summary --target t3 --range today
+agy-switch-cli stats list --target t3 --recent 20
+agy-switch-cli stats summary --target t3 --watch
+```
+
+- **完全隔离与安全护栏**：
+  - **纯文件模式**：所有外部凭据操作均严格仅读写 `<target-dir>/antigravity-oauth-token`，绝不触碰系统 Secret Service 钥匙串，也不受 `config.json` 中为官方 `agy` 配置的 `backend: "dual"` 或 `"keyring"` 影响（仅当同次命令行显式传入 `--backend keyring` 时报用法冲突返回退出码 `2`）。
+  - **严格防误操作**：要求目标目录已真实存在（绝不自动 `mkdir -p`），全程使用 `O_NOFOLLOW` 拒绝软链接穿越，拒绝将文件路径（含末尾带 `/antigravity-oauth-token`）传给 `--target-dir`，拒绝与官方 `~/.gemini/antigravity-cli`、`~/.gemini/antigravity` 及本工具自身 `data_dir` / `cache_dir` 碰撞，并在网络刷新前后执行 SHA-256 CAS 比对防止覆盖并发写入。
+  - **槽位级精准进程检测**：针对外部目录时，程序仅通过 `/proc/<pid>/cmdline` 解析同 UID `agy` 进程的 `--gemini-dir` 与 `--app-data-dir`（不读取 `/proc/<pid>/environ`），只对真正绑定在该目标目录的运行中 `agy` 进程发出提醒或响应 `--require-idle`，不会被无关的原生终端 `agy` 会话误拦。
+  - **运行中 `agy acp` 的生效边界**：与原生 `agy` 相同，已常驻运行中的 `agy acp` 进程会将启动时加载的令牌缓存在内存中，切号后仅对新启动的会话进程生效，且旧常驻进程到期自动续期时可能回写覆盖该凭据文件。
+  - **不跨界修改整体状态**：`status`、`daemon`、`tui` 与 `run` 继续专注服务官方 `agy` 槽位，`stats` 默认 `--source all|cli|app` 亦仅统计官方目录（与 `--target` / `--target-dir` 互斥），外部目标不会与官方状态相互污染。
+  - **离线身份识别口径（`current` 零网络）**：外部槽位仅以 `refresh_token` SHA-256 指纹与本地账号池精确匹配；对于尚未经本工具切写或导入的游离文件，纯离线只读解析会兼容提取 `id_token` JWT 或新版官方 `agy` 写入的 `id_token_email` 与 `user_tier` 提示（若邮箱与池内账号相同但 `refresh_token` 不同，会同时展示池内邮箱与 ID 提示差异而非冒认池内身份），完整套餐配额与支持模型清单在切号/入池后离线可见，或通过 `quota --refresh` 直接联网查看。
 
 ---
 
@@ -766,14 +806,16 @@ agy-switch-cli tui
 
 #### 共享参数详解（`stats summary` 与 `stats list` 通用）
 
-- **数据源选择：`--source <all|cli|app>`（默认值为 `all`）**
+- **数据源选择：`--source <all|cli|app>`（默认值为 `all`）或外部目标目录 `--target <NAME>` / `--target-dir <DIR>`**
   - `all`（默认）：
-    - 合并扫描当前 `HOME` 内支持的两个数据源（`~/.gemini/antigravity-cli/conversations/*.db` 与 `~/.gemini/antigravity/conversations/*.db` 及其 `token_usage_archive.db`），自动按同一会话文件与生成序号去重。
+    - 合并扫描当前 `HOME` 内支持的两个官方数据源（`~/.gemini/antigravity-cli/conversations/*.db` 与 `~/.gemini/antigravity/conversations/*.db` 及其 `token_usage_archive.db`），自动按同一会话文件与生成序号去重。
     - 在无桌面的远程 Linux 服务器或容器上，由于不存在 `~/.gemini/antigravity`，默认 `all` 会自动等效读取 `cli`；在同时装有 CLI 与桌面端 App 的机器上，默认直接展示完整结果，无需额外传参。
   - `cli`：仅只读扫描当前 `HOME` 下官方 `agy` CLI 的会话目录 `~/.gemini/antigravity-cli/conversations/*.db`。
   - `app`：
     - 仅只读扫描当前 `HOME` 下桌面端 Antigravity App 的会话目录 `~/.gemini/antigravity/conversations/*.db` 及 `token_usage_archive.db`。
     - 若原实时 `.db` 仍存在于磁盘，程序会从实时库补充提取步骤状态、流式响应延迟与吐字速度；若原实时 `.db` 已被清理而仅存于 `token_usage_archive.db`，`stats list` 会将该行状态标为 `arch`（`--json` 中为 `"archived"`）。
+  - `--target <NAME>` / `--target-dir <DIR>`（与 `--source` 互斥）：
+    - 复用同一套零写入只读 VFS（`"agy_pinned_ro"`）与 `--watch` 文件元数据指纹机制，仅扫描指定外部应用数据目录下的 `conversations/*.db`（及可选 `token_usage_archive.db`）；人类输出顶部 `Source` 行会将位于当前 `$HOME` 下的目录路径缩写为 `~/` 并在终端较窄时按路径段自动中间省略（极窄窗口下，具名 `--target` 退回纯别名，无别名的 `--target-dir` 退回 `external`）；`--json` 输出中 `source` 标为 `"external"` 并附加完整规范绝对路径的 `target` 元数据；同样拒绝符号链接穿越与官方目录/仓内目录双向重叠碰撞。
 - **四组互斥的时间/条数窗口参数**
   - **按最近调用条数截取：`--recent <N>`（`1 <= N <= 500`，仅限完整长选项，无 `-n` 短参数）**
     - 在 `stats list` 中：不传任何窗口参数时，默认即为 `--recent 10`（展示最近 10 次模型调用）。
@@ -881,10 +923,10 @@ Requests (newest first, showing 5)
   - `St`：请求状态简码，实时库映射为 `ok`（已完成 `status=3`）、`clr`（已压缩/清理出活跃上下文的历史步骤 `status=5`，JSON 为 `cleared`）、`err`（报错或无效 `status=4/7`，或 `gen_metadata` 含非空白错误字符串/解码失败）、`canc`（已取消 `status=6`，JSON 为 `canceled`）、`intr`（已中断 `status=12`，JSON 为 `interrupted`）、`run`（进行中或排队中）、`unk`（缺失或未识别的状态值），仅存于历史归档库且原实时 `.db` 已移除的记录显示为 `arch`。
 - **上限截断说明**：按日期区间（`--range` / `--date` / `--from`）查询 `stats list` 时，最多输出最新的 `500` 条记录；若匹配总数超过 `500` 条，表头会自动注明 `(newest first, showing 500 of <总数> — capped at 500)`。
 - **`stats summary --json` 与 `stats list --json` 机器输出说明（`schema_version: 1`）**：
-  - **共享顶层字段**：`source`、`range`（当使用 `--recent` 时为 `{"kind": "recent", "recent": N, "from": ..., "to": ...}`）、`databases_scanned`、`generations_scanned`、`skipped_large_records`、`unreadable_databases`、`last_activity`、`range_last_activity` 与 `generated_at`。
+  - **共享顶层字段**：`source`（官方模式为 `"all"` / `"cli"` / `"app"`，外部目录模式为 `"external"`）、可选 `target`（仅在显式传入 `--target` / `--target-dir` 时出现，包含 `{"name": "<别名或null>", "target_dir": "<规范绝对路径>"}`）、`range`（当使用 `--recent` 时为 `{"kind": "recent", "recent": N, "from": ..., "to": ...}`）、`databases_scanned`、`generations_scanned`、`skipped_large_records`、`unreadable_databases`、`last_activity`、`range_last_activity` 与 `generated_at`。
   - **`stats summary --json` 专属字段**：输出 `summary`、`performance` 与 `models` 数组（每项含 `model`、`request_count`、`total_input_tokens`、`uncached_input_tokens`、`cached_input_tokens`、`cache_hit_ratio`、`cache_hit_percent`、`output_tokens`、`total_tokens`）。
   - **`stats list --json` 专属字段**：输出 `total_matching`、`shown_count`、`truncated` 与 `items` 数组（每项含 `timestamp`、`local_time`、`model`、`uncached_input_tokens`、`cached_input_tokens`、`total_input_tokens`、`cache_hit_ratio`、`cache_hit_percent`、`output_tokens`、`total_tokens`、`ttft_seconds`、`duration_seconds`、`output_tps`、`status`）。
-  - **隐私与模型名过滤约束**：结构中不导出 `source_key`、本机路径或账号邮箱；模型名经已知公共模型家族与受限语法过滤，仅保留符合公共模型命名规范的标签，其余统一回退为 `"Unknown"`。
+  - **隐私与模型名过滤约束**：在默认官方模式（`--source all|cli|app`）下，结构中不导出 `source_key`、本机路径或账号邮箱；显式使用外部 `--target` / `--target-dir` 时，JSON 顶层 `target.target_dir` 及外部目录初始化/I/O 错误诊断会包含所指定的外部绝对路径，对外分享前请先脱敏。模型名经已知公共模型家族与受限语法过滤，仅保留符合公共模型命名规范的标签，其余统一回退为 `"Unknown"`。
 
 ---
 
@@ -935,14 +977,15 @@ Requests (newest first, showing 5)
 
 ---
 
-## 6. 可选配置文件（`config.json` 代理、后端、通知与自定义 OAuth 客户端）
+## 6. 可选配置文件（`config.json` 代理、后端、通知、外部槽位别名与自定义 OAuth 客户端）
 
-`~/.local/share/agy-switch-cli/config.json` 是**完全可选**的配置文件。默认情况下该文件不存在，所有功能均可直接使用（程序已内置与官方 `agy` 一致的默认 OAuth 客户端 `antigravity_enterprise`）。只有当你遇到以下四类需求时，才需要手动创建它：
+`~/.local/share/agy-switch-cli/config.json` 是**完全可选**的配置文件。默认情况下该文件不存在，所有功能均可直接使用（程序已内置与官方 `agy` 一致的默认 OAuth 客户端 `antigravity_enterprise`）。只有当你遇到以下五类需求时，才需要手动创建它：
 
 - **固定网络代理**：在 Linux 环境下，图形界面的“系统代理”设置并不会自动注入命令行终端或后台 `daemon` 服务的环境变量中。如果你不想每次在命令行手敲 `--proxy`，也不想每次新开终端都手动执行 `export https_proxy=...`，可以将代理地址写入 `config.json` 实现跨终端与后台守护进程的永久生效（此外，若终端环境变量中的代理格式异常而被忽略，人类输出模式会在联网时打印仅含变量名的脱敏提示）。
 - **固定凭据后端模式**：希望跨所有终端与后台服务统一固定使用 `keyring`（纯钥匙串零本地文件）、`file`（纯本地文件）或 `dual`（强制双写），而非每次手动传 `--backend`。
 - **控制桌面切号通知**：在 Linux 图形桌面上开关 `daemon` 的原生桌面通知推送（`notifications.enabled`），以及设置切号通知默认常驻屏幕或按桌面默认超时自动消失（`notifications.persistent`）。
-- **自定义 OAuth 客户端（进阶场景）**：你手头拥有由其他 Google Cloud OAuth 客户端签发的 `refresh_token`，或者希望使用自建 OAuth 客户端进行登录（详见下方 `6.2` 节零基础完整拆解）。
+- **配置外部目标目录别名（`targets`）**：为第三方工具（如 `t3code` 等通过 `agy acp --gemini-dir` 隔离凭据与会话数据库的宿主）冗长的应用数据目录路径定义简短别名，配合 `--target <NAME>` 在 `switch`、`current`、`quota`、`refresh`、`accounts add --from-local` 与 `stats summary/list` 中统一复用（详见下方 `6.2` 节）。
+- **自定义 OAuth 客户端（进阶场景）**：你手头拥有由其他 Google Cloud OAuth 客户端签发的 `refresh_token`，或者希望使用自建 OAuth 客户端进行登录（详见下方 `6.3` 节零基础完整拆解）。
 
 > **文件权限要求**：由于 `config.json` 中可能包含带密码的代理地址或 `client_secret` 密钥，创建时请将文件权限设为仅当前用户可读写的 `0600`（若权限过宽如 `0644`，`status` 与联网命令会输出安全提示，执行 `chmod 600 ~/.local/share/agy-switch-cli/config.json` 即可收紧权限）：
 > ```bash
@@ -974,7 +1017,24 @@ Requests (newest first, showing 5)
 - **`notifications.enabled`**（可选，省略时默认为 `true`）：控制 `daemon` 是否发送 Linux 桌面通知（`org.freedesktop.Notifications`）。无头服务器或无活跃桌面通知服务时会自动静默跳过；若希望在图形桌面上彻底关闭推送，可设为 `false`。生效优先级为：`命令行 --no-notify > AGY_SWITCH_CLI_NOTIFY 环境变量 > config.json > 默认开启`。
 - **`notifications.persistent`**（可选，省略时默认为 `true`）：控制 `Account Switched` 切号成功通知（普通级别 `urgency=1`）的停留方式。设为 `true`（默认）时以 `expire_timeout=0` 常驻屏幕直至手动关闭，避免错过切号提醒；设为 `false` 时改为 `expire_timeout=-1`，交由桌面通知服务按默认数秒自动消失。`Auto-Switch Paused` 熔断暂停警告（严重级别 `urgency=2`）始终以 `expire_timeout=0` 常驻显示。
 
-### 6.2 场景二：零基础读懂并注册自定义 OAuth 客户端（完整字段详解）
+### 6.2 场景二：配置外部目标目录别名（`targets`）
+
+当你需要通过 `--target <NAME>` 独立操作某个外部应用数据目录（例如 `t3code` 默认实例下的 `antigravity-acp` 目录，其中同时包含 `antigravity-oauth-token` 与 `conversations/*.db`，路径中的 `ac0a3dfd...` 为固定字符串 `"antigravity"` 的 SHA-256 哈希）时，可在 `config.json` 中添加可选的 `targets` 映射：
+
+```json
+{
+  "schema_version": 1,
+  "targets": {
+    "t3": "~/.t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32/antigravity-acp"
+  }
+}
+```
+
+- **别名键名规则**：长度为 `1..=64` 个 ASCII 字符，须以字母或数字开头，其余仅允许字母、数字、`-`、`_`、`.`，且不可使用保留名 `default`。
+- **路径值规则**：必须为绝对路径（`/` 开头）或家目录相对路径（`~/` 开头，按当前已解析的 `HOME` 展开），指向应用数据目录本身（不要在末尾附加 `/antigravity-oauth-token`）；不允许指向官方 `~/.gemini/antigravity-cli`、`~/.gemini/antigravity` 或本工具自身的 `data_dir` / `cache_dir`。
+- 配置完成后即可在 `switch`、`current`、`quota`、`refresh`、`accounts add --from-local` 以及 `stats summary/list [--watch]` 中直接使用 `--target t3`，无需每次输入完整路径。
+
+### 6.3 场景三：零基础读懂并注册自定义 OAuth 客户端（完整字段详解）
 
 #### 先搞懂背景原理：什么是 OAuth 客户端？为什么会有“令牌绑定规则”？
 

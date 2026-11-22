@@ -4,6 +4,7 @@ use crate::error::{CliError, CliResult, ExitCode};
 use crate::oauth::refresh::{ensure_account_token_fresh_locked, OAuthEndpoints};
 use crate::oauth::registry::OAuthClientRegistry;
 use crate::session::backend::{CredentialBackend, ReplicaCasExpectation, SlotInspectState};
+use crate::session::external_slot::{ExternalSlotTarget, ExternalSlotTargetDto};
 use crate::session::journal::{
     clear_journal, diagnose_journal_replicas, diagnose_journal_replicas_with_intent,
     journal_on_disk_may_need_keyring, keyring_collection_ids_match, read_journal_full_readonly,
@@ -14,7 +15,7 @@ use crate::session::journal::{
     ClearSlotTargetMeta, JournalDiagnosis, JournalPhase, JournalReplicaRecord, SwitchJournal,
 };
 use crate::session::payload::{bytes_sha256_hex, serialize_session_payload};
-use crate::session::process::observe_runtime_state;
+use crate::session::process::{observe_runtime_state, observe_slot_runtime_state};
 use crate::store::fs_atomic::{check_fault_injection, cleanup_owned_orphan_temp_files_pinned};
 use crate::store::locks::ActiveSlotLock;
 use crate::store::repository::StoreRepository;
@@ -52,6 +53,23 @@ impl RunningGuardMode {
 pub struct SwitchOutcome {
     pub dry_run: bool,
     pub previous_selected_id: Option<String>,
+    pub target_account_id: String,
+    pub target_email: String,
+    pub token_refreshed: bool,
+    pub refresh_token_rotated: bool,
+    pub runtime_warning: Option<String>,
+    pub validation_blocked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalSwitchOutcome {
+    pub dry_run: bool,
+    pub target: ExternalSlotTargetDto,
+    pub previous_slot_account_id: Option<String>,
+    pub previous_slot_email: Option<String>,
+    pub previous_slot_state: &'static str,
     pub target_account_id: String,
     pub target_email: String,
     pub token_refreshed: bool,
@@ -755,6 +773,258 @@ fn check_running_guard(
             }
         }
     }
+}
+
+fn check_external_running_guard(
+    runtime: &RuntimeState,
+    guard_mode: RunningGuardMode,
+    slot_dir: &std::path::Path,
+) -> CliResult<Option<String>> {
+    match runtime {
+        RuntimeState::Idle => Ok(None),
+        RuntimeState::ManagedRunning { pids, .. } | RuntimeState::UnmanagedRunning { pids, .. } => {
+            if matches!(
+                guard_mode,
+                RunningGuardMode::AllowVerifiedRunning
+                    | RunningGuardMode::ForceAllowRunningAndUnverified
+            ) {
+                Ok(Some(format!(
+                    "Warning: detected running `agy` process(es) {:?} bound to target slot '{}'. Existing sessions keep their in-memory credentials until restarted or a new session starts, and automatic token refresh in an old process may overwrite the credential file.",
+                    pids,
+                    slot_dir.display()
+                )))
+            } else {
+                Err(CliError::env_not_ready(
+                    "active_agy_running",
+                    format!(
+                        "Detected running `agy` process(es) {:?} bound to target slot '{}' while `--require-idle` is active. Wait for them to exit or omit `--require-idle` to write credentials for newly opened sessions.",
+                        pids,
+                        slot_dir.display()
+                    ),
+                ))
+            }
+        }
+        RuntimeState::Unverified { detail } => {
+            if guard_mode == RunningGuardMode::ForceAllowRunningAndUnverified {
+                Ok(Some(format!(
+                    "Warning: target slot process state unverified ({detail})."
+                )))
+            } else {
+                Err(CliError::env_not_ready(
+                    "runtime_state_unverified",
+                    format!("Cannot verify whether `agy` is currently bound to target slot '{}' ({detail}). Pass `--allow-running` to override.", slot_dir.display()),
+                ))
+            }
+        }
+    }
+}
+
+fn summarize_previous_external_slot(
+    slot_state: &SlotInspectState,
+    snapshot: &crate::store::repository::StoreSnapshot,
+) -> (Option<String>, Option<String>, &'static str) {
+    match slot_state {
+        SlotInspectState::Present(parsed) => {
+            if let Some(acc) = snapshot
+                .accounts
+                .iter()
+                .find(|a| a.token.refresh_token_fingerprint() == parsed.refresh_token_digest)
+            {
+                (
+                    Some(acc.id.clone()),
+                    Some(acc.email.clone()),
+                    "matched_pool",
+                )
+            } else {
+                (None, parsed.email_hint.clone(), "external")
+            }
+        }
+        SlotInspectState::AbsentInInitializedDir => (None, None, "absent"),
+        SlotInspectState::Uninitialized => (None, None, "uninitialized"),
+        SlotInspectState::Corrupt(_) => (None, None, "corrupt"),
+        SlotInspectState::Unverified(_) => (None, None, "unverified"),
+    }
+}
+
+/// Strictly read-only, zero-network dry-run preview for switching an external pure-file slot.
+#[allow(clippy::too_many_arguments)]
+pub fn preview_external_switch_dry_run(
+    repo: &StoreRepository,
+    external_slot: &ExternalSlotTarget,
+    registry: &OAuthClientRegistry,
+    selector: &str,
+    allow_running: bool,
+    require_idle: bool,
+    now_unix: i64,
+) -> CliResult<ExternalSwitchOutcome> {
+    let paths = repo.paths();
+    let guard_mode = RunningGuardMode::from_flags(allow_running, require_idle);
+
+    let snapshot = repo.read_snapshot()?;
+    let target = snapshot.select(selector)?;
+    validate_target_usable(target, now_unix, true)?;
+    let missing_scopes = registry.missing_required_scopes(&target.token);
+    if !missing_scopes.is_empty() {
+        return Err(CliError::auth(
+            "scope_reauth_required",
+            format!(
+                "Account '{}' ({}) lacks required OAuth scope(s) ({}). Token refresh cannot upgrade scopes (RFC 6749 §6); run `agy-switch-cli auth reauthorize {}`.",
+                target.id,
+                target.email,
+                missing_scopes.join(", "),
+                target.id
+            ),
+        ));
+    }
+
+    let slot_state = external_slot.inspect_slot(paths);
+    match &slot_state {
+        SlotInspectState::Uninitialized => {
+            return Err(CliError::env_not_ready(
+                "slot_dir_uninitialized",
+                format!(
+                    "External slot directory '{}' does not exist. Initialize the target tool's profile directory before switching.",
+                    external_slot.slot_dir.display()
+                ),
+            ));
+        }
+        SlotInspectState::Corrupt(detail) => {
+            return Err(CliError::data(format!(
+                "External credential slot '{}' is corrupt: {detail}",
+                external_slot.slot_file.display()
+            )));
+        }
+        SlotInspectState::Unverified(detail) => {
+            return Err(CliError::io(
+                "slot_unverified",
+                format!(
+                    "Cannot verify external credential slot '{}': {detail}",
+                    external_slot.slot_file.display()
+                ),
+            ));
+        }
+        SlotInspectState::AbsentInInitializedDir | SlotInspectState::Present(_) => {}
+    }
+
+    let runtime = observe_slot_runtime_state(paths, &external_slot.slot_dir);
+    let runtime_warning =
+        check_external_running_guard(&runtime, guard_mode, &external_slot.slot_dir)?;
+    let (prev_id, prev_email, prev_state) =
+        summarize_previous_external_slot(&slot_state, &snapshot);
+    let validation_blocked = target.is_validation_blocked_at(now_unix);
+    let validation_warning =
+        validation_blocked.then(|| format_validation_blocked_warning(&target.id));
+
+    Ok(ExternalSwitchOutcome {
+        dry_run: true,
+        target: external_slot.dto(),
+        previous_slot_account_id: prev_id,
+        previous_slot_email: prev_email,
+        previous_slot_state: prev_state,
+        target_account_id: target.id.clone(),
+        target_email: target.email.clone(),
+        token_refreshed: false,
+        refresh_token_rotated: false,
+        runtime_warning,
+        validation_blocked,
+        validation_warning,
+    })
+}
+
+/// Switch a decoupled external pure-file `antigravity-oauth-token` slot under path-scoped
+/// `L1 (ExternalSlotLock) -> L2 (AccountRefreshLock) -> L3 (StoreWriteLock)` with CAS verification.
+/// Never touches the official `~/.gemini/antigravity-cli` slot, system Keyring,
+/// `index.json::selected_account_id`, or `switch_journal.json`.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_external_switch(
+    repo: &StoreRepository,
+    external_slot: &ExternalSlotTarget,
+    transport: &dyn HttpTransport,
+    oauth_endpoints: &OAuthEndpoints,
+    registry: &OAuthClientRegistry,
+    user_agent: &str,
+    selector: &str,
+    options: &SwitchOptions,
+    require_idle: bool,
+    now_unix: i64,
+) -> CliResult<ExternalSwitchOutcome> {
+    if options.dry_run {
+        return preview_external_switch_dry_run(
+            repo,
+            external_slot,
+            registry,
+            selector,
+            options.allow_running,
+            require_idle,
+            now_unix,
+        );
+    }
+
+    let paths = repo.paths();
+    let clock = AnchoredClock::new(now_unix);
+    let guard_mode = RunningGuardMode::from_flags(options.allow_running, require_idle);
+
+    // 0. Verify target directory is already initialized BEFORE creating or acquiring any lock file
+    external_slot.ensure_slot_dir_initialized(paths)?;
+
+    // 1. Acquire path-scoped L1 lock for this external file BEFORE touching L2/L3
+    let _slot_lock =
+        ActiveSlotLock::try_acquire_for_slot_file(paths, external_slot.lock_file(paths))?;
+
+    let snapshot = repo.read_snapshot()?;
+    let target_initial = snapshot.select(selector)?.clone();
+    validate_target_usable(&target_initial, clock.now_unix(), true)?;
+
+    // 2. Verify external slot directory & capture pre-write CAS digest
+    let pre_bytes = external_slot.snapshot_valid_before_write(paths)?;
+    let pre_digest = pre_bytes.as_deref().map(bytes_sha256_hex);
+    let pre_slot_state = external_slot.inspect_slot(paths);
+    let (prev_id, prev_email, prev_state) =
+        summarize_previous_external_slot(&pre_slot_state, &snapshot);
+
+    // 3. Slot-scoped process guard (checks only same-UID `agy` processes bound to `slot_dir`)
+    let runtime = observe_slot_runtime_state(paths, &external_slot.slot_dir);
+    let runtime_warning =
+        check_external_running_guard(&runtime, guard_mode, &external_slot.slot_dir)?;
+
+    // 4. Refresh target pool account token under L2 -> L3 (any rotated refresh_token persists immediately)
+    let refresh_outcome = ensure_account_token_fresh_locked(
+        repo,
+        transport,
+        oauth_endpoints,
+        registry,
+        user_agent,
+        &target_initial.id,
+        false,
+        clock.now_unix(),
+    )
+    .await?;
+
+    let latest_target = refresh_outcome.account;
+    let payload = serialize_session_payload(&latest_target.token)?;
+
+    // 5. Atomic 0600 write with pre-commit CAS check (aborts if modified externally during refresh)
+    external_slot.write_slot_cas(paths, &payload, pre_digest.as_deref())?;
+
+    let commit_now = clock.now_unix();
+    let validation_blocked = latest_target.is_validation_blocked_at(commit_now);
+    let validation_warning =
+        validation_blocked.then(|| format_validation_blocked_warning(&latest_target.id));
+
+    Ok(ExternalSwitchOutcome {
+        dry_run: false,
+        target: external_slot.dto(),
+        previous_slot_account_id: prev_id,
+        previous_slot_email: prev_email,
+        previous_slot_state: prev_state,
+        target_account_id: latest_target.id,
+        target_email: latest_target.email,
+        token_refreshed: refresh_outcome.refreshed_over_network,
+        refresh_token_rotated: refresh_outcome.refresh_token_rotated,
+        runtime_warning,
+        validation_blocked,
+        validation_warning,
+    })
 }
 
 /// Shared transactional account deletion service used by both `agy-switch-cli accounts delete`

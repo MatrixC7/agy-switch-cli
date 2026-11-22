@@ -46,7 +46,7 @@ pub enum Commands {
     Accounts(AccountsCommand),
 
     /// Inspect current selected account, active `agy` slot sync, live runtime state, and supported models
-    Current,
+    Current(CurrentArgs),
 
     /// Switch active `agy` credential slot to the selected account (applies to new `agy` invocations)
     Switch(SwitchArgs),
@@ -192,7 +192,7 @@ pub struct AccountsListArgs {
 
 #[derive(Debug, Args)]
 pub struct AccountsAddArgs {
-    /// Import the currently signed-in local Antigravity account (from desktop keyring or `~/.gemini/antigravity-cli/antigravity-oauth-token`)
+    /// Import the currently signed-in local Antigravity account (from desktop keyring or `~/.gemini/antigravity-cli/antigravity-oauth-token`, or an external `--target` / `--target-dir`)
     #[arg(long, conflicts_with_all = ["from_stdin", "from_file"])]
     pub from_local: bool,
 
@@ -203,6 +203,24 @@ pub struct AccountsAddArgs {
     /// Read one or more refresh tokens (one per line; `# label` comments supported) from a `0600` regular file
     #[arg(long, value_name = "PATH", conflicts_with_all = ["from_stdin", "from_local"])]
     pub from_file: Option<PathBuf>,
+
+    /// Named external target directory from `config.json` (`targets.<NAME>`) for `--from-local`
+    #[arg(
+        long,
+        value_name = "NAME",
+        requires = "from_local",
+        conflicts_with = "target_dir"
+    )]
+    pub target: Option<String>,
+
+    /// Explicit external target application data directory (containing `antigravity-oauth-token`) for `--from-local`
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires = "from_local",
+        conflicts_with = "target"
+    )]
+    pub target_dir: Option<PathBuf>,
 
     /// Optional default custom label
     #[arg(long, value_name = "TEXT")]
@@ -261,11 +279,30 @@ pub struct AccountsDeleteArgs {
     pub force: bool,
 }
 
+#[derive(Debug, Default, Args)]
+pub struct CurrentArgs {
+    /// Inspect a named external target directory from `config.json` (`targets.<NAME>`)
+    #[arg(long, value_name = "NAME", conflicts_with = "target_dir")]
+    pub target: Option<String>,
+
+    /// Inspect an explicit external target application data directory (containing `antigravity-oauth-token`)
+    #[arg(long, value_name = "DIR", conflicts_with = "target")]
+    pub target_dir: Option<PathBuf>,
+}
+
 #[derive(Debug, Args)]
 pub struct SwitchArgs {
     /// Account ID or case-insensitive Email
     #[arg(value_name = "ID|EMAIL")]
     pub selector: String,
+
+    /// Switch a named external target directory from `config.json` (`targets.<NAME>`) instead of the official `agy` slot
+    #[arg(long, value_name = "NAME", conflicts_with = "target_dir")]
+    pub target: Option<String>,
+
+    /// Switch an explicit external target application data directory (containing `antigravity-oauth-token`) instead of the official `agy` slot
+    #[arg(long, value_name = "DIR", conflicts_with = "target")]
+    pub target_dir: Option<PathBuf>,
 
     /// Validate preconditions without modifying any files or making network calls
     #[arg(long)]
@@ -293,12 +330,20 @@ pub struct RunArgs {
 
 #[derive(Debug, Args)]
 pub struct QuotaArgs {
-    #[arg(value_name = "ID|EMAIL", conflicts_with = "all")]
+    #[arg(value_name = "ID|EMAIL", conflicts_with_all = ["all", "target", "target_dir"])]
     pub selector: Option<String>,
 
     /// Show quotas for all saved accounts
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["selector", "target", "target_dir"])]
     pub all: bool,
+
+    /// Inspect quota for the account in a named external target directory from `config.json` (`targets.<NAME>`)
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["target_dir", "selector", "all"])]
+    pub target: Option<String>,
+
+    /// Inspect quota for the account in an explicit external target application data directory
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["target", "selector", "all"])]
+    pub target_dir: Option<PathBuf>,
 
     /// Refresh CloudCode quota over the network first before displaying the quota table
     #[arg(long)]
@@ -311,12 +356,20 @@ pub struct QuotaArgs {
 
 #[derive(Debug, Args)]
 pub struct RefreshArgs {
-    #[arg(value_name = "ID|EMAIL", conflicts_with = "all")]
+    #[arg(value_name = "ID|EMAIL", conflicts_with_all = ["all", "target", "target_dir"])]
     pub selector: Option<String>,
 
     /// Refresh all enabled accounts
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["selector", "target", "target_dir"])]
     pub all: bool,
+
+    /// Refresh the account in a named external target directory from `config.json` (`targets.<NAME>`)
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["target_dir", "selector", "all"])]
+    pub target: Option<String>,
+
+    /// Refresh the account in an explicit external target application data directory
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["target", "selector", "all"])]
+    pub target_dir: Option<PathBuf>,
 
     /// Bounded concurrency for multi-account refresh (`1..=5`, default `2`)
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=5))]
@@ -518,10 +571,26 @@ pub struct StatsWindowArgs {
     #[arg(
         long,
         value_enum,
-        default_value_t = CliStatsSource::All,
-        value_name = "SOURCE"
+        value_name = "SOURCE",
+        conflicts_with_all = ["target", "target_dir"]
     )]
-    pub source: CliStatsSource,
+    pub source: Option<CliStatsSource>,
+
+    /// Named external target directory from `config.json` (`targets.<NAME>`) to scan `conversations/*.db`
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with_all = ["target_dir", "source"]
+    )]
+    pub target: Option<String>,
+
+    /// Explicit external target application data directory (containing `conversations/*.db`)
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["target", "source"]
+    )]
+    pub target_dir: Option<PathBuf>,
 
     /// Preset local-date range (`today`, `yesterday`, `all`, or `<N>d` such as `1d`, `3d`, `7d`, `30d`)
     #[arg(
@@ -575,6 +644,12 @@ pub struct StatsWindowArgs {
         value_parser = clap::value_parser!(u64).range(1..=MAX_STATS_WATCH_INTERVAL_SECS)
     )]
     pub watch: Option<u64>,
+}
+
+impl StatsWindowArgs {
+    pub fn effective_source(&self) -> CliStatsSource {
+        self.source.unwrap_or(CliStatsSource::All)
+    }
 }
 
 pub type StatsArgs = StatsWindowArgs;

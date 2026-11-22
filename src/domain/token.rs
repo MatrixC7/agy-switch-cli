@@ -88,9 +88,35 @@ pub fn parse_scope_string(raw: Option<&str>) -> Option<Vec<String>> {
     }
 }
 
-/// Extract an unverified `email` claim hint from an OIDC `id_token` JWT solely for `DriftedExternal` display.
+pub(crate) const MAX_EMAIL_HINT_BYTES: usize = 320;
+
+/// Shared email-hint sanitization applied identically to OIDC `id_token` JWT `email` claims
+/// and compact `id_token_email` session fields.
+/// Checks raw byte length and control characters BEFORE whitespace trimming so trailing `\n`/`\r`/`\t`
+/// are rejected rather than silently stripped.
+pub(crate) fn sanitize_email_hint(raw: &str) -> Option<String> {
+    if raw.len() > MAX_EMAIL_HINT_BYTES || raw.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || !trimmed.contains('@') {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+/// Extract an unverified `email` claim hint from an OIDC `id_token` JWT solely for display hints.
 pub fn extract_email_hint_from_jwt(id_token: &str) -> Option<String> {
-    let mut parts = id_token.trim().split('.');
+    if id_token.len() > crate::cli::secret_input::MAX_SECRET_BYTES
+        || id_token.chars().any(|c| c.is_control())
+    {
+        return None;
+    }
+    let trimmed = id_token.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = trimmed.split('.');
     let _header = parts.next()?;
     let payload_b64 = parts.next()?;
     let _sig = parts.next()?;
@@ -103,9 +129,7 @@ pub fn extract_email_hint_from_jwt(id_token: &str) -> Option<String> {
     let val: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
     val.get("email")
         .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
+        .and_then(sanitize_email_hint)
 }
 
 #[cfg(test)]

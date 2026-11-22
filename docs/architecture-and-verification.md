@@ -72,8 +72,8 @@ flowchart TD
 | `store/locks.rs` | 基于 POSIX `flock` + 线程级顺序守卫的四级单向锁实现（`L1`、`PendingAuthLock`、`L2`、`L3`）与 `DaemonInstanceLock` |
 | `store/fs_atomic.rs` | 全深度祖先符号链接拦截、`O_NOFOLLOW \| O_NONBLOCK` 有界普通文件读取、临时文件与父目录双 `fsync` 原子写入及仅在测试/调试构建启用的故障注入钩子（Release 构建编译为空操作） |
 | `store/repository.rs` / `transfer.rs` | 账号库事务读写、单调授权序号 `auth_sequence.json`、两级轮换指纹谱系归档、备份包导入导出与旧桌面端只读迁移 |
-| `session/backend.rs` / `payload.rs` | 官方凭据 JSON 序列化校验、`auto` 自适应探测、`file` 纯文件后端、`dual` 钥匙串+文件事务性双写后端、`keyring` 纯钥匙串零磁盘写入后端，以及 `--from-local` 本机已登录凭据提取器 |
-| `session/journal.rs` / `process.rs` | 三阶段崩溃恢复日志 `switch_journal.json` 内置写前自愈 CAS 对账机、`/proc` 故障关闭进程扫描与双因子（`pid + starttime`）进程租约 |
+| `session/backend.rs` / `external_slot.rs` / `payload.rs` | 官方凭据 JSON 序列化校验、`auto` 自适应探测、`file` 纯文件后端、`dual` 钥匙串+文件事务性双写后端、`keyring` 纯钥匙串零磁盘写入后端、`--from-local` 本机凭据提取器，以及支持 `--target` / `--target-dir` 的解耦外部目标目录解析、碰撞拦截、CAS 写回与游离令牌（含 `id_token_email` / `user_tier`）解析器 |
+| `session/journal.rs` / `process.rs` | 三阶段崩溃恢复日志 `switch_journal.json` 内置写前自愈 CAS 对账机、`/proc` 故障关闭进程扫描、面向外部槽位的 `/proc/<pid>/cmdline` 目录级精准进程匹配（不读取 `/proc/<pid>/environ`）与双因子（`pid + starttime`）进程租约 |
 | `transport/client.rs` / `proxy.rs` / `user_agent.rs` | 基于 `reqwest` + `rustls` 的 HTTP 传输抽象、系统代理环境变量自动规范化与异常项容错隔离（支持 `socks5h`/`socks`、裸 `host:port` 与精确 `url::Host` 本地回环直连分流）、`antigravity/hub/<ver>` 请求标识管理与隔离沙盒下的本机官方 `agy` 版本探测 |
 | `oauth/registry.rs` / `flow.rs` / `refresh.rs` | 内置与自定义 OAuth 客户端注册表、PKCE（`S256`）授权流、全入口 `/token` 签发后立即 `0600` 落盘与并发防回退续期闭环 |
 | `quota/client.rs` / `fusion.rs` | 单环境隔离的 CloudCode 三步配额拉取（`Daily -> Sandbox -> Production`）、401 单次强刷重试与双窗口配额融合 |
@@ -147,7 +147,7 @@ flowchart TD
 `agy-switch-cli stats summary` 与 `stats list`（受默认特性 `stats` 控制，静态内嵌 `rusqlite` `bundled` SQLite3 源码）提供完全离线、源目录零写入副作用的本地 Token 聚合统计与最近调用明细查询：
 
 - **可信目录句柄绑定与自定义零写入 VFS（`"agy_pinned_ro"`）**：
-  - 拒绝相对 `HOME` 输入，所有数据库路径严格基于规范化绝对路径 `HeadlessPaths.home_dir` 自顶向下通过链式 `openat` 绑定真实目录句柄（`~/.gemini/antigravity-cli/conversations/*.db`、`~/.gemini/antigravity/conversations/*.db` 与 `token_usage_archive.db`），确保自动化沙盒测试与宿主机真实会话目录完全物理隔离，且错误消息采用固定路径类别而不回显本机绝对路径。
+  - 拒绝相对 `HOME` 输入，默认官方模式的所有数据库路径严格基于规范化绝对路径 `HeadlessPaths.home_dir` 自顶向下通过链式 `openat` 绑定真实目录句柄（`~/.gemini/antigravity-cli/conversations/*.db`、`~/.gemini/antigravity/conversations/*.db` 与 `token_usage_archive.db`），确保自动化沙盒测试与宿主机真实会话目录完全物理隔离，且默认官方模式的错误消息采用固定路径类别、JSON 亦不导出本机绝对路径；显式外部 `--target` / `--target-dir` 模式则在校验无软链接与无保留目录重叠后仅打开该外部目录句柄（其 JSON `target.target_dir` 与外部初始化诊断可能提及所指定的外部路径，对外分享前须先脱敏）。
   - 通过注册自定义只读 VFS `"agy_pinned_ro"`，将已通过 `openat(O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)` 核验普通文件身份的主库描述符直接交付给 SQLite，并使 `-wal`、`-shm`、`-journal` 的每次存在性检查、打开与只读共享内存映射（`PROT_READ`）全部约束在同一 `dir_fd` 下执行，同时关闭 URI 解释并将临时存储强制置于受界进程内存（`PRAGMA temp_store = MEMORY`）。
   - 面对已正常关闭且目录中无伴生文件的 WAL 模式数据库（以及不支持 Linux OFD 锁的降级环境），VFS 提供零字节虚拟只读 WAL 与堆内存 WAL 索引（`SQLITE_READONLY_CANTINIT`），仅凭真实 Linux OFD 共享锁（`F_OFD_SETLK`）同时持有 DMS 与 `WAL_READ_LOCK` 才进入可靠 mmap 分支；在无 OFD 或无 `-shm` 锁定的读事务提交统计前，始终重验主库与伴生文件的目录项、`(dev, ino, size, mtime, ctime)` 元数据以及主库、`-wal` 与 `-journal` 的有限文件头（不比较 `-shm` 内容；若扫描中途有新写者挂载则自动退避重试），确保在普通回滚库、关闭态 WAL 库、崩溃残留 WAL 库与并发活跃写入/检查点 WAL 库上均实现 **100% 源目录零文件创建、零字节修改与单一快照一致性**。
 - **锁步流式关联、索引归档点查、有界最小堆（`O(500)`）与异常无索引预算保护**：
@@ -197,6 +197,7 @@ flowchart LR
   - 无人值守后台 `daemon` 保留日志并进入持久故障暂停（`paused_on_failure`，单轮 `--once` 以固定原因码汇报并退出 `0`）；
   - 交互式写命令（`switch`、`policy set`、`accounts` 等）在满足同后端或超集后端且通过逐集合 CAS 保护与隐藏集合校验的前提下尝试同步修复双端副本（手动 `switch` 同时基于钉扎目录 FD 清理本工具已过期的残留临时文件并解除 `daemon` 暂停标记，若这两项辅助操作失败均明确报错而不伪装为已恢复）。
 - 若 `switch_journal.json` 内容损坏、schema 版本不符或副本元数据不完整/矛盾（含文件副本记录 `file.prev_uniform = false`），程序一律保留现场绝不在单后端下擅自清除（`status` 与交互式写命令返回退出码 `7`，后台 `daemon` 进入 `paused_on_failure` 并以固定 `corrupted_switch_journal` 或 `incomplete_switch_recovery` 原因码汇报）。
+- **解耦外部目标目录（`--target` / `--target-dir`）隔离设计**：对通过 `config.json` `targets` 或 `--target-dir` 指定的外部应用数据目录（内含 `antigravity-oauth-token` 与可选 `conversations/*.db`），凭据类命令严格运行在纯文件模式（不受 `config.json` 中 `dual` / `keyring` 与裁剪特性档影响，不触碰系统 Keyring、官方 `~/.gemini/antigravity-cli`、`index.json::selected_account_id` 与 `switch_journal.json`；当磁盘存在未决官方 `switch_journal.json` 时，`accounts add --from-local --target/--target-dir` 仅做只读检测并保留现场退出 `7`，绝不在外部导入中自动重放官方事务），按路径组件对官方目录、`data_dir` 与 `cache_dir` 实施双向重叠拦截，先验证目录已存在再获取按目标路径原始字节哈希派生的独立 `L1` 槽位锁 `locks/slot-<sha256>.lock`（仍严格遵守 `L1 -> L2 -> L3` 锁序）并执行写前 SHA-256 CAS 校验；对池内匹配与未入池游离外部文件执行 `quota --refresh` 或 `refresh` 时，无论首次刷新还是 `401` 二次强刷，一旦 OAuth `/token` 签发或轮换了新令牌并完成池内耐久写（或游离内存换发），均在发起后续 CloudCode 探测前立即经 `L1` + CAS 原子回写该外部文件（游离文件保留原有经校验的 `auth_method`、`id_token_email` 与 `user_tier` 且零污染 `accounts/`），确保远端失败不丢轮换令牌且冲突时不覆盖第三方写入；`stats summary/list [--watch]` 亦复用同一目录与零写入 `"agy_pinned_ro"` VFS 独立扫描外部会话数据库，不与官方 `--source all|cli|app` 混算。
 - 若崩溃后用户在外部登录了第三个新账号，写前对账机不会盲目用旧快照覆盖用户刚在外部登录的新凭据，而是自动保护该外部凭据或遇到双外部冲突时保留现场返回退出码 `7`。
 
 ### 4.3 零丢码暂存、授权世代（`auth_seq`）与两级防回退谱系
@@ -249,7 +250,7 @@ Google OAuth 刷新令牌在轮换或重新授权时，一旦服务端 `/token` 
   - 自定义 `clap` 错误格式化器直接借用入口已构建的 `Command` 静态元数据派生已注册的子命令词、选项旗标、枚举值与占位符白名单（错误路径不再重建命令树或额外读取环境变量），任何未知参数、未注册选项或 `--flag=secret` 内联值一律固定替换为 `[REDACTED]`；所有含环境变量绑定的参数均启用 `hide_env_values = true`，防止 `--help` 把当前环境变量中的值打印到终端。
   - JSON 反序列化错误仅提取行号、列号与分类描述，D-Bus 未分类异常映射为固定错误类别，避免直接透传外部错误正文。
 - **DTO 字段白名单与动态文本归一化**：
-  - 所有对外展示与 `--json` 序列化均通过独立的只读视图结构体（`AccountViewDto`、`QuotaViewDto`、`SelectedAccountBriefDto`、`StatsViewDto`、`StatsListViewDto`）转换，结构体字段层面不包含 `access_token`、`refresh_token`、`id_token`、`client_secret` 或本机文件路径；对于源自本地数据库的 `StatsViewDto.models[].model` 与 `StatsListViewDto.items[].model`，仅放行严格匹配已知公共模型 ID 或公开家族标签语法的值，其余任何本地自然语言文本、无扩展名文件名、路径、邮箱、URL 或凭据前缀均统一回退为 `"Unknown"`。
+  - 所有对外展示与 `--json` 序列化均通过独立的只读视图结构体（`AccountViewDto`、`QuotaViewDto`、`SelectedAccountBriefDto`、`StatsViewDto`、`StatsListViewDto`）转换，结构体字段层面绝不包含 `access_token`、`refresh_token`、`id_token` 或 `client_secret`；在默认官方模式下亦不包含本机文件路径（当显式使用外部 `--target` / `--target-dir` 时，`StatsViewDto` / `StatsListViewDto` 会将 `source` 设为 `"external"` 并在顶层附加显式请求的 `target` 元数据，对外分享外部目标输出或外部初始化错误诊断前应先脱敏）。对于源自本地数据库的 `StatsViewDto.models[].model` 与 `StatsListViewDto.items[].model`，仅放行严格匹配已知公共模型 ID 或公开家族标签语法的值，其余任何本地自然语言文本、无扩展名文件名、路径、邮箱、URL 或凭据前缀均统一回退为 `"Unknown"`。
 - **终端 `ECHO` 与备用屏幕信号级恢复**：
   - 无回显密码输入（`secret_input.rs`）与交互式看板（`tui/mod.rs`）同时部署了 Rust RAII `Drop` 守卫与异步信号安全的 POSIX `sigaction` 处理器（覆盖 `SIGINT`、`SIGTERM`、`SIGHUP`、`SIGQUIT`）。即使进程在等待输入或全屏看板期间收到外部终止信号，也会先恢复原始 `termios` 回显属性并退出备用屏幕，不会把用户的 SSH 终端留在盲打乱码状态。
 

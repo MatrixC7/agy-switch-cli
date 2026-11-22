@@ -451,6 +451,81 @@ pub async fn exchange_authorization_code(
     })
 }
 
+pub struct StandaloneRefreshOutcome {
+    pub token: TokenRecord,
+    pub refresh_token_rotated: bool,
+}
+
+/// Refresh an unpooled / standalone `refresh_token` directly via the specified OAuth client
+/// without modifying the local account store (`accounts/` or `index.json`).
+pub async fn refresh_standalone_refresh_token(
+    transport: &dyn HttpTransport,
+    endpoints: &OAuthEndpoints,
+    client: &OAuthClientConfig,
+    user_agent: &str,
+    refresh_token: &str,
+    previous_id_token: Option<&str>,
+    now_unix: i64,
+) -> CliResult<StandaloneRefreshOutcome> {
+    let clock = AnchoredClock::new(now_unix);
+    let form = vec![
+        ("client_id".into(), client.client_id.clone()),
+        ("client_secret".into(), client.client_secret.clone()),
+        ("refresh_token".into(), refresh_token.to_string()),
+        ("grant_type".into(), "refresh_token".into()),
+    ];
+    let raw = execute_token_form_with_backoff(transport, endpoints, user_agent, client, form)
+        .await
+        .map_err(StructuredOAuthError::into_cli_error)?;
+    let post_now = clock.now_unix();
+    let access_token = raw.access_token.trim().to_string();
+    if access_token.is_empty() {
+        return Err(CliError::auth(
+            "oauth_protocol_error",
+            "OAuth token refresh response returned an empty `access_token`.",
+        ));
+    }
+    let rotated_rt = raw
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let refresh_token_rotated = rotated_rt
+        .as_deref()
+        .is_some_and(|next| next != refresh_token);
+    let effective_rt = rotated_rt.unwrap_or_else(|| refresh_token.to_string());
+    let expires_in = raw.expires_in.max(60);
+    let expiry_timestamp = post_now.saturating_add(expires_in).max(1);
+    let id_token = raw
+        .id_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| previous_id_token.map(str::to_owned));
+
+    Ok(StandaloneRefreshOutcome {
+        token: TokenRecord {
+            access_token,
+            refresh_token: effective_rt,
+            expires_in,
+            expiry_timestamp,
+            token_type: if raw.token_type.trim().is_empty() {
+                "Bearer".into()
+            } else {
+                raw.token_type
+            },
+            id_token,
+            oauth_client_key: Some(client.key.clone()),
+            granted_scopes: parse_scope_string(raw.scope.as_deref()),
+            project_id: None,
+            is_gcp_tos: true,
+        },
+        refresh_token_rotated,
+    })
+}
+
 pub async fn fetch_userinfo(
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
@@ -1621,6 +1696,39 @@ pub async fn ensure_account_token_fresh_locked(
     force_refresh: bool,
     now_unix: i64,
 ) -> CliResult<RefreshOutcome> {
+    ensure_account_token_fresh_locked_with_hook(
+        repo,
+        transport,
+        endpoints,
+        registry,
+        user_agent,
+        account_id,
+        force_refresh,
+        now_unix,
+        |_| Ok(()),
+    )
+    .await
+}
+
+/// Same as `ensure_account_token_fresh_locked`, invoking `on_token_persisted` immediately after
+/// durable pool token persistence under L3 (`merge_refreshed_token`) and BEFORE any subsequent
+/// scope rejection or optional `userinfo` call so decoupled external slots always receive newly
+/// rotated tokens even when a post-rotation check returns an early error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn ensure_account_token_fresh_locked_with_hook<F>(
+    repo: &StoreRepository,
+    transport: &dyn HttpTransport,
+    endpoints: &OAuthEndpoints,
+    registry: &OAuthClientRegistry,
+    user_agent: &str,
+    account_id: &str,
+    force_refresh: bool,
+    now_unix: i64,
+    mut on_token_persisted: F,
+) -> CliResult<RefreshOutcome>
+where
+    F: FnMut(&AccountRecord) -> CliResult<()>,
+{
     let clock = AnchoredClock::new(now_unix);
     with_account_refresh_lock(repo.paths(), account_id, Duration::from_secs(20), || async {
         // Re-read latest account snapshot AFTER acquiring L2 lock!
@@ -1757,6 +1865,10 @@ pub async fn ensure_account_token_fresh_locked(
         let mut updated_acc = repo
             .with_write_lock(|tx| tx.merge_refreshed_token(account_id, new_token, None, post_now))
             .map_err(|e| wrap_unpersisted_token_exchange_error(e, refresh_token_rotated))?;
+
+        // Notify optional external-slot CAS sync hook IMMEDIATELY after durable pool write and
+        // BEFORE any subsequent scope check or optional `userinfo` request can exit early.
+        on_token_persisted(&updated_acc)?;
 
         // Check known `granted_scopes` AFTER rotated `refresh_token` is safely persisted on disk!
         let missing = registry.missing_required_scopes(&updated_acc.token);

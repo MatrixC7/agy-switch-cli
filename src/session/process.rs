@@ -1,6 +1,6 @@
 use crate::domain::account::{RuntimeState, STORE_SCHEMA_VERSION};
 use crate::error::{CliError, CliResult};
-use crate::paths::HeadlessPaths;
+use crate::paths::{normalize_components, HeadlessPaths};
 use crate::store::fs_atomic::{
     ensure_no_symlink_components_under, ensure_private_dir, read_regular_file_opt_bounded,
     write_atomic_durable,
@@ -8,10 +8,12 @@ use crate::store::fs_atomic::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const MAX_LEASE_BYTES: usize = 64 * 1024;
+const MAX_CMDLINE_BYTES: usize = 256 * 1024;
 
 /// Two-factor managed process lease (`<data_dir>/state/leases/<pid>.json`) per Blueprint §7.1.
 /// Binds both `pid` and `/proc/<pid>/stat` field 22 `starttime` (`proc_starttime_ticks`)
@@ -498,6 +500,377 @@ pub fn observe_runtime_state(paths: &HeadlessPaths) -> RuntimeState {
     RuntimeState::Idle
 }
 
+fn read_proc_cmdline_bounded(entry_dir: &Path, pid: u32) -> Result<Option<Vec<u8>>, String> {
+    let cmdline_path = entry_dir.join("cmdline");
+    let file = match fs::File::open(&cmdline_path) {
+        Ok(f) => f,
+        Err(e) if is_proc_vanished_io(&e) => {
+            if !entry_dir.exists() {
+                return Ok(None);
+            }
+            return Err(format!(
+                "Cannot read '{}' for live process {pid}: {e}",
+                cmdline_path.display()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "Cannot read '{}' for process {pid}: {e}",
+                cmdline_path.display()
+            ));
+        }
+    };
+    let mut buf = Vec::new();
+    file.take((MAX_CMDLINE_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| {
+            format!(
+                "Failed reading '{}' for process {pid}: {e}",
+                cmdline_path.display()
+            )
+        })?;
+    if buf.len() > MAX_CMDLINE_BYTES {
+        return Err(format!(
+            "Command line '{}' for process {pid} exceeds {MAX_CMDLINE_BYTES} bytes.",
+            cmdline_path.display()
+        ));
+    }
+    Ok(Some(buf))
+}
+
+const GEMINI_DIR_FLAGS: [&str; 4] = ["--gemini-dir", "--gemini_dir", "-gemini-dir", "-gemini_dir"];
+const APP_DATA_DIR_FLAGS: [&str; 4] = [
+    "--app-data-dir",
+    "--app_data_dir",
+    "-app-data-dir",
+    "-app_data_dir",
+];
+
+fn is_known_slot_dir_flag(arg: &str) -> bool {
+    GEMINI_DIR_FLAGS
+        .iter()
+        .chain(APP_DATA_DIR_FLAGS.iter())
+        .any(|flag| arg == *flag || arg.starts_with(&format!("{flag}=")))
+}
+
+enum AgyFlagMatch<'a> {
+    NotMatched,
+    Value { value: &'a str, consumed_next: bool },
+    MissingOrEmpty,
+}
+
+fn parse_agy_flag_value<'a>(
+    arg: &'a str,
+    next: Option<&'a str>,
+    names: &[&str],
+) -> AgyFlagMatch<'a> {
+    for flag in names {
+        if arg == *flag {
+            return match next {
+                Some(v) if !v.trim().is_empty() && v != "--" && !is_known_slot_dir_flag(v) => {
+                    AgyFlagMatch::Value {
+                        value: v,
+                        consumed_next: true,
+                    }
+                }
+                _ => AgyFlagMatch::MissingOrEmpty,
+            };
+        }
+        if let Some(rest) = arg.strip_prefix(flag) {
+            if let Some(val) = rest.strip_prefix('=') {
+                return if !val.trim().is_empty() {
+                    AgyFlagMatch::Value {
+                        value: val,
+                        consumed_next: false,
+                    }
+                } else {
+                    AgyFlagMatch::MissingOrEmpty
+                };
+            }
+        }
+    }
+    AgyFlagMatch::NotMatched
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParsedCmdlineSlotDir {
+    /// Process omitted both `--gemini-dir` and `--app-data-dir`, using the official default slot.
+    OfficialDefault(PathBuf),
+    /// Process supplied explicit directory flag(s) that resolved deterministically.
+    Explicit(PathBuf),
+    /// Command line is empty, has incomplete/empty directory flag(s), or uses a relative
+    /// `--gemini-dir` whose `/proc/<pid>/cwd` could not be verified -> fail closed (`Unverified`).
+    Indeterminate(&'static str),
+}
+
+/// Resolve the effective credential slot directory (`<gemini-dir>/<app-data-dir>`) of an `agy`
+/// process from its NUL-delimited `/proc/<pid>/cmdline` bytes (NEVER reads `/proc/<pid>/environ`).
+pub(crate) fn parse_agy_cmdline_slot_dir(
+    cmdline_bytes: &[u8],
+    home_dir: &Path,
+    proc_cwd: Option<&Path>,
+) -> ParsedCmdlineSlotDir {
+    let args: Vec<String> = cmdline_bytes
+        .split(|&b| b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect();
+    if args.is_empty() {
+        return ParsedCmdlineSlotDir::Indeterminate("empty command line");
+    }
+
+    let mut gemini_dir_arg: Option<String> = None;
+    let mut app_data_dir_arg: Option<String> = None;
+
+    let mut idx = 1usize;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        if arg == "--" {
+            break;
+        }
+        let next = args.get(idx + 1).map(String::as_str);
+        match parse_agy_flag_value(arg, next, &GEMINI_DIR_FLAGS) {
+            AgyFlagMatch::Value {
+                value,
+                consumed_next,
+            } => {
+                gemini_dir_arg = Some(value.to_string());
+                idx += if consumed_next { 2 } else { 1 };
+                continue;
+            }
+            AgyFlagMatch::MissingOrEmpty => {
+                return ParsedCmdlineSlotDir::Indeterminate("incomplete or empty `--gemini-dir`");
+            }
+            AgyFlagMatch::NotMatched => {}
+        }
+        match parse_agy_flag_value(arg, next, &APP_DATA_DIR_FLAGS) {
+            AgyFlagMatch::Value {
+                value,
+                consumed_next,
+            } => {
+                app_data_dir_arg = Some(value.to_string());
+                idx += if consumed_next { 2 } else { 1 };
+                continue;
+            }
+            AgyFlagMatch::MissingOrEmpty => {
+                return ParsedCmdlineSlotDir::Indeterminate("incomplete or empty `--app-data-dir`");
+            }
+            AgyFlagMatch::NotMatched => {}
+        }
+        idx += 1;
+    }
+
+    if gemini_dir_arg.is_none() && app_data_dir_arg.is_none() {
+        return ParsedCmdlineSlotDir::OfficialDefault(normalize_components(
+            &home_dir.join(".gemini").join("antigravity-cli"),
+        ));
+    }
+
+    let gemini_dir = match gemini_dir_arg {
+        Some(raw) => {
+            let p = PathBuf::from(&raw);
+            if p.is_absolute() {
+                normalize_components(&p)
+            } else if let Some(cwd) = proc_cwd.filter(|c| c.is_absolute()) {
+                normalize_components(&cwd.join(p))
+            } else {
+                return ParsedCmdlineSlotDir::Indeterminate(
+                    "relative `--gemini-dir` without verified `/proc/<pid>/cwd`",
+                );
+            }
+        }
+        None => normalize_components(&home_dir.join(".gemini")),
+    };
+
+    let slot_dir = match app_data_dir_arg {
+        Some(raw) => {
+            let p = PathBuf::from(raw);
+            if p.is_absolute() {
+                normalize_components(&p)
+            } else {
+                normalize_components(&gemini_dir.join(p))
+            }
+        }
+        None => normalize_components(&gemini_dir.join("antigravity-cli")),
+    };
+
+    ParsedCmdlineSlotDir::Explicit(slot_dir)
+}
+
+/// Fail-closed read-only runtime process observation scoped strictly to a specific external
+/// credential slot directory (`<gemini-dir>/<app-data-dir>`).
+/// Inspects only same-UID `agy` processes' `/proc/<pid>/cmdline` (never `/proc/<pid>/environ`)
+/// so native `agy` sessions bound to `~/.gemini/antigravity-cli` do not trigger false positives.
+pub fn observe_slot_runtime_state(paths: &HeadlessPaths, target_slot_dir: &Path) -> RuntimeState {
+    let proc_dir = proc_root();
+    match fs::metadata(&proc_dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return RuntimeState::Unverified {
+                detail: format!("Process table '{}' is not a directory.", proc_dir.display()),
+            };
+        }
+        Err(e) => {
+            return RuntimeState::Unverified {
+                detail: format!("Process table '{}' is unavailable: {e}", proc_dir.display()),
+            };
+        }
+    }
+
+    let proc_entries = match fs::read_dir(&proc_dir) {
+        Ok(it) => it,
+        Err(e) => {
+            return RuntimeState::Unverified {
+                detail: format!(
+                    "Cannot enumerate process table '{}' ({e}).",
+                    proc_dir.display()
+                ),
+            };
+        }
+    };
+
+    let canonical_target =
+        fs::canonicalize(target_slot_dir).unwrap_or_else(|_| normalize_components(target_slot_dir));
+    let own_pid = std::process::id();
+    let current_uid = unsafe { libc::geteuid() };
+    let explicit_agy_bin = std::env::var_os("AGY_SWITCH_CLI_AGY_BIN")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let canonical_agy_bin = explicit_agy_bin
+        .as_ref()
+        .and_then(|p| fs::canonicalize(p).ok().or_else(|| Some(p.clone())));
+    let target_bin_basename = canonical_agy_bin
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("agy");
+
+    let mut matched_pids: BTreeSet<u32> = BTreeSet::new();
+
+    for entry_res in proc_entries {
+        let entry = match entry_res {
+            Ok(e) => e,
+            Err(e) => {
+                return RuntimeState::Unverified {
+                    detail: format!("Process table iteration failed: {e}"),
+                };
+            }
+        };
+        let Some(name_str) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = name_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+
+        let pid_dir = proc_dir.join(&name_str);
+        let pid_meta = match fs::metadata(&pid_dir) {
+            Ok(m) => m,
+            Err(e) if is_proc_vanished_io(&e) => continue,
+            Err(e) => {
+                return RuntimeState::Unverified {
+                    detail: format!("Cannot stat process directory '{}': {e}", pid_dir.display()),
+                };
+            }
+        };
+        if pid_meta.uid() != current_uid {
+            continue;
+        }
+
+        let info = match inspect_proc_pid_strict(&proc_dir, pid) {
+            StrictProcOutcome::Alive(i) => i,
+            StrictProcOutcome::VanishedOrZombie => continue,
+            StrictProcOutcome::Unverified(detail) => {
+                return RuntimeState::Unverified { detail };
+            }
+        };
+
+        let matches_agy = if let Some(ref target_bin) = canonical_agy_bin {
+            if let Some(ref exe_p) = info.exe_path {
+                let clean_exe = exe_p
+                    .to_str()
+                    .and_then(|s| s.strip_suffix(" (deleted)"))
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| exe_p.clone());
+                let norm = fs::canonicalize(&clean_exe).unwrap_or(clean_exe);
+                &norm == target_bin
+            } else if info.exe_basename.as_deref().is_some_and(|b| {
+                b == "agy"
+                    || b == target_bin_basename
+                    || (b.len() >= 15 && target_bin_basename.starts_with(b))
+            }) {
+                return RuntimeState::Unverified {
+                    detail: format!(
+                        "Cannot verify executable symlink for same-UID candidate process {pid}."
+                    ),
+                };
+            } else {
+                false
+            }
+        } else {
+            match info.exe_basename.as_deref() {
+                Some(base) => base == "agy",
+                None => {
+                    return RuntimeState::Unverified {
+                        detail: format!(
+                            "Cannot verify executable basename for same-UID process {pid}."
+                        ),
+                    };
+                }
+            }
+        };
+
+        if !matches_agy {
+            continue;
+        }
+
+        let cmdline_bytes = match read_proc_cmdline_bounded(&pid_dir, pid) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(detail) => return RuntimeState::Unverified { detail },
+        };
+        if cmdline_bytes.is_empty() {
+            return RuntimeState::Unverified {
+                detail: format!(
+                    "Empty command line for running `agy` process {pid}; cannot verify bound credential slot."
+                ),
+            };
+        }
+        let proc_cwd = fs::read_link(pid_dir.join("cwd")).ok();
+        let proc_slot_dir = match parse_agy_cmdline_slot_dir(
+            &cmdline_bytes,
+            &paths.home_dir,
+            proc_cwd.as_deref(),
+        ) {
+            ParsedCmdlineSlotDir::OfficialDefault(dir) | ParsedCmdlineSlotDir::Explicit(dir) => dir,
+            ParsedCmdlineSlotDir::Indeterminate(reason) => {
+                return RuntimeState::Unverified {
+                    detail: format!(
+                        "Cannot verify bound credential slot for running `agy` process {pid}: {reason}."
+                    ),
+                };
+            }
+        };
+        let canonical_proc_slot = fs::canonicalize(&proc_slot_dir)
+            .unwrap_or_else(|_| normalize_components(&proc_slot_dir));
+        if canonical_proc_slot == canonical_target {
+            matched_pids.insert(pid);
+        }
+    }
+
+    if !matched_pids.is_empty() {
+        return RuntimeState::UnmanagedRunning {
+            pids: matched_pids.into_iter().collect(),
+            managed_account_ids: Vec::new(),
+        };
+    }
+
+    RuntimeState::Idle
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,5 +933,98 @@ mod tests {
         };
         assert!(is_lease_alive(&fake_proc, &live_lease));
         assert!(lease_file.exists());
+    }
+
+    #[test]
+    fn parses_agy_cmdline_slot_dir_across_flag_variants_and_double_dash_barrier() {
+        let home = Path::new("/home/alice");
+
+        // Default `agy` (no flags) -> OfficialDefault(~/.gemini/antigravity-cli)
+        assert_eq!(
+            parse_agy_cmdline_slot_dir(b"/usr/bin/agy\0", home, None),
+            ParsedCmdlineSlotDir::OfficialDefault(PathBuf::from(
+                "/home/alice/.gemini/antigravity-cli"
+            ))
+        );
+
+        // `agy acp --gemini-dir <abs> --app-data-dir antigravity-acp`
+        assert_eq!(
+            parse_agy_cmdline_slot_dir(
+                b"/usr/bin/agy\0acp\0--gemini-dir\0/home/alice/.t3/userdata/providers/antigravity/hash1\0--app-data-dir\0antigravity-acp\0",
+                home,
+                None,
+            ),
+            ParsedCmdlineSlotDir::Explicit(PathBuf::from(
+                "/home/alice/.t3/userdata/providers/antigravity/hash1/antigravity-acp"
+            ))
+        );
+
+        // `=` and underscore single-dash forms
+        assert_eq!(
+            parse_agy_cmdline_slot_dir(
+                b"/usr/bin/agy\0acp\0--gemini_dir=/var/lib/harness/p1\0-app_data_dir=custom-acp\0",
+                home,
+                None,
+            ),
+            ParsedCmdlineSlotDir::Explicit(PathBuf::from("/var/lib/harness/p1/custom-acp"))
+        );
+
+        // Relative `--gemini-dir` WITH verified absolute `cwd` resolves deterministically;
+        // WITHOUT verified absolute `cwd` MUST fail closed (`Indeterminate`), never guess `HOME`!
+        assert_eq!(
+            parse_agy_cmdline_slot_dir(
+                b"/usr/bin/agy\0acp\0--gemini-dir\0./profile\0--app-data-dir\0antigravity-acp\0",
+                home,
+                Some(Path::new("/srv/runner")),
+            ),
+            ParsedCmdlineSlotDir::Explicit(PathBuf::from("/srv/runner/profile/antigravity-acp"))
+        );
+        assert!(matches!(
+            parse_agy_cmdline_slot_dir(
+                b"/usr/bin/agy\0acp\0--gemini-dir\0./profile\0--app-data-dir\0antigravity-acp\0",
+                home,
+                None,
+            ),
+            ParsedCmdlineSlotDir::Indeterminate(_)
+        ));
+        assert!(matches!(
+            parse_agy_cmdline_slot_dir(
+                b"/usr/bin/agy\0acp\0--gemini-dir\0.gemini\0--app-data-dir\0antigravity-acp\0",
+                home,
+                Some(Path::new("relative/cwd")),
+            ),
+            ParsedCmdlineSlotDir::Indeterminate(_)
+        ));
+
+        // Incomplete or empty directory flags MUST fail closed (`Indeterminate`), never look like default!
+        for bad_cmdline in [
+            &b""[..],
+            &b"/usr/bin/agy\0acp\0--gemini-dir\0"[..],
+            &b"/usr/bin/agy\0acp\0--gemini-dir=\0--app-data-dir\0antigravity-acp\0"[..],
+            &b"/usr/bin/agy\0acp\0--gemini-dir\0--app-data-dir\0antigravity-acp\0"[..],
+            &b"/usr/bin/agy\0acp\0--gemini-dir\0/var/p\0--app-data-dir=\0"[..],
+            &b"/usr/bin/agy\0acp\0--gemini-dir\0/var/p\0--app-data-dir\0"[..],
+        ] {
+            assert!(
+                matches!(
+                    parse_agy_cmdline_slot_dir(bad_cmdline, home, Some(Path::new("/srv/runner"))),
+                    ParsedCmdlineSlotDir::Indeterminate(_)
+                ),
+                "expected Indeterminate for {:?}",
+                String::from_utf8_lossy(bad_cmdline)
+            );
+        }
+
+        // `--` stops flag scanning so positional args are ignored
+        assert_eq!(
+            parse_agy_cmdline_slot_dir(
+                b"/usr/bin/agy\0-p\0--\0--gemini-dir\0/should/be/ignored\0--app-data-dir\0fake\0",
+                home,
+                None,
+            ),
+            ParsedCmdlineSlotDir::OfficialDefault(PathBuf::from(
+                "/home/alice/.gemini/antigravity-cli"
+            ))
+        );
     }
 }
