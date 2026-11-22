@@ -10047,3 +10047,139 @@ fn synthetic_v125_r405_systemd_edge_states_and_install_active_state() {
     );
     assert!(!unit_file.exists());
 }
+
+#[cfg(feature = "stats")]
+#[test]
+fn synthetic_v125_stats_cleared_canceled_interrupted_cli_contract() {
+    let env = IsolatedEnv::new();
+    let cli_conv = env.home.join(".gemini/antigravity-cli/conversations");
+    fs::create_dir_all(&cli_conv).unwrap();
+
+    let vi = |mut v: u64| -> Vec<u8> {
+        let mut b = Vec::new();
+        loop {
+            let n = (v & 0x7f) as u8;
+            v >>= 7;
+            b.push(if v == 0 { n } else { n | 0x80 });
+            if v == 0 {
+                return b;
+            }
+        }
+    };
+    let pb_v = |num: u32, v: u64| -> Vec<u8> { [vi(u64::from(num) << 3), vi(v)].concat() };
+    let pb_b = |num: u32, v: &[u8]| -> Vec<u8> {
+        [
+            vi((u64::from(num) << 3) | 2),
+            vi(v.len() as u64),
+            v.to_vec(),
+        ]
+        .concat()
+    };
+
+    let make_blob =
+        |out_tok: u64, ttft_s: u64, stream_s: u64, ts: u64, err: Option<&[u8]>| -> Vec<u8> {
+            let usage = [pb_v(1, 300), pb_v(2, 200), pb_v(3, out_tok), pb_v(5, 1_500)].concat();
+            let timing = pb_b(4, &pb_v(1, ts));
+            let wrapped = [
+                pb_b(4, &usage),
+                pb_b(9, &timing),
+                pb_b(11, &pb_v(1, ttft_s)),
+                pb_b(12, &pb_v(1, stream_s)),
+                pb_b(19, b"gemini-3.1-pro"),
+                pb_b(21, b"Gemini 3.1 Pro (High)"),
+            ]
+            .concat();
+            let mut outer = pb_b(1, &wrapped);
+            if let Some(e) = err {
+                outer.extend(pb_b(5, e));
+            }
+            outer
+        };
+
+    let t0 = "2026-11-21T09:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second() as u64;
+    let valid_payload = pb_b(20, &pb_b(1, b"done"));
+    let db_path = cli_conv.join("status_split.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB, status INTEGER, step_payload BLOB);
+         CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+    )
+    .unwrap();
+    for (idx, status, out_tok, err) in [
+        (1i64, 12i64, 400u64, None),
+        (2, 6, 400, None),
+        (3, 5, 400, Some(&b"upstream_failed"[..])),
+        (4, 5, 480, None),
+        (5, 3, 240, None),
+    ] {
+        conn.execute(
+            "INSERT INTO steps VALUES (?1, 15, NULL, ?2, ?3)",
+            rusqlite::params![idx, status, &valid_payload],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata VALUES (?1, ?2)",
+            rusqlite::params![idx, make_blob(out_tok, 2, 4, t0 + (idx as u64) * 10, err)],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    // 1. `stats list --range all --json`
+    let list_json = env
+        .cli_cmd()
+        .args(["--json", "stats", "list", "--range", "all"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        list_json.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&list_json.stderr)
+    );
+    let lj: serde_json::Value = serde_json::from_slice(&list_json.stdout).unwrap();
+    let items = lj["items"].as_array().unwrap();
+    assert_eq!(items.len(), 5);
+    assert_eq!(items[0]["status"], "ok");
+    assert_eq!(items[0]["output_tps"].as_f64().unwrap().round() as u64, 60);
+    assert_eq!(items[1]["status"], "cleared");
+    assert_eq!(items[1]["output_tps"].as_f64().unwrap().round() as u64, 120);
+    assert_eq!(items[2]["status"], "error");
+    assert!(items[2]["output_tps"].is_null());
+    assert_eq!(items[3]["status"], "canceled");
+    assert!(items[3]["output_tps"].is_null());
+    assert_eq!(items[4]["status"], "interrupted");
+    assert!(items[4]["output_tps"].is_null());
+
+    // 2. `stats summary --range all --json` shares the exact 2 eligible TPS samples (`3` and clean `5`)
+    let sum_json = env
+        .cli_cmd()
+        .args(["--json", "stats", "summary", "--range", "all"])
+        .output()
+        .unwrap();
+    assert_eq!(sum_json.status.code(), Some(0));
+    let sj: serde_json::Value = serde_json::from_slice(&sum_json.stdout).unwrap();
+    assert_eq!(sj["performance"]["sample_count"], 2);
+    assert_eq!(
+        sj["performance"]["output_tps"]["p50"]
+            .as_f64()
+            .unwrap()
+            .round() as u64,
+        90
+    );
+
+    // 3. Human `stats list --range all` shows `ok`, `clr`, `err`, `canc`, `intr`
+    let list_text = env
+        .cli_cmd()
+        .args(["stats", "list", "--range", "all"])
+        .output()
+        .unwrap();
+    assert_eq!(list_text.status.code(), Some(0));
+    let txt = String::from_utf8_lossy(&list_text.stdout);
+    for tok in [" ok", " clr", " err", " canc", " intr", " 120 ", " 60 "] {
+        assert!(txt.contains(tok), "missing `{tok}` in stats list:\n{txt}");
+    }
+}

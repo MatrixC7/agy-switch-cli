@@ -967,8 +967,10 @@ pub fn collect_token_stats_list(
 #[serde(rename_all = "lowercase")]
 pub enum StatsCallStatus {
     Ok,
+    Cleared,
     Error,
     Canceled,
+    Interrupted,
     Running,
     Archived,
     Unknown,
@@ -978,8 +980,10 @@ impl StatsCallStatus {
     pub fn short_label(self) -> &'static str {
         match self {
             Self::Ok => "ok",
+            Self::Cleared => "clr",
             Self::Error => "err",
             Self::Canceled => "canc",
+            Self::Interrupted => "intr",
             Self::Running => "run",
             Self::Archived => "arch",
             Self::Unknown => "unk",
@@ -4264,11 +4268,13 @@ fn is_valid_step_payload_framing(payload: &[u8]) -> bool {
 
 /// Single authoritative TPS completion predicate shared across `stats list`, `stats summary --date/--range`,
 /// and `stats summary --recent`:
-/// - Requires explicitly completed step (`steps.status == 3`)
+/// - Accepts explicitly completed (`steps.status == 3`, `CORTEX_STEP_STATUS_DONE`) and compacted/cleared
+///   history steps (`steps.status == 5`, `CORTEX_STEP_STATUS_CLEARED`), while strictly excluding
+///   `6` (`CANCELED`), `12` (`INTERRUPTED`), errors, running/queued steps, and absent/unknown statuses
 /// - Rejects any non-NULL oversized, non-BLOB, or corrupt-wire `step_payload`
 /// - Rejects error string (`field 5`) or corrupt wire framing on `gen_metadata.data`
 fn is_tps_eligible_step(step_info: StepGenInfo, blob: &[u8]) -> bool {
-    step_info.status == StepStatusValue::Known(3)
+    matches!(step_info.status, StepStatusValue::Known(3 | 5))
         && step_info.payload_state != StepPayloadState::Invalid
         && matches!(string_field(5, blob), Ok(None))
 }
@@ -4290,8 +4296,10 @@ fn classify_live_step_status(step_status: StepStatusValue, blob: &[u8]) -> Stats
     }
     match step_status {
         StepStatusValue::Known(3) => StatsCallStatus::Ok,
+        StepStatusValue::Known(5) => StatsCallStatus::Cleared,
         StepStatusValue::Known(4 | 7) => StatsCallStatus::Error,
-        StepStatusValue::Known(5 | 6 | 12) => StatsCallStatus::Canceled,
+        StepStatusValue::Known(6) => StatsCallStatus::Canceled,
+        StepStatusValue::Known(12) => StatsCallStatus::Interrupted,
         StepStatusValue::Known(1 | 2 | 8 | 9 | 11) => StatsCallStatus::Running,
         StepStatusValue::Absent | StepStatusValue::InvalidType | StepStatusValue::Known(_) => {
             StatsCallStatus::Unknown
@@ -5773,6 +5781,40 @@ mod tests {
             step_with_status(StepStatusValue::Known(3), StepPayloadState::Absent),
             &sample_ok_blob
         ));
+        assert!(is_tps_eligible_step(
+            step_with_status(StepStatusValue::Known(5), StepPayloadState::Valid),
+            &sample_ok_blob
+        ));
+        assert!(is_tps_eligible_step(
+            step_with_status(StepStatusValue::Known(5), StepPayloadState::Absent),
+            &sample_ok_blob
+        ));
+        assert!(!is_tps_eligible_step(
+            step_with_status(StepStatusValue::Known(5), StepPayloadState::Invalid),
+            &sample_ok_blob
+        ));
+        let mut sample_err_blob = sample_ok_blob.clone();
+        sample_err_blob.extend(pb_bytes(5, b"synthetic upstream error"));
+        assert!(!is_tps_eligible_step(
+            step_with_status(StepStatusValue::Known(5), StepPayloadState::Valid),
+            &sample_err_blob
+        ));
+        assert_eq!(
+            classify_live_step_status(StepStatusValue::Known(5), &sample_ok_blob),
+            StatsCallStatus::Cleared
+        );
+        assert_eq!(
+            classify_live_step_status(StepStatusValue::Known(5), &sample_err_blob),
+            StatsCallStatus::Error
+        );
+        assert_eq!(
+            classify_live_step_status(StepStatusValue::Known(6), &sample_ok_blob),
+            StatsCallStatus::Canceled
+        );
+        assert_eq!(
+            classify_live_step_status(StepStatusValue::Known(12), &sample_ok_blob),
+            StatsCallStatus::Interrupted
+        );
         assert!(!is_tps_eligible_step(
             step_with_status(StepStatusValue::Known(3), StepPayloadState::Invalid),
             &sample_ok_blob
@@ -5795,6 +5837,10 @@ mod tests {
         ));
         assert!(!is_tps_eligible_step(
             step_with_status(StepStatusValue::Known(6), StepPayloadState::Valid),
+            &sample_ok_blob
+        ));
+        assert!(!is_tps_eligible_step(
+            step_with_status(StepStatusValue::Known(12), StepPayloadState::Valid),
             &sample_ok_blob
         ));
         assert!(!is_tps_eligible_step(
@@ -7584,5 +7630,188 @@ mod tests {
             res_b_dup,
             RetryScanOutcome::SkippedUnsafeOrDuplicate
         ));
+    }
+
+    #[test]
+    fn synthetic_v125_stats_cleared_canceled_interrupted_and_tps_parity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cli_conv = home.join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&cli_conv).unwrap();
+
+        let tz = jiff::tz::TimeZone::UTC;
+        let now = "2026-11-21T12:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .to_zoned(tz);
+        let t_base = "2026-11-21T08:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_second() as u64;
+
+        let make_blob = |out_tok: u64,
+                         ttft_secs: u64,
+                         stream_secs: u64,
+                         ts: u64,
+                         err_str: Option<&[u8]>|
+         -> Vec<u8> {
+            let usage = [
+                pb_varint(1, 200),
+                pb_varint(2, 100),
+                pb_varint(3, out_tok),
+                pb_varint(5, 700),
+            ]
+            .concat();
+            let timing = pb_bytes(4, &pb_varint(1, ts));
+            let ttft = pb_varint(1, ttft_secs);
+            let stream = pb_varint(1, stream_secs);
+            let wrapped = [
+                pb_bytes(4, &usage),
+                pb_bytes(9, &timing),
+                pb_bytes(11, &ttft),
+                pb_bytes(12, &stream),
+                pb_bytes(19, b"gemini-3.1-pro"),
+                pb_bytes(21, b"Gemini 3.1 Pro (High)"),
+            ]
+            .concat();
+            let mut outer = pb_bytes(1, &wrapped);
+            if let Some(err) = err_str {
+                outer.extend(pb_bytes(5, err));
+            }
+            outer
+        };
+
+        let valid_payload = pb_bytes(20, &pb_bytes(1, b"ok"));
+        let corrupt_payload = vec![0x80u8];
+
+        let conn = Connection::open(cli_conv.join("cleared_split.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB, status INTEGER, step_payload BLOB);
+             CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+        )
+        .unwrap();
+
+        // idx=1 (oldest): status=12 (`INTERRUPTED` -> `intr`, excluded from TPS)
+        conn.execute(
+            "INSERT INTO steps VALUES (1, 15, NULL, 12, ?1)",
+            rusqlite::params![&valid_payload],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata VALUES (1, ?1)",
+            rusqlite::params![make_blob(400, 2, 4, t_base + 10, None)],
+        )
+        .unwrap();
+
+        // idx=2: status=6 (`CANCELED` -> `canc`, excluded from TPS)
+        conn.execute(
+            "INSERT INTO steps VALUES (2, 15, NULL, 6, ?1)",
+            rusqlite::params![&valid_payload],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata VALUES (2, ?1)",
+            rusqlite::params![make_blob(300, 2, 3, t_base + 20, None)],
+        )
+        .unwrap();
+
+        // idx=3: status=5 (`CLEARED`) with corrupt step_payload -> `clr`, excluded from TPS
+        conn.execute(
+            "INSERT INTO steps VALUES (3, 15, NULL, 5, ?1)",
+            rusqlite::params![&corrupt_payload],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata VALUES (3, ?1)",
+            rusqlite::params![make_blob(500, 2, 5, t_base + 30, None)],
+        )
+        .unwrap();
+
+        // idx=4: status=5 (`CLEARED`) with error field 5 -> `err`, excluded from TPS
+        conn.execute(
+            "INSERT INTO steps VALUES (4, 15, NULL, 5, ?1)",
+            rusqlite::params![&valid_payload],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata VALUES (4, ?1)",
+            rusqlite::params![make_blob(600, 2, 6, t_base + 40, Some(b"synthetic_err"))],
+        )
+        .unwrap();
+
+        // idx=5: status=5 (`CLEARED`) clean & valid nonempty payload -> `clr`, TPS = 400 / 4.0s = 100
+        conn.execute(
+            "INSERT INTO steps VALUES (5, 15, NULL, 5, ?1)",
+            rusqlite::params![&valid_payload],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata VALUES (5, ?1)",
+            rusqlite::params![make_blob(400, 2, 4, t_base + 50, None)],
+        )
+        .unwrap();
+
+        // idx=6 (newest): status=3 (`DONE`) -> `ok`, TPS = 200 / 4.0s = 50
+        conn.execute(
+            "INSERT INTO steps VALUES (6, 15, NULL, 3, ?1)",
+            rusqlite::params![&valid_payload],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata VALUES (6, ?1)",
+            rusqlite::params![make_blob(200, 1, 4, t_base + 60, None)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let all_spec = StatsRangeSpec::AllTime;
+        let list_view = collect_token_stats_list_at(&home, StatsSource::All, &all_spec, &now);
+        assert_eq!(list_view.items.len(), 6);
+        // Newest-first order: idx 6, 5, 4, 3, 2, 1
+        assert_eq!(list_view.items[0].status, StatsCallStatus::Ok);
+        assert_eq!(
+            list_view.items[0].output_tps.map(|v| v.round() as u64),
+            Some(50)
+        );
+        assert_eq!(list_view.items[1].status, StatsCallStatus::Cleared);
+        assert_eq!(
+            list_view.items[1].output_tps.map(|v| v.round() as u64),
+            Some(100)
+        );
+        assert_eq!(list_view.items[2].status, StatsCallStatus::Error);
+        assert_eq!(list_view.items[2].output_tps, None);
+        assert_eq!(list_view.items[3].status, StatsCallStatus::Cleared);
+        assert_eq!(list_view.items[3].output_tps, None);
+        assert_eq!(list_view.items[4].status, StatsCallStatus::Canceled);
+        assert_eq!(list_view.items[4].output_tps, None);
+        assert_eq!(list_view.items[5].status, StatsCallStatus::Interrupted);
+        assert_eq!(list_view.items[5].output_tps, None);
+
+        // Verify `stats summary` agrees on exact `sample_count == 2` across `--range all` and `--recent 6`.
+        for spec in [StatsRangeSpec::AllTime, StatsRangeSpec::Recent { limit: 6 }] {
+            let summary = collect_token_stats_at(&home, StatsSource::All, &spec, &now);
+            let perf = summary
+                .performance
+                .as_ref()
+                .expect("expected 2 eligible perf samples");
+            assert_eq!(perf.sample_count, 2);
+            assert!((perf.output_tps.p50 - 75.0).abs() < 1e-6);
+            assert!((perf.ttft_seconds.p50 - 1.5).abs() < 1e-6);
+        }
+
+        // Verify human rendering displays `ok`, `clr`, `err`, `canc`, `intr` without overflowing 100 cols.
+        let rendered = list_view.render_human_for_width(Some(100));
+        for label in [" ok", " clr", " err", " canc", " intr"] {
+            assert!(
+                rendered.contains(label),
+                "expected status label `{label}` in rendered list:\n{rendered}"
+            );
+        }
+        for line in rendered.lines() {
+            assert!(
+                UnicodeWidthStr::width(line) <= 100,
+                "rendered line > 100 cols: {line}"
+            );
+        }
     }
 }

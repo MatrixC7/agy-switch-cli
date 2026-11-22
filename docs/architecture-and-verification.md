@@ -157,7 +157,7 @@ flowchart TD
   - 零外部生成代码的内联 Protobuf 解码器施加 29 位字段号上限（`1..=536,870,911`），区分“字段缺失”与“帧/编码损坏”，在重复子消息拼接前对每个独立片段先行完成帧完整性校验，并对标量字段遵循标准 `Last-One-Wins` 语义。
   - `--source` 默认设为 `all`（无桌面服务器自动等效扫描 `cli`，桌面环境合并汇总 `cli + app`；亦支持显式指定 `cli` 或 `app`）。扫描 `all` 或 `app` 时，按 `(source_key, generation_idx)` 执行有效归档优先去重（若归档行无效则自动回退采用同键有效实时记录，且归档总额仅由三项 Token 明细重算而不依赖可空的冗余 `total_tokens` 列），并按 `antigravity/*` 与 `antigravity-cli/*` 前缀严格隔离归档记录。
   - **统一性能采样与响应式渲染（`stats summary` 与 `stats list` 共用谓词）**：
-    - 两者共用同一条记录解码、事件时间与实测 `TPS`（`= live_output_tokens / live_streaming_duration`）过滤谓词：严格要求已完成步骤 `steps.status == 3`、`gen_metadata` 无错误字段、无非法或超限 `step_payload`、`retries == 0`、实时输出 `live_output_tokens > 0`、`ttft > 0` 且 `live_streaming_duration >= 1.0s`（兼容含工具调用与常规流式回复），状态简码覆盖 `ok` / `err` / `canc` / `run` / `unk` / `arch`。
+    - 两者共用同一条记录解码、事件时间与实测 `TPS`（`= live_output_tokens / live_streaming_duration`）过滤谓词：接受已完成步骤 `steps.status == 3`（`DONE`）与经压缩/清理的历史步骤 `steps.status == 5`（`CLEARED`），排除 `6`（`CANCELED`）、`12`（`INTERRUPTED`）与报错/进行中步骤，同时要求 `gen_metadata` 解码有效且无非空白的错误字符串、无非法或超限 `step_payload`、`retries == 0`、实时输出 `live_output_tokens > 0`、`ttft > 0` 且 `live_streaming_duration >= 1.0s`（兼容含工具调用与常规流式回复），状态简码覆盖 `ok` / `clr` / `err` / `canc` / `intr` / `run` / `unk` / `arch`。
     - `stats summary` 线性插值输出 `TTFT` 与 `TPS` 的 `P10 / P50 / P90` 分位值，并在 `Models` 七列表中统一展示 `Input`（总输入）、`Cached` 与一位小数 `Hit%`（存在未缓存输入时封顶 `99.9%`）。
     - `stats list` 输出十列紧凑明细表，常规窄屏保留十列并收紧时间与模型列宽，低于十列最小可读宽度的极窄终端自动切换紧凑多行块格式，避免截去 `TPS` 与 `St`。
   - 四组互斥窗口参数统一校验：`--recent <N>`（`1..=500`，`stats list` 默认 `10`）、`--range <today|yesterday|<N>d|all>`（`stats summary` 默认 `today`）、`--date <YYYY-MM-DD>` 与 `--from <YYYY-MM-DD> [--to <YYYY-MM-DD>]`。

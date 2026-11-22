@@ -55,7 +55,7 @@
 
 ```bash
 # 第 1 步：在终端直接下载对应架构的压缩包与 SHA-256 校验文件（需要代理时可先 export https_proxy=... 或给 curl 加 -x）
-VER=v1.2.4
+VER=v1.2.5
 ARCH="$(uname -m)"   # x86_64 或 aarch64
 curl -fLO "https://github.com/MatrixC7/agy-switch-cli/releases/download/${VER}/agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz"
 curl -fLO "https://github.com/MatrixC7/agy-switch-cli/releases/download/${VER}/agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz.sha256"
@@ -184,7 +184,7 @@ agy-switch-cli status --json   # 输出结构化 JSON 巡检报告
 
 标准输出示例：
 ```text
-agy-switch-cli status (v1.2.4)
+agy-switch-cli status (v1.2.5)
   Backend:           dual
   Store status:      OK
   Journal status:    Clean
@@ -852,7 +852,7 @@ Models (sorted by total tokens)
   - `Requests`：所选窗口内的有效模型生成请求总次数。
   - `TTFT (P10/P50/P90)`：首字到达耗时（单位秒 `s`）的 10% / 50% / 90% 分位值。
   - `TPS (P10/P50/P90)`：流式阶段实测输出速度（`= live_output_tokens / live_streaming_duration`，单位 `t/s`）的 `P10 / P50 / P90` 分位值；分子与分母均固定取自实时生成记录的输出量与实时流式时长（即使同次请求的汇总输出量 `Total output` 优先采用了有效归档记录）。
-  - **统一性能样本口径（`stats summary` 与 `stats list` 完全一致）**：仅当该次生成步骤明确完成（`steps.status == 3` 且 `gen_metadata` 无错误字段）、无非法或超限 `step_payload`（兼容含工具调用与简短回复）、无内部重试退避污染（`retries == 0`）、实时输出 `live_output_tokens > 0`、首字耗时 `ttft > 0` 且实时流式阶段耗时 **`live_streaming_duration >= 1.0s`**（过滤不足 `1.0` 秒的单块缓冲瞬时突发达峰，避免扭曲真实流式速度）时，才纳入实测 `TPS` 计算（无合格样本时显示 `—`）。
+  - **统一性能样本口径（`stats summary` 与 `stats list` 完全一致）**：仅当该次生成步骤为已完成状态（`steps.status == 3`，`DONE`）或经上下文压缩/轨迹清理保留的历史步骤（`steps.status == 5`，`CLEARED`；注：官方写入 `5` 后未单独留存原状态，但仍继续受下述错误、载荷与流式时长门控约束），且 `gen_metadata` 解码有效且无非空白的错误字符串、无非法或超限 `step_payload`（兼容含工具调用与简短回复）、无内部重试退避污染（`retries == 0`）、实时输出 `live_output_tokens > 0`、首字耗时 `ttft > 0` 且实时流式阶段耗时 **`live_streaming_duration >= 1.0s`**（过滤不足 `1.0` 秒的单块缓冲瞬时突发达峰，避免扭曲真实流式速度）时，才纳入实测 `TPS` 计算；明确排除已取消（`status == 6`）、已中断（`status == 12`）、报错与进行中步骤（无合格样本时显示 `—`）。
 - **`Models` 分模型汇总表（共 7 列）**：
   - `Model` / `Reqs`：模型名称与该模型在所选窗口内的请求次数。
   - `Input` / `Cached` / `Hit%`：该模型的**总输入 Token**（`= uncached_input + cached_input`，与上方 `Total input` 口径一致）、其中命中缓存的输入 Token，以及精确到一位小数的缓存命中率（`= Cached / Input`；存在未缓存输入时最高封顶 `99.9%`）。
@@ -877,8 +877,8 @@ Requests (newest first, showing 5)
   - `In` / `Cache` / `Out`：当次请求的**总输入 Token**（未缓存新增输入与缓存命中输入之和，与 `stats summary` 的 `Input` 口径一致）、其中命中上下文缓存的输入 Token 与总输出 Token（自适应紧凑单位；若存在有效归档记录则优先采用归档中的用量值）。
   - `Hit%`：当次请求的缓存命中率百分比（`= Cache / In`，固定保留一位小数，如 `99.5%`、`91.9%`、`0.0%`）；只要存在未缓存输入（即 `Cache < In` 且 `Cache > 0`），上限封顶为 **`99.9%`**（防止 `99.96%` 四舍五入误显示为 `100.0%`），仅当全部输入均命中缓存（`In == Cache` 且 `Cache > 0`）时才显示 `100.0%`（总输入 `In == 0` 时显示 `—`）。
   - `TTFT` / `Dur`：首字到达耗时与请求总耗时（`Dur = ttft + streaming_duration`，流式时长缺省时取 `ttft`）。
-  - `TPS`：无单位后缀的四舍五入整数吐字速度（`= live_output_tokens / live_streaming_duration`，始终使用实时记录的输出量与实时流式时长；当 `Out` 取自有效归档记录时，`Out` 可以与 `TPS` 的分子不同）；采用与 `stats summary` 完全统一的事件时间戳与过滤条件（严格要求已完成步骤 `steps.status == 3`、`gen_metadata` 无错误字段、无非法/超限 `step_payload`、`retries == 0`、实时输出 `live_output_tokens > 0`、`ttft > 0` 且 **`live_streaming_duration >= 1.0s`**），包含工具调用回合与流式回复，流式阶段不足 `1.0s` 或不满足条件时显示 `—`。
-  - `St`：请求状态简码，实时库映射为 `ok`（已完成 `status=3`）、`err`（报错或无效）、`canc`（取消或中断）、`run`（进行中或排队中）、`unk`（缺失或未识别的状态值），仅存于历史归档库且原实时 `.db` 已移除的记录显示为 `arch`。
+  - `TPS`：无单位后缀的四舍五入整数吐字速度（`= live_output_tokens / live_streaming_duration`，始终使用实时记录的输出量与实时流式时长；当 `Out` 取自有效归档记录时，`Out` 可以与 `TPS` 的分子不同）；采用与 `stats summary` 完全统一的事件时间戳与过滤条件（接受已完成 `steps.status == 3` 与经压缩/清理的历史步骤 `steps.status == 5`，严格排除 `6` 取消、`12` 中断与报错/进行中步骤，同时要求 `gen_metadata` 解码有效且无非空白的错误字符串、无非法/超限 `step_payload`、`retries == 0`、实时输出 `live_output_tokens > 0`、`ttft > 0` 且 **`live_streaming_duration >= 1.0s`**），包含工具调用回合与流式回复，流式阶段不足 `1.0s` 或不满足条件时显示 `—`。
+  - `St`：请求状态简码，实时库映射为 `ok`（已完成 `status=3`）、`clr`（已压缩/清理出活跃上下文的历史步骤 `status=5`，JSON 为 `cleared`）、`err`（报错或无效 `status=4/7`，或 `gen_metadata` 含非空白错误字符串/解码失败）、`canc`（已取消 `status=6`，JSON 为 `canceled`）、`intr`（已中断 `status=12`，JSON 为 `interrupted`）、`run`（进行中或排队中）、`unk`（缺失或未识别的状态值），仅存于历史归档库且原实时 `.db` 已移除的记录显示为 `arch`。
 - **上限截断说明**：按日期区间（`--range` / `--date` / `--from`）查询 `stats list` 时，最多输出最新的 `500` 条记录；若匹配总数超过 `500` 条，表头会自动注明 `(newest first, showing 500 of <总数> — capped at 500)`。
 - **`stats summary --json` 与 `stats list --json` 机器输出说明（`schema_version: 1`）**：
   - **共享顶层字段**：`source`、`range`（当使用 `--recent` 时为 `{"kind": "recent", "recent": N, "from": ..., "to": ...}`）、`databases_scanned`、`generations_scanned`、`skipped_large_records`、`unreadable_databases`、`last_activity`、`range_last_activity` 与 `generated_at`。
