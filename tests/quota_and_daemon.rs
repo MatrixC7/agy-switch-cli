@@ -5,10 +5,11 @@ use agy_switch_cli::domain::quota::{
     QuotaEval, QuotaGroup, QuotaObservation, QuotaSourceEnv, DEFAULT_QUOTA_MAX_AGE_SECS,
 };
 use agy_switch_cli::domain::token::TokenRecord;
-use agy_switch_cli::oauth::refresh::OAuthEndpoints;
 use agy_switch_cli::oauth::registry::OAuthClientRegistry;
 use agy_switch_cli::paths::HeadlessPaths;
-use agy_switch_cli::quota::client::CloudCodeEndpoints;
+use agy_switch_cli::quota::official_cli::{
+    OfficialCliQuotaError, OfficialCliQuotaRunner, OfficialCliUsageOutcome,
+};
 use agy_switch_cli::session::backend::{CredentialBackend, FileSessionBackend};
 use agy_switch_cli::session::payload::serialize_session_payload;
 use agy_switch_cli::session::process::ProcessLease;
@@ -18,14 +19,110 @@ use agy_switch_cli::switching::daemon::{
     read_daemon_state_readonly, DaemonConfigOverrides, DaemonEngine, TickStageOutcome,
 };
 use agy_switch_cli::switching::executor::{execute_switch, SwitchOptions};
-use agy_switch_cli::transport::client::MockTransport;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::pin::Pin;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
+
+type SlotUsageFn = dyn Fn(&HeadlessPaths, bool, &str) -> Result<OfficialCliUsageOutcome, OfficialCliQuotaError>
+    + Send
+    + Sync;
+
+struct SlotQuotaRunner {
+    handler: Arc<SlotUsageFn>,
+    probed_slots: Arc<Mutex<Vec<String>>>,
+    delay: Duration,
+}
+
+impl SlotQuotaRunner {
+    fn from_handler<F>(f: F) -> Self
+    where
+        F: Fn(&HeadlessPaths, bool, &str) -> Result<OfficialCliUsageOutcome, OfficialCliQuotaError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            handler: Arc::new(f),
+            probed_slots: Arc::new(Mutex::new(Vec::new())),
+            delay: Duration::ZERO,
+        }
+    }
+
+    fn constant_pct(pct: f64) -> Self {
+        Self::from_handler(move |_, _, _| Ok(quota_outcome_for_frac(pct, pct)))
+    }
+
+    fn probed_slots(&self) -> Vec<String> {
+        self.probed_slots.lock().unwrap().clone()
+    }
+}
+
+impl OfficialCliQuotaRunner for SlotQuotaRunner {
+    fn query_active_usage<'a>(
+        &'a self,
+        paths: &'a HeadlessPaths,
+        explicit_file_backend: bool,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<OfficialCliUsageOutcome, OfficialCliQuotaError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let slot_text = fs::read_to_string(&paths.active_slot_file).unwrap_or_default();
+            self.probed_slots.lock().unwrap().push(slot_text.clone());
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            (self.handler)(paths, explicit_file_backend, &slot_text)
+        })
+    }
+}
+
+fn quota_outcome_for_frac(short_5h: f64, weekly: f64) -> OfficialCliUsageOutcome {
+    OfficialCliUsageOutcome::Quota {
+        description: Some("Usage summary".into()),
+        groups: vec![QuotaGroup {
+            display_name: "Gemini Models".into(),
+            description: Some("Models within this group: gemini-3.1-pro, gemini-3-flash".into()),
+            buckets: vec![
+                QuotaBucket {
+                    bucket_id: "gemini-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: short_5h,
+                    remaining_fraction_known: Some(true),
+                    reset_time: if short_5h >= 1.0 {
+                        String::new()
+                    } else {
+                        "2099-01-01T05:00:00Z".into()
+                    },
+                    display_name: None,
+                    description: None,
+                },
+                QuotaBucket {
+                    bucket_id: "gemini-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: weekly,
+                    remaining_fraction_known: Some(true),
+                    reset_time: if weekly >= 1.0 {
+                        String::new()
+                    } else {
+                        "2099-01-07T00:00:00Z".into()
+                    },
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        }],
+    }
+}
 
 static PROC_ENV_MUTEX: AsyncMutex<()> = AsyncMutex::const_new(());
 
@@ -353,7 +450,6 @@ async fn managed_run_keeps_selected_without_policy_switch_supports_explicit_acco
         .args([
             "--data-dir",
             data.to_str().unwrap(),
-            "--no-remote-version",
             "run",
             "--",
             "agy",
@@ -399,7 +495,6 @@ async fn managed_run_keeps_selected_without_policy_switch_supports_explicit_acco
         .args([
             "--data-dir",
             data.to_str().unwrap(),
-            "--no-remote-version",
             "run",
             "--account",
             "acc-high",
@@ -509,17 +604,16 @@ async fn daemon_enforces_request_budget_stale_pid_lease_ignore_revalidate_cancel
     let mut engine = DaemonEngine::new();
     let overrides = DaemonConfigOverrides {
         cooldown_secs: 30,
+        step_buffer_delay: Duration::ZERO,
         ..DaemonConfigOverrides::default()
     };
-    let fast_oauth = OAuthEndpoints {
-        base_backoff: std::time::Duration::from_millis(2),
-        ..OAuthEndpoints::default()
-    };
-    let fast_quota = CloudCodeEndpoints {
-        fallback_delay: std::time::Duration::from_millis(2),
-        ..CloudCodeEndpoints::default()
-    };
-    let mock = MockTransport::default();
+    let runner = SlotQuotaRunner::from_handler(|_, _, slot| {
+        if slot.contains("1//RT_acc-a") {
+            Ok(quota_outcome_for_frac(0.05, 0.05))
+        } else {
+            Ok(quota_outcome_for_frac(0.85, 0.85))
+        }
+    });
     let reg = OAuthClientRegistry::parse_from_raw(None, None);
 
     // Case 1: Active `agy` lease with MATCHING starttime blocks switch in `Mode::Wait`!
@@ -545,17 +639,7 @@ async fn daemon_enforces_request_budget_stale_pid_lease_ignore_revalidate_cancel
     .unwrap();
 
     let out_blocked = engine
-        .run_single_tick(
-            &repo,
-            &backend,
-            &mock,
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
-            &reg,
-            "vscode/1.X.X (Antigravity/4.3.0)",
-            &overrides,
-            now,
-        )
+        .run_single_tick(&repo, &backend, &runner, &reg, &overrides, now)
         .await
         .unwrap();
     assert_eq!(
@@ -564,8 +648,8 @@ async fn daemon_enforces_request_budget_stale_pid_lease_ignore_revalidate_cancel
             target_id: "acc-b".into()
         }
     );
-    // Request budget: cached quotas were fresh -> ZERO network calls!
-    assert_eq!(mock.recorded_requests().len(), 0);
+    // Request budget: cached source quota was ultra-fresh low & Wait blocked before probing candidates -> ZERO probes!
+    assert_eq!(runner.probed_slots().len(), 0);
 
     // Case 2: Simulate `SIGKILL` + PID reuse on PID 5001 (starttime changes to 999000, non-agy exe `sleep`)
     // AND inject manual user switch to `acc-c` right before Stage 5 `Revalidate`!
@@ -581,45 +665,25 @@ async fn daemon_enforces_request_budget_stale_pid_lease_ignore_revalidate_cancel
         let r = repo_hook.clone();
         // Simulate concurrent manual switch from another OS thread/process between Stage 4 and Stage 5!
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async {
-                execute_switch(
-                    &r,
-                    &FileSessionBackend,
-                    &MockTransport::default(),
-                    &OAuthEndpoints::default(),
-                    &OAuthClientRegistry::parse_from_raw(None, None),
-                    "vscode/1.X.X (Antigravity/4.3.0)",
-                    "acc-c",
-                    &SwitchOptions {
-                        dry_run: false,
-                        allow_running: false,
-                    },
-                    now + 2,
-                )
-                .await
-                .unwrap();
-            });
+            execute_switch(
+                &r,
+                &FileSessionBackend,
+                &OAuthClientRegistry::parse_from_raw(None, None),
+                "acc-c",
+                &SwitchOptions {
+                    dry_run: false,
+                    allow_running: false,
+                },
+                now + 2,
+            )
+            .unwrap();
         })
         .join()
         .unwrap();
     }));
 
     let out_cancelled = engine
-        .run_single_tick(
-            &repo,
-            &backend,
-            &mock,
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
-            &reg,
-            "vscode/1.X.X (Antigravity/4.3.0)",
-            &overrides,
-            now + 3,
-        )
+        .run_single_tick(&repo, &backend, &runner, &reg, &overrides, now + 3)
         .await
         .unwrap();
     engine.before_revalidate_hook = None;
@@ -641,14 +705,11 @@ async fn daemon_enforces_request_budget_stale_pid_lease_ignore_revalidate_cancel
         .unwrap()
         .contains("1//RT_acc-c"));
 
-    // Case 3: Switch back to low `acc-a`, run clean tick -> commits switch to `acc-b` and enters Cooldown!
+    // Case 3: Switch back to low `acc-a`, run clean tick -> Step-and-Verify switches to `acc-b`, probes `acc-b`, and enters Cooldown!
     execute_switch(
         &repo,
         &backend,
-        &mock,
-        &OAuthEndpoints::default(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-a",
         &SwitchOptions {
             dry_run: false,
@@ -656,21 +717,10 @@ async fn daemon_enforces_request_budget_stale_pid_lease_ignore_revalidate_cancel
         },
         now + 4,
     )
-    .await
     .unwrap();
 
     let out_committed = engine
-        .run_single_tick(
-            &repo,
-            &backend,
-            &mock,
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
-            &reg,
-            "vscode/1.X.X (Antigravity/4.3.0)",
-            &overrides,
-            now + 5,
-        )
+        .run_single_tick(&repo, &backend, &runner, &reg, &overrides, now + 5)
         .await
         .unwrap();
     assert_eq!(
@@ -683,17 +733,7 @@ async fn daemon_enforces_request_budget_stale_pid_lease_ignore_revalidate_cancel
 
     // Next tick within 30s cooldown (`now + 15 < now + 35`) stays in `InCooldown`
     let out_cool = engine
-        .run_single_tick(
-            &repo,
-            &backend,
-            &mock,
-            &fast_oauth,
-            &fast_quota,
-            &reg,
-            "vscode/1.X.X (Antigravity/4.3.0)",
-            &overrides,
-            now + 15,
-        )
+        .run_single_tick(&repo, &backend, &runner, &reg, &overrides, now + 15)
         .await
         .unwrap();
     assert!(matches!(out_cool, TickStageOutcome::InCooldown { .. }));
@@ -711,17 +751,7 @@ async fn daemon_enforces_request_budget_stale_pid_lease_ignore_revalidate_cancel
         .refresh_backoff_until
         .insert("acc-b".into(), now + 1000);
     let out_hold = engine
-        .run_single_tick(
-            &repo,
-            &backend,
-            &mock,
-            &fast_oauth,
-            &fast_quota,
-            &reg,
-            "vscode/1.X.X (Antigravity/4.3.0)",
-            &overrides,
-            now + 40,
-        )
+        .run_single_tick(&repo, &backend, &runner, &reg, &overrides, now + 40)
         .await
         .unwrap();
     assert!(matches!(out_hold, TickStageOutcome::UncertainHold { .. }));
@@ -730,10 +760,7 @@ async fn daemon_enforces_request_budget_stale_pid_lease_ignore_revalidate_cancel
     execute_switch(
         &repo,
         &backend,
-        &mock,
-        &fast_oauth,
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-a",
         &SwitchOptions {
             dry_run: false,
@@ -741,7 +768,6 @@ async fn daemon_enforces_request_budget_stale_pid_lease_ignore_revalidate_cancel
         },
         now + 41,
     )
-    .await
     .unwrap();
     // Restore `acc-c` as top candidate
     repo.with_write_lock(|tx| {
@@ -753,21 +779,11 @@ async fn daemon_enforces_request_budget_stale_pid_lease_ignore_revalidate_cancel
     })
     .unwrap();
 
-    // Make slot dir read-only (0500) during commit so all 3 commits fail while quotas remain fresh (< 180s)!
+    // Make slot dir read-only (0500) during commit so all 3 commits fail while source quota stays ultra-fresh low!
     fs::set_permissions(&paths.active_slot_dir, fs::Permissions::from_mode(0o500)).unwrap();
     for step in 0..3 {
         let res = engine
-            .run_single_tick(
-                &repo,
-                &backend,
-                &mock,
-                &fast_oauth,
-                &fast_quota,
-                &reg,
-                "vscode/1.X.X (Antigravity/4.3.0)",
-                &overrides,
-                now + 50 + step,
-            )
+            .run_single_tick(&repo, &backend, &runner, &reg, &overrides, now + 50 + step)
             .await
             .unwrap();
         assert!(matches!(res, TickStageOutcome::CommitFailed { .. }));
@@ -781,17 +797,7 @@ async fn daemon_enforces_request_budget_stale_pid_lease_ignore_revalidate_cancel
     // Brand-new DaemonEngine instance after simulated restart STILL honors `PausedOnFailure`!
     let mut restarted_engine = DaemonEngine::new();
     let post_restart = restarted_engine
-        .run_single_tick(
-            &repo,
-            &backend,
-            &mock,
-            &fast_oauth,
-            &fast_quota,
-            &reg,
-            "vscode/1.X.X (Antigravity/4.3.0)",
-            &overrides,
-            now + 60,
-        )
+        .run_single_tick(&repo, &backend, &runner, &reg, &overrides, now + 60)
         .await
         .unwrap();
     assert!(matches!(
@@ -839,7 +845,6 @@ async fn foreground_daemon_enforces_single_instance_lock_and_exits_gracefully_on
         .args([
             "--data-dir",
             data.to_str().unwrap(),
-            "--no-remote-version",
             "daemon",
             "--interval",
             "60",
@@ -877,7 +882,6 @@ async fn foreground_daemon_enforces_single_instance_lock_and_exits_gracefully_on
         .args([
             "--data-dir",
             data.to_str().unwrap(),
-            "--no-remote-version",
             "--json",
             "daemon",
             "--once",
@@ -906,13 +910,7 @@ async fn foreground_daemon_enforces_single_instance_lock_and_exits_gracefully_on
             format!("unix:path={}/no-dbus", run_dir.display()),
         )
         .env("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir)
-        .args([
-            "--data-dir",
-            data.to_str().unwrap(),
-            "--no-remote-version",
-            "daemon",
-            "--once",
-        ])
+        .args(["--data-dir", data.to_str().unwrap(), "daemon", "--once"])
         .output()
         .unwrap();
     assert_eq!(d3.status.code(), Some(0));
@@ -979,25 +977,9 @@ async fn managed_run_refreshes_expired_slot_even_when_refresh_token_unchanged_an
         .write_slot(&paths, &serialize_session_payload(&old_tok).unwrap())
         .unwrap();
 
-    // OAuth refresh returns a brand-new `access_token` WITHOUT rotating `refresh_token`!
-    let mock = MockTransport::from_handler(|req| {
-        if req.url.contains("userinfo") {
-            return Ok(MockTransport::json_response(
-                200,
-                serde_json::json!({"email": "same@example.invalid", "name": "Same RT"}),
-            ));
-        }
-        Ok(MockTransport::json_response(
-            200,
-            serde_json::json!({
-                "access_token": "ya29.BRAND_NEW_ACCESS_TOKEN",
-                "expires_in": 3600,
-                "token_type": "Bearer"
-                // no `refresh_token` field -> keeps `1//UNCHANGED_REFRESH_TOKEN`!
-            }),
-        ))
-    });
-
+    // Under v1.2.7 Option 1B, `run` is strictly offline (zero `/token` HTTP calls), keeps the
+    // synced slot untouched for official `agy` to refresh lazily on launch, AND masks D-Bus when
+    // `--backend file` is explicitly requested!
     let _dbus_env = ScopedEnvVar::set(
         "DBUS_SESSION_BUS_ADDRESS",
         format!("unix:path={}/mock-bus", tmp.path().display()),
@@ -1005,10 +987,7 @@ async fn managed_run_refreshes_expired_slot_even_when_refresh_token_unchanged_an
     let code = agy_switch_cli::switching::runner::run_managed_agy(
         &repo,
         &FileSessionBackend,
-        &mock,
-        &OAuthEndpoints::default(),
         &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
         None,
         true, // explicit_file_backend = true
         &[fake_agy.to_string_lossy().into_owned()],
@@ -1018,11 +997,11 @@ async fn managed_run_refreshes_expired_slot_even_when_refresh_token_unchanged_an
     .unwrap();
     assert_eq!(code, 0);
 
-    // Spawned `agy` MUST see `ya29.BRAND_NEW_ACCESS_TOKEN` on disk AND sanitized DBUS_SESSION_BUS_ADDRESS!
+    // Spawned `agy` sees the synced account slot AND sanitized DBUS_SESSION_BUS_ADDRESS!
     let slot_seen = fs::read_to_string(trace_dir.join("slot_seen.json")).unwrap();
     assert!(
-        slot_seen.contains("ya29.BRAND_NEW_ACCESS_TOKEN"),
-        "Slot was not updated with fresh access_token when refresh_token stayed unchanged: {slot_seen}"
+        slot_seen.contains("1//UNCHANGED_REFRESH_TOKEN"),
+        "Slot must preserve synced account credential offline: {slot_seen}"
     );
     let dbus_seen = fs::read_to_string(trace_dir.join("dbus_env.txt")).unwrap();
     assert_eq!(dbus_seen, "unix:path=/dev/null");
@@ -1128,58 +1107,23 @@ async fn daemon_concurrent_chunk_budget_zombie_proc_ignore_and_cli_env_policy_ov
     drop(reserve_env);
     assert_eq!(repo.read_policy().unwrap().reserve_percentage, 10);
 
-    // Mock CloudCode: c1 returns 20% (< 50%), c2 returns 85% (>= 50%), c3 returns 90%,
-    // and c4/c5 MUST NEVER BE QUERIED because chunk 1 (`c1..=c3`) already found `c2`!
-    let queried_tokens = Arc::new(Mutex::new(Vec::<String>::new()));
-    let qt = queried_tokens.clone();
-    let mock = MockTransport::from_handler(move |req| {
-        let auth = req
-            .headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
-        if req.url.ends_with(":fetchAvailableModels") {
-            qt.lock().unwrap().push(auth.clone());
-            let frac = if auth.contains("c1") { 0.20 } else { 0.85 };
-            return Ok(MockTransport::json_response(
-                200,
-                serde_json::json!({
-                    "models": {
-                        "gemini-3.8-flash": {
-                            "quotaInfo": {"remainingFraction": frac, "resetTime": "2099-01-01T00:00:00Z"}
-                        }
-                    }
-                }),
-            ));
-        }
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(
-                200,
-                serde_json::json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
-            ));
-        }
-        if req.url.ends_with(":retrieveUserQuotaSummary") {
-            let frac = if auth.contains("c1") { 0.20 } else { 0.85 };
-            return Ok(MockTransport::json_response(
-                200,
-                serde_json::json!({
-                    "groups": [{
-                        "displayName": "Gemini Models",
-                        "buckets": [
-                            {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": frac, "resetTime": "2099-01-01T05:00:00Z"},
-                            {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": frac, "resetTime": "2099-01-07T00:00:00Z"}
-                        ]
-                    }]
-                }),
-            ));
-        }
-        panic!("unexpected URL {}", req.url);
+    // Step-and-Verify official CLI runner: c1 returns 20% (< 50%), c2 returns 85% (>= 50%),
+    // and c3/c4/c5 MUST NEVER BE QUERIED because Step-and-Verify lands immediately on c2!
+    let runner = SlotQuotaRunner::from_handler(|_, _, slot| {
+        let frac = if slot.contains("1//RT_c1") {
+            0.20
+        } else if slot.contains("1//RT_src") {
+            0.15
+        } else {
+            0.85
+        };
+        Ok(quota_outcome_for_frac(frac, frac))
     });
 
     let mut engine = DaemonEngine::new();
     let overrides = DaemonConfigOverrides {
         cooldown_secs: 60,
+        step_buffer_delay: Duration::ZERO,
         policy_overlay: cli_overlay,
         ..DaemonConfigOverrides::default()
     };
@@ -1187,19 +1131,16 @@ async fn daemon_concurrent_chunk_budget_zombie_proc_ignore_and_cli_env_policy_ov
         .run_single_tick(
             &repo,
             &backend,
-            &mock,
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
+            &runner,
             &OAuthClientRegistry::parse_from_raw(None, None),
-            "vscode/1.X.X (Antigravity/4.3.0)",
             &overrides,
             now,
         )
         .await
         .unwrap();
 
-    // Zombie PID 8888 did NOT block, CLI reserve=20% triggered switch from 15% `src` to `c2`,
-    // and chunk 2 (`c4`, `c5`) was NEVER queried!
+    // Zombie PID 8888 did NOT block, CLI reserve=20% triggered Step-and-Verify from 15% `src` -> `c1` (20%) -> `c2` (85%),
+    // and remaining candidates (`c3`, `c4`, `c5`) were NEVER probed!
     assert_eq!(
         outcome,
         TickStageOutcome::CommittedSwitch {
@@ -1207,8 +1148,12 @@ async fn daemon_concurrent_chunk_budget_zombie_proc_ignore_and_cli_env_policy_ov
             target_id: "c2".into()
         }
     );
-    let seen = queried_tokens.lock().unwrap().clone();
-    assert!(!seen.iter().any(|h| h.contains("c4") || h.contains("c5")));
+    let seen = runner.probed_slots();
+    assert!(seen.iter().any(|s| s.contains("1//RT_c1")));
+    assert!(seen.iter().any(|s| s.contains("1//RT_c2")));
+    assert!(!seen
+        .iter()
+        .any(|s| s.contains("1//RT_c3") || s.contains("1//RT_c4") || s.contains("1//RT_c5")));
 
     // Verify restarted DaemonEngine STILL honors persisted `cooldown_until` (`now + 60`)!
     let mut restarted = DaemonEngine::new();
@@ -1216,11 +1161,8 @@ async fn daemon_concurrent_chunk_budget_zombie_proc_ignore_and_cli_env_policy_ov
         .run_single_tick(
             &repo,
             &backend,
-            &mock,
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
+            &runner,
             &OAuthClientRegistry::parse_from_raw(None, None),
-            "vscode/1.X.X (Antigravity/4.3.0)",
             &overrides,
             now + 20,
         )
@@ -1322,11 +1264,8 @@ async fn daemon_cancels_on_policy_set_or_delete_and_never_reenters_on_slow_netwo
         .run_single_tick(
             &repo,
             &backend,
-            &MockTransport::default(),
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
+            &SlotQuotaRunner::constant_pct(0.85),
             &OAuthClientRegistry::parse_from_raw(None, None),
-            "vscode/1.X.X (Antigravity/4.3.0)",
             &DaemonConfigOverrides::default(),
             now + 1,
         )
@@ -1350,11 +1289,8 @@ async fn daemon_cancels_on_policy_set_or_delete_and_never_reenters_on_slow_netwo
         .run_single_tick(
             &repo,
             &backend,
-            &MockTransport::default(),
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
+            &SlotQuotaRunner::constant_pct(0.85),
             &OAuthClientRegistry::parse_from_raw(None, None),
-            "vscode/1.X.X (Antigravity/4.3.0)",
             &DaemonConfigOverrides::default(),
             now + 2,
         )
@@ -1368,10 +1304,10 @@ async fn daemon_cancels_on_policy_set_or_delete_and_never_reenters_on_slow_netwo
         }
     );
 
-    // 3. Slow network exceeding tick interval NEVER causes concurrent tick re-entrancy (`max_active == 1`)!
+    // 3. Slow `agy -p "/usage"` exceeding tick interval NEVER causes concurrent tick re-entrancy (`max_active == 1`)!
     repo.with_write_lock(|tx| {
         let mut s = tx.load_account_opt("acc-src")?.unwrap();
-        s.quota = None; // Force network fetch in Stage 1
+        s.quota = None; // Force official CLI probe in Stage 1
         tx.save_account(&s)
     })
     .unwrap();
@@ -1381,19 +1317,21 @@ async fn daemon_cancels_on_policy_set_or_delete_and_never_reenters_on_slow_netwo
     let ifn = in_flight_now.clone();
     let pif = peak_in_flight.clone();
 
-    struct SlowTrackingTransport {
+    struct SlowTrackingRunner {
         cur: Arc<AtomicUsize>,
         peak: Arc<AtomicUsize>,
     }
-    impl agy_switch_cli::transport::client::HttpTransport for SlowTrackingTransport {
-        fn execute<'a>(
+    impl OfficialCliQuotaRunner for SlowTrackingRunner {
+        fn query_active_usage<'a>(
             &'a self,
-            _req: agy_switch_cli::transport::client::HttpRequest,
-        ) -> agy_switch_cli::transport::client::BoxFuture<
-            'a,
-            Result<
-                agy_switch_cli::transport::client::HttpResponse,
-                agy_switch_cli::transport::client::TransportError,
+            _paths: &'a HeadlessPaths,
+            _explicit_file_backend: bool,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<OfficialCliUsageOutcome, OfficialCliQuotaError>,
+                    > + Send
+                    + 'a,
             >,
         > {
             Box::pin(async move {
@@ -1401,15 +1339,15 @@ async fn daemon_cancels_on_policy_set_or_delete_and_never_reenters_on_slow_netwo
                 self.peak.fetch_max(c, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(80)).await;
                 self.cur.fetch_sub(1, Ordering::SeqCst);
-                Ok(MockTransport::json_response(
-                    200,
-                    serde_json::json!({"models": {}}),
-                ))
+                Ok(OfficialCliUsageOutcome::Quota {
+                    description: None,
+                    groups: Vec::new(),
+                })
             })
         }
     }
 
-    let slow_tr = SlowTrackingTransport {
+    let slow_runner = SlowTrackingRunner {
         cur: ifn,
         peak: pif,
     };
@@ -1423,11 +1361,8 @@ async fn daemon_cancels_on_policy_set_or_delete_and_never_reenters_on_slow_netwo
             .run_single_tick(
                 &repo,
                 &backend,
-                &slow_tr,
-                &OAuthEndpoints::default(),
-                &CloudCodeEndpoints::default(),
+                &slow_runner,
                 &OAuthClientRegistry::parse_from_raw(None, None),
-                "vscode/1.X.X (Antigravity/4.3.0)",
                 &DaemonConfigOverrides::default(),
                 now + 10 + step,
             )
@@ -1533,7 +1468,7 @@ async fn quota_and_quota_all_respect_policy_monitored_model_and_render_four_stat
                 format!("unix:path={}/no-dbus", run_dir.display()),
             )
             .env("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir)
-            .args(["--data-dir", data.to_str().unwrap(), "--no-remote-version"]);
+            .args(["--data-dir", data.to_str().unwrap()]);
         c
     };
 
@@ -1767,7 +1702,7 @@ async fn managed_run_rejects_disabled_or_unscoped_synced_slot_and_daemon_stage5_
                 format!("unix:path={}/no-dbus", run_dir.display()),
             )
             .env("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir)
-            .args(["--data-dir", data.to_str().unwrap(), "--no-remote-version"]);
+            .args(["--data-dir", data.to_str().unwrap()]);
         c
     };
 
@@ -1888,11 +1823,8 @@ async fn managed_run_rejects_disabled_or_unscoped_synced_slot_and_daemon_stage5_
         .run_single_tick(
             &repo,
             &backend,
-            &MockTransport::default(),
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
+            &SlotQuotaRunner::constant_pct(0.90),
             &OAuthClientRegistry::parse_from_raw(None, None),
-            "vscode/1.X.X (Antigravity/4.3.0)",
             &DaemonConfigOverrides::default(),
             now + 5,
         )
@@ -2002,22 +1934,20 @@ async fn synthetic_immediate_mode_overwrites_slot_with_running_agy_fails_closed_
     let mut engine = DaemonEngine::new();
     let overrides = DaemonConfigOverrides {
         cooldown_secs: 10,
+        step_buffer_delay: Duration::ZERO,
         ..DaemonConfigOverrides::default()
     };
     let reg = OAuthClientRegistry::parse_from_raw(None, None);
+    let imm_runner = SlotQuotaRunner::from_handler(|_, _, slot| {
+        if slot.contains("1//RT_acc-imm-1") {
+            Ok(quota_outcome_for_frac(0.05, 0.05))
+        } else {
+            Ok(quota_outcome_for_frac(0.85, 0.85))
+        }
+    });
 
     let t1 = engine
-        .run_single_tick(
-            &repo,
-            &backend,
-            &MockTransport::default(),
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
-            &reg,
-            "antigravity/hub/1.5.7 (os_type=linux; arch=amd64)",
-            &overrides,
-            now,
-        )
+        .run_single_tick(&repo, &backend, &imm_runner, &reg, &overrides, now)
         .await
         .unwrap();
     assert_eq!(
@@ -2055,19 +1985,16 @@ async fn synthetic_immediate_mode_overwrites_slot_with_running_agy_fails_closed_
         tx.save_account(&a2)
     })
     .unwrap();
+    let rr_runner = SlotQuotaRunner::from_handler(|_, _, slot| {
+        if slot.contains("1//RT_acc-imm-2") {
+            Ok(quota_outcome_for_frac(0.05, 0.05))
+        } else {
+            Ok(quota_outcome_for_frac(0.90, 0.90))
+        }
+    });
 
     let t2 = engine
-        .run_single_tick(
-            &repo,
-            &backend,
-            &MockTransport::default(),
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
-            &reg,
-            "antigravity/hub/1.5.7 (os_type=linux; arch=amd64)",
-            &overrides,
-            now + 20,
-        )
+        .run_single_tick(&repo, &backend, &rr_runner, &reg, &overrides, now + 20)
         .await
         .unwrap();
     assert_eq!(
@@ -2092,23 +2019,20 @@ async fn synthetic_immediate_mode_overwrites_slot_with_running_agy_fails_closed_
         tx.save_account(&a3)
     })
     .unwrap();
+    let unv_runner = SlotQuotaRunner::from_handler(|_, _, slot| {
+        if slot.contains("1//RT_acc-imm-3") {
+            Ok(quota_outcome_for_frac(0.05, 0.05))
+        } else {
+            Ok(quota_outcome_for_frac(0.90, 0.90))
+        }
+    });
 
     // 4a: Stage 4 `/proc` missing -> `UncertainHold` without blind-writing slot!
     let missing_proc = tmp.path().join("nonexistent_proc_dir");
     {
         let _unver_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &missing_proc);
         let t_unver_s4 = engine
-            .run_single_tick(
-                &repo,
-                &backend,
-                &MockTransport::default(),
-                &OAuthEndpoints::default(),
-                &CloudCodeEndpoints::default(),
-                &reg,
-                "antigravity/hub/1.5.7 (os_type=linux; arch=amd64)",
-                &overrides,
-                now + 40,
-            )
+            .run_single_tick(&repo, &backend, &unv_runner, &reg, &overrides, now + 40)
             .await
             .unwrap();
         assert!(
@@ -2130,17 +2054,7 @@ async fn synthetic_immediate_mode_overwrites_slot_with_running_agy_fails_closed_
             fs::remove_dir_all(&proc_s5_hook).unwrap();
         }));
         let t_unver_s5 = engine
-            .run_single_tick(
-                &repo,
-                &backend,
-                &MockTransport::default(),
-                &OAuthEndpoints::default(),
-                &CloudCodeEndpoints::default(),
-                &reg,
-                "antigravity/hub/1.5.7 (os_type=linux; arch=amd64)",
-                &overrides,
-                now + 41,
-            )
+            .run_single_tick(&repo, &backend, &unv_runner, &reg, &overrides, now + 41)
             .await
             .unwrap();
         engine.before_revalidate_hook = None;
@@ -2172,7 +2086,7 @@ async fn synthetic_immediate_mode_overwrites_slot_with_running_agy_fails_closed_
                 format!("unix:path={}/no-dbus", run_dir.display()),
             )
             .env("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc)
-            .args(["--data-dir", data.to_str().unwrap(), "--no-remote-version"]);
+            .args(["--data-dir", data.to_str().unwrap()]);
         c
     };
 
@@ -2256,12 +2170,11 @@ fn make_v122_account(
 
 #[tokio::test]
 async fn v122_validation_blocked_manual_switch_run_dry_run_unlock_and_daemon_triple_guard() {
-    use agy_switch_cli::quota::client::refresh_account_quota_locked;
+    use agy_switch_cli::quota::official_cli::refresh_active_slot_quota_with_runner;
     use agy_switch_cli::store::locks::ActiveSlotLock;
     use agy_switch_cli::switching::executor::{
         execute_switch_with_slot_lock, preview_switch_dry_run,
     };
-    use serde_json::json;
 
     let _guard = PROC_ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -2314,7 +2227,7 @@ async fn v122_validation_blocked_manual_switch_run_dry_run_unlock_and_daemon_tri
         .unwrap();
 
     let reg = OAuthClientRegistry::load(&paths).unwrap();
-    let dummy_transport = MockTransport::default();
+    let dummy_runner = SlotQuotaRunner::constant_pct(0.90);
 
     // 1. `daemon` strictly rejects `validation_blocked` candidate even when active account is at 2% <= 5%.
     let mut engine = DaemonEngine::new();
@@ -2322,11 +2235,8 @@ async fn v122_validation_blocked_manual_switch_run_dry_run_unlock_and_daemon_tri
         .run_single_tick(
             &repo,
             &FileSessionBackend,
-            &dummy_transport,
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
+            &dummy_runner,
             &reg,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
             &DaemonConfigOverrides::default(),
             now,
         )
@@ -2347,15 +2257,11 @@ async fn v122_validation_blocked_manual_switch_run_dry_run_unlock_and_daemon_tri
             &slot_lock,
             &repo,
             &FileSessionBackend,
-            &dummy_transport,
-            &OAuthEndpoints::default(),
             &reg,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
             "acc-v122-b",
             true,
             now,
         )
-        .await
         .unwrap_err();
         assert_eq!(locked_err.error_code, "account_validation_blocked");
     }
@@ -2377,7 +2283,7 @@ async fn v122_validation_blocked_manual_switch_run_dry_run_unlock_and_daemon_tri
     assert!(dry_blocked
         .validation_warning
         .as_deref()
-        .is_some_and(|w| w.contains("verify-blocked") && w.contains("refresh acc-v122-b")));
+        .is_some_and(|w| w.contains("verify-blocked") && w.contains("agy-switch-cli refresh")));
 
     let dry_disabled_err = preview_switch_dry_run(
         &repo,
@@ -2399,10 +2305,7 @@ async fn v122_validation_blocked_manual_switch_run_dry_run_unlock_and_daemon_tri
     let manual_out = execute_switch(
         &repo,
         &FileSessionBackend,
-        &dummy_transport,
-        &OAuthEndpoints::default(),
         &reg,
-        "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
         "acc-v122-b",
         &SwitchOptions {
             dry_run: false,
@@ -2410,7 +2313,6 @@ async fn v122_validation_blocked_manual_switch_run_dry_run_unlock_and_daemon_tri
         },
         now,
     )
-    .await
     .unwrap();
     assert!(manual_out.validation_blocked);
     assert!(manual_out.validation_warning.is_some());
@@ -2429,11 +2331,8 @@ async fn v122_validation_blocked_manual_switch_run_dry_run_unlock_and_daemon_tri
         .run_single_tick(
             &repo,
             &FileSessionBackend,
-            &dummy_transport,
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
+            &dummy_runner,
             &reg,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
             &DaemonConfigOverrides::default(),
             now,
         )
@@ -2466,13 +2365,7 @@ async fn v122_validation_blocked_manual_switch_run_dry_run_unlock_and_daemon_tri
             .env("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc)
             .env("AGY_SWITCH_CLI_PROXY", "direct")
             .env("NO_PROXY", "*")
-            .args([
-                "--data-dir",
-                data.to_str().unwrap(),
-                "--backend",
-                "file",
-                "--no-remote-version",
-            ]);
+            .args(["--data-dir", data.to_str().unwrap(), "--backend", "file"]);
         c
     };
 
@@ -2519,69 +2412,43 @@ async fn v122_validation_blocked_manual_switch_run_dry_run_unlock_and_daemon_tri
         String::from_utf8_lossy(&run_explicit.stdout).trim(),
         "FAKE_AGY_STDOUT"
     );
-    assert!(String::from_utf8_lossy(&run_explicit.stderr).contains("refresh acc-v122-b"));
+    assert!(String::from_utf8_lossy(&run_explicit.stderr).contains("agy-switch-cli refresh"));
     assert!(
         repo.read_account_unchecked("acc-v122-b")
             .unwrap()
             .validation_blocked
     );
 
-    // 7. After user completes Google verification in `agy`, primary HTTP 200 refresh auto-clears `validation_blocked`!
-    let ok_mock = MockTransport::from_handler(|req| {
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
-            ));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"}}}}),
-            ));
-        }
-        Ok(MockTransport::json_response(
-            200,
-            json!({"groups": [{"displayName": "Gemini Models", "buckets": [
-                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"},
-                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.95, "resetTime": "2099-01-07T00:00:00Z"}
-            ]}]}),
-        ))
-    });
-    let unlocked = refresh_account_quota_locked(
+    // 7. After user completes Google verification in `agy`, clean official CLI `/usage` auto-clears `validation_blocked`!
+    let ok_runner = SlotQuotaRunner::constant_pct(0.90);
+    let unlocked = refresh_active_slot_quota_with_runner(
         &repo,
-        &ok_mock,
-        &OAuthEndpoints::default(),
-        &CloudCodeEndpoints {
-            environments: vec![(
-                QuotaSourceEnv::Daily,
-                "http://127.0.0.1:9/v1internal".into(),
-            )],
-            fallback_delay: std::time::Duration::from_millis(1),
-        },
-        &reg,
-        "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
-        "acc-v122-b",
+        &FileSessionBackend,
+        &ok_runner,
+        true,
+        Some("acc-v122-b"),
         now + 5,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .account;
     assert!(!unlocked.validation_blocked);
 }
 
 #[tokio::test]
 async fn v122_daemon_once_live_refresh_180s_max_age_and_human_json_output() {
     use agy_switch_cli::switching::daemon::{
-        effective_source_quota_max_age_secs, DEFAULT_DAEMON_COOLDOWN_SECS,
-        DEFAULT_DAEMON_INTERVAL_SECS,
+        effective_source_quota_max_age_secs, CANDIDATE_REFRESH_BACKOFF_SECS,
+        DEFAULT_DAEMON_COOLDOWN_SECS, DEFAULT_DAEMON_INTERVAL_SECS,
     };
-    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    assert_eq!(DEFAULT_DAEMON_INTERVAL_SECS, 180);
+    assert_eq!(DEFAULT_DAEMON_INTERVAL_SECS, 900);
+    assert_eq!(CANDIDATE_REFRESH_BACKOFF_SECS, 900);
     assert_eq!(DEFAULT_DAEMON_COOLDOWN_SECS, 3600);
     assert_eq!(effective_source_quota_max_age_secs(180), 144);
     assert_eq!(effective_source_quota_max_age_secs(300), 240);
+    assert_eq!(effective_source_quota_max_age_secs(900), 720);
     assert_eq!(effective_source_quota_max_age_secs(3600), 2880);
     assert_eq!(effective_source_quota_max_age_secs(7200), 3600);
     assert_eq!(effective_source_quota_max_age_secs(1), 4);
@@ -2630,22 +2497,13 @@ async fn v122_daemon_once_live_refresh_180s_max_age_and_human_json_output() {
         .unwrap();
 
     let reg = OAuthClientRegistry::load(&paths).unwrap();
-    let fast_cc = CloudCodeEndpoints {
-        environments: vec![(
-            QuotaSourceEnv::Daily,
-            "http://127.0.0.1:9/v1internal".into(),
-        )],
-        fallback_delay: std::time::Duration::from_millis(1),
-    };
 
-    // 1. When `--once` attempts live refresh and network fails, MUST fail closed into `UncertainHold`
+    // 1. When `--once` attempts live refresh and official `agy` fails, MUST fail closed into `UncertainHold`
     //    instead of trusting the 41-minute-old 26.7% cache!
-    let failing_transport = MockTransport::from_handler(|_| {
-        Err(agy_switch_cli::transport::client::TransportError {
-            is_timeout: false,
-            is_connect: true,
-            message: "simulated offline".into(),
-        })
+    let failing_runner = SlotQuotaRunner::from_handler(|_, _, _| {
+        Err(OfficialCliQuotaError::CommandFailed(
+            "simulated offline".into(),
+        ))
     });
     let mut engine = DaemonEngine::new();
     let (_tx, mut dummy_rx) = tokio::sync::watch::channel(false);
@@ -2653,13 +2511,11 @@ async fn v122_daemon_once_live_refresh_180s_max_age_and_human_json_output() {
         .run_single_tick_report_with_shutdown(
             &repo,
             &FileSessionBackend,
-            &failing_transport,
-            &OAuthEndpoints::default(),
-            &fast_cc,
+            &failing_runner,
             &reg,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
             &DaemonConfigOverrides {
                 once: true,
+                step_buffer_delay: Duration::ZERO,
                 ..DaemonConfigOverrides::default()
             },
             now,
@@ -2674,44 +2530,29 @@ async fn v122_daemon_once_live_refresh_180s_max_age_and_human_json_output() {
     assert!(!fail_report.source_refreshed);
     assert!(fail_report.format_human_line().contains("daemon: hold"));
 
-    // 2. Fresh engine with live mock returning 0.2% (0% rounded): `daemon --once` MUST refresh live,
-    //    immediately switch from `acc-src` to `acc-dst`, and format a clear switched report!
+    // 2. Fresh engine with live runner returning 0.2% for `acc-src` and 90% for `acc-dst`:
+    //    `daemon --once` MUST refresh live, Step-and-Verify switch from `acc-src` to `acc-dst`,
+    //    and format a clear switched report!
     let live_hits = Arc::new(AtomicUsize::new(0));
     let live_hits_c = live_hits.clone();
-    let zero_mock = MockTransport::from_handler(move |req| {
-        if req.url.ends_with(":loadCodeAssist") {
-            live_hits_c.fetch_add(1, Ordering::SeqCst);
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
-            ));
+    let zero_runner = SlotQuotaRunner::from_handler(move |_, _, slot| {
+        live_hits_c.fetch_add(1, Ordering::SeqCst);
+        if slot.contains("1//RT_acc-src") {
+            Ok(quota_outcome_for_frac(0.002, 0.30))
+        } else {
+            Ok(quota_outcome_for_frac(0.90, 0.90))
         }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.002, "resetTime": "2099-01-01T05:00:00Z"}}}}),
-            ));
-        }
-        Ok(MockTransport::json_response(
-            200,
-            json!({"groups": [{"displayName": "Gemini Models", "buckets": [
-                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.002, "resetTime": "2099-01-01T05:00:00Z"},
-                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.30, "resetTime": "2099-01-07T00:00:00Z"}
-            ]}]}),
-        ))
     });
     let mut engine2 = DaemonEngine::new();
     let sw_report = engine2
         .run_single_tick_report_with_shutdown(
             &repo,
             &FileSessionBackend,
-            &zero_mock,
-            &OAuthEndpoints::default(),
-            &fast_cc,
+            &zero_runner,
             &reg,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
             &DaemonConfigOverrides {
                 once: true,
+                step_buffer_delay: Duration::ZERO,
                 ..DaemonConfigOverrides::default()
             },
             now,
@@ -2719,7 +2560,7 @@ async fn v122_daemon_once_live_refresh_180s_max_age_and_human_json_output() {
         )
         .await
         .unwrap();
-    assert_eq!(live_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(live_hits.load(Ordering::SeqCst), 2); // 1 source probe + 1 Step-and-Verify candidate probe!
     assert!(sw_report.source_refreshed);
     assert_eq!(
         sw_report.outcome,
@@ -2738,34 +2579,16 @@ async fn v122_daemon_once_live_refresh_180s_max_age_and_human_json_output() {
 
     // 3. G1: Continuous mode (`once = false`) explicitly refreshes eligible active accounts on
     //    scheduled wake-ups regardless of slow prior tick `last_updated` skew:
-    //    - Default `interval = 180s`: prior tick completed at `T+20s` (writing `26.7%`), next
-    //      negative-jitter wake-up at `T+162s` (`age = 142s <= 144s`) MUST still refresh live!
+    //    - Default `interval = 300s`: prior tick completed at `T+20s` (writing `26.7%`), next
+    //      negative-jitter wake-up at `T+270s` (`age = 250s`) or `T+162s` MUST still refresh live!
     //    - Short `interval = 5s`: prior tick at `T`, next negative-jitter wake-up at `T+4s`
     //      (`age = 4s == effective_source_quota_max_age_secs(5)`) MUST still refresh live!
-    //    - Active `refresh_backoff_until` still suppresses redundant network calls.
+    //    - Active `refresh_backoff_until` still suppresses redundant probes.
     let cont_hits = Arc::new(AtomicUsize::new(0));
     let cont_hits_c = cont_hits.clone();
-    let ok_mock = MockTransport::from_handler(move |req| {
-        if req.url.ends_with(":loadCodeAssist") {
-            cont_hits_c.fetch_add(1, Ordering::SeqCst);
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
-            ));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.376, "resetTime": "2099-01-01T05:00:00Z"}}}}),
-            ));
-        }
-        Ok(MockTransport::json_response(
-            200,
-            json!({"groups": [{"displayName": "Gemini Models", "buckets": [
-                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.376, "resetTime": "2099-01-01T05:00:00Z"},
-                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.90, "resetTime": "2099-01-07T00:00:00Z"}
-            ]}]}),
-        ))
+    let ok_runner = SlotQuotaRunner::from_handler(move |_, _, _| {
+        cont_hits_c.fetch_add(1, Ordering::SeqCst);
+        Ok(quota_outcome_for_frac(0.376, 0.90))
     });
     // Seed `acc-dst` as if Tick 1 finished slowly at `now + 20` with `26.7%` and clear cooldown.
     repo.with_write_lock(|tx| {
@@ -2787,17 +2610,12 @@ async fn v122_daemon_once_live_refresh_180s_max_age_and_human_json_output() {
     .unwrap();
 
     let mut engine3 = DaemonEngine::new();
-    // Tick 2 wakes at `now + 162` (`-10%` jitter of 180s from `now`, actual age = 142s <= 144s):
-    // MUST refresh live and observe 37.6% instead of reusing cached 26.7%!
     let live_skew_rep = engine3
         .run_single_tick_report_with_shutdown(
             &repo,
             &FileSessionBackend,
-            &ok_mock,
-            &OAuthEndpoints::default(),
-            &fast_cc,
+            &ok_runner,
             &reg,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
             &DaemonConfigOverrides::default(),
             now + 162,
             &mut dummy_rx,
@@ -2816,11 +2634,8 @@ async fn v122_daemon_once_live_refresh_180s_max_age_and_human_json_output() {
         .run_single_tick_report_with_shutdown(
             &repo,
             &FileSessionBackend,
-            &ok_mock,
-            &OAuthEndpoints::default(),
-            &fast_cc,
+            &ok_runner,
             &reg,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
             &DaemonConfigOverrides {
                 interval_secs: 5,
                 ..DaemonConfigOverrides::default()
@@ -2840,7 +2655,7 @@ async fn v122_daemon_once_live_refresh_180s_max_age_and_human_json_output() {
         .format_human_line()
         .contains("refreshed live"));
 
-    // Active refresh backoff still skips network calls cleanly and reports cached status!
+    // Active refresh backoff still skips probes cleanly and reports cached status!
     engine3
         .refresh_backoff_until
         .insert("acc-dst".into(), now + 500);
@@ -2848,11 +2663,8 @@ async fn v122_daemon_once_live_refresh_180s_max_age_and_human_json_output() {
         .run_single_tick_report_with_shutdown(
             &repo,
             &FileSessionBackend,
-            &ok_mock,
-            &OAuthEndpoints::default(),
-            &fast_cc,
+            &ok_runner,
             &reg,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
             &DaemonConfigOverrides::default(),
             now + 170,
             &mut dummy_rx,
@@ -2885,7 +2697,6 @@ async fn v122_daemon_once_live_refresh_180s_max_age_and_human_json_output() {
             data.to_str().unwrap(),
             "--backend",
             "file",
-            "--no-remote-version",
             "daemon",
             "--once",
         ])
@@ -2915,7 +2726,6 @@ async fn v122_daemon_once_live_refresh_180s_max_age_and_human_json_output() {
             data.to_str().unwrap(),
             "--backend",
             "file",
-            "--no-remote-version",
             "--json",
             "daemon",
             "--once",
@@ -2936,11 +2746,9 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
     use agy_switch_cli::switching::daemon::{
         save_daemon_state_in_tx, DaemonPersistentState, DaemonTickReport,
     };
-    use agy_switch_cli::transport::client::{BoxFuture, HttpRequest, HttpResponse, HttpTransport};
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
-    use std::time::Duration;
 
     let _proc_lock = PROC_ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -3004,41 +2812,23 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
     let index_before = fs::read(paths.index_file()).unwrap();
 
     let reg = OAuthClientRegistry::load(&paths).unwrap();
-    let fast_cc = CloudCodeEndpoints {
-        fallback_delay: Duration::from_millis(1),
-        ..CloudCodeEndpoints::default()
-    };
     let (_tx, mut dummy_rx) = tokio::sync::watch::channel(false);
 
-    // G2-a: Catalog 200 + required summary 503 on `--once` -> `hold` + `source_refresh_failed: quota_network_error`,
+    // G2-a: Official CLI probe failure on `--once` -> `hold` + `source_refresh_failed: official_cli_usage_failed`,
     // `source_refreshed == false`, `source_remaining_percentage == None`, slot & index untouched.
-    let summary_503_mock = MockTransport::from_handler(|req| {
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
-            ));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.267, "resetTime": "2099-01-01T05:00:00Z"}}}}),
-            ));
-        }
-        Ok(MockTransport::json_response(503, json!({"error": "busy"})))
+    let err_runner = SlotQuotaRunner::from_handler(|_, _, _| {
+        Err(OfficialCliQuotaError::CommandFailed("busy 503".into()))
     });
     let mut eng_503 = DaemonEngine::new();
     let rep_503 = eng_503
         .run_single_tick_report_with_shutdown(
             &repo,
             &FileSessionBackend,
-            &summary_503_mock,
-            &OAuthEndpoints::default(),
-            &fast_cc,
+            &err_runner,
             &reg,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
             &DaemonConfigOverrides {
                 once: true,
+                step_buffer_delay: Duration::ZERO,
                 ..DaemonConfigOverrides::default()
             },
             now,
@@ -3049,12 +2839,12 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
     assert_eq!(rep_503.phase, "hold");
     assert_eq!(
         rep_503.reason.as_deref(),
-        Some("source_refresh_failed: quota_network_error")
+        Some("source_refresh_failed: official_cli_usage_failed")
     );
     assert_eq!(
         rep_503.outcome,
         TickStageOutcome::UncertainHold {
-            reason: "source_refresh_failed: quota_network_error".into()
+            reason: "source_refresh_failed: official_cli_usage_failed".into()
         }
     );
     assert!(!rep_503.source_refreshed);
@@ -3062,34 +2852,23 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
     assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
     assert_eq!(fs::read(paths.index_file()).unwrap(), index_before);
 
-    // G2-b: Catalog 200 + HTTP 200 empty groups is NOT an HTTP/transport failure -> remains `unknown_pool`.
-    let empty_200_mock = MockTransport::from_handler(|req| {
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
-            ));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.267, "resetTime": "2099-01-01T05:00:00Z"}}}}),
-            ));
-        }
-        Ok(MockTransport::json_response(200, json!({"groups": []})))
+    // G2-b: Empty groups returned by Official CLI is NOT a transport failure -> remains `unknown_pool`.
+    let empty_runner = SlotQuotaRunner::from_handler(|_, _, _| {
+        Ok(OfficialCliUsageOutcome::Quota {
+            description: None,
+            groups: Vec::new(),
+        })
     });
     let mut eng_empty = DaemonEngine::new();
     let rep_empty = eng_empty
         .run_single_tick_report_with_shutdown(
             &repo,
             &FileSessionBackend,
-            &empty_200_mock,
-            &OAuthEndpoints::default(),
-            &fast_cc,
+            &empty_runner,
             &reg,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
             &DaemonConfigOverrides {
                 once: true,
+                step_buffer_delay: Duration::ZERO,
                 ..DaemonConfigOverrides::default()
             },
             now + 1,
@@ -3117,13 +2896,20 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
     .unwrap();
 
     // G2-c: Source refresh stalls past `tick_timeout` on `--once` -> `source_refresh_failed: tick_budget_timeout`!
-    struct StallTransport;
-    impl HttpTransport for StallTransport {
-        fn execute(
-            &self,
-            _req: HttpRequest,
-        ) -> BoxFuture<'_, Result<HttpResponse, agy_switch_cli::transport::client::TransportError>>
-        {
+    struct StallRunner;
+    impl OfficialCliQuotaRunner for StallRunner {
+        fn query_active_usage<'a>(
+            &'a self,
+            _paths: &'a HeadlessPaths,
+            _explicit_file_backend: bool,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<OfficialCliUsageOutcome, OfficialCliQuotaError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
             Box::pin(async {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 unreachable!()
@@ -3135,14 +2921,12 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
         .run_single_tick_report_with_shutdown(
             &repo,
             &FileSessionBackend,
-            &StallTransport,
-            &OAuthEndpoints::default(),
-            &fast_cc,
+            &StallRunner,
             &reg,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
             &DaemonConfigOverrides {
                 once: true,
                 tick_timeout: Duration::from_millis(60),
+                step_buffer_delay: Duration::ZERO,
                 ..DaemonConfigOverrides::default()
             },
             now + 3,
@@ -3160,8 +2944,8 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
     assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
     assert_eq!(fs::read(paths.index_file()).unwrap(), index_before);
 
-    // G2-d: Candidate stage stall (source already ultra-fresh low 2%, candidate quota missing -> probes candidate)
-    // MUST remain plain `tick_budget_timeout`, NOT `source_refresh_failed`!
+    // G2-d: Candidate Step-and-Verify stall (source already ultra-fresh low 2%, candidate probe stalls)
+    // MUST restore original source cleanly AND report plain `tick_budget_timeout`, NOT `source_refresh_failed`!
     repo.with_write_lock(|tx| {
         let mut s = tx.load_account_opt("acc-g2-src")?.unwrap();
         s.quota = Some(build_quota(
@@ -3183,14 +2967,12 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
         .run_single_tick_report_with_shutdown(
             &repo,
             &FileSessionBackend,
-            &StallTransport,
-            &OAuthEndpoints::default(),
-            &fast_cc,
+            &StallRunner,
             &reg,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
             &DaemonConfigOverrides {
                 once: true,
                 tick_timeout: Duration::from_millis(60),
+                step_buffer_delay: Duration::ZERO,
                 ..DaemonConfigOverrides::default()
             },
             now + 5,
@@ -3200,6 +2982,14 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
         .unwrap();
     assert_eq!(rep_cand_to.phase, "hold");
     assert_eq!(rep_cand_to.reason.as_deref(), Some("tick_budget_timeout"));
+    assert_eq!(
+        repo.read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-g2-src")
+    );
 
     // G3-c: Missing `/proc` (Stage 4 Unverified) MUST NOT leak filesystem path in human line or JSON!
     repo.with_write_lock(|tx| {
@@ -3223,13 +3013,11 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
             .run_single_tick_report_with_shutdown(
                 &repo,
                 &FileSessionBackend,
-                &MockTransport::default(),
-                &OAuthEndpoints::default(),
-                &fast_cc,
+                &SlotQuotaRunner::constant_pct(0.90),
                 &reg,
-                "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
                 &DaemonConfigOverrides {
                     once: true,
+                    step_buffer_delay: Duration::ZERO,
                     ..DaemonConfigOverrides::default()
                 },
                 now + 5,
@@ -3250,20 +3038,18 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
     assert!(!unver_json.contains("missing-proc-g3-secret-dir"));
     assert!(unver_human.contains("agy-switch-cli status"));
 
-    // G3-d: Stage 6 commit failure (read-only slot dir) MUST emit safe error code without path!
+    // G3-d: Stage 5/6 commit failure (read-only slot dir) MUST emit safe error code without path!
     fs::set_permissions(&paths.active_slot_dir, fs::Permissions::from_mode(0o500)).unwrap();
     let mut eng_ro = DaemonEngine::new();
     let rep_ro = eng_ro
         .run_single_tick_report_with_shutdown(
             &repo,
             &FileSessionBackend,
-            &MockTransport::default(),
-            &OAuthEndpoints::default(),
-            &fast_cc,
+            &SlotQuotaRunner::constant_pct(0.90),
             &reg,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
             &DaemonConfigOverrides {
                 once: true,
+                step_buffer_delay: Duration::ZERO,
                 ..DaemonConfigOverrides::default()
             },
             now + 5,
@@ -3297,6 +3083,8 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
         agy_switch_cli::switching::daemon::clear_daemon_pause_in_tx(tx.paths(), now + 6)
     })
     .unwrap();
+    let slot_before_g3a = fs::read(&paths.active_slot_file).unwrap();
+    let index_before_g3a = fs::read(paths.index_file()).unwrap();
     fs::create_dir_all(paths.state_dir()).unwrap();
     fs::write(paths.switch_journal_file(), b"{").unwrap();
     let run_cli = |extra: &[&str]| {
@@ -3311,13 +3099,7 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
                 format!("unix:path={}/no-dbus", run_dir.display()),
             )
             .env("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc)
-            .args([
-                "--data-dir",
-                data.to_str().unwrap(),
-                "--backend",
-                "file",
-                "--no-remote-version",
-            ]);
+            .args(["--data-dir", data.to_str().unwrap(), "--backend", "file"]);
         cmd.args(extra);
         cmd.output().unwrap()
     };
@@ -3334,8 +3116,8 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
         "human output leaked path: {corrupt_human_s}"
     );
     assert_eq!(fs::read(paths.switch_journal_file()).unwrap(), b"{");
-    assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
-    assert_eq!(fs::read(paths.index_file()).unwrap(), index_before);
+    assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before_g3a);
+    assert_eq!(fs::read(paths.index_file()).unwrap(), index_before_g3a);
     let ds_corrupt = read_daemon_state_readonly(&paths).unwrap();
     assert!(ds_corrupt.paused_on_failure);
     assert_eq!(
@@ -3471,13 +3253,7 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
                 format!("unix:path={}/no-dbus", r2_run.display()),
             )
             .env("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc)
-            .args([
-                "--data-dir",
-                r2_data.to_str().unwrap(),
-                "--backend",
-                "file",
-                "--no-remote-version",
-            ]);
+            .args(["--data-dir", r2_data.to_str().unwrap(), "--backend", "file"]);
         cmd.args(extra);
         cmd.output().unwrap()
     };
@@ -3532,7 +3308,6 @@ async fn v122_round2_g2_summary_503_timeout_and_g3_path_redaction() {
             r2_data.to_str().unwrap(),
             "--backend",
             "file",
-            "--no-remote-version",
             "daemon",
             "--no-notify",
         ])
@@ -3648,32 +3423,19 @@ async fn synthetic_v124_daemon_reset_cooldown_wakes_running_engine_and_sanitizes
     // Hold `DaemonInstanceLock` across ticks (simulating a long-running foreground / systemd daemon).
     let _daemon_lock = DaemonInstanceLock::try_acquire(&paths).unwrap();
     let mut engine = DaemonEngine::new();
-    let transport = MockTransport::from_handler(|req| {
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(
-                200,
-                serde_json::json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
-            ));
+    let runner = SlotQuotaRunner::from_handler(|_, _, slot| {
+        if slot.contains("1//RT_acc-a") {
+            Ok(quota_outcome_for_frac(0.04, 0.04))
+        } else {
+            Ok(quota_outcome_for_frac(0.90, 0.90))
         }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(
-                200,
-                serde_json::json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.90, "resetTime": "2099-01-01T00:00:00Z"}}}}),
-            ));
-        }
-        Ok(MockTransport::json_response(
-            200,
-            serde_json::json!({"groups": [{"displayName": "Gemini Models", "buckets": [
-                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.90, "resetTime": "2099-01-01T00:00:00Z"},
-                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.90, "resetTime": "2099-01-07T00:00:00Z"}
-            ]}]}),
-        ))
     });
     let registry = OAuthClientRegistry::load(&paths).unwrap();
     let overrides = DaemonConfigOverrides {
-        interval_secs: 180,
+        interval_secs: 300,
         cooldown_secs: 3600,
         once: true,
+        step_buffer_delay: Duration::ZERO,
         notify_override: Some(false),
         ..DaemonConfigOverrides::default()
     };
@@ -3683,11 +3445,8 @@ async fn synthetic_v124_daemon_reset_cooldown_wakes_running_engine_and_sanitizes
         .run_single_tick(
             &repo,
             &FileSessionBackend,
-            &transport,
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
+            &runner,
             &registry,
-            "antigravity/test",
             &overrides,
             now,
         )
@@ -3708,11 +3467,8 @@ async fn synthetic_v124_daemon_reset_cooldown_wakes_running_engine_and_sanitizes
         .run_single_tick(
             &repo,
             &FileSessionBackend,
-            &transport,
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
+            &runner,
             &registry,
-            "antigravity/test",
             &overrides,
             now + 10,
         )
@@ -3731,11 +3487,8 @@ async fn synthetic_v124_daemon_reset_cooldown_wakes_running_engine_and_sanitizes
         .run_single_tick(
             &repo,
             &FileSessionBackend,
-            &transport,
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
+            &runner,
             &registry,
-            "antigravity/test",
             &overrides,
             now + 15,
         )
@@ -3772,7 +3525,6 @@ async fn synthetic_v124_daemon_reset_cooldown_wakes_running_engine_and_sanitizes
             bad_data.to_str().unwrap(),
             "--backend",
             "file",
-            "--no-remote-version",
             "--json",
             "daemon",
             "--once",
@@ -3792,4 +3544,2539 @@ async fn synthetic_v124_daemon_reset_cooldown_wakes_running_engine_and_sanitizes
     assert_eq!(ej["schema_version"], 1);
     assert_eq!(ej["ok"], false);
     assert_eq!(ej["error_code"], "data_error");
+}
+
+#[tokio::test]
+async fn synthetic_v127_daemon_step_and_verify_local_cache_skip_multi_hop_and_exhausted_steady_state(
+) {
+    let _guard = PROC_ENV_MUTEX.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    let cache = tmp.path().join("cache");
+    let fake_proc = tmp.path().join("proc");
+    fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+    fs::create_dir_all(&fake_proc).unwrap();
+    let _proc_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc);
+
+    let now = 1_800_500_000i64;
+    let future_reset = "2099-01-01T05:00:00Z";
+    let past_reset = jiff::Timestamp::from_second(now - 600).unwrap().to_string();
+    let paths = HeadlessPaths::with_explicit(home, data, cache);
+    let repo = StoreRepository::new(paths.clone());
+    let backend = FileSessionBackend;
+    let reg = OAuthClientRegistry::parse_from_raw(None, None);
+
+    let make_cli_acc = |id: &str, email: &str, pct_5h: f64, reset_5h: &str| -> AccountRecord {
+        let mut a = AccountRecord::new(
+            id.into(),
+            email.into(),
+            TokenRecord {
+                access_token: format!("ya29.{id}"),
+                refresh_token: format!("1//RT_{id}"),
+                expires_in: 7200,
+                expiry_timestamp: now + 7200,
+                token_type: "Bearer".into(),
+                id_token: None,
+                oauth_client_key: Some("antigravity_enterprise".into()),
+                granted_scopes: None,
+                project_id: None,
+                is_gcp_tos: true,
+            },
+            now,
+        );
+        let mut obs = QuotaObservation::new(now - 60, QuotaSourceEnv::OfficialCli);
+        obs.subscription_tier = Some("Google AI Pro".into());
+        obs.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
+        obs.quota_groups = Some(vec![QuotaGroup {
+            display_name: "Gemini Models".into(),
+            description: Some("Models within this group: gemini-3.1-pro".into()),
+            buckets: vec![
+                QuotaBucket {
+                    bucket_id: "gemini-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: pct_5h,
+                    remaining_fraction_known: Some(true),
+                    reset_time: reset_5h.into(),
+                    display_name: None,
+                    description: None,
+                },
+                QuotaBucket {
+                    bucket_id: "gemini-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: 0.90,
+                    remaining_fraction_known: Some(true),
+                    reset_time: future_reset.into(),
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        }]);
+        a.quota = Some(obs);
+        a
+    };
+
+    // Scenario A: Local cache skip + multi-hop Step-and-Verify landing!
+    // - `acc-a`: active source at 5% (<= reserve 10%)
+    // - `acc-c1`: cached 8% (< min 30%) with FUTURE reset_time -> MUST be skipped purely locally!
+    // - `acc-c2`: cached 8% (< min 30%) with EXPIRED reset_time -> MUST be probed; live returns 14% (< 30%) -> advance without cooldown!
+    // - `acc-c3`: live returns 82% (>= 30%) -> LANDS cleanly with cooldown set!
+    let acc_a = make_cli_acc("acc-a", "alice@example.com", 0.05, future_reset);
+    let acc_c1 = make_cli_acc("acc-c1", "bob@example.com", 0.08, future_reset);
+    let acc_c2 = make_cli_acc("acc-c2", "charlie@example.com", 0.08, &past_reset);
+    let acc_c3 = make_cli_acc("acc-c3", "dave@example.com", 0.80, future_reset);
+
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc_a.clone(), true, now)?;
+        tx.upsert_account(acc_c1.clone(), false, now)?;
+        tx.upsert_account(acc_c2.clone(), false, now)?;
+        tx.upsert_account(acc_c3.clone(), false, now)?;
+        let mut pol = SwitchPolicy {
+            enabled: true,
+            mode: PolicyMode::Immediate,
+            strategy: PolicyStrategy::Priority,
+            reserve_percentage: 10,
+            candidate_min_percentage: 30,
+            monitored_model: "all".into(),
+            candidate_account_ids: vec![
+                "acc-c1".into(),
+                "acc-c2".into(),
+                "acc-c3".into(),
+                "acc-a".into(),
+            ],
+            ..SwitchPolicy::default()
+        };
+        tx.save_policy(&mut pol, None, now)?;
+        Ok(())
+    })
+    .unwrap();
+    backend
+        .write_slot(&paths, &serialize_session_payload(&acc_a.token).unwrap())
+        .unwrap();
+
+    let runner_a = SlotQuotaRunner::from_handler(|_, _, slot| {
+        if slot.contains("1//RT_acc-a") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if slot.contains("1//RT_acc-c1") {
+            panic!(
+                "acc-c1 (known low before future reset) MUST be skipped locally without probing!"
+            );
+        } else if slot.contains("1//RT_acc-c2") {
+            Ok(quota_outcome_for_frac(0.14, 0.90))
+        } else if slot.contains("1//RT_acc-c3") {
+            Ok(quota_outcome_for_frac(0.82, 0.90))
+        } else {
+            panic!("unexpected slot: {slot}");
+        }
+    });
+
+    let overrides = DaemonConfigOverrides {
+        cooldown_secs: 1800,
+        step_buffer_delay: Duration::ZERO,
+        notify_override: Some(false),
+        ..DaemonConfigOverrides::default()
+    };
+    let mut engine = DaemonEngine::new();
+    let res_a = engine
+        .run_single_tick(&repo, &backend, &runner_a, &reg, &overrides, now)
+        .await
+        .unwrap();
+    assert_eq!(
+        res_a,
+        TickStageOutcome::CommittedSwitch {
+            source_id: "acc-a".into(),
+            target_id: "acc-c3".into(),
+        }
+    );
+    let probed_a = runner_a.probed_slots();
+    assert!(probed_a.iter().any(|s| s.contains("1//RT_acc-c2")));
+    assert!(probed_a.iter().any(|s| s.contains("1//RT_acc-c3")));
+    assert!(!probed_a.iter().any(|s| s.contains("1//RT_acc-c1")));
+    assert_eq!(
+        read_daemon_state_readonly(&paths).unwrap().cooldown_until,
+        now + 1800
+    );
+
+    // Scenario B: All-exhausted steady-state — stays on highest live-probed candidate > source_rem,
+    // sets NO switch cooldown (or holds without ping-pong), and returns to original source when all <= source_rem!
+    // Reset cooldown and switch back to `acc-a` (5%), with `acc-c2` (18% < 30%) and `acc-c3` (12% < 30%).
+    execute_switch(
+        &repo,
+        &backend,
+        &reg,
+        "acc-a",
+        &SwitchOptions {
+            dry_run: false,
+            allow_running: true,
+        },
+        now + 2000,
+    )
+    .unwrap();
+    repo.with_write_lock(|tx| {
+        let mut ds = read_daemon_state_readonly(tx.paths())?;
+        ds.cooldown_until = 0;
+        agy_switch_cli::switching::daemon::save_daemon_state_in_tx(tx.paths(), &ds)?;
+        // Clear cached future low on c2/c3 so both are live-probed
+        for id in ["acc-c2", "acc-c3"] {
+            let mut rec = tx.load_account_opt(id)?.unwrap();
+            rec.quota = None;
+            tx.save_account(&rec)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let runner_exhausted_best = SlotQuotaRunner::from_handler(|_, _, slot| {
+        if slot.contains("1//RT_acc-a") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if slot.contains("1//RT_acc-c2") {
+            Ok(quota_outcome_for_frac(0.18, 0.90)) // highest below min (18% > 5%)!
+        } else if slot.contains("1//RT_acc-c3") {
+            Ok(quota_outcome_for_frac(0.12, 0.90))
+        } else {
+            panic!("unexpected slot in exhausted best test: {slot}");
+        }
+    });
+    let mut engine_ex = DaemonEngine::new();
+    let res_ex = engine_ex
+        .run_single_tick(
+            &repo,
+            &backend,
+            &runner_exhausted_best,
+            &reg,
+            &overrides,
+            now + 2010,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        res_ex,
+        TickStageOutcome::NoQualifiedCandidate { .. }
+    ));
+    // MUST stay on `acc-c2` (18% > original 5%) rather than leaving slot on `acc-c3` (12%) or `acc-a` (5%)!
+    assert_eq!(
+        repo.read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-c2")
+    );
+    assert!(fs::read_to_string(&paths.active_slot_file)
+        .unwrap()
+        .contains("1//RT_acc-c2"));
+
+    // Next tick when ALL candidates are strictly <= source_rem (`acc-c2` at 18%, `acc-a`/`acc-c3` at 5%/12%)
+    // MUST skip cached low candidates locally (zero ping-pong!) and stay on `acc-c2`!
+    let runner_no_pingpong = SlotQuotaRunner::from_handler(|_, _, slot| {
+        if slot.contains("1//RT_acc-c2") {
+            Ok(quota_outcome_for_frac(0.18, 0.90))
+        } else {
+            panic!("exhausted candidates with cached future reset MUST NOT be re-probed (no ping-pong!): {slot}");
+        }
+    });
+    let res_nopp = engine_ex
+        .run_single_tick(
+            &repo,
+            &backend,
+            &runner_no_pingpong,
+            &reg,
+            &overrides,
+            now + 2400,
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_nopp, TickStageOutcome::IdleSufficientQuota);
+    assert_eq!(runner_no_pingpong.probed_slots().len(), 1);
+}
+
+#[tokio::test]
+async fn synthetic_v127_daemon_hold_backoff_settle_failure_wait_midhop_and_rotated_rt_stage1() {
+    let _guard = PROC_ENV_MUTEX.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    let cache = tmp.path().join("cache");
+    let fake_proc = tmp.path().join("proc");
+    fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+    fs::create_dir_all(&fake_proc).unwrap();
+    let _proc_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc);
+
+    let now = 1_800_600_000i64;
+    let paths = HeadlessPaths::with_explicit(home, data, cache);
+    let repo = StoreRepository::new(paths.clone());
+    let backend = FileSessionBackend;
+    let reg = OAuthClientRegistry::parse_from_raw(None, None);
+
+    let make_acc = |id: &str, email: &str| -> AccountRecord {
+        AccountRecord::new(
+            id.into(),
+            email.into(),
+            TokenRecord {
+                access_token: format!("ya29.{id}"),
+                refresh_token: format!("1//RT_{id}"),
+                expires_in: 7200,
+                expiry_timestamp: now + 7200,
+                token_type: "Bearer".into(),
+                id_token: None,
+                oauth_client_key: Some("antigravity_enterprise".into()),
+                granted_scopes: None,
+                project_id: None,
+                is_gcp_tos: true,
+            },
+            now,
+        )
+    };
+    let acc_a = make_acc("acc-a", "alice@example.com");
+    let acc_b = make_acc("acc-b", "bob@example.com");
+    let acc_c = make_acc("acc-c", "charlie@example.com");
+
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc_a.clone(), true, now)?;
+        tx.upsert_account(acc_b.clone(), false, now)?;
+        tx.upsert_account(acc_c.clone(), false, now)?;
+        let mut pol = SwitchPolicy {
+            enabled: true,
+            mode: PolicyMode::Immediate,
+            strategy: PolicyStrategy::Priority,
+            reserve_percentage: 10,
+            candidate_min_percentage: 30,
+            monitored_model: "all".into(),
+            candidate_account_ids: vec!["acc-b".into(), "acc-c".into(), "acc-a".into()],
+            ..SwitchPolicy::default()
+        };
+        tx.save_policy(&mut pol, None, now)?;
+        Ok(())
+    })
+    .unwrap();
+
+    // 1. Stage 1 MUST accept a rotated refresh_token written by official `agy` for the selected
+    //    account (`acc-a`) with matching `id_token_email`, sync it back, and proceed without wedging!
+    fs::write(
+        &paths.active_slot_file,
+        serde_json::to_vec(&serde_json::json!({
+            "token": {
+                "access_token": "ya29.acc-a-rot",
+                "token_type": "Bearer",
+                "refresh_token": "1//RT_acc-a_ROTATED_BY_AGY",
+                "expiry": "2099-01-01T00:00:00Z"
+            },
+            "id_token_email": "alice@example.com",
+            "user_tier": "PRO"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let runner_rot =
+        SlotQuotaRunner::from_handler(|_, _, _| Ok(quota_outcome_for_frac(0.85, 0.90)));
+    let overrides = DaemonConfigOverrides {
+        interval_secs: 300,
+        cooldown_secs: 3600,
+        step_buffer_delay: Duration::ZERO,
+        notify_override: Some(false),
+        ..DaemonConfigOverrides::default()
+    };
+    let mut engine = DaemonEngine::new();
+    let res_rot = engine
+        .run_single_tick(&repo, &backend, &runner_rot, &reg, &overrides, now)
+        .await
+        .unwrap();
+    assert_eq!(res_rot, TickStageOutcome::IdleSufficientQuota);
+    assert_eq!(
+        repo.read_account_unchecked("acc-a")
+            .unwrap()
+            .token
+            .refresh_token,
+        "1//RT_acc-a_ROTATED_BY_AGY"
+    );
+
+    // 2. All-below-reserve (`<= 10%`) exhausted steady-state MUST set hold backoff (`>= 2 * interval`)
+    //    so the very next tick (`now + 300`) does NOT ping-pong even if cached resets have passed!
+    //    Use `reset_time = now + 200` (expires BEFORE next tick at `now + 300`), so ONLY hold backoff
+    //    prevents re-hopping!
+    let near_reset = jiff::Timestamp::from_second(now + 200).unwrap().to_string();
+    let near_reset_c = near_reset.clone();
+    let make_near_outcome = move |frac: f64| OfficialCliUsageOutcome::Quota {
+        description: None,
+        groups: vec![QuotaGroup {
+            display_name: "Gemini Models".into(),
+            description: None,
+            buckets: vec![
+                QuotaBucket {
+                    bucket_id: "gemini-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: frac,
+                    remaining_fraction_known: Some(true),
+                    reset_time: near_reset_c.clone(),
+                    display_name: None,
+                    description: None,
+                },
+                QuotaBucket {
+                    bucket_id: "gemini-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: 0.90,
+                    remaining_fraction_known: Some(true),
+                    reset_time: "2099-01-07T00:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        }],
+    };
+    let runner_all_low = SlotQuotaRunner::from_handler(move |_, _, slot| {
+        if slot.contains("1//RT_acc-a_ROTATED_BY_AGY") {
+            Ok(make_near_outcome(0.05))
+        } else if slot.contains("1//RT_acc-b") {
+            Ok(make_near_outcome(0.08)) // best, STILL <= reserve 10%!
+        } else if slot.contains("1//RT_acc-c") {
+            Ok(make_near_outcome(0.07))
+        } else {
+            panic!("unexpected slot: {slot}");
+        }
+    });
+    let res_low_1 = engine
+        .run_single_tick(&repo, &backend, &runner_all_low, &reg, &overrides, now + 10)
+        .await
+        .unwrap();
+    assert!(matches!(
+        res_low_1,
+        TickStageOutcome::NoQualifiedCandidate { .. }
+    ));
+    assert_eq!(
+        repo.read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-b")
+    );
+
+    // Tick 2 at `now + 310` (AFTER `near_reset` = `now + 200` has passed!):
+    // `acc-b` is still 8% (<= reserve 10%), but hold backoff MUST prevent hopping to `acc-a` or `acc-c`!
+    let near_reset_2 = jiff::Timestamp::from_second(now + 400).unwrap().to_string();
+    let runner_hold_check = SlotQuotaRunner::from_handler(move |_, _, slot| {
+        if slot.contains("1//RT_acc-b") {
+            Ok(OfficialCliUsageOutcome::Quota {
+                description: None,
+                groups: vec![QuotaGroup {
+                    display_name: "Gemini Models".into(),
+                    description: None,
+                    buckets: vec![
+                        QuotaBucket {
+                            bucket_id: "gemini-5h".into(),
+                            window: "5h".into(),
+                            remaining_fraction: 0.08,
+                            remaining_fraction_known: Some(true),
+                            reset_time: near_reset_2.clone(),
+                            display_name: None,
+                            description: None,
+                        },
+                        QuotaBucket {
+                            bucket_id: "gemini-weekly".into(),
+                            window: "weekly".into(),
+                            remaining_fraction: 0.90,
+                            remaining_fraction_known: Some(true),
+                            reset_time: "2099-01-07T00:00:00Z".into(),
+                            display_name: None,
+                            description: None,
+                        },
+                    ],
+                }],
+            })
+        } else {
+            panic!("hold backoff MUST prevent re-probing exhausted dormant candidate: {slot}");
+        }
+    });
+    let res_low_2 = engine
+        .run_single_tick(
+            &repo,
+            &backend,
+            &runner_hold_check,
+            &reg,
+            &overrides,
+            now + 310,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        res_low_2,
+        TickStageOutcome::NoQualifiedCandidate { .. }
+    ));
+    assert_eq!(runner_hold_check.probed_slots().len(), 1);
+    assert_eq!(
+        repo.read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-b")
+    );
+
+    // 3. Stage 6 settle-back commit failure MUST NOT be swallowed:
+    //    Switch back to `acc-a`, clear caches/backoff, hop `acc-a -> acc-b (18%) -> acc-c (12%)`,
+    //    then chmod slot dir 0500 right inside `acc-c` probe so Stage 6 settle-back (`acc-c -> acc-b`)
+    //    fails and MUST return `CommitFailed` rather than falsely claiming `NoQualifiedCandidate`!
+    execute_switch(
+        &repo,
+        &backend,
+        &reg,
+        "acc-a",
+        &SwitchOptions {
+            dry_run: false,
+            allow_running: true,
+        },
+        now + 1000,
+    )
+    .unwrap();
+    repo.with_write_lock(|tx| {
+        for id in ["acc-a", "acc-b", "acc-c"] {
+            let mut r = tx.load_account_opt(id)?.unwrap();
+            r.quota = None;
+            tx.save_account(&r)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let slot_dir_for_ro = paths.active_slot_dir.clone();
+    let runner_settle_fail = SlotQuotaRunner::from_handler(move |_, _, slot| {
+        if slot.contains("1//RT_acc-a_ROTATED_BY_AGY") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if slot.contains("1//RT_acc-b") {
+            Ok(quota_outcome_for_frac(0.18, 0.90))
+        } else if slot.contains("1//RT_acc-c") {
+            // Make slot dir read-only BEFORE Stage 6 settles back to `acc-b`!
+            fs::set_permissions(&slot_dir_for_ro, fs::Permissions::from_mode(0o500)).unwrap();
+            Ok(quota_outcome_for_frac(0.12, 0.90))
+        } else {
+            panic!("unexpected slot: {slot}");
+        }
+    });
+    let mut engine_sf = DaemonEngine::new();
+    let res_sf = engine_sf
+        .run_single_tick(
+            &repo,
+            &backend,
+            &runner_settle_fail,
+            &reg,
+            &overrides,
+            now + 1010,
+        )
+        .await
+        .unwrap();
+    fs::set_permissions(&paths.active_slot_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        matches!(res_sf, TickStageOutcome::CommitFailed { .. }),
+        "Stage 6 settle-back commit error must return CommitFailed, got {res_sf:?}"
+    );
+    assert_eq!(
+        read_daemon_state_readonly(&paths)
+            .unwrap()
+            .consecutive_commit_failures,
+        1
+    );
+
+    // 3b. Once the slot directory is writable again, a subsequent Stage 6 settle-back `Ok(_)`
+    //     persisting `no_candidate` MUST reset `consecutive_commit_failures` from `1` back to `0`!
+    //     (Start directly from `acc-c` without calling `execute_switch`, which would clear the counter.)
+    assert_eq!(
+        repo.read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-c")
+    );
+    repo.with_write_lock(|tx| {
+        for id in ["acc-a", "acc-b", "acc-c"] {
+            let mut r = tx.load_account_opt(id)?.unwrap();
+            r.quota = None;
+            tx.save_account(&r)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        read_daemon_state_readonly(&paths)
+            .unwrap()
+            .consecutive_commit_failures,
+        1,
+        "precondition: consecutive_commit_failures must still be 1 before Stage 6 recovery tick"
+    );
+    let runner_settle_ok = SlotQuotaRunner::from_handler(|_, _, slot| {
+        if slot.contains("1//RT_acc-c") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if slot.contains("1//RT_acc-b") {
+            Ok(quota_outcome_for_frac(0.18, 0.90))
+        } else if slot.contains("1//RT_acc-a_ROTATED_BY_AGY") {
+            Ok(quota_outcome_for_frac(0.12, 0.90))
+        } else {
+            panic!("unexpected slot: {slot}");
+        }
+    });
+    let mut engine_settle_ok = DaemonEngine::new();
+    let res_settle_ok = engine_settle_ok
+        .run_single_tick(
+            &repo,
+            &backend,
+            &runner_settle_ok,
+            &reg,
+            &overrides,
+            now + 1050,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res_settle_ok,
+        TickStageOutcome::NoQualifiedCandidate {
+            reason: "no_qualified_candidate".into()
+        }
+    );
+    assert_eq!(
+        repo.read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-b")
+    );
+    assert_eq!(
+        read_daemon_state_readonly(&paths)
+            .unwrap()
+            .consecutive_commit_failures,
+        0,
+        "Stage 6 settle-back Ok(_) must reset consecutive_commit_failures to 0"
+    );
+
+    // 4. Mid-hop `PolicyMode::Wait` guard: start an active `agy` process AFTER hop 0 (`acc-b`) probes
+    //    below min, BEFORE hop 1 (`acc-c`): daemon MUST return `BlockedByActiveProcess("acc-c")`
+    //    and MUST NOT switch the slot while `agy` is running!
+    execute_switch(
+        &repo,
+        &backend,
+        &reg,
+        "acc-a",
+        &SwitchOptions {
+            dry_run: false,
+            allow_running: true,
+        },
+        now + 1100,
+    )
+    .unwrap();
+    repo.with_write_lock(|tx| {
+        for id in ["acc-a", "acc-b", "acc-c"] {
+            let mut r = tx.load_account_opt(id)?.unwrap();
+            r.quota = None;
+            tx.save_account(&r)?;
+        }
+        let mut pol = repo.read_policy()?;
+        let rev = pol.revision;
+        pol.mode = PolicyMode::Wait;
+        tx.save_policy(&mut pol, Some(rev), now + 1101)?;
+        Ok(())
+    })
+    .unwrap();
+    let proc_for_wait = fake_proc.clone();
+    let runner_wait_midhop = SlotQuotaRunner::from_handler(move |_, _, slot| {
+        if slot.contains("1//RT_acc-a_ROTATED_BY_AGY") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if slot.contains("1//RT_acc-b") {
+            // Simulate user launching `agy` during hop 0!
+            fs::create_dir_all(proc_for_wait.join("6001")).unwrap();
+            fs::write(
+                proc_for_wait.join("6001/stat"),
+                "6001 (agy) S 1 6001 6001 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 888999 1000 10",
+            )
+            .unwrap();
+            fs::write(proc_for_wait.join("6001/comm"), "agy\n").unwrap();
+            Ok(quota_outcome_for_frac(0.03, 0.90)) // lower than acc-a (5%)!
+        } else {
+            panic!("Wait mode must NOT probe acc-c after agy started: {slot}");
+        }
+    });
+    let mut engine_w = DaemonEngine::new();
+    let res_wait = engine_w
+        .run_single_tick(
+            &repo,
+            &backend,
+            &runner_wait_midhop,
+            &reg,
+            &overrides,
+            now + 1110,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res_wait,
+        TickStageOutcome::BlockedByActiveProcess {
+            target_id: "acc-c".into()
+        }
+    );
+    // Slot MUST remain untouched on `acc-b` (never illegally switched back to `acc-a` while `agy` runs!)
+    assert_eq!(
+        repo.read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-b")
+    );
+
+    // 5. Committed intermediate hop (`hop 0` Ok) MUST reset `consecutive_commit_failures` to 0:
+    //    Seed `consecutive_commit_failures = 2` (1 below pause threshold 3), let `hop 0` commit
+    //    cleanly (`acc-a -> acc-b`), then fail `hop 1` (`acc-c`) with EACCES -> MUST result in
+    //    `CommitFailed` with `consecutive_commit_failures == 1` (NOT `PausedOnFailure` at 3)!
+    let _ = fs::remove_dir_all(fake_proc.join("6001"));
+    execute_switch(
+        &repo,
+        &backend,
+        &reg,
+        "acc-a",
+        &SwitchOptions {
+            dry_run: false,
+            allow_running: true,
+        },
+        now + 1200,
+    )
+    .unwrap();
+    repo.with_write_lock(|tx| {
+        for id in ["acc-a", "acc-b", "acc-c"] {
+            let mut r = tx.load_account_opt(id)?.unwrap();
+            r.quota = None;
+            tx.save_account(&r)?;
+        }
+        let mut pol = repo.read_policy()?;
+        let rev = pol.revision;
+        pol.mode = PolicyMode::Immediate;
+        tx.save_policy(&mut pol, Some(rev), now + 1201)?;
+        Ok(())
+    })
+    .unwrap();
+    let mut st_seed = read_daemon_state_readonly(&paths).unwrap();
+    st_seed.consecutive_commit_failures = 2;
+    st_seed.paused_on_failure = false;
+    st_seed.cooldown_until = 0;
+    fs::write(
+        paths.daemon_state_file(),
+        serde_json::to_vec(&st_seed).unwrap(),
+    )
+    .unwrap();
+    let slot_dir_mid_fail = paths.active_slot_dir.clone();
+    let runner_mid_fail = SlotQuotaRunner::from_handler(move |_, _, slot| {
+        if slot.contains("1//RT_acc-a_ROTATED_BY_AGY") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if slot.contains("1//RT_acc-b") {
+            // Make slot dir read-only AFTER hop 0 committed cleanly so hop 1 fails commit.
+            fs::set_permissions(&slot_dir_mid_fail, fs::Permissions::from_mode(0o500)).unwrap();
+            Ok(quota_outcome_for_frac(0.10, 0.90))
+        } else {
+            panic!("unexpected slot after hop 1 EACCES: {slot}");
+        }
+    });
+    let mut engine_mid_fail = DaemonEngine::new();
+    let res_mid_fail = engine_mid_fail
+        .run_single_tick(
+            &repo,
+            &backend,
+            &runner_mid_fail,
+            &reg,
+            &overrides,
+            now + 1210,
+        )
+        .await
+        .unwrap();
+    fs::set_permissions(&paths.active_slot_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        matches!(res_mid_fail, TickStageOutcome::CommitFailed { .. }),
+        "hop 0 commit must reset consecutive_commit_failures so hop 1 failure is CommitFailed (1), not PausedOnFailure (3): got {res_mid_fail:?}"
+    );
+    let st_after_mid = read_daemon_state_readonly(&paths).unwrap();
+    assert!(!st_after_mid.paused_on_failure);
+    assert_eq!(st_after_mid.consecutive_commit_failures, 1);
+
+    // 6. Stage 6 settle-back MUST detect an external slot overwrite (`agy login`, without bumping
+    //    `index.revision`) via `expected_slot_digest` under L1 and cancel instead of clobbering!
+    execute_switch(
+        &repo,
+        &backend,
+        &reg,
+        "acc-a",
+        &SwitchOptions {
+            dry_run: false,
+            allow_running: true,
+        },
+        now + 1300,
+    )
+    .unwrap();
+    repo.with_write_lock(|tx| {
+        for id in ["acc-a", "acc-b", "acc-c"] {
+            let mut r = tx.load_account_opt(id)?.unwrap();
+            r.quota = None;
+            tx.save_account(&r)?;
+        }
+        let mut pol = repo.read_policy()?;
+        let rev = pol.revision;
+        pol.candidate_account_ids = vec!["acc-a".into(), "acc-b".into()];
+        tx.save_policy(&mut pol, Some(rev), now + 1301)?;
+        Ok(())
+    })
+    .unwrap();
+    let ext_payload = serde_json::to_vec(&serde_json::json!({
+        "token": {
+            "access_token": "ya29.EXT_LOGIN",
+            "token_type": "Bearer",
+            "refresh_token": "1//RT_EXTERNAL_USER",
+            "expiry": "2099-05-01T00:00:00Z"
+        },
+        "id_token_email": "external@example.com"
+    }))
+    .unwrap();
+    let countdown = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    struct CountdownStage6Backend {
+        inner: FileSessionBackend,
+        countdown: std::sync::Arc<std::sync::Mutex<usize>>,
+        ext_bytes: Vec<u8>,
+    }
+    impl agy_switch_cli::session::backend::CredentialBackend for CountdownStage6Backend {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn uses_keyring(&self) -> bool {
+            self.inner.uses_keyring()
+        }
+        fn inspect_slot(
+            &self,
+            p: &HeadlessPaths,
+        ) -> agy_switch_cli::session::backend::SlotInspectState {
+            let st = self.inner.inspect_slot(p);
+            let mut guard = self.countdown.lock().unwrap();
+            if *guard > 0 {
+                *guard -= 1;
+                if *guard == 0 {
+                    fs::write(&p.active_slot_file, &self.ext_bytes).unwrap();
+                }
+            }
+            st
+        }
+        fn snapshot_before_write(
+            &self,
+            p: &HeadlessPaths,
+        ) -> agy_switch_cli::error::CliResult<Option<Vec<u8>>> {
+            self.inner.snapshot_before_write(p)
+        }
+        fn write_slot(
+            &self,
+            p: &HeadlessPaths,
+            payload: &str,
+        ) -> agy_switch_cli::error::CliResult<()> {
+            self.inner.write_slot(p, payload)
+        }
+        fn remove_slot(&self, p: &HeadlessPaths) -> agy_switch_cli::error::CliResult<()> {
+            self.inner.remove_slot(p)
+        }
+    }
+    let cd_backend = CountdownStage6Backend {
+        inner: FileSessionBackend,
+        countdown: countdown.clone(),
+        ext_bytes: ext_payload.clone(),
+    };
+    let cd_for_runner = countdown.clone();
+    let runner_s6_cd = SlotQuotaRunner::from_handler(move |_, _, slot| {
+        if slot.contains("1//RT_acc-a_ROTATED_BY_AGY") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if slot.contains("1//RT_acc-b") {
+            // 1st inspect_slot after this returns = official_cli post-probe guard (countdown 1->0,
+            // overwrites slot immediately after verified_slot_digest is captured so Stage 6 catches it!).
+            *cd_for_runner.lock().unwrap() = 1;
+            Ok(quota_outcome_for_frac(0.03, 0.90))
+        } else {
+            panic!("unexpected slot in Stage 6 external overwrite test: {slot}");
+        }
+    });
+    let mut engine_s6 = DaemonEngine::new();
+    let res_s6_cancel = engine_s6
+        .run_single_tick(
+            &repo,
+            &cd_backend,
+            &runner_s6_cd,
+            &reg,
+            &overrides,
+            now + 1310,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res_s6_cancel,
+        TickStageOutcome::CancelledStalePlan {
+            reason: "active_slot_digest_changed".into()
+        },
+        "Stage 6 settle-back must cancel on external slot overwrite instead of clobbering"
+    );
+    assert_eq!(
+        fs::read(&paths.active_slot_file).unwrap(),
+        ext_payload,
+        "external slot payload must remain intact after Stage 6 cancellation"
+    );
+}
+
+#[tokio::test]
+async fn daemon_s1_pre_probe_external_login_and_s2_stage6_policy_change_cancel_safely() {
+    let _guard = PROC_ENV_MUTEX.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    let cache = tmp.path().join("cache");
+    let fake_proc = tmp.path().join("proc");
+    fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+    fs::create_dir_all(&fake_proc).unwrap();
+    let _proc_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc);
+
+    let paths = HeadlessPaths::with_explicit(home, data, cache);
+    let repo = StoreRepository::new(paths.clone());
+    let reg = OAuthClientRegistry::parse_from_raw(None, None);
+    let now = 1_920_000_000i64;
+
+    let make_acc = |id: &str, email: &str, rt: &str| {
+        AccountRecord::new(
+            id.into(),
+            email.into(),
+            TokenRecord {
+                access_token: format!("ya29.{id}"),
+                refresh_token: rt.into(),
+                expires_in: 3600,
+                expiry_timestamp: now + 7200,
+                token_type: "Bearer".into(),
+                id_token: None,
+                oauth_client_key: None,
+                granted_scopes: None,
+                project_id: None,
+                is_gcp_tos: true,
+            },
+            now,
+        )
+    };
+    let acc_a = make_acc("acc-a", "alice@example.com", "1//RT_S1_A");
+    let acc_b = make_acc("acc-b", "bob@example.com", "1//RT_S1_B");
+    let acc_c = make_acc("acc-c", "charlie@example.com", "1//RT_S1_C");
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc_a.clone(), true, now)?;
+        tx.upsert_account(acc_b.clone(), false, now)?;
+        tx.upsert_account(acc_c.clone(), false, now)?;
+        let mut p = SwitchPolicy {
+            enabled: true,
+            mode: PolicyMode::Immediate,
+            strategy: PolicyStrategy::Priority,
+            monitored_model: "all".into(),
+            reserve_percentage: 10,
+            candidate_min_percentage: 30,
+            candidate_account_ids: vec!["acc-b".into(), "acc-c".into()],
+            ..SwitchPolicy::default()
+        };
+        tx.save_policy(&mut p, None, now)?;
+        Ok(())
+    })
+    .unwrap();
+    FileSessionBackend
+        .write_slot(&paths, &serialize_session_payload(&acc_a.token).unwrap())
+        .unwrap();
+
+    // S1-a: External `agy login` overwrites active slot with an unsaved foreign account right
+    // after Stage 5 switches to `acc-b` and captures its post-switch checkpoint, BEFORE
+    // `refresh_active_slot_quota_detailed`'s pre-probe `resolve_active_official_slot_account_id`
+    // runs. Daemon MUST cancel without adopting the foreign digest and MUST NOT overwrite the
+    // external slot on next hop (`acc-c`) or Stage 6 settle-back!
+    let ext_login_payload = serde_json::to_vec(&serde_json::json!({
+        "token": {
+            "access_token": "ya29.EXT_S1_LOGIN",
+            "token_type": "Bearer",
+            "refresh_token": "1//RT_EXT_S1_FOREIGN",
+            "expiry": "2099-06-01T00:00:00Z"
+        },
+        "id_token_email": "fresh-login@example.com"
+    }))
+    .unwrap();
+
+    struct InjectExternalAfterSwitchBackend {
+        inner: FileSessionBackend,
+        armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ext_bytes: Vec<u8>,
+    }
+    impl agy_switch_cli::session::backend::CredentialBackend for InjectExternalAfterSwitchBackend {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn uses_keyring(&self) -> bool {
+            self.inner.uses_keyring()
+        }
+        fn inspect_slot(
+            &self,
+            p: &HeadlessPaths,
+        ) -> agy_switch_cli::session::backend::SlotInspectState {
+            let st = self.inner.inspect_slot(p);
+            // When `daemon.rs` captures `post_switch_checkpoint` right after switching to `acc-b`,
+            // `armed` was flipped by `write_slot` — immediately simulate an independent `agy login`
+            // right after L1 checkpoint capture, before pre-probe `inspect_slot` runs!
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                fs::write(&p.active_slot_file, &self.ext_bytes).unwrap();
+            }
+            st
+        }
+        fn snapshot_before_write(
+            &self,
+            p: &HeadlessPaths,
+        ) -> agy_switch_cli::error::CliResult<Option<Vec<u8>>> {
+            self.inner.snapshot_before_write(p)
+        }
+        fn write_slot(
+            &self,
+            p: &HeadlessPaths,
+            payload: &str,
+        ) -> agy_switch_cli::error::CliResult<()> {
+            self.inner.write_slot(p, payload)?;
+            if payload.contains("1//RT_S1_B") {
+                self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn remove_slot(&self, p: &HeadlessPaths) -> agy_switch_cli::error::CliResult<()> {
+            self.inner.remove_slot(p)
+        }
+    }
+
+    let s1_backend = InjectExternalAfterSwitchBackend {
+        inner: FileSessionBackend,
+        armed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ext_bytes: ext_login_payload.clone(),
+    };
+    let s1_runner = SlotQuotaRunner::from_handler(|_, _, slot| {
+        if slot.contains("1//RT_S1_A") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else {
+            panic!("pre-probe mismatch must abort before probing foreign slot: {slot}");
+        }
+    });
+    let overrides = DaemonConfigOverrides {
+        interval_secs: 300,
+        cooldown_secs: 3600,
+        step_buffer_delay: Duration::ZERO,
+        once: true,
+        notify_override: Some(false),
+        explicit_file_backend: true,
+        ..DaemonConfigOverrides::default()
+    };
+    let mut engine_s1 = DaemonEngine::new();
+    let res_s1 = engine_s1
+        .run_single_tick(&repo, &s1_backend, &s1_runner, &reg, &overrides, now + 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        res_s1,
+        TickStageOutcome::CancelledStalePlan {
+            reason: "active_slot_digest_changed".into()
+        },
+        "S1: pre-probe external login must cancel daemon tick instead of adopting foreign digest"
+    );
+    assert_eq!(
+        fs::read(&paths.active_slot_file).unwrap(),
+        ext_login_payload,
+        "S1: externally logged-in slot must remain completely intact"
+    );
+
+    // S1-b: Positive control — same-account legitimate RT rotation by official `agy` during a
+    // candidate probe that subsequently returns RateLimited still advances `expected_slot_digest`
+    // from `verified_slot_digest` and cleanly advances to `acc-c` (85%).
+    FileSessionBackend
+        .write_slot(&paths, &serialize_session_payload(&acc_a.token).unwrap())
+        .unwrap();
+    repo.with_write_lock(|tx| tx.commit_selected_account("acc-a", now + 20))
+        .unwrap();
+    let slot_path_rot = paths.active_slot_file.clone();
+    let s1_rot_runner = SlotQuotaRunner::from_handler(move |_, _, slot| {
+        if slot.contains("1//RT_S1_A") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if slot.contains("1//RT_S1_B") {
+            fs::write(
+                &slot_path_rot,
+                serde_json::to_vec(&serde_json::json!({
+                    "token": {
+                        "access_token": "ya29.B_ROTATED_AT",
+                        "token_type": "Bearer",
+                        "refresh_token": "1//RT_S1_B_ROTATED",
+                        "expiry": "2099-07-01T00:00:00Z"
+                    },
+                    "id_token_email": "bob@example.com"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            Err(OfficialCliQuotaError::RateLimited)
+        } else if slot.contains("1//RT_S1_C") {
+            Ok(quota_outcome_for_frac(0.85, 0.90))
+        } else {
+            panic!("unexpected slot in S1-b rotation control: {slot}");
+        }
+    });
+    let mut engine_s1_rot = DaemonEngine::new();
+    let res_s1_rot = engine_s1_rot
+        .run_single_tick(
+            &repo,
+            &FileSessionBackend,
+            &s1_rot_runner,
+            &reg,
+            &overrides,
+            now + 30,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res_s1_rot,
+        TickStageOutcome::CommittedSwitch {
+            source_id: "acc-a".into(),
+            target_id: "acc-c".into()
+        },
+        "S1-b: legitimate same-account RT rotation during failed probe must still advance cleanly"
+    );
+    assert_eq!(
+        repo.read_account_unchecked("acc-b")
+            .unwrap()
+            .token
+            .refresh_token,
+        "1//RT_S1_B_ROTATED"
+    );
+
+    // S2: A=5%, B=18%, C=9%. While probing `acc-c`, user disables policy (`enabled=false`,
+    // revision bumps). Stage 6 settle-back to `acc-b` MUST cancel with
+    // `policy_revision_changed_or_disabled`, NOT bump `index.revision`, and leave `acc-c` in slot!
+    repo.with_write_lock(|tx| {
+        tx.commit_selected_account("acc-a", now + 40)?;
+        let mut p = repo.read_policy()?;
+        let rev = p.revision;
+        p.enabled = true;
+        p.candidate_account_ids = vec!["acc-b".into(), "acc-c".into()];
+        tx.save_policy(&mut p, Some(rev), now + 40)?;
+        // Clear cooldown from S1-b so tick executes immediately
+        agy_switch_cli::switching::daemon::reset_daemon_cooldown_in_tx(tx.paths(), now + 40)?;
+        Ok(())
+    })
+    .unwrap();
+    FileSessionBackend
+        .write_slot(&paths, &serialize_session_payload(&acc_a.token).unwrap())
+        .unwrap();
+    let repo_for_s2 = StoreRepository::new(paths.clone());
+    let rev_at_c_probe = std::sync::Arc::new(std::sync::Mutex::new(0u64));
+    let rev_capture = rev_at_c_probe.clone();
+    let s2_runner = SlotQuotaRunner::from_handler(move |_, _, slot| {
+        if slot.contains("1//RT_S1_A") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if slot.contains("1//RT_S1_B") {
+            Ok(quota_outcome_for_frac(0.18, 0.90))
+        } else if slot.contains("1//RT_S1_C") {
+            *rev_capture.lock().unwrap() = repo_for_s2.read_snapshot().unwrap().index.revision;
+            repo_for_s2
+                .with_write_lock(|tx| {
+                    let mut p = repo_for_s2.read_policy()?;
+                    let rev = p.revision;
+                    p.enabled = false;
+                    tx.save_policy(&mut p, Some(rev), now + 50)?;
+                    Ok(())
+                })
+                .unwrap();
+            Ok(quota_outcome_for_frac(0.09, 0.90))
+        } else {
+            panic!("unexpected slot in S2 test: {slot}");
+        }
+    });
+    let mut engine_s2 = DaemonEngine::new();
+    let res_s2 = engine_s2
+        .run_single_tick(
+            &repo,
+            &FileSessionBackend,
+            &s2_runner,
+            &reg,
+            &overrides,
+            now + 60,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res_s2,
+        TickStageOutcome::CancelledStalePlan {
+            reason: "policy_revision_changed_or_disabled".into()
+        },
+        "S2: Stage 6 settle-back must cancel when policy is disabled or revised during last probe"
+    );
+    let snap_after_s2 = repo.read_snapshot().unwrap();
+    assert_eq!(
+        snap_after_s2.index.selected_account_id.as_deref(),
+        Some("acc-c"),
+        "S2: Stage 6 cancellation must leave acc-c selected"
+    );
+    assert_eq!(
+        snap_after_s2.index.revision,
+        *rev_at_c_probe.lock().unwrap(),
+        "S2: Stage 6 cancellation must NOT bump index.revision"
+    );
+
+    // S2 positive control: re-enable policy and clear cached low-quota observations from S2 so
+    // Stage 3 probes both candidates freshly without local-cache skip -> settles back on B!
+    repo.with_write_lock(|tx| {
+        for id in ["acc-a", "acc-b", "acc-c"] {
+            let mut r = tx.load_account_opt(id)?.unwrap();
+            r.quota = None;
+            tx.save_account(&r)?;
+        }
+        tx.commit_selected_account("acc-a", now + 70)?;
+        let mut p = repo.read_policy()?;
+        let rev = p.revision;
+        p.enabled = true;
+        p.candidate_account_ids = vec!["acc-b".into(), "acc-c".into()];
+        tx.save_policy(&mut p, Some(rev), now + 70)?;
+        Ok(())
+    })
+    .unwrap();
+    FileSessionBackend
+        .write_slot(&paths, &serialize_session_payload(&acc_a.token).unwrap())
+        .unwrap();
+    let s2_ok_runner = SlotQuotaRunner::from_handler(|_, _, slot| {
+        if slot.contains("1//RT_S1_A") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if slot.contains("1//RT_S1_B") {
+            Ok(quota_outcome_for_frac(0.18, 0.90))
+        } else if slot.contains("1//RT_S1_C") {
+            Ok(quota_outcome_for_frac(0.09, 0.90))
+        } else {
+            panic!("unexpected slot in S2 positive control: {slot}");
+        }
+    });
+    let mut engine_s2_ok = DaemonEngine::new();
+    let res_s2_ok = engine_s2_ok
+        .run_single_tick(
+            &repo,
+            &FileSessionBackend,
+            &s2_ok_runner,
+            &reg,
+            &overrides,
+            now + 80,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res_s2_ok,
+        TickStageOutcome::NoQualifiedCandidate {
+            reason: "no_qualified_candidate".into()
+        }
+    );
+    assert_eq!(
+        repo.read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-b"),
+        "S2 positive control: without policy change, Stage 6 settles back to best candidate acc-b"
+    );
+}
+
+#[tokio::test]
+async fn daemon_r2_01_pre_snap_baseline_handoff_cancels_on_hop_and_stage6_settle_back() {
+    let _guard = PROC_ENV_MUTEX.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    let cache = tmp.path().join("cache");
+    let fake_proc = tmp.path().join("proc");
+    fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+    fs::create_dir_all(&fake_proc).unwrap();
+    let _proc_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc);
+
+    let paths = HeadlessPaths::with_explicit(home, data, cache);
+    let repo = StoreRepository::new(paths.clone());
+    let reg = OAuthClientRegistry::parse_from_raw(None, None);
+    let now = 1_930_000_000i64;
+
+    let make_acc = |id: &str, email: &str, rt: &str| {
+        AccountRecord::new(
+            id.into(),
+            email.into(),
+            TokenRecord {
+                access_token: format!("ya29.{id}"),
+                refresh_token: rt.into(),
+                expires_in: 3600,
+                expiry_timestamp: now + 7200,
+                token_type: "Bearer".into(),
+                id_token: None,
+                oauth_client_key: None,
+                granted_scopes: None,
+                project_id: None,
+                is_gcp_tos: true,
+            },
+            now,
+        )
+    };
+    let acc_a = make_acc("acc-a", "alice@example.com", "1//RT_R201_A");
+    let acc_b = make_acc("acc-b", "bob@example.com", "1//RT_R201_B");
+    let acc_c = make_acc("acc-c", "charlie@example.com", "1//RT_R201_C");
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc_a.clone(), true, now)?;
+        tx.upsert_account(acc_b.clone(), false, now)?;
+        tx.upsert_account(acc_c.clone(), false, now)?;
+        let mut p = SwitchPolicy {
+            enabled: true,
+            mode: PolicyMode::Immediate,
+            strategy: PolicyStrategy::Priority,
+            monitored_model: "all".into(),
+            reserve_percentage: 10,
+            candidate_min_percentage: 30,
+            candidate_account_ids: vec!["acc-b".into(), "acc-c".into()],
+            ..SwitchPolicy::default()
+        };
+        tx.save_policy(&mut p, None, now)?;
+        Ok(())
+    })
+    .unwrap();
+
+    // Mock backend that lets `daemon.rs`'s `inspect_slot` see the expected slot, then injects an
+    // external `agy login` right as `executor.rs` takes `snapshot_before_write` (`pre_snap`) when
+    // the slot holds `trigger_rt_substr`!
+    struct InjectOnMatchingPreSnapBackend {
+        inner: FileSessionBackend,
+        trigger_rt_substr: &'static str,
+        write_calls_after_inject: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        injected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ext_bytes: Vec<u8>,
+    }
+    impl agy_switch_cli::session::backend::CredentialBackend for InjectOnMatchingPreSnapBackend {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn uses_keyring(&self) -> bool {
+            self.inner.uses_keyring()
+        }
+        fn inspect_slot(
+            &self,
+            p: &HeadlessPaths,
+        ) -> agy_switch_cli::session::backend::SlotInspectState {
+            self.inner.inspect_slot(p)
+        }
+        fn snapshot_before_write(
+            &self,
+            p: &HeadlessPaths,
+        ) -> agy_switch_cli::error::CliResult<Option<Vec<u8>>> {
+            let cur = self.inner.snapshot_before_write(p)?;
+            if !self.injected.load(std::sync::atomic::Ordering::SeqCst)
+                && cur
+                    .as_deref()
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .is_some_and(|s| s.contains(self.trigger_rt_substr))
+            {
+                fs::write(&p.active_slot_file, &self.ext_bytes).unwrap();
+                self.injected
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return self.inner.snapshot_before_write(p);
+            }
+            Ok(cur)
+        }
+        fn write_slot(
+            &self,
+            p: &HeadlessPaths,
+            payload: &str,
+        ) -> agy_switch_cli::error::CliResult<()> {
+            if self.injected.load(std::sync::atomic::Ordering::SeqCst) {
+                self.write_calls_after_inject
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.write_slot(p, payload)
+        }
+        fn remove_slot(&self, p: &HeadlessPaths) -> agy_switch_cli::error::CliResult<()> {
+            self.inner.remove_slot(p)
+        }
+    }
+
+    let overrides = DaemonConfigOverrides {
+        interval_secs: 300,
+        cooldown_secs: 3600,
+        step_buffer_delay: Duration::ZERO,
+        once: true,
+        notify_override: Some(false),
+        explicit_file_backend: true,
+        ..DaemonConfigOverrides::default()
+    };
+
+    // 1. R2-01 Stage 5 next-hop boundary:
+    //    Hop 0 (A -> B) succeeds normally. On Hop 1 (B -> C), `daemon.rs` line 1847 `inspect_slot`
+    //    sees `1//RT_R201_B` and passes; then `executor.rs` calls `snapshot_before_write` (`pre_snap`)
+    //    which injects an external login payload! MUST cancel before sync-back, journal, or write_slot!
+    FileSessionBackend
+        .write_slot(
+            &paths,
+            &agy_switch_cli::session::payload::serialize_session_payload_for_account(&acc_a)
+                .unwrap(),
+        )
+        .unwrap();
+    let ext_hop_payload = serde_json::to_vec(&serde_json::json!({
+        "token": {
+            "access_token": "ya29.EXT_R201_HOP",
+            "token_type": "Bearer",
+            "refresh_token": "1//RT_EXT_R201_HOP",
+            "expiry": "2099-06-01T00:00:00Z"
+        },
+        "id_token_email": "fresh-r201-hop@example.com"
+    }))
+    .unwrap();
+    let hop_writes_after = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hop_backend = InjectOnMatchingPreSnapBackend {
+        inner: FileSessionBackend,
+        trigger_rt_substr: "1//RT_R201_B",
+        write_calls_after_inject: hop_writes_after.clone(),
+        injected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ext_bytes: ext_hop_payload.clone(),
+    };
+    let rev_before_hop1 = std::sync::Arc::new(std::sync::Mutex::new(0u64));
+    let rev_hop1_cap = rev_before_hop1.clone();
+    let repo_hop1 = StoreRepository::new(paths.clone());
+    let runner_hop = SlotQuotaRunner::from_handler(move |_, _, slot| {
+        if slot.contains("1//RT_R201_A") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if slot.contains("1//RT_R201_B") {
+            *rev_hop1_cap.lock().unwrap() = repo_hop1.read_snapshot().unwrap().index.revision;
+            Ok(quota_outcome_for_frac(0.18, 0.90))
+        } else {
+            panic!("R2-01 hop cancellation must never probe acc-c: {slot}");
+        }
+    });
+    let mut eng_hop = DaemonEngine::new();
+    let res_hop = eng_hop
+        .run_single_tick(&repo, &hop_backend, &runner_hop, &reg, &overrides, now + 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        res_hop,
+        TickStageOutcome::CancelledStalePlan {
+            reason: "active_slot_digest_changed".into()
+        },
+        "R2-01: mismatched pre_snap on Stage 5 hop must cancel cleanly"
+    );
+    assert_eq!(
+        hop_writes_after.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "R2-01: write_slot must NEVER be called after pre_snap mismatch on Stage 5 hop"
+    );
+    assert_eq!(
+        fs::read(&paths.active_slot_file).unwrap(),
+        ext_hop_payload,
+        "R2-01: external login slot must stay byte-for-byte intact"
+    );
+    let snap_after_hop = repo.read_snapshot().unwrap();
+    assert_eq!(
+        snap_after_hop.index.selected_account_id.as_deref(),
+        Some("acc-b")
+    );
+    assert_eq!(
+        snap_after_hop.index.revision,
+        *rev_before_hop1.lock().unwrap(),
+        "R2-01: index.revision must not advance after Stage 5 pre_snap cancellation"
+    );
+    assert!(
+        !paths.switch_journal_file().exists(),
+        "R2-01: no switch_journal.json should be written on pre_snap cancellation"
+    );
+
+    // 2. R2-01 Stage 6 settle-back boundary:
+    //    Hop 0 (A -> B): calls 1, 2. Hop 1 (B -> C): calls 3, 4.
+    //    Stage 6 settle-back (C -> B): call #5 (`pre_snap`) RIGHT AFTER Stage 6 inspect_slot passed!
+    repo.with_write_lock(|tx| {
+        for id in ["acc-a", "acc-b", "acc-c"] {
+            let mut r = tx.load_account_opt(id)?.unwrap();
+            r.quota = None;
+            tx.save_account(&r)?;
+        }
+        tx.commit_selected_account("acc-a", now + 20)?;
+        Ok(())
+    })
+    .unwrap();
+    FileSessionBackend
+        .write_slot(
+            &paths,
+            &agy_switch_cli::session::payload::serialize_session_payload_for_account(&acc_a)
+                .unwrap(),
+        )
+        .unwrap();
+    let ext_s6_payload = serde_json::to_vec(&serde_json::json!({
+        "token": {
+            "access_token": "ya29.EXT_R201_S6",
+            "token_type": "Bearer",
+            "refresh_token": "1//RT_EXT_R201_S6",
+            "expiry": "2099-06-01T00:00:00Z"
+        },
+        "id_token_email": "fresh-r201-stage6@example.com"
+    }))
+    .unwrap();
+    let s6_writes_after = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let s6_backend = InjectOnMatchingPreSnapBackend {
+        inner: FileSessionBackend,
+        trigger_rt_substr: "1//RT_R201_C",
+        write_calls_after_inject: s6_writes_after.clone(),
+        injected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ext_bytes: ext_s6_payload.clone(),
+    };
+    let rev_at_c = std::sync::Arc::new(std::sync::Mutex::new(0u64));
+    let rev_c_cap = rev_at_c.clone();
+    let repo_s6 = StoreRepository::new(paths.clone());
+    let runner_s6 = SlotQuotaRunner::from_handler(move |_, _, slot| {
+        if slot.contains("1//RT_R201_A") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if slot.contains("1//RT_R201_B") {
+            Ok(quota_outcome_for_frac(0.18, 0.90))
+        } else if slot.contains("1//RT_R201_C") {
+            *rev_c_cap.lock().unwrap() = repo_s6.read_snapshot().unwrap().index.revision;
+            Ok(quota_outcome_for_frac(0.09, 0.90))
+        } else {
+            panic!("unexpected slot in R2-01 Stage 6 test: {slot}");
+        }
+    });
+    let mut eng_s6 = DaemonEngine::new();
+    let res_s6 = eng_s6
+        .run_single_tick(&repo, &s6_backend, &runner_s6, &reg, &overrides, now + 30)
+        .await
+        .unwrap();
+    assert_eq!(
+        res_s6,
+        TickStageOutcome::CancelledStalePlan {
+            reason: "active_slot_digest_changed".into()
+        },
+        "R2-01: mismatched pre_snap on Stage 6 settle-back must cancel cleanly"
+    );
+    assert_eq!(
+        s6_writes_after.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "R2-01: write_slot must NEVER be called after pre_snap mismatch on Stage 6 settle-back"
+    );
+    assert_eq!(
+        fs::read(&paths.active_slot_file).unwrap(),
+        ext_s6_payload,
+        "R2-01: external login slot must remain byte-for-byte intact on Stage 6 cancellation"
+    );
+    let snap_after_s6 = repo.read_snapshot().unwrap();
+    assert_eq!(
+        snap_after_s6.index.selected_account_id.as_deref(),
+        Some("acc-c")
+    );
+    assert_eq!(
+        snap_after_s6.index.revision,
+        *rev_at_c.lock().unwrap(),
+        "R2-01: index.revision must not advance after Stage 6 pre_snap cancellation"
+    );
+    assert!(!paths.switch_journal_file().exists());
+
+    // 3. Positive control: matching pre_snap and verified same-account RT rotation during Stage 6
+    //    interrupted settle-back still sync-back C's rotated RT and settle back to B!
+    repo.with_write_lock(|tx| {
+        for id in ["acc-a", "acc-b", "acc-c"] {
+            let mut r = tx.load_account_opt(id)?.unwrap();
+            r.quota = None;
+            tx.save_account(&r)?;
+        }
+        tx.commit_selected_account("acc-a", now + 40)?;
+        Ok(())
+    })
+    .unwrap();
+    FileSessionBackend
+        .write_slot(
+            &paths,
+            &agy_switch_cli::session::payload::serialize_session_payload_for_account(&acc_a)
+                .unwrap(),
+        )
+        .unwrap();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    struct AsyncShutdownRotateRunner {
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+    }
+    impl OfficialCliQuotaRunner for AsyncShutdownRotateRunner {
+        fn query_active_usage<'a>(
+            &'a self,
+            paths: &'a HeadlessPaths,
+            _explicit_file_backend: bool,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<OfficialCliUsageOutcome, OfficialCliQuotaError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let slot = fs::read_to_string(&paths.active_slot_file).unwrap_or_default();
+                if slot.contains("1//RT_R201_A") {
+                    Ok(quota_outcome_for_frac(0.05, 0.90))
+                } else if slot.contains("1//RT_R201_B") {
+                    Ok(quota_outcome_for_frac(0.18, 0.90))
+                } else if slot.contains("1//RT_R201_C") {
+                    // Official `agy` rotates C's RT in the active slot, then shutdown fires before
+                    // `/usage` finishes so Stage 6 runs under `StepLoopExit::Shutdown` and MUST
+                    // accept C's verified rotated RT inside `pre_snap` (`DigestOrSameAccountRotation`)!
+                    fs::write(
+                        &paths.active_slot_file,
+                        serde_json::to_vec(&serde_json::json!({
+                            "token": {
+                                "access_token": "ya29.C_ROT_SHUTDOWN",
+                                "token_type": "Bearer",
+                                "refresh_token": "1//RT_R201_C_ROTATED",
+                                "expiry": "2099-08-01T00:00:00Z"
+                            },
+                            "id_token_email": "charlie@example.com"
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    let _ = self.shutdown_tx.send(true);
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    unreachable!("shutdown_rx must cancel probe before sleep completes")
+                } else {
+                    panic!("unexpected slot in R2-01 shutdown rotation positive control: {slot}");
+                }
+            })
+        }
+    }
+    let shutdown_runner = AsyncShutdownRotateRunner { shutdown_tx };
+    let mut eng_pos = DaemonEngine::new();
+    let res_pos = eng_pos
+        .run_single_tick_with_shutdown(
+            &repo,
+            &FileSessionBackend,
+            &shutdown_runner,
+            &reg,
+            &overrides,
+            now + 50,
+            &mut shutdown_rx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res_pos,
+        TickStageOutcome::UncertainHold {
+            reason: "shutdown_signal_received".into()
+        }
+    );
+    assert_eq!(
+        repo.read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("acc-b"),
+        "R2-01 positive control: verified same-account RT rotation during interrupted Stage 6 still settles back to B"
+    );
+    assert_eq!(
+        repo.read_account_unchecked("acc-c")
+            .unwrap()
+            .token
+            .refresh_token,
+        "1//RT_R201_C_ROTATED",
+        "R2-01 positive control: C's rotated RT must be synced back before settling to B"
+    );
+}
+
+#[tokio::test]
+async fn daemon_r3_01_dual_backend_protects_file_replica_and_allows_single_sided_same_account_rotation(
+) {
+    use agy_switch_cli::session::backend::{
+        BackendPreWriteSnapshot, BackendReplicaInspection, KeyringCollectionDigest,
+        ReplicaCasExpectation, SlotInspectState,
+    };
+    use agy_switch_cli::session::payload::{
+        bytes_sha256_hex, parse_session_payload_bytes, serialize_session_payload_for_account,
+    };
+
+    let _guard = PROC_ENV_MUTEX.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    let cache = tmp.path().join("cache");
+    let fake_proc = tmp.path().join("proc");
+    fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+    fs::create_dir_all(&fake_proc).unwrap();
+    let _proc_env = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc);
+
+    let paths = HeadlessPaths::with_explicit(home, data, cache);
+    let repo = StoreRepository::new(paths.clone());
+    let reg = OAuthClientRegistry::parse_from_raw(None, None);
+    let now = 1_940_000_000i64;
+
+    let make_acc = |id: &str, email: &str, rt: &str| {
+        AccountRecord::new(
+            id.into(),
+            email.into(),
+            TokenRecord {
+                access_token: format!("ya29.{id}"),
+                refresh_token: rt.into(),
+                expires_in: 3600,
+                expiry_timestamp: now + 7200,
+                token_type: "Bearer".into(),
+                id_token: None,
+                oauth_client_key: None,
+                granted_scopes: None,
+                project_id: None,
+                is_gcp_tos: true,
+            },
+            now,
+        )
+    };
+    let acc_a = make_acc("acc-a", "alice@example.com", "1//RT_R301_A");
+    let acc_b = make_acc("acc-b", "bob@example.com", "1//RT_R301_B");
+    let acc_c = make_acc("acc-c", "charlie@example.com", "1//RT_R301_C");
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc_a.clone(), true, now)?;
+        tx.upsert_account(acc_b.clone(), false, now)?;
+        tx.upsert_account(acc_c.clone(), false, now)?;
+        let mut p = SwitchPolicy {
+            enabled: true,
+            mode: PolicyMode::Immediate,
+            strategy: PolicyStrategy::Priority,
+            monitored_model: "all".into(),
+            reserve_percentage: 10,
+            candidate_min_percentage: 30,
+            candidate_account_ids: vec!["acc-b".into(), "acc-c".into()],
+            ..SwitchPolicy::default()
+        };
+        tx.save_policy(&mut p, None, now)?;
+        Ok(())
+    })
+    .unwrap();
+
+    /// Synthetic dual (`keyring` + `file`) backend matching production `SecretServiceSessionBackend`
+    /// semantics: `inspect_slot` prefers keyring over file, `inspect_replicas` and
+    /// `snapshot_replicas_before_write` return BOTH replicas independently, and `write_slot_cas`
+    /// verifies per-replica CAS and writes BOTH replicas. Supports injecting a file-only external
+    /// login right when `snapshot_replicas_before_write` (`pre_snap`) runs!
+    type PreSnapFileInject = Arc<Mutex<Option<(&'static str, Vec<u8>)>>>;
+    struct SyntheticDualBackend {
+        keyring: Arc<Mutex<Option<Vec<u8>>>>,
+        file_writes: Arc<std::sync::atomic::AtomicUsize>,
+        kr_writes: Arc<std::sync::atomic::AtomicUsize>,
+        pre_snap_file_inject: PreSnapFileInject,
+    }
+
+    impl SyntheticDualBackend {
+        fn new(initial: &str) -> Self {
+            Self {
+                keyring: Arc::new(Mutex::new(Some(initial.as_bytes().to_vec()))),
+                file_writes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                kr_writes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                pre_snap_file_inject: Arc::new(Mutex::new(None)),
+            }
+        }
+        fn keyring_state(&self) -> SlotInspectState {
+            match self.keyring.lock().unwrap().as_deref() {
+                None => SlotInspectState::AbsentInInitializedDir,
+                Some(b) => match parse_session_payload_bytes(b) {
+                    Ok(p) => SlotInspectState::Present(p),
+                    Err(e) => SlotInspectState::Corrupt(e),
+                },
+            }
+        }
+    }
+
+    impl CredentialBackend for SyntheticDualBackend {
+        fn name(&self) -> &'static str {
+            "dual"
+        }
+        fn uses_keyring(&self) -> bool {
+            true
+        }
+        fn uses_file(&self) -> bool {
+            true
+        }
+        fn inspect_slot(&self, paths: &HeadlessPaths) -> SlotInspectState {
+            let kr = self.keyring_state();
+            if kr.is_absent_clean() {
+                FileSessionBackend.inspect_slot(paths)
+            } else {
+                kr
+            }
+        }
+        fn inspect_replicas(&self, paths: &HeadlessPaths) -> BackendReplicaInspection {
+            let kr_bytes = self.keyring.lock().unwrap().clone();
+            let kr_state = self.keyring_state();
+            let col = KeyringCollectionDigest {
+                path: "/org/freedesktop/secrets/collection/login".into(),
+                present: kr_bytes.is_some(),
+                digest: kr_bytes.as_deref().map(bytes_sha256_hex),
+                valid_refresh_token_digest: kr_bytes
+                    .as_deref()
+                    .and_then(|b| parse_session_payload_bytes(b).ok())
+                    .map(|p| p.refresh_token_digest),
+            };
+            BackendReplicaInspection {
+                backend_name: "dual",
+                uses_keyring: true,
+                uses_file: true,
+                keyring: Some(kr_state),
+                keyring_all_collections_uniform: true,
+                keyring_collections: vec![col],
+                file: FileSessionBackend.inspect_slot(paths),
+            }
+        }
+        fn snapshot_before_write(
+            &self,
+            paths: &HeadlessPaths,
+        ) -> agy_switch_cli::error::CliResult<Option<Vec<u8>>> {
+            FileSessionBackend.snapshot_before_write(paths)
+        }
+        fn snapshot_replicas_before_write(
+            &self,
+            paths: &HeadlessPaths,
+        ) -> agy_switch_cli::error::CliResult<BackendPreWriteSnapshot> {
+            let mut file_bytes = FileSessionBackend.snapshot_before_write(paths)?;
+            // Optionally inject a file-only external login right at `pre_snap` capture
+            // (after daemon's L1 `inspect_replicas` already passed!).
+            let maybe_inj = {
+                let mut g = self.pre_snap_file_inject.lock().unwrap();
+                if let Some((substr, _)) = g.as_ref() {
+                    if file_bytes
+                        .as_deref()
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .is_some_and(|s| s.contains(substr))
+                    {
+                        g.take().map(|(_, bytes)| bytes)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(ext_bytes) = maybe_inj {
+                fs::write(&paths.active_slot_file, &ext_bytes).unwrap();
+                file_bytes = Some(ext_bytes);
+            }
+            let kr_bytes = self.keyring.lock().unwrap().clone();
+            Ok(BackendPreWriteSnapshot {
+                backend_name: "dual",
+                uses_keyring: true,
+                uses_file: true,
+                keyring_bytes: Some(kr_bytes.clone()),
+                keyring_uniform: true,
+                keyring_collections: vec![(
+                    "/org/freedesktop/secrets/collection/login".into(),
+                    kr_bytes,
+                )],
+                file_bytes,
+            })
+        }
+        fn write_slot(
+            &self,
+            paths: &HeadlessPaths,
+            payload: &str,
+        ) -> agy_switch_cli::error::CliResult<()> {
+            FileSessionBackend.write_slot(paths, payload)?;
+            self.file_writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.keyring.lock().unwrap() = Some(payload.as_bytes().to_vec());
+            self.kr_writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn write_slot_cas(
+            &self,
+            paths: &HeadlessPaths,
+            payload: &str,
+            expected: &ReplicaCasExpectation,
+        ) -> agy_switch_cli::error::CliResult<()> {
+            if let Some(ref exp_file) = expected.file_expected {
+                let cur_file = FileSessionBackend.snapshot_before_write(paths)?;
+                if !exp_file.matches_bytes(cur_file.as_deref()) {
+                    return Err(agy_switch_cli::error::CliError::partial_commit(
+                        "recovery_incomplete",
+                        "file CAS mismatch",
+                    ));
+                }
+            }
+            if let Some(ref exp_cols) = expected.keyring_expected_collections {
+                let cur_kr = self.keyring.lock().unwrap().clone();
+                if exp_cols
+                    .iter()
+                    .any(|(_, exp)| !exp.matches_bytes(cur_kr.as_deref()))
+                {
+                    return Err(agy_switch_cli::error::CliError::partial_commit(
+                        "recovery_incomplete",
+                        "keyring CAS mismatch",
+                    ));
+                }
+            }
+            self.write_slot(paths, payload)
+        }
+        fn remove_slot(&self, paths: &HeadlessPaths) -> agy_switch_cli::error::CliResult<()> {
+            FileSessionBackend.remove_slot(paths)?;
+            *self.keyring.lock().unwrap() = None;
+            Ok(())
+        }
+        fn read_raw_keyring_secret(&self) -> agy_switch_cli::error::CliResult<Option<Vec<u8>>> {
+            Ok(self.keyring.lock().unwrap().clone())
+        }
+    }
+
+    let overrides = DaemonConfigOverrides {
+        interval_secs: 300,
+        cooldown_secs: 3600,
+        step_buffer_delay: Duration::ZERO,
+        once: true,
+        notify_override: Some(false),
+        explicit_file_backend: false,
+        ..DaemonConfigOverrides::default()
+    };
+
+    let payload_a = serialize_session_payload_for_account(&acc_a).unwrap();
+
+    // 1. R3-01 Stage 5 next hop (file-only external login injected right at Hop 1 `pre_snap`
+    //    AND separately during B's probe while keyring STILL holds B):
+    for inject_during_probe in [true, false] {
+        repo.with_write_lock(|tx| {
+            for id in ["acc-a", "acc-b", "acc-c"] {
+                let mut r = tx.load_account_opt(id)?.unwrap();
+                r.quota = None;
+                tx.save_account(&r)?;
+            }
+            tx.commit_selected_account("acc-a", now + 5)?;
+            agy_switch_cli::switching::daemon::reset_daemon_cooldown_in_tx(tx.paths(), now + 5)?;
+            Ok(())
+        })
+        .unwrap();
+        FileSessionBackend.write_slot(&paths, &payload_a).unwrap();
+        let dual_be = SyntheticDualBackend::new(&payload_a);
+        let ext_ssh_file = serde_json::to_vec(&serde_json::json!({
+            "token": {
+                "access_token": "ya29.SSH_EXT_HOP",
+                "token_type": "Bearer",
+                "refresh_token": "1//RT_SSH_EXT_HOP",
+                "expiry": "2099-06-01T00:00:00Z"
+            },
+            "id_token_email": "ssh-hop@example.com"
+        }))
+        .unwrap();
+        if !inject_during_probe {
+            *dual_be.pre_snap_file_inject.lock().unwrap() =
+                Some(("1//RT_R301_B", ext_ssh_file.clone()));
+        }
+        let kr_ref = dual_be.keyring.clone();
+        let file_path = paths.active_slot_file.clone();
+        let ext_for_probe = ext_ssh_file.clone();
+        let rev_after_hop0 = Arc::new(Mutex::new(0u64));
+        let rev_cap = rev_after_hop0.clone();
+        let repo_cap = StoreRepository::new(paths.clone());
+        let runner = SlotQuotaRunner::from_handler(move |_, _, _| {
+            let kr_str = String::from_utf8(kr_ref.lock().unwrap().clone().unwrap()).unwrap();
+            if kr_str.contains("1//RT_R301_A") {
+                Ok(quota_outcome_for_frac(0.05, 0.90))
+            } else if kr_str.contains("1//RT_R301_B") {
+                *rev_cap.lock().unwrap() = repo_cap.read_snapshot().unwrap().index.revision;
+                if inject_during_probe {
+                    // External SSH `agy login` writes ONLY disk file while keyring stays B!
+                    fs::write(&file_path, &ext_for_probe).unwrap();
+                }
+                Ok(quota_outcome_for_frac(0.18, 0.90))
+            } else {
+                panic!("R3-01 hop cancellation must never probe acc-c: {kr_str}");
+            }
+        });
+        let mut eng = DaemonEngine::new();
+        let res = eng
+            .run_single_tick(&repo, &dual_be, &runner, &reg, &overrides, now + 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            res,
+            TickStageOutcome::CancelledStalePlan {
+                reason: "active_slot_digest_changed".into()
+            },
+            "R3-01 Stage 5 hop (during_probe={inject_during_probe}) must cancel when file replica holds external login"
+        );
+        // Only Hop 0 (A -> B) wrote once; Hop 1 performed 0 writes to either replica!
+        assert_eq!(
+            dual_be
+                .file_writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            dual_be.kr_writes.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(fs::read(&paths.active_slot_file).unwrap(), ext_ssh_file);
+        assert!(
+            String::from_utf8(dual_be.keyring.lock().unwrap().clone().unwrap())
+                .unwrap()
+                .contains("1//RT_R301_B")
+        );
+        let snap_after = repo.read_snapshot().unwrap();
+        assert_eq!(
+            snap_after.index.selected_account_id.as_deref(),
+            Some("acc-b")
+        );
+        assert_eq!(snap_after.index.revision, *rev_after_hop0.lock().unwrap());
+        assert!(!paths.switch_journal_file().exists());
+    }
+
+    // 2. R3-01 Stage 6 settle-back (A=5%, B=18%, C=9%): Hop 1 dual-writes C, then external SSH
+    //    `agy login` writes ONLY disk file (tested at `pre_snap`) -> MUST cancel with 0 writes!
+    repo.with_write_lock(|tx| {
+        for id in ["acc-a", "acc-b", "acc-c"] {
+            let mut r = tx.load_account_opt(id)?.unwrap();
+            r.quota = None;
+            tx.save_account(&r)?;
+        }
+        tx.commit_selected_account("acc-a", now + 20)?;
+        Ok(())
+    })
+    .unwrap();
+    FileSessionBackend.write_slot(&paths, &payload_a).unwrap();
+    let dual_s6 = SyntheticDualBackend::new(&payload_a);
+    let ext_ssh_s6 = serde_json::to_vec(&serde_json::json!({
+        "token": {
+            "access_token": "ya29.SSH_EXT_S6",
+            "token_type": "Bearer",
+            "refresh_token": "1//RT_SSH_EXT_S6",
+            "expiry": "2099-06-01T00:00:00Z"
+        },
+        "id_token_email": "ssh-s6@example.com"
+    }))
+    .unwrap();
+    *dual_s6.pre_snap_file_inject.lock().unwrap() = Some(("1//RT_R301_C", ext_ssh_s6.clone()));
+    let kr_s6 = dual_s6.keyring.clone();
+    let rev_at_c = Arc::new(Mutex::new(0u64));
+    let rev_c_cap = rev_at_c.clone();
+    let repo_s6 = StoreRepository::new(paths.clone());
+    let runner_s6 = SlotQuotaRunner::from_handler(move |_, _, _| {
+        let kr_str = String::from_utf8(kr_s6.lock().unwrap().clone().unwrap()).unwrap();
+        if kr_str.contains("1//RT_R301_A") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if kr_str.contains("1//RT_R301_B") {
+            Ok(quota_outcome_for_frac(0.18, 0.90))
+        } else if kr_str.contains("1//RT_R301_C") {
+            *rev_c_cap.lock().unwrap() = repo_s6.read_snapshot().unwrap().index.revision;
+            Ok(quota_outcome_for_frac(0.09, 0.90))
+        } else {
+            panic!("unexpected slot in R3-01 Stage 6 test: {kr_str}");
+        }
+    });
+    let mut eng_s6 = DaemonEngine::new();
+    let res_s6 = eng_s6
+        .run_single_tick(&repo, &dual_s6, &runner_s6, &reg, &overrides, now + 30)
+        .await
+        .unwrap();
+    assert_eq!(
+        res_s6,
+        TickStageOutcome::CancelledStalePlan {
+            reason: "active_slot_digest_changed".into()
+        },
+        "R3-01 Stage 6 settle-back must cancel when file replica holds external login"
+    );
+    assert_eq!(
+        dual_s6
+            .file_writes
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        dual_s6.kr_writes.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(fs::read(&paths.active_slot_file).unwrap(), ext_ssh_s6);
+    assert!(
+        String::from_utf8(dual_s6.keyring.lock().unwrap().clone().unwrap())
+            .unwrap()
+            .contains("1//RT_R301_C")
+    );
+    let snap_s6 = repo.read_snapshot().unwrap();
+    assert_eq!(snap_s6.index.selected_account_id.as_deref(), Some("acc-c"));
+    assert_eq!(snap_s6.index.revision, *rev_at_c.lock().unwrap());
+    assert!(!paths.switch_journal_file().exists());
+
+    // 3. R3-01 Stage 1 initial check: keyring holds A while disk file already holds external login
+    //    -> daemon MUST hold without overwriting either replica!
+    repo.with_write_lock(|tx| tx.commit_selected_account("acc-a", now + 35))
+        .unwrap();
+    let dual_s1 = SyntheticDualBackend::new(&payload_a);
+    fs::write(&paths.active_slot_file, &ext_ssh_s6).unwrap();
+    let runner_never = SlotQuotaRunner::from_handler(|_, _, _| {
+        panic!("Stage 1 divergent file replica must hold before probing")
+    });
+    let mut eng_s1 = DaemonEngine::new();
+    let res_s1 = eng_s1
+        .run_single_tick(&repo, &dual_s1, &runner_never, &reg, &overrides, now + 40)
+        .await
+        .unwrap();
+    assert_eq!(
+        res_s1,
+        TickStageOutcome::UncertainHold {
+            reason: "session_identity_not_matched".into()
+        }
+    );
+    assert_eq!(
+        dual_s1
+            .file_writes
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(fs::read(&paths.active_slot_file).unwrap(), ext_ssh_s6);
+
+    // 4. Positive control 1: legitimate single-sided same-account RT rotation in KEYRING ONLY
+    //    during B's probe (18%) MUST NOT trigger false cancellation -> advances cleanly to C (85%)!
+    repo.with_write_lock(|tx| {
+        for id in ["acc-a", "acc-b", "acc-c"] {
+            let mut r = tx.load_account_opt(id)?.unwrap();
+            r.quota = None;
+            tx.save_account(&r)?;
+        }
+        tx.commit_selected_account("acc-a", now + 45)?;
+        agy_switch_cli::switching::daemon::reset_daemon_cooldown_in_tx(tx.paths(), now + 45)?;
+        Ok(())
+    })
+    .unwrap();
+    FileSessionBackend.write_slot(&paths, &payload_a).unwrap();
+    let dual_kr_rot = SyntheticDualBackend::new(&payload_a);
+    let kr_rot_ref = dual_kr_rot.keyring.clone();
+    let runner_kr_rot = SlotQuotaRunner::from_handler(move |_, _, _| {
+        let kr_str = String::from_utf8(kr_rot_ref.lock().unwrap().clone().unwrap()).unwrap();
+        if kr_str.contains("1//RT_R301_A") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if kr_str.contains("1//RT_R301_B") {
+            // Desktop `agy` rotates ONLY keyring for B; disk file stays at Hop 0's `1//RT_R301_B`!
+            *kr_rot_ref.lock().unwrap() = Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "token": {
+                        "access_token": "ya29.B_KR_ROT",
+                        "token_type": "Bearer",
+                        "refresh_token": "1//RT_R301_B_KR_ROT",
+                        "expiry": "2099-07-01T00:00:00Z"
+                    },
+                    "id_token_email": "bob@example.com"
+                }))
+                .unwrap(),
+            );
+            Ok(quota_outcome_for_frac(0.18, 0.90))
+        } else if kr_str.contains("1//RT_R301_C") {
+            Ok(quota_outcome_for_frac(0.85, 0.90))
+        } else {
+            panic!("unexpected slot in R3-01 keyring-only rotation control: {kr_str}");
+        }
+    });
+    let mut eng_kr_rot = DaemonEngine::new();
+    let res_kr_rot = eng_kr_rot
+        .run_single_tick(
+            &repo,
+            &dual_kr_rot,
+            &runner_kr_rot,
+            &reg,
+            &overrides,
+            now + 50,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res_kr_rot,
+        TickStageOutcome::CommittedSwitch {
+            source_id: "acc-a".into(),
+            target_id: "acc-c".into()
+        },
+        "R3-01 positive control: single-sided keyring rotation for same account must advance to C"
+    );
+    assert_eq!(
+        repo.read_account_unchecked("acc-b")
+            .unwrap()
+            .token
+            .refresh_token,
+        "1//RT_R301_B_KR_ROT"
+    );
+
+    // 5. Positive control 2: legitimate single-sided same-account RT rotation in FILE ONLY
+    //    during B's probe (18%) MUST also advance cleanly to C (85%) and sync B's rotated RT!
+    repo.with_write_lock(|tx| {
+        for id in ["acc-a", "acc-b", "acc-c"] {
+            let mut r = tx.load_account_opt(id)?.unwrap();
+            r.quota = None;
+            tx.save_account(&r)?;
+        }
+        tx.commit_selected_account("acc-a", now + 60)?;
+        agy_switch_cli::switching::daemon::reset_daemon_cooldown_in_tx(tx.paths(), now + 60)?;
+        Ok(())
+    })
+    .unwrap();
+    FileSessionBackend.write_slot(&paths, &payload_a).unwrap();
+    let dual_file_rot = SyntheticDualBackend::new(&payload_a);
+    let kr_file_rot_ref = dual_file_rot.keyring.clone();
+    let file_rot_path = paths.active_slot_file.clone();
+    let runner_file_rot = SlotQuotaRunner::from_handler(move |_, _, _| {
+        let kr_str = String::from_utf8(kr_file_rot_ref.lock().unwrap().clone().unwrap()).unwrap();
+        if kr_str.contains("1//RT_R301_A") {
+            Ok(quota_outcome_for_frac(0.05, 0.90))
+        } else if kr_str.contains("1//RT_R301_B_KR_ROT") {
+            // Rotate ONLY disk file for B with fresher expiry; keyring stays at Hop 0's payload!
+            fs::write(
+                &file_rot_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "token": {
+                        "access_token": "ya29.B_FILE_ROT",
+                        "token_type": "Bearer",
+                        "refresh_token": "1//RT_R301_B_FILE_ROT",
+                        "expiry": "2099-08-01T00:00:00Z"
+                    },
+                    "id_token_email": "bob@example.com"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            Ok(quota_outcome_for_frac(0.18, 0.90))
+        } else if kr_str.contains("1//RT_R301_C") {
+            Ok(quota_outcome_for_frac(0.85, 0.90))
+        } else {
+            panic!("unexpected slot in R3-01 file-only rotation control: {kr_str}");
+        }
+    });
+    let mut eng_file_rot = DaemonEngine::new();
+    let res_file_rot = eng_file_rot
+        .run_single_tick(
+            &repo,
+            &dual_file_rot,
+            &runner_file_rot,
+            &reg,
+            &overrides,
+            now + 70,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res_file_rot,
+        TickStageOutcome::CommittedSwitch {
+            source_id: "acc-a".into(),
+            target_id: "acc-c".into()
+        },
+        "R3-01 positive control: single-sided file rotation for same account must advance to C"
+    );
+    assert_eq!(
+        repo.read_account_unchecked("acc-b")
+            .unwrap()
+            .token
+            .refresh_token,
+        "1//RT_R301_B_FILE_ROT"
+    );
+
+    // 5b. F-01 regression (exact equal-expiry AND missing-expiry file-only RT rotation):
+    //     When B's probe rotates ONLY disk file's RT while keeping the EXACT same AT and expiry
+    //     (and separately with MISSING expiry), BOTH `sync_back_active_slot_for_account` AND
+    //     `sync_back_pre_switch_snapshot` MUST persist B's new RT into `accounts/acc-b.json`
+    //     before dual-writing C (while keyring stayed at old B)!
+    for (case_idx, (new_rt, new_at, omit_expiry)) in [
+        ("1//RT_F01_B_EQUAL_EXP", "ya29.B_FILE_ROT", false),
+        ("1//RT_F01_B_NO_EXP", "ya29.B_NO_EXP_AT", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let t_base = now + 100 + (case_idx as i64) * 30;
+        let expected_prev_rt = repo
+            .read_account_unchecked("acc-b")
+            .unwrap()
+            .token
+            .refresh_token;
+        let expected_prev_exp = repo
+            .read_account_unchecked("acc-b")
+            .unwrap()
+            .token
+            .expiry_timestamp;
+        let expected_prev_exp_iso = jiff::Timestamp::from_second(expected_prev_exp)
+            .unwrap()
+            .to_string();
+        repo.with_write_lock(|tx| {
+            for id in ["acc-a", "acc-b", "acc-c"] {
+                let mut r = tx.load_account_opt(id)?.unwrap();
+                r.quota = None;
+                tx.save_account(&r)?;
+            }
+            tx.commit_selected_account("acc-a", t_base)?;
+            agy_switch_cli::switching::daemon::reset_daemon_cooldown_in_tx(tx.paths(), t_base)?;
+            Ok(())
+        })
+        .unwrap();
+        FileSessionBackend.write_slot(&paths, &payload_a).unwrap();
+        let dual_f01 = SyntheticDualBackend::new(&payload_a);
+        let kr_f01_ref = dual_f01.keyring.clone();
+        let file_f01_path = paths.active_slot_file.clone();
+        let new_rt_owned = new_rt.to_string();
+        let new_at_owned = new_at.to_string();
+        let prev_rt_owned = expected_prev_rt.clone();
+        let prev_exp_iso_owned = expected_prev_exp_iso.clone();
+        let runner_f01 = SlotQuotaRunner::from_handler(move |_, _, _| {
+            let kr_str = String::from_utf8(kr_f01_ref.lock().unwrap().clone().unwrap()).unwrap();
+            if kr_str.contains("1//RT_R301_A") {
+                Ok(quota_outcome_for_frac(0.05, 0.90))
+            } else if kr_str.contains(&prev_rt_owned) {
+                // Rotate ONLY disk file's RT with equal (or omitted) expiry; keyring stays old B!
+                let mut token_obj = serde_json::json!({
+                    "access_token": new_at_owned,
+                    "token_type": "Bearer",
+                    "refresh_token": new_rt_owned,
+                });
+                if !omit_expiry {
+                    token_obj["expiry"] = serde_json::Value::String(prev_exp_iso_owned.clone());
+                }
+                fs::write(
+                    &file_f01_path,
+                    serde_json::to_vec(&serde_json::json!({
+                        "token": token_obj,
+                        "id_token_email": "bob@example.com"
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                Ok(quota_outcome_for_frac(0.18, 0.90))
+            } else if kr_str.contains("1//RT_R301_C") {
+                Ok(quota_outcome_for_frac(0.85, 0.90))
+            } else {
+                panic!("unexpected slot in F-01 case {case_idx}: {kr_str}");
+            }
+        });
+        let mut eng_f01 = DaemonEngine::new();
+        let res_f01 = eng_f01
+            .run_single_tick(&repo, &dual_f01, &runner_f01, &reg, &overrides, t_base + 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            res_f01,
+            TickStageOutcome::CommittedSwitch {
+                source_id: "acc-a".into(),
+                target_id: "acc-c".into()
+            },
+            "F-01 case {case_idx}: equal/missing-expiry file-only RT rotation must advance to C"
+        );
+        let b_after = repo.read_account_unchecked("acc-b").unwrap();
+        assert_eq!(
+            b_after.token.refresh_token, new_rt,
+            "F-01 case {case_idx}: B's rotated disk RT MUST be persisted to accounts/acc-b.json"
+        );
+        if omit_expiry {
+            assert_eq!(
+                b_after.token.expiry_timestamp, 1,
+                "F-01 + R2-02: rotated RT with missing expiry must fall back conservatively to 1"
+            );
+            assert_eq!(b_after.token.expires_in, 0);
+        }
+        assert!(
+            fs::read_to_string(&paths.active_slot_file)
+                .unwrap()
+                .contains("1//RT_R301_C")
+                && String::from_utf8(dual_f01.keyring.lock().unwrap().clone().unwrap())
+                    .unwrap()
+                    .contains("1//RT_R301_C"),
+            "F-01 case {case_idx}: both active replicas must hold C after commit"
+        );
+    }
+
+    // 5c. F-01 mirror & standalone `refresh_active_slot_quota_with_runner` + manual `execute_switch`
+    //     controls under `dual`:
+    //     - Standalone `quota --refresh` (no switch) saves equal-expiry file-only rotated RT;
+    //     - Manual `execute_switch` saves equal-expiry file-only rotated RT AND (mirror) saves
+    //       missing-expiry keyring-only rotated RT even when file carries a later expiry with old RT;
+    //     - Superseded historical RT in disk file is NEVER rolled back over current keyring RT.
+    let b_cur = repo.read_account_unchecked("acc-b").unwrap();
+    let payload_b_cur = serialize_session_payload_for_account(&b_cur).unwrap();
+    repo.with_write_lock(|tx| {
+        tx.commit_selected_account("acc-b", now + 200)?;
+        Ok(())
+    })
+    .unwrap();
+    FileSessionBackend
+        .write_slot(&paths, &payload_b_cur)
+        .unwrap();
+    let dual_direct = SyntheticDualBackend::new(&payload_b_cur);
+    let file_direct_path = paths.active_slot_file.clone();
+    let runner_direct = SlotQuotaRunner::from_handler(move |_, _, _| {
+        fs::write(
+            &file_direct_path,
+            serde_json::to_vec(&serde_json::json!({
+                "token": {
+                    "access_token": "ya29.B_NO_EXP_AT",
+                    "token_type": "Bearer",
+                    "refresh_token": "1//RT_F01_B_DIRECT_REFRESH",
+                    "expiry": "1970-01-01T00:00:01Z"
+                },
+                "id_token_email": "bob@example.com"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Ok(quota_outcome_for_frac(0.88, 0.90))
+    });
+    let direct_out = agy_switch_cli::quota::official_cli::refresh_active_slot_quota_with_runner(
+        &repo,
+        &dual_direct,
+        &runner_direct,
+        false,
+        Some("acc-b"),
+        now + 205,
+    )
+    .await
+    .unwrap();
+    assert!(direct_out.token_synced_back);
+    assert_eq!(
+        repo.read_account_unchecked("acc-b")
+            .unwrap()
+            .token
+            .refresh_token,
+        "1//RT_F01_B_DIRECT_REFRESH"
+    );
+
+    // Manual `execute_switch` under `dual`: equal-expiry file-only RT rotation is synced before switch.
+    let b_for_man = repo.read_account_unchecked("acc-b").unwrap();
+    let payload_b_man = serialize_session_payload_for_account(&b_for_man).unwrap();
+    let dual_man_f01 = SyntheticDualBackend::new(&payload_b_man);
+    fs::write(
+        &paths.active_slot_file,
+        serde_json::to_vec(&serde_json::json!({
+            "token": {
+                "access_token": b_for_man.token.access_token,
+                "token_type": "Bearer",
+                "refresh_token": "1//RT_F01_B_MANUAL_FILE_ROT",
+                "expiry": jiff::Timestamp::from_second(b_for_man.token.expiry_timestamp)
+                    .unwrap()
+                    .to_string()
+            },
+            "id_token_email": "bob@example.com"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    execute_switch(
+        &repo,
+        &dual_man_f01,
+        &reg,
+        "acc-c",
+        &SwitchOptions {
+            dry_run: false,
+            allow_running: true,
+        },
+        now + 210,
+    )
+    .unwrap();
+    assert_eq!(
+        repo.read_account_unchecked("acc-b")
+            .unwrap()
+            .token
+            .refresh_token,
+        "1//RT_F01_B_MANUAL_FILE_ROT"
+    );
+
+    // Mirror + superseded check during manual `execute_switch` from B -> C:
+    // Keyring rotated RT with missing expiry MUST beat disk file holding stored RT + 2099 expiry;
+    // then disk file holding superseded historical RT (`1//RT_R301_B`) MUST NOT roll back B!
+    repo.with_write_lock(|tx| {
+        tx.commit_selected_account("acc-b", now + 215)?;
+        Ok(())
+    })
+    .unwrap();
+    let dual_mirror = SyntheticDualBackend::new(
+        &serde_json::to_string(&serde_json::json!({
+            "token": {
+                "access_token": "ya29.B_KR_MIRROR_NO_EXP",
+                "token_type": "Bearer",
+                "refresh_token": "1//RT_F01_B_KR_MIRROR"
+            },
+            "id_token_email": "bob@example.com"
+        }))
+        .unwrap(),
+    );
+    fs::write(
+        &paths.active_slot_file,
+        serde_json::to_vec(&serde_json::json!({
+            "token": {
+                "access_token": "ya29.B_STALE_LATER_EXP",
+                "token_type": "Bearer",
+                "refresh_token": "1//RT_F01_B_MANUAL_FILE_ROT",
+                "expiry": "2099-12-01T00:00:00Z"
+            },
+            "id_token_email": "bob@example.com"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    execute_switch(
+        &repo,
+        &dual_mirror,
+        &reg,
+        "acc-c",
+        &SwitchOptions {
+            dry_run: false,
+            allow_running: true,
+        },
+        now + 220,
+    )
+    .unwrap();
+    assert_eq!(
+        repo.read_account_unchecked("acc-b")
+            .unwrap()
+            .token
+            .refresh_token,
+        "1//RT_F01_B_KR_MIRROR"
+    );
+
+    // Superseded historical RT in disk file with 2099 expiry MUST NOT roll back B's current RT.
+    repo.with_write_lock(|tx| {
+        tx.commit_selected_account("acc-b", now + 225)?;
+        Ok(())
+    })
+    .unwrap();
+    let b_cur2 = repo.read_account_unchecked("acc-b").unwrap();
+    let payload_b_cur2 = serialize_session_payload_for_account(&b_cur2).unwrap();
+    let dual_sup = SyntheticDualBackend::new(&payload_b_cur2);
+    fs::write(
+        &paths.active_slot_file,
+        serde_json::to_vec(&serde_json::json!({
+            "token": {
+                "access_token": "ya29.B_SUPERSEDED",
+                "token_type": "Bearer",
+                "refresh_token": "1//RT_R301_B",
+                "expiry": "2099-12-31T00:00:00Z"
+            },
+            "id_token_email": "bob@example.com"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    execute_switch(
+        &repo,
+        &dual_sup,
+        &reg,
+        "acc-c",
+        &SwitchOptions {
+            dry_run: false,
+            allow_running: true,
+        },
+        now + 230,
+    )
+    .unwrap();
+    assert_eq!(
+        repo.read_account_unchecked("acc-b")
+            .unwrap()
+            .token
+            .refresh_token,
+        "1//RT_F01_B_KR_MIRROR",
+        "superseded historical RT in file replica must never roll back B"
+    );
+
+    // 6. Positive control 3: explicit manual `execute_switch` under `dual` STILL overrides an
+    //    external disk file cleanly (daemon cancellation rules do NOT restrict manual `switch`).
+    fs::write(&paths.active_slot_file, &ext_ssh_s6).unwrap();
+    let man_res = execute_switch(
+        &repo,
+        &dual_file_rot,
+        &reg,
+        "acc-a",
+        &SwitchOptions {
+            dry_run: false,
+            allow_running: true,
+        },
+        now + 240,
+    )
+    .unwrap();
+    assert_eq!(man_res.target_account_id, "acc-a");
+    assert!(fs::read_to_string(&paths.active_slot_file)
+        .unwrap()
+        .contains("1//RT_R301_A"));
 }

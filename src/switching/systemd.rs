@@ -264,7 +264,8 @@ pub fn render_systemd_user_unit(
     let exe_str = path_to_utf8(exe_path, "Executable path")?;
     let data_str = path_to_utf8(&paths.data_dir, "Data directory path")?;
     let cache_str = path_to_utf8(&paths.cache_dir, "Cache directory path")?;
-    let slot_str = path_to_utf8(&paths.active_slot_dir, "Active slot directory path")?;
+    let gemini_dir = paths.home_dir.join(".gemini");
+    let gemini_str = path_to_utf8(&gemini_dir, "Gemini directory path")?;
 
     let mut exec_tokens = vec![systemd_quote_exec_program(exe_str, "Executable path")?];
     if let Some(choice) = opts.explicit_backend {
@@ -312,11 +313,12 @@ pub fn render_systemd_user_unit(
     } else {
         String::new()
     };
-    // Prefix `active_slot_dir` with `-` per `systemd.exec(5)` so `systemd` starts cleanly even when
-    // `~/.gemini/antigravity-cli` has not been created yet (or under `--backend keyring`).
-    let rw_slot = format!(
+    // Prefix `~/.gemini` with `-` per `systemd.exec(5)` so `systemd` starts cleanly even before
+    // `~/.gemini` exists, while granting official `agy -p "/usage"` write access to both
+    // `~/.gemini/antigravity-cli` and `~/.gemini/config` under `ProtectSystem=strict`.
+    let rw_gemini = format!(
         "-{}",
-        systemd_quote_setting_value(slot_str, "Active slot directory")?
+        systemd_quote_setting_value(gemini_str, "Gemini directory")?
     );
     let rw_data = systemd_quote_setting_value(data_str, "Data directory")?;
     let rw_cache = systemd_quote_setting_value(cache_str, "Cache directory")?;
@@ -324,7 +326,7 @@ pub fn render_systemd_user_unit(
     let use_private_tmp = !path_resides_in_system_tmp(&paths.home_dir)
         && !path_resides_in_system_tmp(&paths.data_dir)
         && !path_resides_in_system_tmp(&paths.cache_dir)
-        && !path_resides_in_system_tmp(&paths.active_slot_dir)
+        && !path_resides_in_system_tmp(&gemini_dir)
         && !path_resides_in_system_tmp(exe_path);
     let private_tmp_line = if use_private_tmp {
         "PrivateTmp=true\n"
@@ -348,11 +350,11 @@ ExecStart={exec_start_line}\n\
 Restart=on-failure\n\
 RestartSec=10\n\
 \n\
-# 文件系统最小权限沙盒边界：保持系统目录只读，仅显式放行官方生效位目录、独立无头数据目录与全局锁/缓存目录的写权限\n\
+# 文件系统最小权限沙盒边界：保持系统目录只读，仅显式放行官方 ~/.gemini 目录（含生效位与 agy 配置/日志）、独立无头数据目录与全局锁/缓存目录的写权限\n\
 NoNewPrivileges=true\n\
 {private_tmp_line}\
 ProtectSystem=strict\n\
-ReadWritePaths={rw_slot} {rw_data} {rw_cache}\n\
+ReadWritePaths={rw_gemini} {rw_data} {rw_cache}\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n"
@@ -1413,7 +1415,7 @@ mod tests {
         assert!(unit.contains("PrivateTmp=true"));
         assert!(unit.contains("ProtectSystem=strict"));
         assert!(unit.contains(
-            "ReadWritePaths=-\"/home/alice/.gemini/antigravity-cli\" \"/home/alice/my data%%dir$1\" \"/home/alice/.custom cache%%dir/agy-switch-cli\""
+            "ReadWritePaths=-\"/home/alice/.gemini\" \"/home/alice/my data%%dir$1\" \"/home/alice/.custom cache%%dir/agy-switch-cli\""
         ));
 
         // Verify real `systemd-analyze verify` accepts our rendered unit (including `$`, `%`, and spaces in `argv[0]`)

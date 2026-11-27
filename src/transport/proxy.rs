@@ -374,6 +374,136 @@ fn first_non_empty_env<'a>(names: &'a [&'a str]) -> Option<(&'a str, String)> {
     None
 }
 
+/// Resolved proxy environment directive applied when invoking the official `agy -p "/usage"`
+/// subprocess (`--proxy` > `AGY_SWITCH_CLI_PROXY` > `config.json` `network.proxy_url`).
+#[derive(Clone, PartialEq, Eq)]
+pub enum SubprocessProxyOverride {
+    /// No explicit CLI/env/config override: inherit ambient shell proxy variables as-is,
+    /// optionally applying `config.json`'s `network.no_proxy` if present.
+    Inherit { no_proxy: Option<String> },
+    /// Explicit `direct`/`none`: remove ambient proxy variables from the child process.
+    Direct,
+    /// Explicit proxy URL: inject standard uppercase and lowercase proxy env vars into child.
+    Explicit {
+        proxy_url: String,
+        no_proxy: Option<String>,
+    },
+}
+
+impl fmt::Debug for SubprocessProxyOverride {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inherit { no_proxy } => f
+                .debug_struct("Inherit")
+                .field("no_proxy", no_proxy)
+                .finish(),
+            Self::Direct => write!(f, "Direct"),
+            Self::Explicit {
+                proxy_url,
+                no_proxy,
+            } => f
+                .debug_struct("Explicit")
+                .field("proxy_url", &redact_proxy_url_for_debug(proxy_url))
+                .field("no_proxy", no_proxy)
+                .finish(),
+        }
+    }
+}
+
+impl SubprocessProxyOverride {
+    pub fn resolve(
+        cli_proxy: Option<&str>,
+        network_cfg: Option<&NetworkConfig>,
+    ) -> CliResult<Self> {
+        let env_override = std::env::var("AGY_SWITCH_CLI_PROXY")
+            .ok()
+            .map(|s| strip_matching_quotes(s.trim()).to_string())
+            .filter(|s| !s.is_empty());
+        let cfg_proxy = network_cfg
+            .and_then(|c| c.proxy_url.as_deref())
+            .map(|s| strip_matching_quotes(s.trim()))
+            .filter(|s| !s.is_empty());
+        let cli_clean = cli_proxy
+            .map(|s| strip_matching_quotes(s.trim()))
+            .filter(|s| !s.is_empty());
+
+        let explicit_choice: Option<(&str, &str)> = if let Some(c) = cli_clean {
+            Some((c, "`--proxy`"))
+        } else if let Some(ref e) = env_override {
+            Some((e.as_str(), "`AGY_SWITCH_CLI_PROXY`"))
+        } else {
+            cfg_proxy.map(|c| (c, "`config.json` (`network.proxy_url`)"))
+        };
+
+        let cfg_no_proxy = network_cfg
+            .and_then(|c| c.no_proxy.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let raw_no_proxy = first_non_empty_env(&["NO_PROXY", "no_proxy"]).map(|(_, v)| v);
+
+        if let Some((spec, source_name)) = explicit_choice {
+            if is_direct_keyword(spec) {
+                return Ok(Self::Direct);
+            }
+            let normalized = normalize_proxy_url(spec);
+            validate_proxy_url_for_source(&normalized, Some(source_name))?;
+            let merged_no_proxy = Some(merge_no_proxy_sources(
+                cfg_no_proxy,
+                raw_no_proxy.as_deref(),
+            ));
+            return Ok(Self::Explicit {
+                proxy_url: normalized,
+                no_proxy: merged_no_proxy,
+            });
+        }
+
+        Ok(Self::Inherit {
+            no_proxy: cfg_no_proxy
+                .map(|c| merge_no_proxy_sources(Some(c), raw_no_proxy.as_deref())),
+        })
+    }
+
+    pub fn apply_to_tokio_command(&self, cmd: &mut tokio::process::Command) {
+        match self {
+            Self::Inherit { no_proxy } => {
+                if let Some(ref np) = no_proxy {
+                    cmd.env("NO_PROXY", np).env("no_proxy", np);
+                }
+            }
+            Self::Direct => {
+                for var in [
+                    "HTTPS_PROXY",
+                    "https_proxy",
+                    "HTTP_PROXY",
+                    "http_proxy",
+                    "ALL_PROXY",
+                    "all_proxy",
+                ] {
+                    cmd.env_remove(var);
+                }
+            }
+            Self::Explicit {
+                proxy_url,
+                no_proxy,
+            } => {
+                for var in [
+                    "HTTPS_PROXY",
+                    "https_proxy",
+                    "HTTP_PROXY",
+                    "http_proxy",
+                    "ALL_PROXY",
+                    "all_proxy",
+                ] {
+                    cmd.env(var, proxy_url);
+                }
+                if let Some(ref np) = no_proxy {
+                    cmd.env("NO_PROXY", np).env("no_proxy", np);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +572,33 @@ mod tests {
                 )),
             }
         );
+
+        // SubprocessProxyOverride: explicit direct, explicit config URL, and invalid URL
+        assert_eq!(
+            SubprocessProxyOverride::resolve(Some("direct"), None).unwrap(),
+            SubprocessProxyOverride::Direct
+        );
+        let cfg = NetworkConfig {
+            proxy_url: Some("127.0.0.1:7890".into()),
+            no_proxy: Some("corp.internal".into()),
+        };
+        let resolved_cfg = SubprocessProxyOverride::resolve(None, Some(&cfg)).unwrap();
+        match resolved_cfg {
+            SubprocessProxyOverride::Explicit {
+                proxy_url,
+                no_proxy,
+            } => {
+                assert_eq!(proxy_url, "http://127.0.0.1:7890");
+                assert!(no_proxy.unwrap().contains("corp.internal"));
+            }
+            SubprocessProxyOverride::Direct => {
+                // Only possible if ambient AGY_SWITCH_CLI_PROXY=direct is set in the test runner
+                assert!(std::env::var("AGY_SWITCH_CLI_PROXY")
+                    .ok()
+                    .is_some_and(|v| v.eq_ignore_ascii_case("direct")));
+            }
+            other => panic!("unexpected subprocess proxy override: {other:?}"),
+        }
+        assert!(SubprocessProxyOverride::resolve(Some("ftp://bad:21"), None).is_err());
     }
 }

@@ -202,16 +202,16 @@ jobs:
               echo "Expected static aarch64-musl ELF without PT_INTERP or NEEDED!"
               exit 1
             fi
-            "$QEMU_AARCH64" "$bin" --no-remote-version current --json >/dev/null
-            "$QEMU_AARCH64" "$bin" --no-remote-version status --json >/dev/null
+            "$QEMU_AARCH64" "$bin" current --json >/dev/null
+            "$QEMU_AARCH64" "$bin" status --json >/dev/null
             if [ "$flags" != "--no-default-features" ]; then
-              "$QEMU_AARCH64" "$bin" --no-remote-version stats summary --json >/dev/null
-              "$QEMU_AARCH64" "$bin" --no-remote-version stats list --json >/dev/null
+              "$QEMU_AARCH64" "$bin" stats summary --json >/dev/null
+              "$QEMU_AARCH64" "$bin" stats list --json >/dev/null
             fi
             set +e
             bad_err="$("$QEMU_AARCH64" "$bin" --json auth login "4/PART1'CI_ARM_SECRET_999" 2>&1)"
             bad_rc=$?
-            "$QEMU_AARCH64" "$bin" --no-remote-version --json accounts import --from-file "$ISO_ROOT/pipe.json" >/dev/null 2>&1
+            "$QEMU_AARCH64" "$bin" --json accounts import --from-file "$ISO_ROOT/pipe.json" >/dev/null 2>&1
             fifo_rc=$?
             set -e
             if [ "$bad_rc" -ne 2 ] || echo "$bad_err" | grep -iq 'ci_arm_secret_999' || [ "$fifo_rc" -ne 2 ]; then
@@ -255,16 +255,16 @@ jobs:
               echo "Forbidden external libsqlite3 shared library detected in aarch64-gnu ELF!"
               exit 1
             fi
-            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version current --json >/dev/null
-            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version status --json >/dev/null
+            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" current --json >/dev/null
+            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" status --json >/dev/null
             if [ "$flags" != "--no-default-features" ]; then
-              "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version stats summary --json >/dev/null
-              "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version stats list --json >/dev/null
+              "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" stats summary --json >/dev/null
+              "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" stats list --json >/dev/null
             fi
             set +e
             bad_err="$("$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --json auth login "4/PART1'CI_ARM_GNU_SECRET_999" 2>&1)"
             bad_rc=$?
-            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --no-remote-version --json accounts import --from-file "$ISO_ROOT/pipe.json" >/dev/null 2>&1
+            "$QEMU_AARCH64" -L /usr/aarch64-linux-gnu "$bin" --json accounts import --from-file "$ISO_ROOT/pipe.json" >/dev/null 2>&1
             fifo_rc=$?
             set -e
             if [ "$bad_rc" -ne 2 ] || echo "$bad_err" | grep -iq 'ci_arm_gnu_secret_999' || [ "$fifo_rc" -ne 2 ]; then

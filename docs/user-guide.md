@@ -13,21 +13,21 @@
    - [1.2 下载、校验与安装步骤](#12-下载校验与安装步骤)
    - [1.3 Arch Linux / EndeavourOS 等 Arch 系发行版（AUR 安装）](#13-arch-linux--endeavouros-等-arch-系发行版aur-安装)
    - [1.4 从源码自行编译（可选，要求 Rust 1.89 及以上）](#14-从源码自行编译可选要求-rust-189-及以上)
-2. [上手前必读：四个核心概念](#2-上手前必读四个核心概念)
+2. [上手前必读：五个核心概念与合规风控边界](#2-上手前必读五个核心概念与合规风控边界)
 3. [全局选项与环境变量](#3-全局选项与环境变量)
 4. [全量命令与参数详解](#4-全量命令与参数详解)
    - [4.1 环境状态只读巡检：`status`](#41-环境状态只读巡检status)
    - [4.2 登录与 OAuth 授权管理：`auth`（默认免配置粘贴登录）](#42-登录与-oauth-授权管理auth默认免配置粘贴登录)
    - [4.3 账号池管理、批量导入与排序：`accounts`](#43-账号池管理批量导入与排序accounts)
    - [4.4 查看当前身份/可用模型与手动切号：`current` / `switch`](#44-查看当前身份可用模型与手动切号current--switch)
-   - [4.5 配额查询与流式联网刷新：`quota` / `refresh`](#45-配额查询与流式联网刷新quota--refresh)
+   - [4.5 配额查询与官方 CLI 委托刷新：`quota` / `refresh`](#45-配额查询与官方-cli-委托刷新quota--refresh)
    - [4.6 自动切号规则配置：`policy`（设定规则）](#46-自动切号规则配置policy设定规则)
    - [4.7 指定凭据与后端启动包装器：`run`](#47-指定凭据与后端启动包装器run)
    - [4.8 后台自动切号守护进程：`daemon`（定时巡检与服务安装）](#48-后台自动切号守护进程daemon定时巡检与服务安装)
    - [4.9 SSH 交互式终端看板：`tui`（全键盘可视化操作）](#49-ssh-交互式终端看板tui全键盘可视化操作)
    - [4.10 本地 Token 用量统计与请求明细：`stats summary` / `stats list`](#410-本地-token-用量统计与请求明细stats-summary--stats-list)
 5. [标准退出码（`0..=8`）与 `--json` 脚本集成契约](#5-标准退出码08与---json-脚本集成契约)
-6. [可选配置文件（`config.json` 代理、后端、通知、外部槽位别名与自定义 OAuth 客户端）](#6-可选配置文件configjson-代理后端通知外部槽位别名与自定义-oauth-客户端)
+6. [可选配置文件（`config.json` 代理、后端、通知与自定义 OAuth 客户端）](#6-可选配置文件configjson-代理后端通知与自定义-oauth-客户端)
 7. [后台常驻运行指南（`systemd --user` 与无 `systemd` 的 Docker 容器环境）](#7-后台常驻运行指南systemd---user-与无-systemd-的-docker-容器环境)
 8. [常见问题解答（FAQ）](#8-常见问题解答faq)
 9. [完整卸载与本地遗留文件清理清单](#9-完整卸载与本地遗留文件清理清单)
@@ -55,7 +55,7 @@
 
 ```bash
 # 第 1 步：在终端直接下载对应架构的压缩包与 SHA-256 校验文件（需要代理时可先 export https_proxy=... 或给 curl 加 -x）
-VER=v1.2.6
+VER=v1.2.7
 ARCH="$(uname -m)"   # x86_64 或 aarch64
 curl -fLO "https://github.com/MatrixC7/agy-switch-cli/releases/download/${VER}/agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz"
 curl -fLO "https://github.com/MatrixC7/agy-switch-cli/releases/download/${VER}/agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz.sha256"
@@ -108,7 +108,7 @@ cargo build --release --locked --target x86_64-unknown-linux-musl    # 纯静态
 
 ---
 
-## 2. 上手前必读：四个核心概念
+## 2. 上手前必读：五个核心概念与合规风控边界
 
 - **如何在命令中指定账号（`<ID|EMAIL>`）？**
   - 为防止排序变动或账号增删导致命令行序号漂移误触其他账号，所有命令行子命令统一采用与账号终身绑定的精确标识：
@@ -135,13 +135,32 @@ cargo build --release --locked --target x86_64-unknown-linux-musl    # 纯静态
     - **`Claude / GPT` 池**：Claude Sonnet / Opus 与 GPT-OSS 等模型共用。
     - **`Argon` 池**：仅部分灰度测试账号才会被下发。普通商业订阅账号没有该池，`tui` 和 `quota` 会默认将其隐藏，属于正常现象。
   - 每个配额池同时受 **`Weekly`（7 天滚动周总额度）** 和 **`5h`（5 小时短期防刷窗口）** 限制，任意一个窗口降为 `0%` 都会触发限流，因此工具会同时展示这两个窗口。
-- **配额缓存保鲜期（`stale`）与 `daemon` 实时刷新机制**
-  - 为避免高频请求触发 Google 服务端风控，通用本地配额缓存（`quota` 只读查看与闲置候选账号缓存）的默认保鲜期为 **`1 小时（3600 秒）`**：
+- **官方 CLI 委托查额、配额缓存保鲜期（`stale`）与 `daemon` 步进核验机制**
+  - 为彻底避免直连 Google 内部接口的风险，本工具的配额刷新（`quota --refresh`、`refresh`、`tui` 中的 `r` 与 `daemon` 巡检）统一委托本机已安装的官方 `agy -p "/usage" --output-format json < /dev/null`，**仅针对当前官方活跃槽位**查询最新配额（零对话落盘、零 token 消耗；尚未消耗的满额桶若返回 Unix Epoch 0 重置时间，工具自动归一化展示为 `—` 而不会误判过期）。
+  - 通用本地配额缓存（`quota` 只读查看与休眠账号缓存）的默认保鲜期为 **`1 小时（3600 秒）`**：
     - 距离上次刷新 **1 小时以内**（且未跨过重置时间点），只读查看 `agy-switch-cli quota` 显示为 `known`（新鲜有效）。
-    - 超过 **1 小时**后，缓存标为 `stale`。此时手动运行 `agy-switch-cli quota` **依然会正常展示上次缓存的进度表**，并在状态行温和提示可加 `--refresh`（`agy-switch-cli quota --refresh`）联网更新。
-  - **后台守护进程 `daemon` 对当前活跃账号采用实时刷新机制**：
-    - 常驻 `daemon`（默认每 `180` 秒巡检一次）在每次定时唤醒且不处于冷却期、失败退避或不可用阻断态（`disabled` / `verify-blocked` / `quota_forbidden`）时，都会直接对当前正在消耗的活跃账号执行实时联网配额复核（避免慢轮落盘或负抖动跳过刷新；仅在极短低水位宽限窗口内跳过重复查询，且 `Wait` 模式挂起计划的锁内复验保鲜期随巡检间隔缩放到 `80%`，范围 `1..=3600` 秒），而闲置备用候选号继续沿用 `3600s` 缓存避免高频轰炸。
-    - 手动或通过 `cron` 执行 `daemon --once` 时，会对非阻断态的当前活跃账号直接执行一次实时联网配额刷新（仅当本地 `<= 15` 秒前刚确认额度已低于保留线且未过重置点时跳过重复查询）；若此次联网请求、必要摘要获取或源刷新预算超时失败，则严格故障关闭进入 `hold`（`source_refresh_failed: ...`），绝不回退旧缓存误判。
+    - 超过 **1 小时**后，缓存标为 `stale`。此时手动运行 `agy-switch-cli quota` **依然会正常展示上次缓存的进度表**，并在状态行温和提示可加 `--refresh`（`agy-switch-cli quota --refresh`）委托官方 `agy` 更新当前活跃槽位。
+  - **后台守护进程 `daemon` 的 15 分钟步进核验机制**：
+    - 常驻 `daemon`（默认巡检基准为 **`900` 秒即 15 分钟**，调度附加 `±10%` 随机抖动；退避截止时间不附抖动：当前活跃源号查额失败默认退避 `max(900, interval)` 即 `900` 秒，候选探测失败/不可用及全池低额后其余已探低额号默认退避 `max(900, 2 × interval)` 即 **`1800` 秒（30 分钟）**，低额停留号本身不写入该次批量退避）在每次定时唤醒且不处于冷却期、失败退避或不可用阻断态（`disabled` / `verify-blocked` / `quota_forbidden`）时，仅针对**当前官方活跃槽位**调用 `agy -p "/usage"` 复核余量，**绝不后台轮询休眠账号**。
+    - 只有当当前活跃账号跌至 `<= reserve` 时，才按策略顺序过滤掉缓存已知低于 `minimum` 且未过重置线的空号，随后单轮有界逐个离线切入剩余候选号并用 `agy -p "/usage"` 实测核验，找到首个 `>= minimum` 的账号即落脚并写入冷却。
+    - 手动或通过 `cron` 执行 `daemon --once` 时，会对非阻断态的当前活跃账号执行一次实时 `agy -p "/usage"` 核验（仅当本地 `<= 15` 秒前刚确认额度已低于保留线且未过重置点时跳过重复查询）；若此次查询失败或超时，则严格故障关闭进入 `hold`（`source_refresh_failed: ...`），绝不回退旧缓存误判。
+- **合规边界与账号风控说明（`agy -p "/usage"`、ACP、多账号轮换与降风险实践）**
+  - **风险分层与已移除的高危路径**：
+    - 第三方客户端直连 Google 内部后端配额接口、伪造内部客户端请求头，或通过非官方代理/桥接层转发消费级 OAuth 令牌，明确违反 Google Antigravity 附加服务条款（第 6 节），属于自动化反滥用清扫（`403 PERMISSION_DENIED` / `TOS_VIOLATION`）的最高风险来源。本工具已彻底移除全部内部接口直连与客户端标识伪造。
+  - **官方 CLI 委托查额（`agy -p "/usage"`）与 ACP 场景的残余风险**：
+    - **技术实现口径**：本工具的实时查额统一委托本机已安装的官方 `agy -p "/usage" --output-format json < /dev/null`（打印模式内置斜杠命令，非 `agy acp`，当前 ACP 协议尚未暴露额度 RPC）。
+    - **条款与风控灰区**：从 Google 消费级订阅条款（`oauth-personal`）的严格口径看，官方主要面向交互式 `agy` 与受支持 IDE（如 Zed、JetBrains 官方扩展）的薄客户端集成。无论是由第三方工具在后台程序化调用 `agy -p "/usage"`，还是在外部编排框架中封装 `agy acp` 驱动自动化循环，都**不能保证零风控风险**，仍可能被判定为第三方工具包装或非交互式自动化访问。
+  - **多账号切换、同机并发与自动守护巡检风险**：
+    - 个人消费级订阅（免费 / Google AI Pro / Google AI Ultra）均按单人单账号配额模型授权。
+    - 在同一台机器上并发运行多个消费级账号、高频切换本地槽位，或开启后台 `daemon` 在额度触底时自动跨多个账号连续步进探额以规避 `5h` / `Weekly` 限流，均存在触发 Google 自动化反滥用检测的风险。
+  - **触发风控后的影响范围与申诉规则**：
+    - 一旦触发 `TOS_VIOLATION`（HTTP `403 PERMISSION_DENIED`），停用范围通常会联动波及同一账号下的 **Antigravity、Gemini CLI 与 Gemini Code Assist** 等同源开发者服务层（通常不会直接停用 Gmail、Google Drive 等主站基础个人服务，但相关 AI 编码服务权限会被冻结）。
+    - 按 Google 现行处理惯例，首次触发第三方工具风控通常有一次通过官方表单提交申诉并承诺停止使用非官方工具的恢复机会；**二次重复违规可能导致相关开发者服务被永久停用**。
+  - **建议的低风险使用习惯与官方替代方案**：
+    - **纯离线功能优先**：日常凭据备份、本地只读 `stats` 统计与低频手动 `switch` / `accounts add --from-local` 均为纯本地零网络操作，不产生额外远端特征。
+    - **控制查额频率与守护间隔**：避免短时间内反复执行 `quota --refresh`、`refresh` 或在 `tui` 中频繁按 `r`；不需要自动切号时保持 `policy` 关闭、不运行 `daemon`；确需使用 `daemon` 时，建议保持默认的 **`900` 秒（15 分钟）**或设置更长间隔（如 `1800` 秒），且避免维护大量已耗尽低额账号导致单轮连续多跳。
+    - **避免同机多账号并发**：不要在同一台宿主机上同时并行跑多个不同消费级账号的自动化任务。
+    - **自动化与多 Agent 场景改用官方 API 凭据**：如果你的核心需求是脚本编排、CI/CD 集成或外部多 Agent 调度，请使用 Google 官方面向程序化访问的 **Google AI Studio API Key（`GEMINI_API_KEY`）** 或 **Vertex AI / Gemini Enterprise** 商业凭据，切勿复用个人消费级 OAuth 订阅。
 
 ---
 
@@ -152,9 +171,8 @@ cargo build --release --locked --target x86_64-unknown-linux-musl    # 纯静态
 | 全局选项 | 对应环境变量 | 默认行为与通俗说明 |
 | :--- | :--- | :--- |
 | `--data-dir <目录路径>` | `AGY_SWITCH_CLI_DATA_DIR` | 指定账号库存储目录。默认位于 `~/.local/share/agy-switch-cli`（目录权限自动设为 `0700`）。 |
-| `--proxy <代理地址\|direct>` | `AGY_SWITCH_CLI_PROXY` | 指定访问 Google 的网络代理，支持 `socks5h://127.0.0.1:1080`、`socks://127.0.0.1:1080`、`http://127.0.0.1:7890`、省略协议头的 `127.0.0.1:7890`，或填 `direct` 强制直连。不填时优先读取 `config.json`，其次自动读取并规范化终端环境变量 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`（注意 Linux 图形界面的“系统代理”不会自动注入终端，若不想每次传 `--proxy`，需在终端导出代理环境变量或写入 `config.json`）。 |
+| `--proxy <代理地址\|direct>` | `AGY_SWITCH_CLI_PROXY` | 指定显式 `auth` 登录/重授权与裸 `refresh_token` 导入访问 Google 标准 OAuth 端点的网络代理，支持 `socks5h://127.0.0.1:1080`、`socks://127.0.0.1:1080`、`http://127.0.0.1:7890`、省略协议头的 `127.0.0.1:7890`，或填 `direct` 强制直连。不填时优先读取 `config.json`，其次自动读取并规范化终端环境变量 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`（注意 Linux 图形界面的“系统代理”不会自动注入终端，若不想每次传 `--proxy`，需在终端导出代理环境变量或写入 `config.json`）。 |
 | `--backend <auto\|dual\|file\|keyring>` | `AGY_SWITCH_CLI_BACKEND` | 指定凭据槽位后端模式（严格匹配这 4 个小写字面值，区分大小写且不接受空字符串或外围空白；亦可在 `config.json` 的 `"backend"` 字段持久化），默认为 **`auto`**。四种模式的具体区别见下表。 |
-| `--no-remote-version` | — | 关闭联网命令每 24 小时一次的客户端最新版本号缓存查询。 |
 | `--json` | — | 输出机器可读的标准 JSON 格式（供自动化脚本解析使用；全屏交互看板 `tui` 与实时监控 `stats ... --watch` 均与 `--json` 互斥，`run` 包装器在启动准备无误后直接透传 `agy` 子进程的标准输入输出）。 |
 
 #### `--backend` 四种凭据后端模式详解
@@ -165,7 +183,7 @@ cargo build --release --locked --target x86_64-unknown-linux-musl    # 纯静态
 - **`dual`（显式双写同步）**：
   - 强制要求同时读写系统钥匙串与本地 `~/.gemini/antigravity-cli/antigravity-oauth-token` 文件，并在切号时执行双端原子事务与异常回滚（若当前环境没有可用钥匙串则明确报错退出）。
 - **`file`（纯本地文件模式）**：
-  - 仅读写本地 `~/.gemini/antigravity-cli/antigravity-oauth-token` 文件，全程不访问或修改系统钥匙串。当通过 `--backend file`、`AGY_SWITCH_CLI_BACKEND=file` 或 `config.json` 中的 `"backend": "file"` **显式指定**为 `file` 模式且宿主环境中存在桌面 D-Bus 会话总线时，可选包装器 `run` 会自动为拉起的 `agy` 子进程注入 `DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null`，从而将终端 CLI 登录态与图形桌面 App 钥匙串登录态隔离（而无钥匙串服务器上的默认 `auto` 回退不会修改子进程 D-Bus 环境变量，不影响子进程内的 `systemctl --user` 等操作）。
+  - 仅读写本地 `~/.gemini/antigravity-cli/antigravity-oauth-token` 文件，全程不访问或修改系统钥匙串。当通过 `--backend file`、`AGY_SWITCH_CLI_BACKEND=file` 或 `config.json` 中的 `"backend": "file"` **显式指定**为 `file` 模式且宿主环境中存在桌面 D-Bus 会话总线时，拉起官方 `agy` 子进程的入口（包括可选包装器 `run` 以及委托查额的 `quota --refresh` / `refresh` / `daemon` / `tui`）都会自动为 `agy` 子进程注入 `DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null`，从而确保 `agy` 严格读写本地文件槽位而与图形桌面 App 钥匙串登录态隔离（而无钥匙串服务器上的默认 `auto` 回退不会修改子进程 D-Bus 环境变量，不影响子进程内的 `systemctl --user` 等操作）。
 - **`keyring`（纯系统钥匙串模式，零本地文件读写）**：
   - 仅读写系统 D-Bus Secret Service 钥匙串，绝不创建、修改、读取或要求本地 `~/.gemini/antigravity-cli/antigravity-oauth-token` 文件存在（适合已在图形桌面完全使用钥匙串管理登录态、希望保持磁盘上不留明文凭据文件的用户）。
 
@@ -184,7 +202,7 @@ agy-switch-cli status --json   # 输出结构化 JSON 巡检报告
 
 标准输出示例：
 ```text
-agy-switch-cli status (v1.2.6)
+agy-switch-cli status (v1.2.7)
   Backend:           dual
   Store status:      OK
   Journal status:    Clean
@@ -290,7 +308,7 @@ agy-switch-cli auth clients
     - 开头的 `*` 表示当前未传 `--client` 时默认使用的客户端；
     - `antigravity_enterprise` 是客户端短名称（`key`），`Antigravity Enterprise` 是显示备注名；
     - `(builtin)` 表示程序内置客户端，`(custom)` 表示你在 `config.json` 或环境变量中自行注册的自定义客户端。
-  - **什么情况下才会用到它？** Google OAuth 2.0 有一条严格规则：**由哪个 `client_id` 签发的 `refresh_token`，后续刷新续期时就必须继续配对同一个 `client_id` 和 `client_secret`**。如果你手头有通过自建 Google Cloud 项目或其他第三方工具签发的 Token，在按第 `6.3` 节写入 `config.json` 后，就可以运行 `auth clients` 核对自定义客户端是否已成功加载、有没有字段缺失警告。
+  - **什么情况下才会用到它？** Google OAuth 2.0 有一条严格规则：**由哪个 `client_id` 签发的 `refresh_token`，后续在显式 `auth` 换码或裸令牌导入时就必须继续配对同一个 `client_id` 和 `client_secret`**。如果你手头有通过自建 Google Cloud 项目或其他第三方工具签发的 Token，在按第 `6.2` 节写入 `config.json` 后，就可以运行 `auth clients` 核对自定义客户端是否已成功加载、有没有字段缺失警告。
 
 ---
 
@@ -322,20 +340,16 @@ agy-switch-cli accounts list --order bob@example.com charlie@example.com alice@e
 
 > **安全保护说明**：为防止机密 Token 留在终端历史记录（`.bash_history`）或被系统进程表泄露，工具禁止将 Token 直接作为命令行位置参数传入，统一使用清晰一致的 `--from-local`、`--from-file`、`--from-stdin` 或交互式无回显粘贴：
 
-**场景 A：当前设备已登录官方 `agy`（或桌面端与 `agy` 在系统钥匙串中共用条目），一键抓入账号库（`--from-local`）**
+**场景 A：当前设备已登录官方 `agy`（或桌面端与 `agy` 在系统钥匙串中共用条目），纯本地离线抓入账号库（`--from-local`）**
 ```bash
 agy-switch-cli accounts add --from-local --label "local"
-# 也可指定独立的外部目标应用数据目录（例如第三方 ACP 宿主隔离的 antigravity-acp 目录）：
-agy-switch-cli accounts add --from-local --target t3 --label "t3-local"
-agy-switch-cli accounts add --from-local --target-dir ~/.t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32/antigravity-acp --label "t3-local"
 ```
 - **按当前生效的 `--backend` 模式自动选择读取源**：
   - 在默认的 **`auto`**（桌面有钥匙串时）或 **`dual`** 模式下：程序优先读取系统钥匙串（`Password for 'antigravity' on 'gemini'`，若集合处于锁定状态会按标准接口请求解锁，而日常只读探测 `auto` / `current` / `status` 绝不触发解锁）；若钥匙串中尚无记录，则自动回退读取 `~/.gemini/antigravity-cli/antigravity-oauth-token`。
   - 在 **`file`** 模式（或无桌面服务器 / 容器环境）下：程序仅读取 `~/.gemini/antigravity-cli/antigravity-oauth-token`。
   - 在 **`keyring`** 模式下：程序仅读取系统钥匙串，不会回退读取磁盘上的 `antigravity-oauth-token`。
-  - 当附加 **`--target <NAME>`** 或 **`--target-dir <DIR>`** 时：程序严格按纯文件只读方式从该外部目录下的 `antigravity-oauth-token` 提取 `refresh_token`，不解析官方钥匙串后端、不触碰系统钥匙串或官方 `~/.gemini/antigravity-cli`（若同时显式传入 `--backend keyring` 则返回用法错误退出码 `2`）；若磁盘上存在未解决的官方 `switch_journal.json`，程序仅做只读检测并保留现场返回退出码 `7`（`pending_official_journal`），要求先用官方入口恢复，绝不在外部导入中自动重放官方切号事务。
-  - **支持范围边界**：`--from-local` 严格面向 `agy` CLI 生效凭据源设计，不会读取桌面端 App / VS Code 扩展专用的回退文件 `~/.gemini/jetski-standalone-oauth-token`。若桌面系统未启用钥匙串、且仅存在 `jetski-standalone-oauth-token` 而未登录过 `agy` CLI，请改用 `agy-switch-cli auth login` 登录。
-- 读取到 `refresh_token` 后，程序会先在本地预检并准备 `0700/0600` 私有暂存目录与单调授权序号，随后联网核验令牌有效性、拉取对应的真实邮箱并安全落盘（若该邮箱已在库中则自动刷新更新，不会重复建号）。
+  - **支持范围边界**：`--from-local` 严格面向官方 `agy` CLI 生效凭据源设计，不会读取桌面端 App / VS Code 扩展专用的回退文件 `~/.gemini/jetski-standalone-oauth-token`。若桌面系统未启用钥匙串、且仅存在 `jetski-standalone-oauth-token` 而未登录过 `agy` CLI，请改用 `agy-switch-cli auth login` 登录。
+- **100% 纯本地离线入库（零网络请求）**：读取本地完整凭据载荷后，程序直接从 `id_token` JWT 或官方 `agy 1.5+` 写入的紧凑字段 `id_token_email` 中提取邮箱，并顺带提取 `user_tier`（若有）写入套餐占位，全程不发起任何 OAuth 网络请求（若该邮箱已在库中则按令牌谱系防回退规则安全更新，不会重复建号；若极少数早期本地凭据文件缺失邮箱元数据，程序会给出清晰报错提示改用 `agy-switch-cli auth login` 或先启动一次官方 `agy`）。
 
 **场景 B：手动安全粘贴单条 `refresh_token`**
 ```bash
@@ -447,26 +461,28 @@ Supported models : 15 available (cached)
     - `managed_accounts=[...]`：仅当系统中同时既有直接启动的 `agy`、又有通过 `agy-switch-cli run -- agy` 启动的受管进程时才会出现，用于列出受管进程已登记的账号 ID；平时没有受管进程时会自动省略该字段，保持输出简洁。
   - **`managed_running (count=1, accounts=["acc-0001"], pids=[636240])`**：当前所有运行中的 `agy` 进程均是通过可选的 `agy-switch-cli run -- agy` 启动的，工具通过本地双因子进程租约确切知道运行数量（`count`）、对应的账号 ID（`accounts`）与进程号（`pids`）。
   - **`unverified (...)`**：当前运行环境（如挂载受限的特殊容器）无法完整读取 `/proc` 进程表，工具无法核实是否有 `agy` 正在运行；出于故障关闭安全原则，自动切号与未加 `--allow-running` 的手动切号此时会拒绝盲目改写凭据。
-- **`Supported models`**：当前账号可使用的全部模型清单（读取自最近一次配额刷新缓存，自动剔除未开放模型并按模型家族分组展示）。
+- **`Supported models` / 模型分组说明**：当账号存在缓存的逐模型清单时按家族分组展示；采用官方 `agy -p "/usage"` 观测（无逐模型列表）时，自动展示各配额池的模型分组说明（`quota_groups[].description`）。
 
-#### （2）手动切换生效账号：`switch`（运行中进程行为与四种后端模式详解）
+#### （2）手动切换生效账号：`switch`（纯本地离线切槽、切出前回采与四种后端模式详解）
 
-`switch` 通过**邮箱**或**账号 ID**精确指定目标账号（日常交互切号也可直接使用 `agy-switch-cli tui`）：
+`switch` 通过**邮箱**或**账号 ID**精确指定目标账号（日常交互切号也可直接使用 `agy-switch-cli tui`），全程**纯本地零网络操作**（不再调用 OAuth 续期接口，由官方 `agy` 在启动时自主按需续期）：
 
 ```bash
-agy-switch-cli switch bob@example.com                   # 按邮箱立即切换到指定账号（对后续新启动的 agy 生效）
+agy-switch-cli switch bob@example.com                   # 按邮箱立即离线切换到指定账号（对后续新启动的 agy 生效）
 agy-switch-cli switch acc-0002                          # 或按内部账号 ID 切换到指定账号
 agy-switch-cli switch bob@example.com --dry-run         # 仅做切换前条件预检，不发网络请求也不修改任何凭据
 agy-switch-cli switch bob@example.com --require-idle    # 严格要求当前无任何运行中的 agy 进程才允许切号（适合特殊脚本）
 agy-switch-cli switch bob@example.com --allow-running   # 在 /proc 不可读（unverified）的特殊容器环境中显式放行切号
 ```
 
+- **切出前自动本地回采同步（Pre-Switch Sync-Back）**：
+  - 每次切出当前账号 A 之前，程序在 `L1` 槽位锁内会先纯本地检查当前官方槽位/钥匙串中的凭据：若可确认为账号 A（按 `refresh_token` 指纹或当前 `selected_account_id` 配合本地 `id_token` / `id_token_email` 邮箱一致）且官方 `agy` 在运行期间刷新了更新鲜的 `access_token` 或轮换了新的 `refresh_token`，程序会先在 `L3` 写锁内将最新令牌安全合并回 `accounts/<A>.json`（保留 `66,048` 级已淘汰谱系防回退），再原子写入目标账号 B。
 - **当已有 `agy` 窗口正在运行时执行 `switch`（或 `tui` 切号）会发生什么？**
   - 默认情况下，检测到正在运行的 `agy` 进程时**不会报错拦截**，而是立即完成凭据切换，并输出一条温和提示：正在运行的旧 `agy` 窗口继续保持其启动时的原账号会话不受打断，而此后新打开的 `agy` 终端窗口将立即使用刚切好的新账号。
   - 如果你的自动化脚本希望“只要有 `agy` 在跑就禁止切号”，可显式加上 `--require-idle`（存在活跃 `agy` 时返回退出码 `8`）；若处于 `/proc` 被屏蔽的特殊容器（`unverified`），默认仍保持故障关闭拦截，确认安全时可加 `--allow-running` 放行（`--require-idle` 与 `--allow-running` 互斥）。
 - **当账号处于 `verify-blocked`（`[verification required]`）风控验证状态时**：
-  - 当账号因 Google CloudCode 返回 `403 VALIDATION_REQUIRED` 被标为 `verify-blocked` 时，其 OAuth 登录令牌本身仍有效。手动执行 `switch --dry-run` 可正常预检，手动执行 `switch`、`tui` 按 `Enter` 或可选的 `run` 均允许切入该账号以便打开官方 `agy` 完成网页/扫码验证。
-  - 人工切入时**不会提前清除** `verify-blocked` 标记，同时会打印操作指引：后台 `daemon` 仍将其严格排除在自动切号候选之外（且当前生效账号处于 `verify-blocked` 时 `daemon` 会自动进入 `hold` 等待而不抢切槽位）。在官方 `agy` 内完成验证后，执行 `agy-switch-cli refresh <ID|EMAIL>`（或在 `tui` 中按 `r`），当最终采用主环境未阻断的有效观测时即自动解除该状态。
+  - 当账号因 Google 返回 `403 VALIDATION_REQUIRED` 被标为 `verify-blocked` 时，其 OAuth 登录令牌本身仍有效。手动执行 `switch --dry-run` 可正常预检，手动执行 `switch`、`tui` 按 `Enter` 或可选的 `run` 均允许切入该账号以便打开官方 `agy` 完成网页/扫码验证。
+  - 人工切入时**不会提前清除** `verify-blocked` 标记，同时会打印操作指引：后台 `daemon` 仍将其严格排除在自动切号候选之外（且当前生效账号处于 `verify-blocked` 时 `daemon` 会自动进入 `hold` 等待而不抢切槽位）。在官方 `agy` 内完成验证后，直接执行 `agy-switch-cli refresh`（或在 `tui` 中停在当前活跃 `*` 行按 `r`），当官方 `agy -p "/usage"` 返回未阻断的有效观测时即自动解除该状态。
   - 被禁用（`disabled`）、令牌已被吊销或缺失 OAuth 权限范围（`scope_reauth_required`）的账号在所有入口仍严格拒绝切换。
 - **不同环境与 `--backend` 模式下的切号行为**：
   - **纯无头环境（远程 SSH 服务器、Docker 容器、无桌面 WSL2）**：默认 `auto` 自动采用 `file` 模式，以 `0600` 权限原子替换 `~/.gemini/antigravity-cli/antigravity-oauth-token`，切完直接运行 `agy` 即刻生效。
@@ -475,79 +491,48 @@ agy-switch-cli switch bob@example.com --allow-running   # 在 /proc 不可读（
     - **仅用钥匙串不留本地文件（`--backend keyring`）**：执行 `agy-switch-cli --backend keyring switch bob@example.com`（或在 `config.json` 中设 `"backend": "keyring"`），程序仅读写系统钥匙串，完全不创建或修改 `~/.gemini/antigravity-cli/antigravity-oauth-token`。
     - **桌面与 CLI 账号隔离（显式 `--backend file` + `run`）**：若希望桌面端 App 保持原钥匙串账号、仅让终端里的 `agy` 换用另一个账号，可执行 `agy-switch-cli --backend file switch bob@example.com` 只改本地文件，再通过可选方式 `agy-switch-cli --backend file run -- agy` 启动（显式选择 `file` 后端时，`run` 会自动为子进程屏蔽桌面钥匙串总线）。
 
-#### （3）管理外部目标目录（`--target` / `--target-dir`，如第三方 ACP 宿主隔离凭据与用量统计）
-
-某些通过 `agy acp --gemini-dir <隔离目录> --app-data-dir <目录名>` 启动本地 `agy` 的第三方工具（例如 `t3code`）会将 Google OAuth 凭据（`antigravity-oauth-token`）与会话数据库（`conversations/*.db`）独立保存在自己的应用数据目录中（格式与官方 `agy` 一致）。为在不耦合任何第三方工具路径的前提下独立管理这些外部目录，以下六个命令统一支持互斥选项 **`--target <NAME>`**（引用 `config.json` 中的 `targets` 别名，详见第 `6.2` 节）与 **`--target-dir <DIR>`**（显式传入目标应用数据目录路径）：
-
-```bash
-# 1. 查看外部目录当前挂接的账号身份、到期时间与绑定在该目录的运行中 agy 进程（纯只读）：
-agy-switch-cli current --target t3
-agy-switch-cli current --target-dir ~/.t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32/antigravity-acp
-
-# 2. 独立切换外部目录凭据（不修改官方 ~/.gemini/antigravity-cli、系统钥匙串、index.json 与 daemon 选中态）：
-agy-switch-cli switch bob@example.com --target t3 --dry-run
-agy-switch-cli switch bob@example.com --target t3 --require-idle
-agy-switch-cli switch bob@example.com --target t3 --allow-running
-
-# 3. 查看或联网刷新外部目录账号的双窗口配额（支持池内账号与未入池的纯游离凭据）：
-agy-switch-cli quota --target t3                # 池内账号直接读取本地缓存（零网络）；未入池游离文件提示加 --refresh
-agy-switch-cli quota --refresh --target t3      # 联网刷新并展示配额（如令牌续期或轮换，经 L1 锁与 CAS 同步回写该文件）
-agy-switch-cli refresh --target t3              # 刷新令牌与配额并按需 CAS 回写该文件（未入池游离文件不改动本地 accounts/）
-
-# 4. 将外部目录中已登录的账号反向导入本工具账号池：
-agy-switch-cli accounts add --from-local --target t3 --label "t3-account"
-
-# 5. 纯只读零写入统计外部目录中 conversations/*.db 的 Token 用量与 TTFT/TPS（支持 --watch 实时看板）：
-agy-switch-cli stats summary --target t3 --range today
-agy-switch-cli stats list --target t3 --recent 20
-agy-switch-cli stats summary --target t3 --watch
-```
-
-- **完全隔离与安全护栏**：
-  - **纯文件模式**：所有外部凭据操作均严格仅读写 `<target-dir>/antigravity-oauth-token`，绝不触碰系统 Secret Service 钥匙串，也不受 `config.json` 中为官方 `agy` 配置的 `backend: "dual"` 或 `"keyring"` 影响（仅当同次命令行显式传入 `--backend keyring` 时报用法冲突返回退出码 `2`）。
-  - **严格防误操作**：要求目标目录已真实存在（绝不自动 `mkdir -p`），全程使用 `O_NOFOLLOW` 拒绝软链接穿越，拒绝将文件路径（含末尾带 `/antigravity-oauth-token`）传给 `--target-dir`，拒绝与官方 `~/.gemini/antigravity-cli`、`~/.gemini/antigravity` 及本工具自身 `data_dir` / `cache_dir` 碰撞，并在网络刷新前后执行 SHA-256 CAS 比对防止覆盖并发写入。
-  - **槽位级精准进程检测**：针对外部目录时，程序仅通过 `/proc/<pid>/cmdline` 解析同 UID `agy` 进程的 `--gemini-dir` 与 `--app-data-dir`（不读取 `/proc/<pid>/environ`），只对真正绑定在该目标目录的运行中 `agy` 进程发出提醒或响应 `--require-idle`，不会被无关的原生终端 `agy` 会话误拦。
-  - **运行中 `agy acp` 的生效边界**：与原生 `agy` 相同，已常驻运行中的 `agy acp` 进程会将启动时加载的令牌缓存在内存中，切号后仅对新启动的会话进程生效，且旧常驻进程到期自动续期时可能回写覆盖该凭据文件。
-  - **不跨界修改整体状态**：`status`、`daemon`、`tui` 与 `run` 继续专注服务官方 `agy` 槽位，`stats` 默认 `--source all|cli|app` 亦仅统计官方目录（与 `--target` / `--target-dir` 互斥），外部目标不会与官方状态相互污染。
-  - **离线身份识别口径（`current` 零网络）**：外部槽位仅以 `refresh_token` SHA-256 指纹与本地账号池精确匹配；对于尚未经本工具切写或导入的游离文件，纯离线只读解析会兼容提取 `id_token` JWT 或新版官方 `agy` 写入的 `id_token_email` 与 `user_tier` 提示（若邮箱与池内账号相同但 `refresh_token` 不同，会同时展示池内邮箱与 ID 提示差异而非冒认池内身份），完整套餐配额与支持模型清单在切号/入池后离线可见，或通过 `quota --refresh` 直接联网查看。
-
 ---
 
-### 4.5 配额查询与流式联网刷新：`quota` / `refresh`
+### 4.5 配额查询与官方 CLI 委托刷新：`quota` / `refresh`
+
+所有联网配额刷新均通过本机官方 `agy -p "/usage" --output-format json < /dev/null` 执行，且**严格仅支持刷新当前官方活跃槽位**（绝不在后台批量扫描休眠账号）：
 
 ```bash
-# 1. 查看当前选中账号的本地缓存配额表（纯本地读取，零网络请求）：
+# 1. 纯只读查看当前选中账号的本地缓存配额表（零网络请求）：
 agy-switch-cli quota
 
-# 2. 先联网刷新最新配额，再立即打印配额进度表：
+# 2. 委托官方 `agy -p "/usage"` 刷新当前活跃官方槽位的最新配额，并立即打印配额进度表：
 agy-switch-cli quota --refresh
 
-# 3. 按邮箱或 ID 查看 / 刷新指定账号：
+# 3. 纯只读查看指定账号或全部账号的本地缓存配额表（零网络请求）：
 agy-switch-cli quota bob@example.com
-agy-switch-cli quota --refresh bob@example.com
-
-# 4. 一次性查看全部账号，或并发流式刷新全部启用账号（每完成一个账号实时输出 [k/N] 进度）后统一打印：
 agy-switch-cli quota --all
-agy-switch-cli quota --refresh --all [--concurrency 3]
 
-# 5. 纯联网刷新落盘（批量模式在终端实时流式打印 [k/N] 完成进度，适合快速巡检或脚本调用；--concurrency 可设 1..5，默认 2）：
-agy-switch-cli refresh [<ID|EMAIL> | --all] [--concurrency 3]
+# 4. 委托官方 `agy -p "/usage"` 刷新当前活跃官方槽位并落盘（顺带纯本地回采最新令牌与套餐层级）：
+agy-switch-cli refresh
+# 也可显式传入当前活跃账号的邮箱或 ID 做安全核对（若传入的不是当前活跃账号，将直接提示用法错误并返回退出码 2）：
+agy-switch-cli refresh alice@example.com
 ```
+
+- **单槽刷新边界说明**：
+  - `quota --refresh --all`、`quota <ID|EMAIL> --refresh`、`refresh --all`、`refresh <非活跃账号>` 与 `--concurrency` 均已移除；传入这些组合会明确报错并返回退出码 `2`。
+  - 若需要刷新某个休眠账号的配额，请先通过 `agy-switch-cli switch <ID|EMAIL>` 切入该账号，再执行 `agy-switch-cli quota --refresh` 或 `agy-switch-cli refresh`。
+  - 显式指定 `--backend file` 且宿主存在桌面 D-Bus 总线时，委托调用 `agy -p "/usage"` 会自动注入 `DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null`，确保 `agy` 读取的是本地文件槽位。
 
 **配额表各列说明**：
 ```text
 Account : alice@example.com  [Google AI Pro]
-Status  : known (37.0% effective on all) · updated just now (source: Daily)
+Status  : known (97.0% effective on all) · updated just now (source: OfficialCli)
 
   Pool           Window   Remaining            Resets (Local)
   ───────────────────────────────────────────────────────────────────────────
-  Gemini         Weekly   [███████░░░]   72%   2026-11-23 19:34  (in 6d 18h)
-                 5h       [██████████]  100%   2026-11-17 05:00  (in 4h 30m)
-  Claude / GPT   Weekly   [████░░░░░░]   37%   2026-11-21 21:22  (in 4d 20h)
-                 5h       [██████████]  100%   2026-11-17 05:00  (in 4h 30m)
+  Gemini         Weekly   [██████████]   97%   2026-12-03 15:17  (in 5d 21h)
+                 5h       [██████████]   97%   2026-11-27 19:18  (in 1h 04m)
+  Claude / GPT   Weekly   [██████████]  100%   —
+                 5h       [██████████]  100%   —
 ```
 - `Weekly` 为 7 天滚动周总额度，`5h` 为 5 小时短期恢复窗口；
-- `Resets (Local)` 已自动换算为本机所在的本地时区时间（统一格式为 `YYYY-MM-DD HH:MM`），并在括号内附带剩余重置倒计时（`in Xd Yh`）。
+- `Resets (Local)` 已自动换算为本机所在的本地时区时间（统一格式为 `YYYY-MM-DD HH:MM`），并在括号内附带剩余重置倒计时（`in Xd Yh`）；满额尚未消耗的桶（官方返回 Unix Epoch 0）展示为 `—`。
 
 ---
 
@@ -560,7 +545,7 @@ Status  : known (37.0% effective on all) · updated just now (source: Daily)
 - **`policy` 同时监控双时间窗口**：对于 `--model` 所指定的目标模型池（默认 `all`，或单独指定 `gemini`、`claude`/`3p`、`argon` 及具体模型 ID），系统会**同时读取该池的 `5h`（五小时短期窗口）与 `Weekly`（7 天滚动周窗口）两个剩余百分比**，按木桶短板原理取 **`min(5h, Weekly)`** 作为该账号的有效剩余额度百分比（免费层 `Free` / `Starter` 账号若无 `5h` 桶则直接按 `Weekly` 评估）。
 - **触发线与准入线共用同一有效百分比**：
   - 当前生效账号的有效剩余百分比 `min(5h, Weekly) <= --reserve` 时，无论是 `5h` 窗口见底还是周中后期 `Weekly` 周额度见底，都会触发换号评估；
-  - 备选账号同样要求 `min(5h, Weekly) >= --minimum` 才具备接班资格。因此默认将 `--reserve` 设为 **`10%`**、`--minimum` 设为 **`30%`**，在重度编码与 `180` 秒巡检间隔下预留充足的提前切号缓冲以减少 `5h` 撞墙，同时确保接班候选号拥有足够续航、不易切入低余量账号后被 `3600` 秒冷却卡住，并保留 `20%` 的安全水位差防止来回震荡（若账号池较小希望更充分用尽残余额度，也可按需通过 `policy set` 下调）。
+  - 备选账号同样要求 `min(5h, Weekly) >= --minimum` 才具备接班资格。因此默认将 `--reserve` 设为 **`10%`**、`--minimum` 设为 **`30%`**，在重度编码与 `900` 秒（15 分钟）巡检间隔下预留充足的提前切号缓冲以减少 `5h` 撞墙，同时确保接班候选号拥有足够续航、不易切入低余量账号后被 `3600` 秒冷却卡住，并保留 `20%` 的安全水位差防止来回震荡（若账号池较小希望更充分用尽残余额度，也可按需通过 `policy set` 下调）。
 
 #### `policy set` 全部参数说明表
 
@@ -587,7 +572,7 @@ Status  : known (37.0% effective on all) · updated just now (source: Daily)
   - `claude`（等价别名 `3p`）：仅监控 `Claude / GPT` 第三方共享池额度。
 
 > **名词说明：为什么 `--model 3p` 代表 `Claude / GPT` 池？**
-> `3p` 是英文 **`Third-Party`（第三方合作模型）** 的缩写。在 Google CloudCode 后端配额体系中，Google 自家研发的 `Gemini` 系列属于第一方模型（桶标识为 `gemini-weekly` / `gemini-5h`），而由外部合作厂商 Anthropic 提供的 `Claude` 系列与 OpenAI 提供的 `GPT` 系列共用同一个第三方模型配额池，其内部桶标识即为 `3p-weekly` 与 `3p-5h`。因此在命令行中填写 `--model claude` 与 `--model 3p` 完全等价，均监控这整个 `Claude / GPT` 共享池。
+> `3p` 是英文 **`Third-Party`（第三方合作模型）** 的缩写。在 Antigravity 配额分组体系中，Google 自家研发的 `Gemini` 系列属于第一方模型（桶标识为 `gemini-weekly` / `gemini-5h`），而由外部合作厂商 Anthropic 提供的 `Claude` 系列与 OpenAI 提供的 `GPT` 系列共用同一个第三方模型配额池，其内部桶标识即为 `3p-weekly` 与 `3p-5h`。因此在命令行中填写 `--model claude` 与 `--model 3p` 完全等价，均监控这整个 `Claude / GPT` 共享池。
 
 #### 水位区间与“无候选账号达到 `minimum`”时的行为说明
 
@@ -595,10 +580,10 @@ Status  : known (37.0% effective on all) · updated just now (source: Daily)
 
 - **情况一：当前正在使用的账号有效额度介于 `10%` 与 `30%` 之间（例如剩余 `20%`）**：
   - **不会触发切换，继续稳定使用当前账号**。
-  - `--minimum`（`30%`）仅用于筛选“准备新换上来的接班候选账号”，并不会限制已经在用的当前账号；只有当当前账号继续消耗至 **`<= 10%`（`--reserve`）** 时才会开始寻找接班账号。
+  - `--minimum`（`30%`）仅用于筛选“准备新换上来的接班候选账号”，并不会限制已经在用的当前账号；只有当当前账号继续消耗至 **`<= 10%`（`--reserve`）** 时才会开始步进寻找接班账号。
 - **情况二：当前账号已降至 `<= 10%`（如剩余 `6%`），但池中其余候选账号全部 `< 30%`（没有任何候选号达到 `>= 30%`）**：
-  - 系统判定为**暂无达标接班候选（`no_qualified_candidate`）**：
-    - 后台 `daemon` 会**保持当前账号不变**（不会在两个低余量账号之间来回横跳浪费请求），静默等待任意候选账号跨过 `5h` 或 `Weekly` 重置时间恢复到 `>= 30%` 后再自动切入。
+  - 系统在单轮有界步进核验完所有未跳过的候选号后判定为**暂无达标接班候选（`no_qualified_candidate`）**：
+    - 后台 `daemon` 会自动**停留在“本轮实测余量最高且高于原号”的候选号上（若所有候选号余量都不高于原号，则切回原号）**，写入退避进入保持状态（不来回乒乓横跳），并向图形桌面发送一次 2 行低额保持通知（`Auto-Switch Holding (Low Quota)`），静候任意候选号跨过重置时间恢复后再自动切入。
     - 执行 `agy-switch-cli policy eval` 模拟测算时，会清晰显示 `would_switch=false` 与 `reason=source_below_reserve_but_no_qualified_candidate`。
     - **如何手动介入使用那些仅剩 `15% ~ 29%` 的备用号？** 手动切号（`agy-switch-cli switch <ID|EMAIL>` 或 `tui` 中按回车 / `s`）不受 `--minimum` 准入线限制，你随时可以手动切到任意未禁用账号把剩余零头额度用尽。
 
@@ -633,12 +618,12 @@ agy-switch-cli run --account bob@example.com -- agy chat "帮我检查这段代�
 # 场景 B：在开启了 GNOME Keyring / KDE Wallet 的 Linux 图形桌面上，显式指定 --backend file（或设置 AGY_SWITCH_CLI_BACKEND=file / config.json "backend": "file"），使用本地文件槽位并自动为该 agy 子进程屏蔽桌面钥匙串：
 agy-switch-cli --backend file run -- agy
 
-# 场景 C：不传 --account 时，确保当前选中账号的访问令牌有效且已同步至生效槽位，登记受管进程租约后启动 agy：
+# 场景 C：不传 --account 时，确保当前选中账号凭据已同步至生效槽位，登记受管进程租约后启动 agy：
 agy-switch-cli run -- agy
 ```
 
 **`run` 的确定性工作机制**：
-- **纯凭据准备、零配额请求**：若传入 `--account <ID|EMAIL>`，将目标账号凭据同步至当前生效后端槽位；若省略 `--account`，则校验当前选中账号凭据与生效槽位一致（仅在短期访问令牌即将过期时执行一次 OAuth 令牌续期，绝不联网拉取配额或隐式切换其他候选号）。
+- **纯本地离线凭据准备、零网络请求**：若传入 `--account <ID|EMAIL>`，纯本地离线将目标账号凭据同步至当前生效后端槽位（切出前自动回采原槽位最新令牌）；若省略 `--account`，则校验当前选中账号凭据与生效槽位一致（全程零 OAuth `/token` 网络调用，由官方 `agy` 启动时自行按需续期，绝不隐式拉取配额或切换其他候选号）。
 - **显式 `file` 后端自动隔离桌面钥匙串总线**：
   - 当通过命令行 `--backend file`、环境变量 `AGY_SWITCH_CLI_BACKEND=file` 或 `config.json` 中的 `"backend": "file"` **显式选择 `file` 后端**，且宿主环境中存在桌面会话总线（`DBUS_SESSION_BUS_ADDRESS` 或 `$XDG_RUNTIME_DIR/bus`）时，`run` 自身使用本地 `FileSessionBackend`（全程不触碰桌面钥匙串），并自动将拉起的 `agy` 子进程的 `DBUS_SESSION_BUS_ADDRESS` 设为 `unix:path=/dev/null`，确保终端内的 `agy` 从本地文件槽位读取凭据，而不影响桌面端 App 原有的钥匙串账号。
   - 若保持默认的 `--backend auto`，在无 Secret Service 钥匙串的无头 SSH 服务器上自动回退至 `file` 时，程序**不会**覆盖子进程的 `DBUS_SESSION_BUS_ADDRESS`，从而保证 `agy` 会话内部执行 `systemctl --user` 等用户总线命令完全不受影响。
@@ -650,17 +635,27 @@ agy-switch-cli run -- agy
 
 如果你习惯直接输入裸 `agy` 启动客户端，或有定时任务/自动化脚本反复拉起新的 `agy` 进程，希望后台定期巡检配额并在跌破 `--reserve` 时提前把凭据槽位切换好，可以使用 `daemon` 命令：
 
-- **后台巡检、桌面推送与无头静默边界说明**：
-  - `daemon` 在后台定时巡检并按需提前切换凭据槽位，绝不会强行终止或打断你正在交互的 `agy` 进程。
+- **15 分钟步进式巡检、桌面推送与无头静默边界说明**：
+  - `daemon` 默认以 **`900` 秒（15 分钟，调度附加 `±10%` 随机抖动）**为巡检基准，仅针对**当前官方活跃槽位**调用本机官方 `agy -p "/usage" --output-format json < /dev/null` 巡检余量（退避截止时间不附抖动：当前活跃源号查额失败默认退避 `max(900, interval)` 即 `900` 秒，候选探测失败/不可用及全池低额后其余已探低额号默认退避 `max(900, 2 × interval)` 即 `1800` 秒即 30 分钟，停留号本身不受该次批量退避），**绝不后台轮询休眠账号**，亦绝不强行终止或打断你正在交互的 `agy` 进程。请注意后台定时拉起 `agy -p "/usage"` 与自动多账号切换仍存在合规风控边界，建议结合自身需求审慎启用并避免缩短间隔（详见第 2 节合规说明）。
+  - 当当前账号受监控池跌至 `<= reserve` 时，按策略排序并纯本地跳过缓存已知 `< minimum` 且未过重置线的空号，随后在遵守 `Immediate` / `Wait` 进程守卫的前提下执行**单轮有界步进核验**（每候选号最多探测 1 次，上限 `N - 1` 跳，跳间缓冲 `2s`）：离线切入下一候选号（自动执行切出前回采）→ `agy -p "/usage"` 实测并回采；达标 `>= minimum` 即落脚、写入切号冷却并发送切号通知；若全部候选号均 `< minimum`，则稳态停留于实测最高且高于原号的候选号（否则切回原号），发送低额保持通知并写入退避，绝不乒乓死循环。
   - **桌面通知与无头自动跳过**：
-    - 当运行于存在活跃桌面通知服务（`org.freedesktop.Notifications`，如 KDE Plasma、GNOME 等）的图形环境时，`daemon` 会在**成功自动切号**时发送普通级别提醒（顶部 `↑` 标出新切入账号及其 `5h` / `Weekly` 双窗口余量，下方 `↓` 标出被切出账号），并在**首次触发连续失败熔断暂停**时发送高优先级警告（后续已暂停轮次不再重复弹窗）；发送前会只读查询 `GetCapabilities`，桌面支持 `body-markup` 时自动加粗新账号与新余量两行（并将 `↑` 一并置于加粗块内）、对故障排查指引使用斜体，不支持时退回纯文本：
+    - 当运行于存在活跃桌面通知服务（`org.freedesktop.Notifications`，如 KDE Plasma、GNOME 等）的图形环境时，`daemon` 会在以下三类事件触发通知：
+      - **成功自动切号**：发送普通级别提醒（顶部 `↑` 标出新切入账号及其 `5h` / `Weekly` 双窗口余量，下方 `↓` 标出被切出账号）；
+      - **全池候选均低于 `minimum`（低额保持）**：发送 2 行低额保持提醒（同一停留账号仅发送一次，不重复刷屏）；
+      - **首次触发连续失败熔断暂停**：发送高优先级警告（后续已暂停轮次不再重复弹窗）。
+    - 发送前会只读查询 `GetCapabilities`，桌面支持 `body-markup` 时自动加粗关键行、对故障排查指引使用斜体，不支持时退回纯文本：
       ```text
-      # 自动切号成功通知示例（支持 body-markup 的桌面会将前两行加粗，其中 `↑` 位于加粗块内）：
+      # 自动切号成功通知示例（固定 4 行，支持 body-markup 的桌面会将前两行加粗，其中 `↑` 位于加粗块内）：
       Account Switched
       ↑ bob@example.com
       5h 100% · Weekly 85%
       ↓ alice@example.com
       5h 2% · Weekly 40%
+
+      # 全池候选均低于最低准入线时的低额保持通知示例（固定 2 行）：
+      Auto-Switch Holding (Low Quota)
+      All candidate accounts are below 30% minimum.
+      Staying on bob@example.com (18%).
 
       # 连续失败熔断暂停通知示例（无目标账号时首行合并为 `■ Journal recovery · 1/3 failed`）：
       Auto-Switch Paused
@@ -672,24 +667,24 @@ agy-switch-cli run -- agy
     - **默认常驻防漏看与可选自动消失**：所有桌面通知统一附加 `transient=false` 与 `resident=true`。`Account Switched`（普通级别 `urgency=1`）默认使用常驻模式（`expire_timeout=0`，停留在屏幕直至手动关闭，且不附带严重告警标识）；若更习惯桌面默认数秒后自动消失，可在 `config.json` 中设置 `"notifications": { "persistent": false }`（切换为 `expire_timeout=-1`）。`Auto-Switch Paused`（严重级别 `urgency=2`）始终保持常驻（`expire_timeout=0`）。
     - 在无图形界面的 SSH 服务器或容器环境中（即使开启了 `systemd --user` 与 `linger`，只要会话 D-Bus 上没有活跃的通知守护进程），`daemon` 会以只读检测自动静默跳过，不尝试拉起桌面服务也不报错。
     - 如需在桌面环境手动关闭推送，可使用 `--no-notify`（配合 `daemon --install --no-notify` 可持久化写入服务单元）、设置环境变量 `AGY_SWITCH_CLI_NOTIFY=0`，或在 `config.json` 中设置 `"notifications": { "enabled": false }`。
-  - 由于官方 `agy` 仅在每次启动时读取一次登录凭据，当你在前台对话中注意到当前账号余量不足而退出重开 `agy`（或者后台脚本发起下一轮新的 `agy` 调用）时，若 `daemon` 已经提前完成了后台预切号，新启动的 `agy` 就会直接使用已经换好的新账号，省去退出后再手动打开 `tui` 刷新切号的步骤；平时也可随时通过 `agy-switch-cli current` 或 `journalctl --user -u agy-switch-cli.service` 查看切号记录。
+  - 由于官方 `agy` 仅在每次启动时读取一次登录凭据，当你在前台对话中注意到当前账号余量不足而退出重开 `agy`（或者后台脚本发起下一轮新的 `agy` 调用）时，若 `daemon` 已经提前完成了后台预切号，新启动的 `agy` 就会直接使用已经换好的新账号，省去退出后再手动打开 `tui` 切号的步骤；平时也可随时通过 `agy-switch-cli current` 或 `journalctl --user -u agy-switch-cli.service` 查看切号记录。
 
 ```bash
 # 1. 在支持 systemd 的 Linux 系统上，一键安装并启动开机自启后台用户服务（最简常驻方式）：
 agy-switch-cli daemon --install
 # 如需自定义后台服务的固定巡检间隔与冷却秒数，可在 --install 时一并传入写入服务文件：
-agy-switch-cli daemon --install --interval 300 --cooldown 3600
+agy-switch-cli daemon --install --interval 1800 --cooldown 3600
 # 如需在安装/刷新服务时顺带清零历史冷却截止时间（不会将 --reset-cooldown 写入服务单元）：
 agy-switch-cli daemon --install --reset-cooldown
 
 # 2. 一键停止、取消自启并安全移除用户级 systemd 服务文件：
 agy-switch-cli daemon --uninstall
 
-# 3. 直接在当前终端前台运行守护进程（按默认每 180 秒即 3 分钟巡检一次，切号冷却 3600 秒，每轮打印单行状态日志）：
+# 3. 直接在当前终端前台运行守护进程（按默认每 900 秒即 15 分钟巡检一次，切号冷却 3600 秒，每轮打印单行状态日志）：
 agy-switch-cli daemon
-agy-switch-cli daemon --interval 300 --cooldown 3600
+agy-switch-cli daemon --interval 1800 --cooldown 3600
 
-# 4. 仅执行单轮实时核查与按需切换后立即退出（输出本轮结论；适合手动排查或配合 crontab 定时任务）：
+# 4. 仅执行单轮实时核查与按需步进切换后立即退出（输出本轮结论；适合手动排查或配合 crontab 定时任务）：
 agy-switch-cli daemon --once
 agy-switch-cli --json daemon --once
 
@@ -707,13 +702,13 @@ agy-switch-cli daemon --once --reset-cooldown
   - `--uninstall`（默认关闭，与 `--install`、`--once`、`--no-notify`、`--reset-cooldown` 互斥）：先核验 `systemd --user` 管理器加载的服务单元身份；确认指向当前用户的 `agy-switch-cli.service` 时执行 `disable --now`，若服务处于未加载且非活跃态则跳过 `disable --now`，随后防符号链接安全删除本地服务文件并重载 `daemon-reload`。
   - `--once`（默认关闭，与 `--install`、`--uninstall` 互斥）：执行单轮实时评估与按需切换后立即退出，非 `--json` 模式向 `stdout` 输出单行状态结论，`--json` 模式输出标准 JSON 结果信封，适合 `cron` 或单次验证排障。
 - **巡检周期、冷却时间与桌面通知**
-  - `--interval <秒>`（环境变量 `AGY_SWITCH_CLI_INTERVAL`，默认值 `180` 即 3 分钟，最小 `1`）：后台巡检间隔秒数（常驻模式内置 `±10%` 随机时间抖动，每次合资格的定时唤醒均会直接联网复核当前活跃账号，`Wait` 模式挂起计划的复验保鲜期自动收紧为有效间隔的 `80%`、范围 `1..=3600` 秒）。配合 `daemon --install` 传入时写入服务单元长期生效。
-  - `--cooldown <秒>`（环境变量 `AGY_SWITCH_CLI_COOLDOWN`，默认值 `3600` 即 1 小时，要求 `>= 0`）：完成一次自动切号后的冷却保护秒数，冷却期内不再连续触发第二次切换（仅对后续新触发的切号生效，不会追溯清除磁盘中尚未到期的旧冷却截止时间）。配合 `daemon --install` 传入时写入服务单元长期生效。
+  - `--interval <秒>`（环境变量 `AGY_SWITCH_CLI_INTERVAL`，默认值 `900` 即 15 分钟，最小 `1`）：后台巡检间隔秒数（常驻模式内置 `±10%` 随机时间抖动，每次合资格的定时唤醒均会委托官方 `agy -p "/usage"` 复核当前活跃账号，`Wait` 模式挂起计划的复验保鲜期自动收紧为有效间隔的 `80%`、范围 `1..=3600` 秒）。配合 `daemon --install` 传入时写入服务单元长期生效。
+  - `--cooldown <秒>`（环境变量 `AGY_SWITCH_CLI_COOLDOWN`，默认值 `3600` 即 1 小时，要求 `>= 0`）：完成一次自动切号落脚后的冷却保护秒数，冷却期内不再连续触发第二次切换（仅对后续新触发的切号生效，不会追溯清除磁盘中尚未到期的旧冷却截止时间）。配合 `daemon --install` 传入时写入服务单元长期生效。
   - `--reset-cooldown`（默认关闭，与 `--uninstall` 互斥）：显式清零 `state/daemon_state.json` 中已持久化的 `cooldown_until` 冷却截止时间（保持 `0600` 权限，保留 `round-robin` 轮询游标与 `paused_on_failure` 熔断暂停状态；状态文件不存在或本无冷却时幂等成功退出 `0`），支持三种入口：
     - **独立执行 `daemon --reset-cooldown`（支持 `--json`）**：零网络请求、不争抢 `daemon.lock` 单实例锁，可在 `systemd --user` 服务或另一终端前台 `daemon` 正在运行时直接执行，运行中的守护进程会在下一次唤醒时自动脱离冷却（同时受 `L3` 锁重读保护，不会被并发巡检写回旧时间戳）；独立模式不允许与单次运行覆盖参数（`--interval`、`--cooldown`、`--no-notify`、`--mode`、`--strategy`、`--reserve`、`--minimum`、`--model`、`--proxy`）混用，混用会明确报错退出 `2`。
-    - **组合单轮 `daemon --once --reset-cooldown`**：获取单实例锁后先清零冷却，再立即执行本轮 7 阶段实时核查与按需切号。
+    - **组合单轮 `daemon --once --reset-cooldown`**：获取单实例锁后先清零冷却，再立即执行本轮步进核验与按需切号。
     - **组合安装 `daemon --install --reset-cooldown`**：在安装并启动用户服务前一次性清零历史冷却，且**绝不**将 `--reset-cooldown` 写入 `agy-switch-cli.service` 的 `ExecStart=`。
-  - `--no-notify`（环境变量 `AGY_SWITCH_CLI_NOTIFY`，默认开启桌面推送并在无头环境自动静默跳过）：关闭 `daemon` 在切号成功或首次熔断暂停时的 Linux 桌面通知（`--install --no-notify` 会将该参数写入生成的 `systemd` 单元；环境变量支持 `1`/`true`/`yes`/`on` 或 `0`/`false`/`no`/`off`，优先级为 `--no-notify` > `AGY_SWITCH_CLI_NOTIFY` > `config.json` > 默认开启）。
+  - `--no-notify`（环境变量 `AGY_SWITCH_CLI_NOTIFY`，默认开启桌面推送并在无头环境自动静默跳过）：关闭 `daemon` 在切号成功、低额保持或首次熔断暂停时的 Linux 桌面通知（`--install --no-notify` 会将该参数写入生成的 `systemd` 单元；环境变量支持 `1`/`true`/`yes`/`on` 或 `0`/`false`/`no`/`off`，优先级为 `--no-notify` > `AGY_SWITCH_CLI_NOTIFY` > `config.json` > 默认开启）。
 - **单次运行策略内存覆盖（仅对当前前台 `daemon` / `daemon --once` 生效，不会写回 `policy.json` 或 `systemd` 服务文件）**
   - `--mode <immediate|wait>`（环境变量 `AGY_SWITCH_CLI_MODE`，默认读取 `policy.json`）：临时覆盖活跃进程防护模式（`immediate` 允许在已核验的 `agy` 运行时更新槽位供后续新终端使用；`wait` 在检测到 `agy` 运行时推迟切换）。
   - `--strategy <priority|round-robin>`（环境变量 `AGY_SWITCH_CLI_STRATEGY`，默认读取 `policy.json`）：临时覆盖备用账号选择策略（按列表顺序优先或轮询）。
@@ -722,10 +717,10 @@ agy-switch-cli daemon --once --reset-cooldown
   - `--model <MODEL>`（环境变量 `AGY_SWITCH_CLI_MODEL`，默认读取 `policy.json`）：临时覆盖监控目标（`all`、`gemini`、`claude`、`argon` 或指定模型 ID）。
 
 > **关于 `--interval`、`--cooldown`、`--reset-cooldown` 及临时覆盖参数的重要说明**：
-> - 直接在前台运行 `agy-switch-cli daemon --interval 300 --cooldown 3600`（或附加 `--reserve`、`--mode` 等参数）时，这些命令行参数**仅对当前这一个 `daemon` 进程本次运行生效，不会修改磁盘上的 `policy.json` 或 `config.json`**；关掉该进程后下次裸跑 `daemon` 仍恢复默认巡检 `180` 秒、冷却 `3600` 秒。
+> - 直接在前台运行 `agy-switch-cli daemon --interval 1800 --cooldown 3600`（或附加 `--reserve`、`--mode` 等参数）时，这些命令行参数**仅对当前这一个 `daemon` 进程本次运行生效，不会修改磁盘上的 `policy.json` 或 `config.json`**；关掉该进程后下次裸跑 `daemon` 仍恢复默认巡检 `900` 秒（15 分钟）、冷却 `3600` 秒。
 > - **为何修改 `--cooldown` 不会立即退出当前冷却期？** 每次自动切号成功后，程序会将绝对冷却截止时间戳（`切号时间 + cooldown`）持久化写入 `state/daemon_state.json`。如需提前解除尚未到期的冷却期，请运行 `agy-switch-cli daemon --reset-cooldown`（或 `daemon --once --reset-cooldown` / `daemon --install --reset-cooldown`）。
 > - **如何持久保存巡检间隔与冷却时间？**
->   - 使用 `systemd` 后台服务时：执行 `agy-switch-cli daemon --install --interval 300 --cooldown 3600`，程序会将这两项参数直接写入 `~/.config/systemd/user/agy-switch-cli.service` 的启动命令中长期生效。
+>   - 使用 `systemd` 后台服务时：执行 `agy-switch-cli daemon --install --interval 1800 --cooldown 3600`，程序会将这两项参数直接写入 `~/.config/systemd/user/agy-switch-cli.service` 的启动命令中长期生效。
 >   - 在无 `systemd` 容器中使用 `nohup` / `supervisord` / `tmux` 时：在启动命令中带上 `--interval` / `--cooldown`，或配置环境变量 `AGY_SWITCH_CLI_INTERVAL` 与 `AGY_SWITCH_CLI_COOLDOWN`。
 > - **如何持久保存自动切号水位、策略规则与网络代理？** 请分别使用 `agy-switch-cli policy set ...` 将策略规则写入 `policy.json`、在 `config.json` 中写入 `network.proxy_url` 保存代理地址（因此在执行 `daemon --install` 时若误带了 `--reserve` 或 `--proxy` 等单次临时参数，程序会主动提醒先持久保存配置）。
 
@@ -733,48 +728,59 @@ agy-switch-cli daemon --once --reset-cooldown
 
 ### 4.9 SSH 交互式终端看板：`tui`（全键盘可视化操作）
 
-如需在单个界面中总览所有账号额度、调整列表顺序、配置自动切号候选池或手动切号，可运行：
+如需在单个界面中总览当前活跃号的双窗口详细配额、查看各账号最近一次观测快照、调整列表顺序、配置自动切号候选池或手动切号，可运行：
 
 ```bash
 agy-switch-cli tui
 ```
 
-#### 界面说明
-- **三行独立对齐状态头、`Daemon` 冷却状态与极矮窗口自适应**：
-  - 在常规高度（`>= 11` 行）终端中，顶部将生效会话、运行中进程与自动切号策略拆分为 **3 行垂直冒号对齐的独立状态行**（`Session [file|dual|keyring] : ...`、`Runtime : ...`、`Policy : ...`），完整展示每项信息而不会因挤在同一行被截断；在极矮终端分屏（`< 11` 行）下则自动折叠为紧凑单行，确保在任意尺寸下都不超出物理视口边界。
+#### 界面布局说明（活跃号按池分行头部 + 单列 `Last Quota` 精简主表）
+- **顶部状态与活跃号 `Quota` 头部（极矮终端自动折叠）**：
+  - 在常规高度（`>= 14` 行）终端中，顶部以垂直冒号对齐方式展示 `Session [file|dual|keyring] : ... · <Plan>`、`Runtime : ...`、`Policy : ...`，紧接着展示**当前活跃官方槽位账号**的无边框按池分行 `Quota (<age>)` 头部：
+    ```text
+    Quota (2m ago) : Gemini      5h  97% (1h04m)  · Weekly  97% (5d21h)
+                     Claude/GPT  5h 100% (—)      · Weekly 100% (—)
+    ```
+    其中灰度池 `Argon` 仅在活跃账号存在该池数据时出现；满额未消耗桶的重置时间展示为 `(—)`。
+  - 在极矮终端（`7–13` 行）下，`Quota` 头部自动折叠为单行摘要（如 `Quota (2m ago) : Gem 97%/97% · 3P 100%/100%`）保住主表行；在 `< 11` 行分屏下顶部状态进一步折叠为紧凑单行，在 `< 7` 行极窄高度下隐藏独立 `Quota` 头部并在当前聚焦行内保留余量显示，确保在任意尺寸下都不超出物理视口边界。
   - 当后台 `daemon` 处于切号冷却期或连续失败熔断暂停时，`Policy` 行末尾自动附加 `· cooldown <剩余时长>` 或 `· PAUSED (run status)`，无需退出看板即可按 `k` 主动解除冷却（不争抢 `daemon.lock`，后台服务运行时同样直接生效）。
-  - 在宽度小于 `152` 列的窗口中自动隐藏冗长的 36 位 `ID` 列；当账号数量超出窗口高度时保持顶栏、表头与底栏固定并跟随光标平滑滚动（标题栏显示 `[Showing X-Y of N]`），同时在表格首行/末行内嵌定高的 **`... (<K> more above)`** 与 **`... (<K> more below)`** 折叠提示行，直观指示上/下方仍有隐藏账号且滚动全程总行数恒定不跳动（一屏可完整容纳时不渲染任何 `...` 行）。
+  - 在宽度小于 `152` 列的窗口中自动隐藏冗长的 36 位 `ID` 列；当账号数量超出窗口高度时保持顶栏、表头与底栏固定并跟随光标平滑滚动（标题栏显示 `[Showing X-Y of N]`），同时在表格首行/末行内嵌定高的 **`... (<K> more above)`** 与 **`... (<K> more below)`** 折叠提示行，滚动全程总行数恒定不跳动。
 - **继承全局 `--backend` 并在顶栏明确标识（无看板内切换热键）**：
   - `tui` 严格继承全局生效后端（默认 `auto` 自动解析为 `Session [file]` 或 `Session [dual]`；若通过 `--backend keyring`、环境变量或 `config.json` 指定了后端，则对应显示 `Session [keyring]` 等标签），不在看板内部设置易误触的后端切换键，保证全局行为一致。
-  - 按 `Enter` 或 `s` 切号时，即使当前已有 `agy` 进程正在运行也会立即完成切换，并在底栏温和提示已运行的 `agy` 保持原登录态、新启动的 `agy` 将使用新账号。
-- **`#`、`Sel`、`Email`（含备注）与 `Plan`**：
-  - `#` 为右对齐账号序号；`Sel` 列依次用 `>` 表示当前光标所在行、`*` 表示当前选中的账号、`+` 表示已用 `Space` 多选标记的账号（如 `>*+`）。
-  - `Email` 列在账号设置了自定义备注（`custom_label`）时以 `alice@example.com (primary)` 形式拼接展示（支持英文与中文 UTF-8，与 `accounts list`、`current` 及桌面通知格式一致，按 `l` 可随时在底栏内联修改或清空备注）。
-  - `Plan` 列在 `tui` 看板内自动将上游返回的免费层原始全称 `Antigravity Starter Quota`（及 `Starter` / `Free Tier` 等变体）简写为 `Free`，将 `Google AI Pro` / `Ultra` 简写为 `Pro` / `Ultra`（未知新套餐名原样兜底保留）；而在命令行 `accounts list`、`current`、`quota` 及所有 `--json` 输出中则原样保留上游原始 `subscription_tier` 字符串以便精确核对。
-- **`Space` 多选联动与底部常驻提醒**：
+  - 按 `Enter` 或 `s` 纯本地离线切号时（切出前自动回采原槽位最新令牌），即使当前已有 `agy` 进程正在运行也会立即完成切换，并在底栏温和提示已运行的 `agy` 保持原登录态、新启动的 `agy` 将使用新账号。
+- **`#`、`Sel`、`Email`（含备注）、`Plan` 与单列 `Last Quota`**：
+  - `#` 为右对齐账号序号；`Sel` 列依次用 `>` 表示当前光标所在行、`*` 表示当前活跃选中账号、`+` 表示已用 `Space` 多选标记的账号（如 `>*+`）。
+  - `Email` 列在账号设置了自定义备注（`custom_label`）时以 `alice@example.com (primary)` 形式拼接展示（支持英文与中文 UTF-8，按 `l` 可随时在底栏内联修改或清空备注）。
+  - `Plan` 列在 `tui` 看板内自动将上游免费层全称 `Antigravity Starter Quota`（及 `Starter` / `Free Tier` 等变体）简写为 `Free`，将 `Google AI Pro` / `Ultra` 简写为 `Pro` / `Ultra`（未知新套餐名原样兜底保留）；而在命令行 `accounts list`、`current`、`quota` 及所有 `--json` 输出中则原样保留上游原始 `subscription_tier` 字符串。
+  - **`Last Quota`（单列最近配额状态）**：用简洁一眼可读的格式汇总每个账号最近一次观测状态：
+    - 正常有效：`97% (2m ago)`；
+    - 低于 `minimum` 且尚未到重置点：`low 8% (resets in 2h10m)`（守护进程步进时会自动跳过此类已知空号）；
+    - 已跨过重置时间点：`reset passed (4h ago)`；
+    - 尚未刷新过：`—`；被拒访问：`forbidden`。
+- **`Space` 多选联动（与 `r` 刷新严格解耦）**：
   - 按 `Space` 可勾选或取消勾选任意多个账号；存在已勾选账号时，标题栏显示 `· <N> marked`，最底行 `Status` 在无临时操作提示时常驻显示 `Marked (<N>): ...  [Esc to clear]`，按 `Esc` 优先一键清空勾选（无勾选时 `Esc` 照常退出看板）。
-  - 存在勾选账号时，`o`（导出）、`r`（刷新）、`c`（切换候选资格）、`e`（启用）、`d`（禁用，`>= 2` 个时弹 `y` 确认）与 `x`（删除，始终弹 `y` 确认）均自动作用于全部已勾选账号，且除被删除的账号自动移出外，操作完成后保持原有勾选状态便于连续批处理；无勾选时上述按键仅作用于当前光标高亮行。
-- **`i` 账号详情卡片与完整模型翻页**：
-  - 按 `i` 将表格区切换为当前高亮账号的只读详情卡片，完整展示邮箱与备注、完整 UUID、套餐与状态/禁用原因、OAuth 客户端与访问令牌到期倒计时、上次刷新时间与来源环境、全部配额池的 `Weekly` / `5h` 进度条与本地重置倒计时，以及按家族分组完整自动换行的支持模型列表（无截断）。
-  - 在详情视图中，使用 `←` / `→` 切换上/下一个账号的详情卡片，使用 `↑` / `↓`、`PgUp` / `PgDn` 或 `g` / `G` 在卡片内上下滚动浏览完整模型清单，同样可直接按 `Space`、`l`、`r`、`k`、`Enter`/`s` 操作，按 `i` 或 `Esc` 返回主表。
-- **`Gemini (5h / W)` 与 `Claude/GPT (5h / W)`**（窄屏紧凑表头为 `Gemini 5h/W` 与 `Claude/GPT 5h/W`）：斜杠左侧为 `5h`（五小时短期窗口剩余额度），右侧为 `W`（Weekly 周剩余额度），如 `100% /  72%`；单元格内对百分比做了固定宽度字符级填充与居中对齐，使上下各行的百分比与斜杠 `/` 保持严格垂直对齐。灰度专属池 `Argon (W)` 在所有账号均无该池数据时会自动隐藏，存在数据时自动展开。
+  - 存在勾选账号时，`o`（导出）、`c`（切换候选资格）、`e`（启用）、`d`（禁用，`>= 2` 个时弹 `y` 确认）与 `x`（删除，始终弹 `y` 确认）均自动作用于全部已勾选账号，且除被删除的账号自动移出外，操作完成后保持原有勾选状态便于连续批处理；无勾选时上述按键仅作用于当前光标高亮行。
+  - **`r` 仅刷新当前活跃 `*` 账号**：已彻底移除批量刷新热键 `R` 并解除 `r` 与 `Space` 多选的联动。只有在光标停留在当前活跃 `*` 账号行（或在 `i` 详情视图查看当前活跃账号）时按 `r`，才会委托本机官方 `agy -p "/usage"` 刷新该活跃槽位；在休眠账号上按 `r` 不会发起任何请求，只在底栏温和提示先按 `s` 切换至该账号再按 `r` 刷新。
+- **`i` 账号详情卡片与模型分组展示**：
+  - 按 `i` 将表格区切换为当前高亮账号的只读详情卡片，完整展示邮箱与备注、完整 UUID、套餐与状态/禁用原因、OAuth 客户端与访问令牌到期倒计时、上次刷新时间与来源环境、全部配额池的 `Weekly` / `5h` 进度条与本地重置倒计时（满额未消耗桶显示 `resets —`），以及按家族分组的完整支持模型清单（当为 `OfficialCli` 观测且无逐模型清单时，展示 `Groups :` 模型分组说明 `quota_groups[].description`）。
+  - 在详情视图中，使用 `←` / `→` 切换上/下一个账号的详情卡片，使用 `↑` / `↓`、`PgUp` / `PgDn` 或 `g` / `G` 在卡片内上下滚动，按 `i` 或 `Esc` 返回主表；详情页底栏仅在当前查看的是活跃 `*` 账号时显示 `r refresh`。
 - **`Policy`**：显示该账号在自动切号候选池中的顺位（如 `cand #1`、`cand #2`，未加入显示 `—`）；若候选池中的某个账号当前处于已禁用（`disabled`）状态，自动切号调度时会自动跳过该账号，并在该列明确标注为 `cand #2 (skip)`。
 - **自适应分组底栏、内联输入与二次确认保护**：
-  - 在常规窗口高度（`>= 14` 行）下，底部常驻展示两行冒号对齐的分组快捷键帮助（`Keys   : ...` 与 `Manage : ...`）；在矮窗口（`< 14` 行）下自动收拢为高优先级单行帮助，窄屏下自动精简缩写而不越界。
-  - 最底行状态栏按优先级显示：内联文本输入（`o`/`O` 导出路径或 `l` 备注编辑，支持 `Ctrl+U` 清空与 UTF-8 字素级 `Backspace`）、`y` 二次确认（导出明文凭据、批量/全部禁用、删号）、临时操作反馈（**3 秒** info / **5 秒** error，含代理环境变量脱敏提示）以及存在勾选时的常驻 `Marked (...)` 摘要。
+  - 在常规窗口高度（`>= 14` 行）下，底部常驻展示两行冒号对齐的分组快捷键帮助（`Keys   : ...` 与 `Manage : r refresh (on *) · ...`）；在矮窗口（`< 14` 行）下自动收拢为高优先级单行帮助，窄屏下自动精简缩写而不越界。
+  - 最底行状态栏按优先级显示：内联文本输入（`o`/`O` 导出路径或 `l` 备注编辑，支持 `Ctrl+U` 清空与 UTF-8 字素级 `Backspace`）、`y` 二次确认（导出明文凭据、批量/全部禁用、删号）、临时操作反馈（**3 秒** info / **5 秒** error）以及存在勾选时的常驻 `Marked (...)` 摘要。
 
 #### `tui` 完整快捷键一览表
 
 | 按键 | 功能说明 |
 | :--- | :--- |
-| `↑` / `↓` 或 `PgUp` / `PgDn` | 主表模式：上下移动高亮光标（超出单屏时列表自动跟随滚动，首/末行内嵌定高 `...` 提示）；`i` 详情模式：在详情卡片内部上下滚动查看完整配额与模型列表 |
+| `↑` / `↓` 或 `PgUp` / `PgDn` | 主表模式：上下移动高亮光标（超出单屏时列表自动跟随滚动，首/末行内嵌定高 `...` 提示）；`i` 详情模式：在详情卡片内部上下滚动查看完整配额与模型/分组说明 |
 | `←` / `→` | 仅在 `i` 账号详情模式生效：切换查看上/下一个账号的详情卡片 |
 | `g` / `Home` 或 `G` / `End` | 主表模式：跳转到账号列表首行（`g`）/ 末行（`G`）；`i` 详情模式：跳转到卡片顶部/底部 |
-| **`Space`（空格）** | 勾选或取消勾选当前高亮账号（`Sel` 列显示 `+`，底栏常驻提示已选账号；按 `Esc` 一键清空全部勾选） |
+| **`Space`（空格）** | 勾选或取消勾选当前高亮账号（`Sel` 列显示 `+`，底栏常驻提示已选账号；按 `Esc` 一键清空全部勾选；作用于 `o`/`c`/`e`/`d`/`x`，不与 `r` 联动） |
 | **`[`** / **`]`** | 将当前高亮账号上移一位（`[`）/ 下移一位（`]`），实时保存新顺序 |
-| `Enter`（回车）或 `s` | 将官方 `agy` 凭据切换到当前高亮账号 |
-| **`i`** | 打开或关闭当前高亮账号的只读详情卡片（完整展示重置倒计时、备注、UUID、令牌有效期、状态原因与可滚动的完整支持模型列表） |
-| `r` / **`R`** | `r` 刷新已勾选的账号（无勾选时刷新当前高亮账号）；大写 **`R`** 以安全有界并发批量刷新全部未禁用账号（底栏实时显示进度，支持按 `Ctrl+C`、`q`、`Esc` 或发送系统信号随时安全中断并恢复终端） |
+| `Enter`（回车）或 `s` | 纯本地离线将官方 `agy` 凭据切换到当前高亮账号（切出前自动本地回采原槽位最新令牌） |
+| **`i`** | 打开或关闭当前高亮账号的只读详情卡片（完整展示重置倒计时、备注、UUID、令牌有效期、状态原因与可滚动的模型列表或 `Groups` 分组说明） |
+| **`r`** | 仅当光标停在当前活跃（`*`）账号行（或在 `i` 详情页查看当前活跃账号）时，委托官方 `agy -p "/usage"` 刷新其最新配额并回采令牌（支持按 `Ctrl+C`、`q`、`Esc` 或发送系统信号随时安全中断并恢复终端）；在休眠账号上按 `r` 不发请求，并在底栏提示先按 `s` 切换再刷新 |
 | **`c`** / **`C`** | `c` 批量切换已勾选账号的候选资格（无勾选时切换当前高亮账号）；大写 **`C`** 一键将所有未禁用账号按列表顺序加入候选池（若已全在池中，再按 **`C`** 则清空候选池并自动关闭策略总开关） |
 | **`p`** | 开启或关闭 `policy` 自动切号总开关 |
 | **`k`** | 主动清零后台 `daemon` 当前生效中的切号冷却期（与 `daemon --reset-cooldown` 等价，不争抢 `daemon.lock`，后台服务运行时同样直接生效） |
@@ -806,7 +812,7 @@ agy-switch-cli tui
 
 #### 共享参数详解（`stats summary` 与 `stats list` 通用）
 
-- **数据源选择：`--source <all|cli|app>`（默认值为 `all`）或外部目标目录 `--target <NAME>` / `--target-dir <DIR>`**
+- **数据源选择：`--source <all|cli|app>`（默认值为 `all`）**
   - `all`（默认）：
     - 合并扫描当前 `HOME` 内支持的两个官方数据源（`~/.gemini/antigravity-cli/conversations/*.db` 与 `~/.gemini/antigravity/conversations/*.db` 及其 `token_usage_archive.db`），自动按同一会话文件与生成序号去重。
     - 在无桌面的远程 Linux 服务器或容器上，由于不存在 `~/.gemini/antigravity`，默认 `all` 会自动等效读取 `cli`；在同时装有 CLI 与桌面端 App 的机器上，默认直接展示完整结果，无需额外传参。
@@ -814,8 +820,6 @@ agy-switch-cli tui
   - `app`：
     - 仅只读扫描当前 `HOME` 下桌面端 Antigravity App 的会话目录 `~/.gemini/antigravity/conversations/*.db` 及 `token_usage_archive.db`。
     - 若原实时 `.db` 仍存在于磁盘，程序会从实时库补充提取步骤状态、流式响应延迟与吐字速度；若原实时 `.db` 已被清理而仅存于 `token_usage_archive.db`，`stats list` 会将该行状态标为 `arch`（`--json` 中为 `"archived"`）。
-  - `--target <NAME>` / `--target-dir <DIR>`（与 `--source` 互斥）：
-    - 复用同一套零写入只读 VFS（`"agy_pinned_ro"`）与 `--watch` 文件元数据指纹机制，仅扫描指定外部应用数据目录下的 `conversations/*.db`（及可选 `token_usage_archive.db`）；人类输出顶部 `Source` 行会将位于当前 `$HOME` 下的目录路径缩写为 `~/` 并在终端较窄时按路径段自动中间省略（极窄窗口下，具名 `--target` 退回纯别名，无别名的 `--target-dir` 退回 `external`）；`--json` 输出中 `source` 标为 `"external"` 并附加完整规范绝对路径的 `target` 元数据；同样拒绝符号链接穿越与官方目录/仓内目录双向重叠碰撞。
 - **四组互斥的时间/条数窗口参数**
   - **按最近调用条数截取：`--recent <N>`（`1 <= N <= 500`，仅限完整长选项，无 `-n` 短参数）**
     - 在 `stats list` 中：不传任何窗口参数时，默认即为 `--recent 10`（展示最近 10 次模型调用）。
@@ -923,10 +927,10 @@ Requests (newest first, showing 5)
   - `St`：请求状态简码，实时库映射为 `ok`（已完成 `status=3`）、`clr`（已压缩/清理出活跃上下文的历史步骤 `status=5`，JSON 为 `cleared`）、`err`（报错或无效 `status=4/7`，或 `gen_metadata` 含非空白错误字符串/解码失败）、`canc`（已取消 `status=6`，JSON 为 `canceled`）、`intr`（已中断 `status=12`，JSON 为 `interrupted`）、`run`（进行中或排队中）、`unk`（缺失或未识别的状态值），仅存于历史归档库且原实时 `.db` 已移除的记录显示为 `arch`。
 - **上限截断说明**：按日期区间（`--range` / `--date` / `--from`）查询 `stats list` 时，最多输出最新的 `500` 条记录；若匹配总数超过 `500` 条，表头会自动注明 `(newest first, showing 500 of <总数> — capped at 500)`。
 - **`stats summary --json` 与 `stats list --json` 机器输出说明（`schema_version: 1`）**：
-  - **共享顶层字段**：`source`（官方模式为 `"all"` / `"cli"` / `"app"`，外部目录模式为 `"external"`）、可选 `target`（仅在显式传入 `--target` / `--target-dir` 时出现，包含 `{"name": "<别名或null>", "target_dir": "<规范绝对路径>"}`）、`range`（当使用 `--recent` 时为 `{"kind": "recent", "recent": N, "from": ..., "to": ...}`）、`databases_scanned`、`generations_scanned`、`skipped_large_records`、`unreadable_databases`、`last_activity`、`range_last_activity` 与 `generated_at`。
+  - **共享顶层字段**：`source`（`"all"` / `"cli"` / `"app"`）、`range`（当使用 `--recent` 时为 `{"kind": "recent", "recent": N, "from": ..., "to": ...}`）、`databases_scanned`、`generations_scanned`、`skipped_large_records`、`unreadable_databases`、`last_activity`、`range_last_activity` 与 `generated_at`。
   - **`stats summary --json` 专属字段**：输出 `summary`、`performance` 与 `models` 数组（每项含 `model`、`request_count`、`total_input_tokens`、`uncached_input_tokens`、`cached_input_tokens`、`cache_hit_ratio`、`cache_hit_percent`、`output_tokens`、`total_tokens`）。
   - **`stats list --json` 专属字段**：输出 `total_matching`、`shown_count`、`truncated` 与 `items` 数组（每项含 `timestamp`、`local_time`、`model`、`uncached_input_tokens`、`cached_input_tokens`、`total_input_tokens`、`cache_hit_ratio`、`cache_hit_percent`、`output_tokens`、`total_tokens`、`ttft_seconds`、`duration_seconds`、`output_tps`、`status`）。
-  - **隐私与模型名过滤约束**：在默认官方模式（`--source all|cli|app`）下，结构中不导出 `source_key`、本机路径或账号邮箱；显式使用外部 `--target` / `--target-dir` 时，JSON 顶层 `target.target_dir` 及外部目录初始化/I/O 错误诊断会包含所指定的外部绝对路径，对外分享前请先脱敏。模型名经已知公共模型家族与受限语法过滤，仅保留符合公共模型命名规范的标签，其余统一回退为 `"Unknown"`。
+  - **隐私与模型名过滤约束**：结构中不导出 `source_key`、本机路径或账号邮箱。模型名经已知公共模型家族与受限语法过滤，仅保留符合公共模型命名规范的标签，其余统一回退为 `"Unknown"`。
 
 ---
 
@@ -941,19 +945,17 @@ Requests (newest first, showing 5)
   - **`daemon --once --json`**：单轮巡检完成后向 `stdout` 输出包含 `"schema_version": 1, "ok": true, "daemon": { ... }` 的结构化结果信封（包含 `outcome`、`phase`、不含本机路径的固定结构化 `reason`、`source_account_id`、`source_remaining_percentage`、`source_refreshed`、`target_account_id` 等字段）并返回退出码 `0`（仅当收到外部终止信号提前取消时静默返回 `0`）。
   - **前台常驻 `daemon --json`**：为避免多轮循环向 `stdout` 连续输出多个根 JSON 对象破坏单 JSON 解析，常驻模式在 `--json` 下保持正常轮次静默，仅在启动校验失败、单实例锁冲突或致命错误时向 `stderr` 输出错误信封并返回非零退出码；需要查看逐轮巡检日志时请在非 `--json` 模式下运行（或通过 `journalctl --user -u agy-switch-cli.service -f` 查看标准输出记录）。
 
-- **单目标命令与前置参数/文件校验**
+- **单目标命令与前置参数/文件校验**（包括单槽 `refresh` 与 `quota --refresh`）
   - **执行成功时**：将结果信封（包含 `"schema_version": 1, "ok": true`）输出至 `stdout`，并返回退出码 `0`。
   - **执行失败时**：将结构化错误信封（包含 `"schema_version": 1, "ok": false, "error_code": "...", "message": "..."`）输出至 `stderr`，并返回对应的非零退出码（`1..=8`）。
-  - **单启用账号刷新例外**：当执行 `refresh --all` 或 `quota --refresh --all` 但本地实际仅有 1 个未禁用账号、且该唯一账号刷新失败时，同样直接按单目标失败在 `stderr` 输出 `"ok": false` 信封并返回对应错误退出码。
 
-- **多条目批量写入与批量联网命令**（包含 2 条及以上令牌的 `accounts add --from-file/--from-stdin`、涉及多账号的 `refresh --all` 与 `quota --refresh --all`，以及 `auth pending --resume`）
-  - **汇总输出位置**：`--json` 模式下保持过程静默（不输出流式 `[k/N]` 进度文本），全部执行完毕后在 `stdout` 输出汇总信封（`"schema_version": 1, "ok": true`，此时 `stderr` 保持为空）。
+- **多条目批量写入命令**（包含 2 条及以上令牌的 `accounts add --from-file/--from-stdin` 以及 `auth pending --resume`）
+  - **汇总输出位置**：`--json` 模式下全部执行完毕后在 `stdout` 输出汇总信封（`"schema_version": 1, "ok": true`，此时 `stderr` 保持为空）。
   - **各命令的失败明细字段**：
     - 批量 `accounts add`：包含 `failed_count` 计数与 `failures` 数组。
-    - 多账号 `refresh --all` 与 `auth pending --resume`：包含 `failures` 数组。
-    - 多账号 `quota --refresh --all`：包含 `refresh_failures` 数组。
+    - `auth pending --resume`：包含 `failures` 数组。
   - **进程退出码**：若其中任何一条遇到令牌已由远端签发但本地未能持久化（`issued_token_unpersisted`）等需恢复状态，立即按结构化错误信封返回退出码 `7`（`PartialCommitOrRecovery`）；其余常规单条失败情形统一汇总后返回退出码 `1`（`GeneralOrDataError`）。
-  - **脚本判定方式**：自动化脚本应同时检查进程退出码是否为 `0`，以及 `stdout` 汇总对象中的失败明细字段（`failed_count` 或 `failures` / `refresh_failures` 数组长度）。
+  - **脚本判定方式**：自动化脚本应同时检查进程退出码是否为 `0`，以及 `stdout` 汇总对象中的失败明细字段（`failed_count` 或 `failures` 数组长度）。
 
 - **离线批量导入与只读巡检 / 统计聚合**
   - **`status --json`**：在 `stdout` 输出包含 `"schema_version": 1, "ok": true` 的只读健康巡检对象，除存储、事务日志与凭据槽位状态外，保留既有 `daemon_state_ok`、`daemon_paused_on_failure` 与 `agy_probe`，并包含结构化守护进程运行态 `daemon_runtime`（`mode` 取值为 `"not_running"` / `"systemd_service"` / `"manual"` / `"systemd_stopped"`，附 `running`、`pid`、`systemd_unit_installed`、`systemd_active_state`、`systemd_unit_file_state`、`cooldown_active`、`cooldown_remaining_secs`）以及可选桌面端探测 `antigravity_app_probe`（含 `checked`、`found`，检测到时附 `path` 与 `version`）。
@@ -977,15 +979,14 @@ Requests (newest first, showing 5)
 
 ---
 
-## 6. 可选配置文件（`config.json` 代理、后端、通知、外部槽位别名与自定义 OAuth 客户端）
+## 6. 可选配置文件（`config.json` 代理、后端、通知与自定义 OAuth 客户端）
 
-`~/.local/share/agy-switch-cli/config.json` 是**完全可选**的配置文件。默认情况下该文件不存在，所有功能均可直接使用（程序已内置与官方 `agy` 一致的默认 OAuth 客户端 `antigravity_enterprise`）。只有当你遇到以下五类需求时，才需要手动创建它：
+`~/.local/share/agy-switch-cli/config.json` 是**完全可选**的配置文件。默认情况下该文件不存在，所有功能均可直接使用（程序已内置与官方 `agy` 一致的默认 OAuth 客户端 `antigravity_enterprise`；旧版本配置文件中若残留已废弃的未知字段会自动静默忽略而不会报错）。只有当你遇到以下四类需求时，才需要手动创建它：
 
-- **固定网络代理**：在 Linux 环境下，图形界面的“系统代理”设置并不会自动注入命令行终端或后台 `daemon` 服务的环境变量中。如果你不想每次在命令行手敲 `--proxy`，也不想每次新开终端都手动执行 `export https_proxy=...`，可以将代理地址写入 `config.json` 实现跨终端与后台守护进程的永久生效（此外，若终端环境变量中的代理格式异常而被忽略，人类输出模式会在联网时打印仅含变量名的脱敏提示）。
+- **固定网络代理**：在 Linux 环境下，图形界面的“系统代理”设置并不会自动注入命令行终端的环境变量中。如果你希望显式 `auth` 登录/重授权与裸令牌导入免重复传 `--proxy`，可以将代理地址写入 `config.json` 实现跨终端持久生效（若终端环境变量中的代理格式异常而被忽略，人类输出模式会在联网时打印仅含变量名的脱敏提示）。
 - **固定凭据后端模式**：希望跨所有终端与后台服务统一固定使用 `keyring`（纯钥匙串零本地文件）、`file`（纯本地文件）或 `dual`（强制双写），而非每次手动传 `--backend`。
 - **控制桌面切号通知**：在 Linux 图形桌面上开关 `daemon` 的原生桌面通知推送（`notifications.enabled`），以及设置切号通知默认常驻屏幕或按桌面默认超时自动消失（`notifications.persistent`）。
-- **配置外部目标目录别名（`targets`）**：为第三方工具（如 `t3code` 等通过 `agy acp --gemini-dir` 隔离凭据与会话数据库的宿主）冗长的应用数据目录路径定义简短别名，配合 `--target <NAME>` 在 `switch`、`current`、`quota`、`refresh`、`accounts add --from-local` 与 `stats summary/list` 中统一复用（详见下方 `6.2` 节）。
-- **自定义 OAuth 客户端（进阶场景）**：你手头拥有由其他 Google Cloud OAuth 客户端签发的 `refresh_token`，或者希望使用自建 OAuth 客户端进行登录（详见下方 `6.3` 节零基础完整拆解）。
+- **自定义 OAuth 客户端（进阶场景）**：你手头拥有由其他 Google Cloud OAuth 客户端签发的 `refresh_token`，或者希望使用自建 OAuth 客户端进行登录（详见下方 `6.2` 节零基础完整拆解）。
 
 > **文件权限要求**：由于 `config.json` 中可能包含带密码的代理地址或 `client_secret` 密钥，创建时请将文件权限设为仅当前用户可读写的 `0600`（若权限过宽如 `0644`，`status` 与联网命令会输出安全提示，执行 `chmod 600 ~/.local/share/agy-switch-cli/config.json` 即可收紧权限）：
 > ```bash
@@ -1017,24 +1018,7 @@ Requests (newest first, showing 5)
 - **`notifications.enabled`**（可选，省略时默认为 `true`）：控制 `daemon` 是否发送 Linux 桌面通知（`org.freedesktop.Notifications`）。无头服务器或无活跃桌面通知服务时会自动静默跳过；若希望在图形桌面上彻底关闭推送，可设为 `false`。生效优先级为：`命令行 --no-notify > AGY_SWITCH_CLI_NOTIFY 环境变量 > config.json > 默认开启`。
 - **`notifications.persistent`**（可选，省略时默认为 `true`）：控制 `Account Switched` 切号成功通知（普通级别 `urgency=1`）的停留方式。设为 `true`（默认）时以 `expire_timeout=0` 常驻屏幕直至手动关闭，避免错过切号提醒；设为 `false` 时改为 `expire_timeout=-1`，交由桌面通知服务按默认数秒自动消失。`Auto-Switch Paused` 熔断暂停警告（严重级别 `urgency=2`）始终以 `expire_timeout=0` 常驻显示。
 
-### 6.2 场景二：配置外部目标目录别名（`targets`）
-
-当你需要通过 `--target <NAME>` 独立操作某个外部应用数据目录（例如 `t3code` 默认实例下的 `antigravity-acp` 目录，其中同时包含 `antigravity-oauth-token` 与 `conversations/*.db`，路径中的 `ac0a3dfd...` 为固定字符串 `"antigravity"` 的 SHA-256 哈希）时，可在 `config.json` 中添加可选的 `targets` 映射：
-
-```json
-{
-  "schema_version": 1,
-  "targets": {
-    "t3": "~/.t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32/antigravity-acp"
-  }
-}
-```
-
-- **别名键名规则**：长度为 `1..=64` 个 ASCII 字符，须以字母或数字开头，其余仅允许字母、数字、`-`、`_`、`.`，且不可使用保留名 `default`。
-- **路径值规则**：必须为绝对路径（`/` 开头）或家目录相对路径（`~/` 开头，按当前已解析的 `HOME` 展开），指向应用数据目录本身（不要在末尾附加 `/antigravity-oauth-token`）；不允许指向官方 `~/.gemini/antigravity-cli`、`~/.gemini/antigravity` 或本工具自身的 `data_dir` / `cache_dir`。
-- 配置完成后即可在 `switch`、`current`、`quota`、`refresh`、`accounts add --from-local` 以及 `stats summary/list [--watch]` 中直接使用 `--target t3`，无需每次输入完整路径。
-
-### 6.3 场景三：零基础读懂并注册自定义 OAuth 客户端（完整字段详解）
+### 6.2 场景二：零基础读懂并注册自定义 OAuth 客户端（完整字段详解）
 
 #### 先搞懂背景原理：什么是 OAuth 客户端？为什么会有“令牌绑定规则”？
 
@@ -1109,7 +1093,7 @@ Requests (newest first, showing 5)
    agy-switch-cli auth login --client my_custom_oauth --label "custom-oauth"
    agy-switch-cli accounts add --client my_custom_oauth
    ```
-   绑定完成后，该账号档案会自动记住 `oauth_client_key = "my_custom_oauth"`，后续日常执行 `switch`、`quota --refresh`、`run` 或 `daemon` 自动续期时都会自动匹配这组客户端凭据，无需每次重复传入 `--client`（即使混用多个不同客户端签发的账号也能各自独立续期）。
+   绑定完成后，该账号档案会自动记住 `oauth_client_key = "my_custom_oauth"`，后续执行 `auth reauthorize` 或 `auth pending --resume` 时会自动匹配这组客户端凭据，无需每次重复传入 `--client`。
 3. **无文件环境变量注入方式（适合 Docker 容器）**：除了写 `config.json`，也可以通过环境变量动态注入（优先级高于 `config.json`）：
    - `ANTIGRAVITY_OAUTH_CLIENTS="key|client_id|client_secret|label"`（多项之间用分号 `;` 分隔）；
    - `ANTIGRAVITY_OAUTH_CLIENT_KEY="<KEY>"`（指定默认客户端短名称）；
@@ -1154,7 +1138,7 @@ agy-switch-cli daemon --uninstall                     # 停止服务、取消开
 - **切换安装方式或修改启动参数后的刷新方法**：
   - 若你先前使用 `~/.local/bin/agy-switch-cli` 执行过 `daemon --install`，随后改用 AUR 安装并删除了 `~/.local/bin/agy-switch-cli`，只需在新安装环境再次运行一次 `agy-switch-cli daemon --install`，服务单元中的 `ExecStart=` 即会自动刷新为 `/usr/bin/agy-switch-cli`；若旧服务当时仍在运行，随后补执行 `systemctl --user restart agy-switch-cli.service` 即可平滑切换至新二进制与新参数。
 - **内置最小权限沙盒与目录边界**：
-  - 自动生成的单元文件内置 `UMask=0077`、`Restart=on-failure`（`RestartSec=10`）、`Environment="RUST_LOG=agy_switch_cli=info"`、数据目录 `AGY_SWITCH_CLI_DATA_DIR`（及自定义 `XDG_CACHE_HOME` 时的对齐环境变量），并启用 `NoNewPrivileges=true`、`PrivateTmp=true`（非 `/tmp` 环境时）、`ProtectSystem=strict` 与 `ReadWritePaths=`（仅放行官方槽位目录 `~/.gemini/antigravity-cli`、独立数据目录与全局锁/缓存目录）。
+  - 自动生成的单元文件内置 `UMask=0077`、`Restart=on-failure`（`RestartSec=10`）、`Environment="RUST_LOG=agy_switch_cli=info"`、数据目录 `AGY_SWITCH_CLI_DATA_DIR`（及自定义 `XDG_CACHE_HOME` 时的对齐环境变量），并启用 `NoNewPrivileges=true`、`PrivateTmp=true`（非 `/tmp` 环境时）、`ProtectSystem=strict` 与 `ReadWritePaths=`（仅放行官方 `~/.gemini` 目录及其下 `antigravity-cli` / `config`、独立数据目录与全局锁/缓存目录，确保沙盒内拉起官方 `agy -p "/usage"` 正常落盘而不触发 `EROFS`）。
   - 如需查看本机当前实际生成的完整单元内容，可执行 `systemctl --user cat agy-switch-cli.service`。
 
 ### 7.2 无 `systemd` 的 Docker 容器环境（后台常驻替代方案）
@@ -1262,10 +1246,10 @@ supervisorctl stop agy-switch-cli      # 停止后台守护进程
     - **当前终端内免重复传参**：在当前终端执行 `export https_proxy=http://127.0.0.1:7890`（或将其写入 `~/.bashrc` / `~/.zshrc`）。
     - **所有终端与后台 `daemon` 持久生效**：按第 `6.1` 节编辑 `~/.local/share/agy-switch-cli/config.json`，写入 `"network": { "proxy_url": "http://127.0.0.1:7890" }`。
 - **问：某个账号刷新后显示 `verify-blocked`（`[verification required]`），应该怎么解锁？**
-  - **答**：该状态表示 Google CloudCode 返回了 `403 VALIDATION_REQUIRED`，需要在官方 `agy` 中打开验证链接完成扫码或网页安全核验（重新授权 `auth reauthorize` 无法代替网页验证）。按三步即可解锁：
+  - **答**：该状态表示 Google 返回了 `403 VALIDATION_REQUIRED`，需要在官方 `agy` 中打开验证链接完成扫码或网页安全核验（重新授权 `auth reauthorize` 无法代替网页验证）。按三步即可解锁：
     - 直接使用 `agy-switch-cli switch <ID|EMAIL>`（或在 `tui` 中选中后按 `Enter`，或用可选的 `run --account <ID|EMAIL> -- agy`）切入该账号（人工切号会放行，同时保留 `verify-blocked` 标记确保后台 `daemon` 不会误选或抢切槽位）。
     - 启动官方 `agy`，按界面提示打开网页或扫码完成 Google 安全验证。
-    - 验证完成后执行 `agy-switch-cli refresh <ID|EMAIL>`（或在 `tui` 按 `r`），当最终采用主环境未阻断的有效观测后即自动清除 `verify-blocked` 标记并恢复参与自动切号。
+    - 验证完成后执行 `agy-switch-cli refresh`（或在 `tui` 中停在当前活跃 `*` 行按 `r`），当官方 `agy -p "/usage"` 返回未阻断的有效观测后即自动清除 `verify-blocked` 标记并恢复参与自动切号。
 - **问：日常使用时，手动切号、可选的 `run` 包装启动与后台 `daemon` 各自适合什么场景？**
   - **答**：三种方式定位清晰，可按实际需求选用：
     - **交互式看板或手动切号（`tui` / `switch`）**：适合日常按需查看额度并手动切换账号，切完直接运行 `agy` 即可。
@@ -1323,7 +1307,7 @@ supervisorctl stop agy-switch-cli      # 停止后台守护进程
 | 本地路径（括号内为自定义环境变量时的对应位置） | 存放内容与用途说明 | 是否建议删除 |
 | :--- | :--- | :--- |
 | `~/.local/share/agy-switch-cli/`<br>（或 `$XDG_DATA_HOME/agy-switch-cli/`、`--data-dir` 指定目录） | 本工具的独立数据目录：包含账号索引 `index.json`、各账号 OAuth 凭据 `accounts/*.json`、自动切号策略 `policy.json`、可选代理/客户端配置 `config.json`、事务状态 `state/` 与目录锁 `locks/`。 | 彻底卸载不再使用时可删 |
-| `~/.cache/agy-switch-cli/`<br>（或 `$XDG_CACHE_HOME/agy-switch-cli/`） | 缓存与全局跨目录锁：包含官方客户端版本号缓存 `ua_version_cache.json` 以及账号槽位/钥匙串锁 `locks/`。 | 彻底卸载时可安全删除 |
+| `~/.cache/agy-switch-cli/`<br>（或 `$XDG_CACHE_HOME/agy-switch-cli/`） | 全局跨目录锁目录：包含账号槽位锁与钥匙串锁 `locks/`。 | 彻底卸载时可安全删除 |
 | `~/.config/systemd/user/agy-switch-cli.service`<br>（或 `$XDG_CONFIG_HOME/systemd/user/agy-switch-cli.service`） | 用户级 `systemd` 服务单元文件（第 1 步执行 `daemon --uninstall` 时已自动清除；若先卸载了程序，可检查确认其已不存在）。 | 彻底卸载时应删除 |
 | `~/.local/state/agy-switch-cli/` | 仅在无 `systemd` 的容器环境中按第 `7.2` 节手动重定向保存 `daemon.log` 时才会存在；标准环境下不会创建该目录。 | 若存在且无需查日志可删 |
 

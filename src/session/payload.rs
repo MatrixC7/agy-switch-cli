@@ -1,4 +1,5 @@
-use crate::domain::account::SessionIdentity;
+use crate::domain::account::{AccountRecord, SessionIdentity};
+use crate::domain::quota::QuotaSourceEnv;
 use crate::domain::token::{
     extract_email_hint_from_jwt, sanitize_email_hint, token_digest, TokenRecord,
 };
@@ -74,25 +75,47 @@ fn validate_optional_session_secret_field<'a>(
 }
 
 /// Strict serializer for `~/.gemini/antigravity-cli/antigravity-oauth-token` per Blueprint §3.2.
-/// Rejects empty tokens and non-positive `expiry_timestamp` instead of silently substituting `Utc::now()`.
+/// Rejects empty `refresh_token`, non-positive `expiry_timestamp`, overlong (>16,384 B) tokens,
+/// and control characters. Permits empty `access_token` (e.g. accounts imported from refresh-only
+/// transfer bundles) so offline `switch` can write the slot and let official `agy` refresh on launch.
 pub fn serialize_session_payload(token: &TokenRecord) -> CliResult<String> {
-    serialize_standalone_session_payload(token, None, None, None)
+    serialize_session_payload_with_meta(token, None, None, None)
 }
 
-/// Strict serializer for standalone external `antigravity-oauth-token` write-backs that preserves
-/// `auth_method`, compact `id_token_email` (used by official `agy 1.5+`), and optional `user_tier`.
-pub fn serialize_standalone_session_payload(
+/// Serialize the active official `agy` slot payload for a verified `AccountRecord`, preserving
+/// compact `id_token_email` and any production-trusted `user_tier` (`OfficialCli` / `Production`)
+/// so offline `accounts add --from-local` round-trips cleanly after `switch` or `run`.
+pub fn serialize_session_payload_for_account(account: &AccountRecord) -> CliResult<String> {
+    let user_tier = account.quota.as_ref().and_then(|q| {
+        let trusted = matches!(
+            q.tier_source_env,
+            Some(QuotaSourceEnv::OfficialCli) | Some(QuotaSourceEnv::Production)
+        );
+        trusted.then_some(q.subscription_tier.as_deref()).flatten()
+    });
+    serialize_session_payload_with_meta(
+        &account.token,
+        None,
+        Some(account.email.as_str()),
+        user_tier,
+    )
+}
+
+/// Strict serializer for `antigravity-oauth-token` payloads with optional metadata (`auth_method`,
+/// compact `id_token_email` used by official `agy 1.5+`, and optional `user_tier`).
+pub fn serialize_session_payload_with_meta(
     token: &TokenRecord,
     auth_method: Option<&str>,
     id_token_email: Option<&str>,
     user_tier: Option<&str>,
 ) -> CliResult<String> {
-    let access_token = validate_required_session_secret_field(
-        &token.access_token,
+    let access_token = validate_optional_session_secret_field(
+        Some(token.access_token.as_str()),
         "access_token",
         "Session token payload",
     )
-    .map_err(CliError::data)?;
+    .map_err(CliError::data)?
+    .unwrap_or("");
     let refresh_token = validate_required_session_secret_field(
         &token.refresh_token,
         "refresh_token",
@@ -160,7 +183,7 @@ pub fn serialize_standalone_session_payload(
         id_token_email: effective_email.as_deref(),
         user_tier: effective_tier.as_deref(),
     })
-    .map_err(|_| CliError::data("Failed to serialize standalone session credential payload."))
+    .map_err(|_| CliError::data("Failed to serialize session credential payload."))
 }
 
 fn extract_compact_id_token_email_from_session_json(json: &serde_json::Value) -> Option<String> {
@@ -263,29 +286,29 @@ pub fn extract_raw_refresh_token_from_session_bytes(
     Ok(refresh_token.to_string())
 }
 
-/// Full parsed representation of a standalone `antigravity-oauth-token` file used for direct
-/// refresh / quota probing without importing into `accounts/`.
+/// Full parsed representation of an official `antigravity-oauth-token` / keyring payload used for
+/// offline `--from-local` import and local pre-switch / post-`/usage` sync-back.
 /// Sensitive fields are redacted in `Debug` output.
 #[derive(Clone)]
-pub struct ExtractedExternalSessionToken {
+pub struct ExtractedSessionToken {
     pub access_token: Option<String>,
     pub refresh_token: String,
     pub expiry: Option<String>,
     pub expiry_unix: Option<i64>,
     pub auth_method: Option<String>,
     pub id_token: Option<String>,
-    /// Preserved compact `id_token_email` field from the original file (distinct from JWT-derived `email_hint`).
+    /// Preserved compact `id_token_email` field from `agy 1.5+` (distinct from JWT-derived `email_hint`).
     pub id_token_email: Option<String>,
-    /// Derived display hint (`id_token` JWT `email` claim, falling back to `id_token_email`).
+    /// Derived email hint (`id_token` JWT `email` claim, falling back to `id_token_email`).
     pub email_hint: Option<String>,
     pub user_tier: Option<String>,
     pub raw_digest: String,
     pub refresh_token_digest: String,
 }
 
-impl fmt::Debug for ExtractedExternalSessionToken {
+impl fmt::Debug for ExtractedSessionToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExtractedExternalSessionToken")
+        f.debug_struct("ExtractedSessionToken")
             .field(
                 "access_token",
                 &self.access_token.as_ref().map(|_| "[REDACTED]"),
@@ -304,10 +327,10 @@ impl fmt::Debug for ExtractedExternalSessionToken {
     }
 }
 
-pub fn extract_external_session_token_from_bytes(
+pub fn extract_session_token_from_bytes(
     bytes: &[u8],
     source_desc: &str,
-) -> CliResult<ExtractedExternalSessionToken> {
+) -> CliResult<ExtractedSessionToken> {
     let raw_str = std::str::from_utf8(bytes)
         .map_err(|_| CliError::data(format!("{source_desc} is not valid UTF-8.")))?;
     let trimmed = raw_str.strip_prefix("go-keyring-base64:").and_then(|b64| {
@@ -364,7 +387,7 @@ pub fn extract_external_session_token_from_bytes(
     let email_hint = extract_email_hint_from_session_json(&json, id_token_email.as_deref());
     let user_tier = extract_user_tier_from_session_json(&json);
 
-    Ok(ExtractedExternalSessionToken {
+    Ok(ExtractedSessionToken {
         access_token,
         refresh_token: refresh_token.to_string(),
         expiry,
@@ -540,7 +563,7 @@ mod tests {
             Some("alice@example.com")
         );
         assert_eq!(parsed_compact.user_tier.as_deref(), Some("PRO"));
-        let extracted_compact = extract_external_session_token_from_bytes(compact, "ext").unwrap();
+        let extracted_compact = extract_session_token_from_bytes(compact, "slot").unwrap();
         assert_eq!(
             extracted_compact.id_token_email.as_deref(),
             Some("alice@example.com")
@@ -567,13 +590,13 @@ mod tests {
             "user_tier": "ULTRA"
         });
         let both_bytes = serde_json::to_vec(&both_json).unwrap();
-        let ex_both = extract_external_session_token_from_bytes(&both_bytes, "ext").unwrap();
+        let ex_both = extract_session_token_from_bytes(&both_bytes, "slot").unwrap();
         assert_eq!(ex_both.email_hint.as_deref(), Some("jwt-user@example.com"));
         assert_eq!(
             ex_both.id_token_email.as_deref(),
             Some("compact-user@example.com")
         );
-        let rewritten = serialize_standalone_session_payload(
+        let rewritten = serialize_session_payload_with_meta(
             &sample_token(1_800_000_000),
             ex_both.auth_method.as_deref(),
             ex_both.id_token_email.as_deref(),
@@ -582,6 +605,17 @@ mod tests {
         .unwrap();
         let rewritten_val: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
         assert_eq!(rewritten_val["id_token_email"], "compact-user@example.com");
+
+        // Offline switch for transfer-bundle imported accounts (`access_token == ""`, `expiry_timestamp == 1`)
+        let mut empty_at_tok = sample_token(1);
+        empty_at_tok.access_token = String::new();
+        let encoded_empty_at = serialize_session_payload(&empty_at_tok).unwrap();
+        let empty_at_val: serde_json::Value = serde_json::from_str(&encoded_empty_at).unwrap();
+        assert_eq!(empty_at_val["token"]["access_token"], "");
+        assert_eq!(
+            empty_at_val["token"]["expiry"],
+            "1970-01-01T00:00:01.000000Z"
+        );
 
         // Bad JWT or JWT with internal OR trailing control characters (LF/CR/TAB) falls back cleanly to `id_token_email`.
         for (bad_jwt, bad_tier) in [
@@ -607,7 +641,7 @@ mod tests {
                 Some("fallback@example.com")
             );
             assert_eq!(parsed_fb.user_tier, None);
-            let ex_fb = extract_external_session_token_from_bytes(&raw, "ext").unwrap();
+            let ex_fb = extract_session_token_from_bytes(&raw, "slot").unwrap();
             assert_eq!(ex_fb.email_hint.as_deref(), Some("fallback@example.com"));
             assert_eq!(
                 ex_fb.id_token_email.as_deref(),
@@ -660,9 +694,9 @@ mod tests {
                 !p_err.contains("SECRET"),
                 "leaked secret in {label}: {p_err}"
             );
-            let e_err = extract_external_session_token_from_bytes(&raw_bytes, "ext").expect_err(
-                &format!("{label} should fail extract_external_session_token_from_bytes"),
-            );
+            let e_err = extract_session_token_from_bytes(&raw_bytes, "slot").expect_err(&format!(
+                "{label} should fail extract_session_token_from_bytes"
+            ));
             assert_eq!(e_err.exit_code.as_i32(), 1);
             assert_eq!(e_err.error_code, "data_error");
             assert!(
@@ -670,9 +704,10 @@ mod tests {
                 "leaked secret in {label}: {}",
                 e_err.message
             );
-            let r_err = extract_raw_refresh_token_from_session_bytes(&raw_bytes, "ext").expect_err(
-                &format!("{label} should fail extract_raw_refresh_token_from_session_bytes"),
-            );
+            let r_err = extract_raw_refresh_token_from_session_bytes(&raw_bytes, "slot")
+                .expect_err(&format!(
+                    "{label} should fail extract_raw_refresh_token_from_session_bytes"
+                ));
             assert_eq!(r_err.exit_code.as_i32(), 1);
             assert_eq!(r_err.error_code, "data_error");
             assert!(
@@ -743,7 +778,7 @@ mod tests {
             ),
         ] {
             let raw_bytes = serde_json::to_vec(&raw_json).unwrap();
-            let got = extract_raw_refresh_token_from_session_bytes(&raw_bytes, "ext")
+            let got = extract_raw_refresh_token_from_session_bytes(&raw_bytes, "slot")
                 .unwrap_or_else(|e| panic!("{label} should succeed: {}", e.message));
             assert_eq!(got, expected_rt, "label={label}");
             assert!(
@@ -751,7 +786,7 @@ mod tests {
                 "{label} should parse"
             );
             assert!(
-                extract_external_session_token_from_bytes(&raw_bytes, "ext").is_ok(),
+                extract_session_token_from_bytes(&raw_bytes, "slot").is_ok(),
                 "{label} should extract"
             );
         }

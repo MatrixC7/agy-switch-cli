@@ -3,8 +3,8 @@ use crate::domain::account::{
 };
 use crate::domain::policy::SwitchPolicy;
 use crate::domain::quota::{
-    observed_quota_percentage, quota_pool, ModelQuota, QuotaBucket, QuotaEval, QuotaGroup,
-    QuotaObservation, QuotaPool, QuotaSourceEnv,
+    is_unused_full_bucket_reset_time, observed_quota_percentage, quota_pool, ModelQuota,
+    QuotaBucket, QuotaEval, QuotaGroup, QuotaObservation, QuotaPool, QuotaSourceEnv,
 };
 use serde::Serialize;
 
@@ -151,6 +151,8 @@ pub struct ModelViewDto {
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupViewDto {
     pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub buckets: Vec<BucketViewDto>,
 }
 
@@ -283,7 +285,15 @@ impl QuotaViewDto {
                 let pct =
                     observed_quota_percentage(b.remaining_fraction, b.remaining_fraction_known);
                 let bar_col = format_bar_and_pct(pct);
-                let reset_col = format_reset_local(&b.reset_time, now_unix);
+                let reset_col = if is_unused_full_bucket_reset_time(
+                    &b.reset_time,
+                    b.remaining_fraction,
+                    b.remaining_fraction_known,
+                ) {
+                    "—".into()
+                } else {
+                    format_reset_local(&b.reset_time, now_unix)
+                };
                 rows.push(PoolRow {
                     pool_col,
                     win_col,
@@ -497,6 +507,7 @@ impl GroupViewDto {
     fn from_group(g: &QuotaGroup) -> Self {
         Self {
             display_name: g.display_name.clone(),
+            description: g.description.clone(),
             buckets: g.buckets.iter().map(BucketViewDto::from_bucket).collect(),
         }
     }
@@ -562,6 +573,55 @@ pub fn extract_supported_models(obs: &QuotaObservation) -> Vec<String> {
     models.sort();
     models.dedup();
     models
+}
+
+/// Extract `(display_name, description)` pairs from `quota_groups` for `OfficialCli` observations
+/// where per-model catalog entries (`models`) are absent.
+pub fn extract_quota_group_descriptions(obs: &QuotaObservation) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for g in obs.quota_groups.iter().flatten() {
+        if let Some(desc) = g
+            .description
+            .as_deref()
+            .map(|s| {
+                terminal_text(s)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|s| !s.is_empty())
+        {
+            let name = terminal_text(g.display_name.trim());
+            let label = if name.is_empty() {
+                "Group".to_string()
+            } else {
+                name
+            };
+            out.push((label, desc));
+        }
+    }
+    out
+}
+
+/// Render cached supported models or official `quota_groups` descriptions for `current`.
+pub fn format_supported_models_or_groups_human(
+    models: Option<&[String]>,
+    group_descriptions: &[(String, String)],
+) -> Vec<String> {
+    if models.is_some_and(|list| !list.is_empty()) {
+        return format_supported_models_human(models);
+    }
+    if !group_descriptions.is_empty() {
+        let mut out = vec![format!(
+            "Model groups     : {} group(s) (from official agy /usage)",
+            group_descriptions.len()
+        )];
+        for (name, desc) in group_descriptions {
+            out.push(format!("  {name} : {desc}"));
+        }
+        return out;
+    }
+    format_supported_models_human(models)
 }
 
 /// Render cached supported models grouped by family (`Gemini`, `Claude/GPT`, `Other`) with clean line wrapping.

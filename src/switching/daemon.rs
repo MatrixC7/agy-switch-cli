@@ -3,18 +3,17 @@ use crate::domain::account::{RuntimeState, SessionIdentity, STORE_SCHEMA_VERSION
 use crate::domain::clock::{AnchoredClock, Clock, SystemClock};
 use crate::domain::policy::{PolicyMode, PolicyStrategy, SwitchPolicy};
 use crate::domain::quota::{
-    evaluate_account_quota, evaluate_account_window_quotas, QuotaEval, DEFAULT_QUOTA_MAX_AGE_SECS,
+    cached_candidate_known_below_min_before_reset, evaluate_account_quota,
+    evaluate_account_window_quotas, QuotaEval, DEFAULT_QUOTA_MAX_AGE_SECS,
 };
 use crate::error::{format_safe_json_error, CliError, CliResult, ExitCode};
-use crate::oauth::refresh::{
-    ensure_account_token_fresh_locked, OAuthEndpoints, TOKEN_REFRESH_SKEW_SECONDS,
-};
 use crate::oauth::registry::OAuthClientRegistry;
 use crate::paths::HeadlessPaths;
-use crate::quota::client::{
-    refresh_account_quota_locked, refresh_account_quota_locked_with_meta, CloudCodeEndpoints,
+use crate::quota::official_cli::{
+    refresh_active_slot_quota_detailed, OfficialCliQuotaRunner, RefreshActiveSlotError,
+    SystemOfficialCliRunner,
 };
-use crate::session::backend::CredentialBackend;
+use crate::session::backend::{CredentialBackend, SlotInspectState};
 use crate::session::journal::{
     journal_on_disk_may_need_keyring, read_journal_readonly, read_journal_record_readonly,
     reconcile_journal_locked, JournalReplicaRecord,
@@ -27,28 +26,30 @@ use crate::store::fs_atomic::{
 };
 use crate::store::locks::{ActiveSlotLock, DaemonInstanceLock, DaemonLockProbe};
 use crate::store::repository::StoreRepository;
-use crate::switching::executor::{execute_switch_with_slot_lock_and_guard, RunningGuardMode};
+use crate::switching::executor::{
+    execute_switch_with_slot_lock_and_guard, extract_verified_checkpoint_from_replicas,
+    replica_inspection_matches_expectation, slot_matches_selected_rotated_account,
+    PreSwitchSlotExpectation, RunningGuardMode,
+};
 use crate::switching::notify::{
     resolve_effective_notify_enabled, resolve_effective_notify_persistent,
     send_daemon_notification_best_effort, DaemonNotificationEvent,
 };
 use crate::switching::runner::ordered_candidate_ids;
 use crate::switching::systemd::DaemonSystemdProbe;
-use crate::transport::client::{BoxFuture, HttpTransport};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
 
-pub const DEFAULT_DAEMON_INTERVAL_SECS: u64 = 180;
+pub const DEFAULT_DAEMON_INTERVAL_SECS: u64 = 900;
 pub const DEFAULT_DAEMON_COOLDOWN_SECS: i64 = 3600;
-pub const DEFAULT_TICK_HARD_TIMEOUT: Duration = Duration::from_secs(45);
+pub const DEFAULT_TICK_HARD_TIMEOUT: Duration = Duration::from_secs(180);
+pub const DEFAULT_STEP_BUFFER_DELAY: Duration = Duration::from_secs(2);
 pub const MAX_CONSECUTIVE_COMMIT_FAILURES: u32 = 3;
-pub const CANDIDATE_REFRESH_BACKOFF_SECS: i64 = 300;
+pub const CANDIDATE_REFRESH_BACKOFF_SECS: i64 = 900;
 const ONCE_ALREADY_LOW_GRACE_SECS: i64 = 15;
 
 /// Compute the active-account quota cache max-age for `Wait`-mode pending-plan revalidation
@@ -459,20 +460,6 @@ impl DaemonRuntimeStatusDto {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PendingSwitchPlan {
-    pub source_account_id: String,
-    pub target_account_id: String,
-    /// Captured at Stage 1/2 (`Observe`/`Evaluate`) BEFORE `Prepare` network I/O!
-    pub index_revision: u64,
-    /// Captured at Stage 1/2 (`Observe`/`Evaluate`) BEFORE `Prepare` network I/O!
-    pub policy_revision: u64,
-    /// Snapshot of `(candidate_id, disabled)` for candidates ranked ahead of `target_account_id` at Evaluate time.
-    pub higher_priority_candidate_states: Vec<(String, bool)>,
-    pub source_slot_digest: String,
-    pub created_at: i64,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct DaemonPolicyOverlay {
     pub mode: Option<PolicyMode>,
@@ -487,6 +474,8 @@ pub struct DaemonConfigOverrides {
     pub interval_secs: u64,
     pub cooldown_secs: i64,
     pub tick_timeout: Duration,
+    pub step_buffer_delay: Duration,
+    pub explicit_file_backend: bool,
     pub once: bool,
     pub reset_cooldown: bool,
     pub json_mode: bool,
@@ -500,6 +489,8 @@ impl Default for DaemonConfigOverrides {
             interval_secs: DEFAULT_DAEMON_INTERVAL_SECS,
             cooldown_secs: DEFAULT_DAEMON_COOLDOWN_SECS,
             tick_timeout: DEFAULT_TICK_HARD_TIMEOUT,
+            step_buffer_delay: DEFAULT_STEP_BUFFER_DELAY,
+            explicit_file_backend: false,
             once: false,
             reset_cooldown: false,
             json_mode: false,
@@ -958,12 +949,15 @@ impl DaemonTickReport {
     }
 }
 
-/// In-memory runtime coordinator for the 7-stage foreground `daemon` state machine (Blueprint §7.2).
+/// In-memory runtime coordinator for the single-pass Step-and-Verify foreground `daemon`.
+/// Periodically checks ONLY the active official slot via `agy -p "/usage"` (never polling dormant
+/// accounts in the background) and performs bounded single-pass Step-and-Verify when quota drops
+/// to or below `reserve_percentage`.
 pub struct DaemonEngine {
-    pub pending: Option<PendingSwitchPlan>,
     pub refresh_backoff_until: HashMap<String, i64>,
+    pub last_low_quota_hold_notified_account: Option<String>,
     pub clock: Option<Arc<dyn Clock>>,
-    /// Test hook invoked right before Stage 5 (`Revalidate` under L1 lock) to deterministically
+    /// Test hook invoked right before the first step switch under `L1` to deterministically
     /// simulate concurrent manual `switch` / `accounts delete` / `policy set`!
     pub before_revalidate_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -977,8 +971,8 @@ impl Default for DaemonEngine {
 impl DaemonEngine {
     pub fn new() -> Self {
         Self {
-            pending: None,
             refresh_backoff_until: HashMap::new(),
+            last_low_quota_hold_notified_account: None,
             clock: None,
             before_revalidate_hook: None,
         }
@@ -986,25 +980,20 @@ impl DaemonEngine {
 
     pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         Self {
-            pending: None,
             refresh_backoff_until: HashMap::new(),
+            last_low_quota_hold_notified_account: None,
             clock: Some(clock),
             before_revalidate_hook: None,
         }
     }
 
-    /// Execute one bounded, non-reentrant 7-stage daemon tick:
-    /// `Observe -> Evaluate -> Prepare -> Process Guard -> Revalidate (under L1 lock) -> Commit & Reconcile -> Cooldown / PausedOnFailure`.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_single_tick(
         &mut self,
         repo: &StoreRepository,
         backend: &dyn CredentialBackend,
-        transport: &dyn HttpTransport,
-        oauth_endpoints: &OAuthEndpoints,
-        quota_endpoints: &CloudCodeEndpoints,
+        runner: &dyn OfficialCliQuotaRunner,
         registry: &OAuthClientRegistry,
-        user_agent: &str,
         overrides: &DaemonConfigOverrides,
         now_unix: i64,
     ) -> CliResult<TickStageOutcome> {
@@ -1012,11 +1001,8 @@ impl DaemonEngine {
         self.run_single_tick_with_shutdown(
             repo,
             backend,
-            transport,
-            oauth_endpoints,
-            quota_endpoints,
+            runner,
             registry,
-            user_agent,
             overrides,
             now_unix,
             &mut dummy_rx,
@@ -1029,11 +1015,8 @@ impl DaemonEngine {
         &mut self,
         repo: &StoreRepository,
         backend: &dyn CredentialBackend,
-        transport: &dyn HttpTransport,
-        oauth_endpoints: &OAuthEndpoints,
-        quota_endpoints: &CloudCodeEndpoints,
+        runner: &dyn OfficialCliQuotaRunner,
         registry: &OAuthClientRegistry,
-        user_agent: &str,
         overrides: &DaemonConfigOverrides,
         now_unix: i64,
         shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
@@ -1041,11 +1024,8 @@ impl DaemonEngine {
         self.run_single_tick_report_with_shutdown(
             repo,
             backend,
-            transport,
-            oauth_endpoints,
-            quota_endpoints,
+            runner,
             registry,
-            user_agent,
             overrides,
             now_unix,
             shutdown_rx,
@@ -1059,11 +1039,8 @@ impl DaemonEngine {
         &mut self,
         repo: &StoreRepository,
         backend: &dyn CredentialBackend,
-        transport: &dyn HttpTransport,
-        oauth_endpoints: &OAuthEndpoints,
-        quota_endpoints: &CloudCodeEndpoints,
+        runner: &dyn OfficialCliQuotaRunner,
         registry: &OAuthClientRegistry,
-        user_agent: &str,
         overrides: &DaemonConfigOverrides,
         now_unix: i64,
         shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
@@ -1072,6 +1049,7 @@ impl DaemonEngine {
             Some(ref c) => c.clone(),
             None => Arc::new(AnchoredClock::new(now_unix)),
         };
+        let tick_deadline = tokio::time::Instant::now() + overrides.tick_timeout;
         let mut rctx = TickReportCtx::default();
 
         let paths = repo.paths();
@@ -1087,7 +1065,7 @@ impl DaemonEngine {
             ));
         }
 
-        // Reconcile any leftover `switch_journal.json` before reading `index.json` (Blueprint §3.3 & §7.2 Rule 6):
+        // Reconcile any leftover `switch_journal.json` before reading `index.json`:
         // - `CommittedIndexPending` / `AbortedUncommitted` auto-reconcile cleanly;
         // - `RecoveryIncomplete` (or corrupted journal) transitions daemon into persistent `PausedOnFailure`!
         match read_journal_record_readonly(paths) {
@@ -1152,7 +1130,6 @@ impl DaemonEngine {
                         pstate.paused_on_failure = true;
                         let reason = "incomplete_switch_recovery".to_string();
                         pstate.paused_reason = Some(reason.clone());
-                        self.pending = None;
                         let p_now = active_clock.now_unix();
                         self.persist_status(
                             repo,
@@ -1187,7 +1164,6 @@ impl DaemonEngine {
                 pstate.paused_on_failure = true;
                 let reason = "corrupted_switch_journal".to_string();
                 pstate.paused_reason = Some(reason.clone());
-                self.pending = None;
                 let p_now = active_clock.now_unix();
                 self.persist_status(repo, &mut pstate, "paused_on_failure", Some(&reason), p_now)?;
                 notify_paused_on_failure(
@@ -1216,7 +1192,6 @@ impl DaemonEngine {
         rctx.candidate_min_percentage = Some(policy.candidate_min_percentage);
 
         if !policy.enabled {
-            self.pending = None;
             let d_now = active_clock.now_unix();
             self.persist_status(
                 repo,
@@ -1246,14 +1221,147 @@ impl DaemonEngine {
             ));
         }
 
-        let source_max_age = effective_source_quota_max_age_secs(overrides.interval_secs);
+        // ================= STAGE 1: OBSERVE CURRENT OFFICIAL ACTIVE SLOT =================
+        let snapshot = repo.read_snapshot()?;
+        let decision_index_revision = snapshot.index.revision;
+        let Some(source_acc) = snapshot.selected_account() else {
+            let t_now = active_clock.now_unix();
+            self.persist_status(
+                repo,
+                &mut pstate,
+                "hold",
+                Some("no_selected_account"),
+                t_now,
+            )?;
+            return Ok(rctx.into_report(
+                t_now,
+                "hold",
+                Some("no_selected_account".into()),
+                TickStageOutcome::UncertainHold {
+                    reason: "no_selected_account".into(),
+                },
+            ));
+        };
+        let source_id = source_acc.id.clone();
+        rctx.source_account_id = Some(source_id.clone());
+        rctx.source_email = Some(source_acc.email.clone());
 
-        if self.pending.is_none() {
-            let source_refresh_in_flight = AtomicBool::new(false);
-            let early_opt: Option<DaemonTickReport> = tokio::select! {
-                _ = shutdown_rx.changed() => {
+        let source_replicas = backend.inspect_replicas(paths);
+        let slot_state = source_replicas.effective_slot_state();
+        let session_id = resolve_session_identity(slot_state, &snapshot);
+        if slot_state.raw_digest().is_none() {
+            let t_now = active_clock.now_unix();
+            self.persist_status(
+                repo,
+                &mut pstate,
+                "hold",
+                Some("session_slot_uninitialized_or_corrupt"),
+                t_now,
+            )?;
+            return Ok(rctx.into_report(
+                t_now,
+                "hold",
+                Some("session_slot_uninitialized_or_corrupt".into()),
+                TickStageOutcome::UncertainHold {
+                    reason: "session_slot_uninitialized_or_corrupt".into(),
+                },
+            ));
+        }
+        let slot_matches_source = matches!(
+            session_id,
+            SessionIdentity::Matched { ref account_id, .. } if account_id == &source_id
+        ) || matches!(
+            slot_state,
+            SlotInspectState::Present(ref parsed)
+                if slot_matches_selected_rotated_account(repo, &snapshot, parsed, source_acc)
+        );
+        let source_checkpoint = if slot_matches_source {
+            extract_verified_checkpoint_from_replicas(
+                repo,
+                &snapshot,
+                &source_replicas,
+                &source_id,
+                true,
+            )
+        } else {
+            None
+        };
+        let Some(mut expected_checkpoint) = source_checkpoint else {
+            let t_now = active_clock.now_unix();
+            self.persist_status(
+                repo,
+                &mut pstate,
+                "hold",
+                Some("session_identity_not_matched"),
+                t_now,
+            )?;
+            return Ok(rctx.into_report(
+                t_now,
+                "hold",
+                Some("session_identity_not_matched".into()),
+                TickStageOutcome::UncertainHold {
+                    reason: "session_identity_not_matched".into(),
+                },
+            ));
+        };
+
+        let source_max_age = effective_source_quota_max_age_secs(overrides.interval_secs);
+        let obs_now = active_clock.now_unix();
+        let mut source_eval =
+            evaluate_account_quota(source_acc, &policy.monitored_model, obs_now, source_max_age);
+        let backoff_ok = self
+            .refresh_backoff_until
+            .get(&source_id)
+            .copied()
+            .unwrap_or(0)
+            <= obs_now;
+        let low_grace_secs = if overrides.once {
+            ONCE_ALREADY_LOW_GRACE_SECS
+        } else {
+            ONCE_ALREADY_LOW_GRACE_SECS.min(source_max_age.saturating_sub(1))
+        };
+        let already_ultra_fresh_low = matches!(
+            source_eval,
+            QuotaEval::Known { remaining_percentage }
+                if remaining_percentage <= policy.reserve_percentage as f64
+        ) && source_acc.quota.as_ref().is_some_and(|q| {
+            let age = obs_now.saturating_sub(q.last_updated);
+            (0..=low_grace_secs).contains(&age)
+        });
+        let should_refresh_source = backoff_ok
+            && !matches!(source_eval, QuotaEval::Unavailable { .. })
+            && !already_ultra_fresh_low;
+
+        if should_refresh_source {
+            enum SourceProbeRace {
+                Shutdown,
+                Timeout,
+                Done(
+                    Box<
+                        Result<
+                            crate::quota::official_cli::ActiveSlotQuotaRefreshOutcome,
+                            RefreshActiveSlotError,
+                        >,
+                    >,
+                ),
+            }
+            let race = tokio::select! {
+                _ = shutdown_rx.changed() => SourceProbeRace::Shutdown,
+                _ = tokio::time::sleep_until(tick_deadline) => SourceProbeRace::Timeout,
+                res = refresh_active_slot_quota_detailed(
+                    repo,
+                    backend,
+                    runner,
+                    overrides.explicit_file_backend,
+                    Some(&source_id),
+                    active_clock.now_unix(),
+                ) => SourceProbeRace::Done(Box::new(res)),
+            };
+            match race {
+                SourceProbeRace::Shutdown => {
+                    let t_now = active_clock.now_unix();
                     return Ok(rctx.into_report(
-                        active_clock.now_unix(),
+                        t_now,
                         "hold",
                         Some("shutdown_signal_received".into()),
                         TickStageOutcome::UncertainHold {
@@ -1261,9 +1369,9 @@ impl DaemonEngine {
                         },
                     ));
                 }
-                _ = tokio::time::sleep(overrides.tick_timeout) => {
+                SourceProbeRace::Timeout => {
                     let t_now = active_clock.now_unix();
-                    let reason = if overrides.once && source_refresh_in_flight.load(Ordering::SeqCst) {
+                    let reason = if overrides.once {
                         "source_refresh_failed: tick_budget_timeout"
                     } else {
                         "tick_budget_timeout"
@@ -1278,356 +1386,138 @@ impl DaemonEngine {
                         },
                     ));
                 }
-                res = async {
-                    // ================= STAGE 1: OBSERVE =================
-                    let snapshot = repo.read_snapshot()?;
-                    // Capture the exact store index revision BEFORE any network I/O in Observe/Evaluate/Prepare!
-                    let decision_index_revision = snapshot.index.revision;
-
-                    let Some(source_acc) = snapshot.selected_account() else {
-                        let t_now = active_clock.now_unix();
-                        self.persist_status(repo, &mut pstate, "hold", Some("no_selected_account"), t_now)?;
-                        return Ok::<Option<DaemonTickReport>, CliError>(Some(rctx.clone().into_report(
-                            t_now,
-                            "hold",
-                            Some("no_selected_account".into()),
-                            TickStageOutcome::UncertainHold {
-                                reason: "no_selected_account".into(),
-                            },
-                        )));
-                    };
-                    let source_id = source_acc.id.clone();
-                    rctx.source_account_id = Some(source_id.clone());
-                    rctx.source_email = Some(source_acc.email.clone());
-
-                    let slot_state = backend.inspect_slot(paths);
-                    let session_id = resolve_session_identity(&slot_state, &snapshot);
-                    let Some(source_slot_digest) = slot_state.raw_digest().map(str::to_owned) else {
-                        let t_now = active_clock.now_unix();
-                        self.persist_status(
-                            repo,
-                            &mut pstate,
-                            "hold",
-                            Some("session_slot_uninitialized_or_corrupt"),
-                            t_now,
-                        )?;
-                        return Ok(Some(rctx.clone().into_report(
-                            t_now,
-                            "hold",
-                            Some("session_slot_uninitialized_or_corrupt".into()),
-                            TickStageOutcome::UncertainHold {
-                                reason: "session_slot_uninitialized_or_corrupt".into(),
-                            },
-                        )));
-                    };
-                    if !matches!(session_id, SessionIdentity::Matched { ref account_id, .. } if account_id == &source_id)
-                    {
-                        let t_now = active_clock.now_unix();
-                        self.persist_status(
-                            repo,
-                            &mut pstate,
-                            "hold",
-                            Some("session_identity_not_matched"),
-                            t_now,
-                        )?;
-                        return Ok(Some(rctx.clone().into_report(
-                            t_now,
-                            "hold",
-                            Some("session_identity_not_matched".into()),
-                            TickStageOutcome::UncertainHold {
-                                reason: "session_identity_not_matched".into(),
-                            },
-                        )));
-                    };
-
-                    let obs_now = active_clock.now_unix();
-                    let mut source_eval = evaluate_account_quota(
-                        source_acc,
-                        &policy.monitored_model,
-                        obs_now,
-                        source_max_age,
-                    );
-                    let backoff_ok = self
-                        .refresh_backoff_until
-                        .get(&source_id)
-                        .copied()
-                        .unwrap_or(0)
-                        <= obs_now;
-                    let low_grace_secs = if overrides.once {
-                        ONCE_ALREADY_LOW_GRACE_SECS
-                    } else {
-                        ONCE_ALREADY_LOW_GRACE_SECS.min(source_max_age.saturating_sub(1))
-                    };
-                    let already_ultra_fresh_low = matches!(
-                        source_eval,
-                        QuotaEval::Known { remaining_percentage }
-                            if remaining_percentage <= policy.reserve_percentage as f64
-                    ) && source_acc.quota.as_ref().is_some_and(|q| {
-                        let age = obs_now.saturating_sub(q.last_updated);
-                        (0..=low_grace_secs).contains(&age)
-                    });
-                    let should_refresh_source = backoff_ok
-                        && !matches!(source_eval, QuotaEval::Unavailable { .. })
-                        && !already_ultra_fresh_low;
-                    if should_refresh_source {
-                        source_refresh_in_flight.store(true, Ordering::SeqCst);
-                        let refresh_res = refresh_account_quota_locked_with_meta(
-                            repo,
-                            transport,
-                            oauth_endpoints,
-                            quota_endpoints,
-                            registry,
-                            user_agent,
-                            &source_id,
+                SourceProbeRace::Done(boxed) => match *boxed {
+                    Ok(refreshed) => {
+                        rctx.source_refreshed = true;
+                        source_eval = evaluate_account_quota(
+                            &refreshed.account,
+                            &policy.monitored_model,
                             active_clock.now_unix(),
-                        )
-                        .await;
-                        source_refresh_in_flight.store(false, Ordering::SeqCst);
-                        match refresh_res {
-                            Ok((updated, summary_err_code)) => {
-                                let next_eval = evaluate_account_quota(
-                                    &updated,
-                                    &policy.monitored_model,
-                                    active_clock.now_unix(),
-                                    source_max_age,
-                                );
-                                if overrides.once
-                                    && summary_err_code.is_some()
-                                    && matches!(next_eval, QuotaEval::Unknown { .. })
-                                {
-                                    let fail_now = active_clock.now_unix();
-                                    self.refresh_backoff_until
-                                        .insert(source_id.clone(), fail_now + CANDIDATE_REFRESH_BACKOFF_SECS);
-                                    source_eval = QuotaEval::Unknown {
-                                        reason: format!(
-                                            "source_refresh_failed: {}",
-                                            summary_err_code.unwrap_or("quota_network_error")
-                                        ),
-                                    };
-                                } else {
-                                    rctx.source_refreshed = true;
-                                    source_eval = next_eval;
-                                }
-                            }
-                            Err(err) => {
-                                let fail_now = active_clock.now_unix();
-                                self.refresh_backoff_until
-                                    .insert(source_id.clone(), fail_now + CANDIDATE_REFRESH_BACKOFF_SECS);
-                                if overrides.once {
-                                    source_eval = QuotaEval::Unknown {
-                                        reason: format!(
-                                            "source_refresh_failed: {}",
-                                            safe_daemon_error_code(&err.error_code)
-                                        ),
-                                    };
-                                }
-                            }
+                            source_max_age,
+                        );
+                        // Advance per-replica expected checkpoint ONLY for replicas already verified
+                        // as belonging to `source_id` inside `refresh_active_slot_quota_detailed`.
+                        if let Some(ref verified_cp) = refreshed.verified_checkpoint {
+                            expected_checkpoint.advance_from_verified_probe(verified_cp);
                         }
                     }
-
-                    // ================= STAGE 2: EVALUATE =================
-                    let eval_now = active_clock.now_unix();
-                    let source_rem = match source_eval {
-                        QuotaEval::Known {
-                            remaining_percentage,
-                        } => remaining_percentage,
-                        QuotaEval::Unknown { reason } | QuotaEval::Stale { reason } => {
-                            self.persist_status(repo, &mut pstate, "hold", Some(&reason), eval_now)?;
-                            return Ok(Some(rctx.clone().into_report(
-                                eval_now,
-                                "hold",
-                                Some(reason.clone()),
-                                TickStageOutcome::UncertainHold { reason },
-                            )));
-                        }
-                        QuotaEval::Unavailable { reason } => {
-                            self.persist_status(repo, &mut pstate, "hold", Some(&reason), eval_now)?;
-                            return Ok(Some(rctx.clone().into_report(
-                                eval_now,
-                                "hold",
-                                Some(reason.clone()),
-                                TickStageOutcome::UncertainHold { reason },
-                            )));
-                        }
-                    };
-                    rctx.source_remaining_percentage = Some(source_rem);
-
-                    if source_rem > policy.reserve_percentage as f64 {
-                        self.persist_status(repo, &mut pstate, "monitoring", Some("quota_sufficient"), eval_now)?;
-                        return Ok(Some(rctx.clone().into_report(
-                            eval_now,
-                            "monitoring",
-                            Some("quota_sufficient".into()),
-                            TickStageOutcome::IdleSufficientQuota,
-                        )));
-                    }
-
-                    let ordered_at_decision = ordered_candidate_ids(
-                        &policy.candidate_account_ids,
-                        &source_id,
-                        policy.strategy,
-                        pstate.last_rotated_candidate_id.as_deref(),
-                    );
-                    let pre_probe_snap = repo.read_snapshot()?;
-                    if pre_probe_snap.index.revision != decision_index_revision {
+                    Err(RefreshActiveSlotError::PreProbeSlotMismatch(_)) => {
                         let c_now = active_clock.now_unix();
-                        self.persist_status(repo, &mut pstate, "cancelled", Some("store_index_revision_changed"), c_now)?;
-                        return Ok(Some(rctx.clone().into_report(
+                        self.persist_status(
+                            repo,
+                            &mut pstate,
+                            "cancelled",
+                            Some("active_slot_digest_changed"),
+                            c_now,
+                        )?;
+                        return Ok(rctx.into_report(
                             c_now,
                             "cancelled",
-                            Some("store_index_revision_changed".into()),
+                            Some("active_slot_digest_changed".into()),
                             TickStageOutcome::CancelledStalePlan {
-                                reason: "store_index_revision_changed".into(),
+                                reason: "active_slot_digest_changed".into(),
                             },
-                        )));
+                        ));
                     }
-
-                    let Some(target_id) = self
-                        .probe_first_qualified_candidate(
-                            repo,
-                            transport,
-                            oauth_endpoints,
-                            quota_endpoints,
-                            registry,
-                            user_agent,
-                            &policy,
-                            &ordered_at_decision,
-                            active_clock.as_ref(),
-                        )
-                        .await?
-                    else {
-                        let n_now = active_clock.now_unix();
-                        self.persist_status(repo, &mut pstate, "no_candidate", Some("no_qualified_candidate"), n_now)?;
-                        return Ok(Some(rctx.clone().into_report(
-                            n_now,
-                            "no_candidate",
-                            Some("no_qualified_candidate".into()),
-                            TickStageOutcome::NoQualifiedCandidate {
-                                reason: "no_qualified_candidate".into(),
-                            },
-                        )));
-                    };
-                    rctx.target_account_id = Some(target_id.clone());
-
-                    let mut higher_priority_states = Vec::new();
-                    for cid in &ordered_at_decision {
-                        if cid == &target_id {
-                            break;
-                        }
-                        let was_disabled = pre_probe_snap
-                            .accounts
-                            .iter()
-                            .find(|a| a.id == *cid)
-                            .map(|a| a.disabled)
-                            .unwrap_or(true);
-                        higher_priority_states.push((cid.clone(), was_disabled));
-                    }
-
-                    // ================= STAGE 3: PREPARE =================
-                    if let Err(e) = ensure_account_token_fresh_locked(
-                        repo,
-                        transport,
-                        oauth_endpoints,
-                        registry,
-                        user_agent,
-                        &target_id,
-                        false,
-                        active_clock.now_unix(),
-                    )
-                    .await
+                    Err(RefreshActiveSlotError::Cli(ce))
+                        if ce.error_code == "active_slot_changed_during_refresh" =>
                     {
-                        let fail_now = active_clock.now_unix();
-                        self.refresh_backoff_until
-                            .insert(target_id, fail_now + CANDIDATE_REFRESH_BACKOFF_SECS);
-                        let msg = format!(
-                            "target_prepare_refresh_failed: {}",
-                            safe_daemon_error_code(&e.error_code)
-                        );
-                        self.persist_status(repo, &mut pstate, "no_candidate", Some(&msg), fail_now)?;
-                        return Ok(Some(rctx.clone().into_report(
-                            fail_now,
-                            "no_candidate",
-                            Some(msg.clone()),
-                            TickStageOutcome::NoQualifiedCandidate { reason: msg },
-                        )));
+                        let c_now = active_clock.now_unix();
+                        self.persist_status(
+                            repo,
+                            &mut pstate,
+                            "cancelled",
+                            Some("selected_account_changed_manually"),
+                            c_now,
+                        )?;
+                        return Ok(rctx.into_report(
+                            c_now,
+                            "cancelled",
+                            Some("selected_account_changed_manually".into()),
+                            TickStageOutcome::CancelledStalePlan {
+                                reason: "selected_account_changed_manually".into(),
+                            },
+                        ));
                     }
-
-                    // Preserve the ORIGINAL decision revisions (`decision_index_revision` & `decision_policy_revision`)
-                    // captured BEFORE network I/O so any manual `policy order/set` or `switch` during Prepare
-                    // is deterministically caught in Stage 5 `Revalidate`!
-                    self.pending = Some(PendingSwitchPlan {
-                        source_account_id: source_id,
-                        target_account_id: target_id,
-                        index_revision: decision_index_revision,
-                        policy_revision: decision_policy_revision,
-                        higher_priority_candidate_states: higher_priority_states,
-                        source_slot_digest,
-                        created_at: active_clock.now_unix(),
-                    });
-                    Ok(None)
-                } => res?,
-            };
-            if let Some(early) = early_opt {
-                return Ok(early);
+                    Err(err) => {
+                        if let RefreshActiveSlotError::Probe {
+                            verified_checkpoint: Some(ref verified_cp),
+                            ..
+                        } = err
+                        {
+                            expected_checkpoint.advance_from_verified_probe(verified_cp);
+                        }
+                        let fail_now = active_clock.now_unix();
+                        let backoff_secs =
+                            CANDIDATE_REFRESH_BACKOFF_SECS.max(overrides.interval_secs as i64);
+                        self.refresh_backoff_until
+                            .insert(source_id.clone(), fail_now + backoff_secs);
+                        let cli_err = err.into_cli_error();
+                        if overrides.once || !matches!(source_eval, QuotaEval::Known { .. }) {
+                            source_eval = QuotaEval::Unknown {
+                                reason: format!(
+                                    "source_refresh_failed: {}",
+                                    safe_daemon_error_code(&cli_err.error_code)
+                                ),
+                            };
+                        }
+                    }
+                },
             }
         }
 
-        if *shutdown_rx.borrow() {
-            return Ok(rctx.into_report(
-                active_clock.now_unix(),
-                "hold",
-                Some("shutdown_signal_received".into()),
-                TickStageOutcome::UncertainHold {
-                    reason: "shutdown_signal_received".into(),
-                },
-            ));
-        }
+        // ================= STAGE 2: EVALUATE SOURCE QUOTA =================
+        let eval_now = active_clock.now_unix();
+        let source_rem = match source_eval {
+            QuotaEval::Known {
+                remaining_percentage,
+            } => remaining_percentage,
+            QuotaEval::Unknown { reason }
+            | QuotaEval::Stale { reason }
+            | QuotaEval::Unavailable { reason } => {
+                self.persist_status(repo, &mut pstate, "hold", Some(&reason), eval_now)?;
+                return Ok(rctx.into_report(
+                    eval_now,
+                    "hold",
+                    Some(reason.clone()),
+                    TickStageOutcome::UncertainHold { reason },
+                ));
+            }
+        };
+        rctx.source_remaining_percentage = Some(source_rem);
 
-        let plan = self.pending.clone().expect("pending set above");
-        if rctx.source_account_id.is_none() {
-            rctx.source_account_id = Some(plan.source_account_id.clone());
-        }
-        if rctx.target_account_id.is_none() {
-            rctx.target_account_id = Some(plan.target_account_id.clone());
-        }
-
-        // ================= STAGE 4: PROCESS GUARD =================
-        let guard_now = active_clock.now_unix();
-        let guard_runtime = observe_runtime_state(paths);
-        if matches!(guard_runtime, RuntimeState::Unverified { .. }) {
+        if source_rem > policy.reserve_percentage as f64 {
+            self.last_low_quota_hold_notified_account = None;
             self.persist_status(
                 repo,
                 &mut pstate,
-                "hold",
-                Some("process_state_unverified"),
-                guard_now,
+                "monitoring",
+                Some("quota_sufficient"),
+                eval_now,
             )?;
             return Ok(rctx.into_report(
-                guard_now,
-                "hold",
-                Some("process_state_unverified".into()),
-                TickStageOutcome::UncertainHold {
-                    reason: "process_state_unverified".into(),
-                },
+                eval_now,
+                "monitoring",
+                Some("quota_sufficient".into()),
+                TickStageOutcome::IdleSufficientQuota,
             ));
         }
 
-        // Re-check store/policy/slot revisions BEFORE `PolicyMode::Wait` holds on an active process
-        // (and use the latest effective policy mode in case policy changed during Stage 3 `Prepare` or between ticks).
-        let (guard_policy, guard_policy_rev) =
-            resolve_effective_daemon_policy(repo, &overrides.policy_overlay)?;
-        let guard_snap = repo.read_snapshot()?;
-        if guard_snap.index.revision != plan.index_revision {
-            self.pending = None;
+        // ================= STAGE 3: CANDIDATE ORDERING & LOCAL CACHE SKIP =================
+        let pre_step_snap = repo.read_snapshot()?;
+        if pre_step_snap.index.revision != decision_index_revision
+            || pre_step_snap.index.selected_account_id.as_deref() != Some(source_id.as_str())
+        {
+            let c_now = active_clock.now_unix();
             self.persist_status(
                 repo,
                 &mut pstate,
                 "cancelled",
                 Some("store_index_revision_changed"),
-                guard_now,
+                c_now,
             )?;
             return Ok(rctx.into_report(
-                guard_now,
+                c_now,
                 "cancelled",
                 Some("store_index_revision_changed".into()),
                 TickStageOutcome::CancelledStalePlan {
@@ -1635,627 +1525,1259 @@ impl DaemonEngine {
                 },
             ));
         }
-        if guard_policy_rev != plan.policy_revision || !guard_policy.enabled {
-            self.pending = None;
-            self.persist_status(
-                repo,
-                &mut pstate,
-                "cancelled",
-                Some("policy_revision_changed_or_disabled"),
-                guard_now,
-            )?;
-            return Ok(rctx.into_report(
-                guard_now,
-                "cancelled",
-                Some("policy_revision_changed_or_disabled".into()),
-                TickStageOutcome::CancelledStalePlan {
-                    reason: "policy_revision_changed_or_disabled".into(),
-                },
-            ));
-        }
-        if backend.inspect_slot(paths).raw_digest() != Some(plan.source_slot_digest.as_str()) {
-            self.pending = None;
-            self.persist_status(
-                repo,
-                &mut pstate,
-                "cancelled",
-                Some("active_slot_digest_changed"),
-                guard_now,
-            )?;
-            return Ok(rctx.into_report(
-                guard_now,
-                "cancelled",
-                Some("active_slot_digest_changed".into()),
-                TickStageOutcome::CancelledStalePlan {
-                    reason: "active_slot_digest_changed".into(),
-                },
-            ));
+
+        let ordered_candidates = ordered_candidate_ids(
+            &policy.candidate_account_ids,
+            &source_id,
+            policy.strategy,
+            pstate.last_rotated_candidate_id.as_deref(),
+        );
+        let mut eligible_candidates: Vec<String> = Vec::with_capacity(ordered_candidates.len());
+        for cid in &ordered_candidates {
+            if self.refresh_backoff_until.get(cid).copied().unwrap_or(0) > eval_now {
+                continue;
+            }
+            let Some(acc) = pre_step_snap.accounts.iter().find(|a| &a.id == cid) else {
+                continue;
+            };
+            if !acc.is_usable_at(eval_now) {
+                continue;
+            }
+            if !registry.missing_required_scopes(&acc.token).is_empty() {
+                continue;
+            }
+            // Local cache skip: skip known exhausted candidates whose blocking reset deadline is still in the future.
+            if cached_candidate_known_below_min_before_reset(
+                acc,
+                &policy.monitored_model,
+                policy.candidate_min_percentage,
+                eval_now,
+            )
+            .is_some()
+            {
+                continue;
+            }
+            eligible_candidates.push(cid.clone());
         }
 
+        // ================= STAGE 4: PROCESS GUARD =================
+        let guard_now = active_clock.now_unix();
+        let guard_runtime = observe_runtime_state(paths);
         match guard_runtime {
-            RuntimeState::Idle => {}
-            RuntimeState::ManagedRunning { .. } | RuntimeState::UnmanagedRunning { .. } => {
-                match guard_policy.mode {
-                    PolicyMode::Immediate => {
-                        // Never kill running `agy` processes; proceed to Stage 5 & Stage 6 to
-                        // update the credential slot immediately for subsequent `agy` terminals.
-                    }
-                    PolicyMode::Wait => {
-                        self.persist_status(
-                            repo,
-                            &mut pstate,
-                            "blocked_by_active_process",
-                            Some("waiting_for_agy_idle"),
-                            guard_now,
-                        )?;
-                        return Ok(rctx.into_report(
-                            guard_now,
-                            "blocked_by_active_process",
-                            Some("waiting_for_agy_idle".into()),
-                            TickStageOutcome::BlockedByActiveProcess {
-                                target_id: plan.target_account_id,
-                            },
-                        ));
-                    }
-                }
+            RuntimeState::Unverified { .. } => {
+                self.persist_status(
+                    repo,
+                    &mut pstate,
+                    "hold",
+                    Some("process_state_unverified"),
+                    guard_now,
+                )?;
+                return Ok(rctx.into_report(
+                    guard_now,
+                    "hold",
+                    Some("process_state_unverified".into()),
+                    TickStageOutcome::UncertainHold {
+                        reason: "process_state_unverified".into(),
+                    },
+                ));
             }
-            RuntimeState::Unverified { .. } => unreachable!("handled above"),
+            RuntimeState::ManagedRunning { .. } | RuntimeState::UnmanagedRunning { .. }
+                if policy.mode == PolicyMode::Wait && !eligible_candidates.is_empty() =>
+            {
+                let first_target = eligible_candidates[0].clone();
+                rctx.target_account_id = Some(first_target.clone());
+                self.persist_status(
+                    repo,
+                    &mut pstate,
+                    "blocked_by_active_process",
+                    Some("waiting_for_agy_idle"),
+                    guard_now,
+                )?;
+                return Ok(rctx.into_report(
+                    guard_now,
+                    "blocked_by_active_process",
+                    Some("waiting_for_agy_idle".into()),
+                    TickStageOutcome::BlockedByActiveProcess {
+                        target_id: first_target,
+                    },
+                ));
+            }
+            _ => {}
+        }
+
+        if eligible_candidates.is_empty() {
+            let n_now = active_clock.now_unix();
+            self.persist_status(
+                repo,
+                &mut pstate,
+                "no_candidate",
+                Some("no_qualified_candidate"),
+                n_now,
+            )?;
+            self.notify_holding_low_quota_once(
+                repo,
+                overrides.notify_override,
+                &source_id,
+                source_rem,
+                policy.candidate_min_percentage,
+                shutdown_rx,
+            )
+            .await;
+            return Ok(rctx.into_report(
+                n_now,
+                "no_candidate",
+                Some("no_qualified_candidate".into()),
+                TickStageOutcome::NoQualifiedCandidate {
+                    reason: "no_qualified_candidate".into(),
+                },
+            ));
         }
 
         if let Some(ref hook) = self.before_revalidate_hook {
             hook();
         }
 
-        // ================= STAGE 5: REVALIDATE (HOLDING L1 LOCK!) =================
-        let existing_needs_kr = journal_on_disk_may_need_keyring(paths);
-        let mut slot_lock =
-            match ActiveSlotLock::try_acquire(paths, backend.uses_keyring() || existing_needs_kr) {
-                Ok(l) => l,
-                Err(e) if e.exit_code == ExitCode::LockBusyOrConflict => {
-                    let b_now = active_clock.now_unix();
-                    self.persist_status(
-                        repo,
-                        &mut pstate,
-                        "lock_busy",
-                        Some("slot_lock_busy"),
-                        b_now,
-                    )?;
-                    return Ok(rctx.into_report(
-                        b_now,
-                        "lock_busy",
-                        Some("slot_lock_busy".into()),
-                        TickStageOutcome::UncertainHold {
-                            reason: "slot_lock_busy".into(),
-                        },
-                    ));
-                }
-                Err(e) => return Err(e),
-            };
-        if !slot_lock.includes_keyring_scope() && journal_on_disk_may_need_keyring(paths) {
-            drop(slot_lock);
-            slot_lock = match ActiveSlotLock::try_acquire(paths, true) {
-                Ok(l) => l,
-                Err(e) if e.exit_code == ExitCode::LockBusyOrConflict => {
-                    let b_now = active_clock.now_unix();
-                    self.persist_status(
-                        repo,
-                        &mut pstate,
-                        "lock_busy",
-                        Some("slot_lock_busy"),
-                        b_now,
-                    )?;
-                    return Ok(rctx.into_report(
-                        b_now,
-                        "lock_busy",
-                        Some("slot_lock_busy".into()),
-                        TickStageOutcome::UncertainHold {
-                            reason: "slot_lock_busy".into(),
-                        },
-                    ));
-                }
-                Err(e) => return Err(e),
-            };
+        // ================= STAGE 5: SINGLE-PASS BOUNDED STEP-AND-VERIFY =================
+        // Visits each eligible candidate at most ONCE (upper bound N - 1 hops).
+        enum StepLoopExit {
+            Exhausted,
+            Shutdown,
+            TimedOut,
+            LockBusy,
+            ProcessUnverified,
+            BlockedByActiveProcess(String),
         }
 
-        // Capture real commit-moment timestamp INSIDE `L1 ActiveSlotLock`!
-        let commit_now = active_clock.now_unix();
-
-        if let Err(err) = reconcile_journal_locked(&slot_lock, repo, backend, false, commit_now) {
-            drop(slot_lock);
-            self.pending = None;
-            let journal_corrupt = read_journal_readonly(paths).is_err();
-            if err.exit_code == ExitCode::PartialCommitOrRecovery || journal_corrupt {
-                pstate.consecutive_commit_failures =
-                    pstate.consecutive_commit_failures.saturating_add(1);
-                pstate.paused_on_failure = true;
-                let reason = if journal_corrupt {
-                    "corrupted_switch_journal"
-                } else {
-                    "incomplete_switch_recovery"
-                }
-                .to_string();
-                pstate.paused_reason = Some(reason.clone());
-                self.persist_status(
-                    repo,
-                    &mut pstate,
-                    "paused_on_failure",
-                    Some(&reason),
-                    commit_now,
-                )?;
-                let (stage, notify_reason) = if journal_corrupt {
-                    (
-                        "Pre-commit journal check",
-                        "Corrupted switch journal preserved on disk.",
-                    )
-                } else {
-                    (
-                        "Pre-commit journal recovery",
-                        "Incomplete switch recovery requires manual inspection.",
-                    )
-                };
-                notify_paused_on_failure(
-                    repo,
-                    overrides.notify_override,
-                    stage,
-                    Some(&plan.target_account_id),
-                    &pstate,
-                    notify_reason,
-                    shutdown_rx,
-                )
-                .await;
-                return Ok(rctx.into_report(
-                    commit_now,
-                    "paused_on_failure",
-                    Some(reason.clone()),
-                    TickStageOutcome::PausedOnFailure { reason },
-                ));
-            }
-            return Err(err);
-        }
-
-        let revalidate_source_max_age = if overrides.once {
-            DEFAULT_QUOTA_MAX_AGE_SECS
-        } else {
-            source_max_age
-        };
-        let commit_mode = match revalidate_pending_under_l1(
-            repo,
-            backend,
-            &plan,
-            &overrides.policy_overlay,
-            revalidate_source_max_age,
-            commit_now,
-        )? {
-            RevalidateVerdict::Proceed(mode) => mode,
-            RevalidateVerdict::HoldUnverified => {
-                drop(slot_lock);
-                self.persist_status(
-                    repo,
-                    &mut pstate,
-                    "hold",
-                    Some("process_state_unverified"),
-                    commit_now,
-                )?;
-                return Ok(rctx.into_report(
-                    commit_now,
-                    "hold",
-                    Some("process_state_unverified".into()),
-                    TickStageOutcome::UncertainHold {
-                        reason: "process_state_unverified".into(),
-                    },
-                ));
-            }
-            RevalidateVerdict::Cancel(cancel_reason) => {
-                drop(slot_lock);
-                self.pending = None;
-                self.persist_status(
-                    repo,
-                    &mut pstate,
-                    "cancelled",
-                    Some(&cancel_reason),
-                    commit_now,
-                )?;
-                return Ok(rctx.into_report(
-                    commit_now,
-                    "cancelled",
-                    Some(cancel_reason.clone()),
-                    TickStageOutcome::CancelledStalePlan {
-                        reason: cancel_reason,
-                    },
-                ));
-            }
-        };
-
-        // ================= STAGE 6: COMMIT & RECONCILE =================
-        let guard_mode = match commit_mode {
+        let mut current_slot_id = source_id.clone();
+        let mut expected_index_revision = decision_index_revision;
+        let mut best_below_min: Option<(String, f64)> = None;
+        let mut probed_below_min_ids: Vec<String> = Vec::new();
+        let mut loop_exit = StepLoopExit::Exhausted;
+        let min_pct_f = policy.candidate_min_percentage as f64;
+        let guard_mode = match policy.mode {
             PolicyMode::Immediate => RunningGuardMode::AllowVerifiedRunning,
             PolicyMode::Wait => RunningGuardMode::RequireIdle,
         };
-        let commit_res = execute_switch_with_slot_lock_and_guard(
-            &slot_lock,
-            repo,
-            backend,
-            transport,
-            oauth_endpoints,
-            registry,
-            user_agent,
-            &plan.target_account_id,
-            guard_mode,
-            false,
-            false,
-            commit_now,
-        )
-        .await;
-        drop(slot_lock);
-        self.pending = None;
 
-        let post_commit_now = active_clock.now_unix();
-        match commit_res {
-            Ok(_outcome) => {
-                // ================= STAGE 7: COOLDOWN =================
-                pstate.cooldown_until =
-                    post_commit_now.saturating_add(overrides.cooldown_secs.max(0));
-                pstate.last_rotated_candidate_id = Some(plan.target_account_id.clone());
-                pstate.consecutive_commit_failures = 0;
-                pstate.paused_on_failure = false;
-                pstate.paused_reason = None;
-                self.persist_commit_status(
-                    repo,
-                    &mut pstate,
-                    "cooldown",
-                    Some("switch_committed"),
-                    post_commit_now,
-                )?;
-                let snap = repo.read_snapshot().ok();
-                let source_acc = snap
-                    .as_ref()
-                    .and_then(|s| s.accounts.iter().find(|a| a.id == plan.source_account_id));
-                let target_acc = snap
-                    .as_ref()
-                    .and_then(|s| s.accounts.iter().find(|a| a.id == plan.target_account_id));
-                if let Some(s_acc) = source_acc {
-                    rctx.source_email = Some(s_acc.email.clone());
-                    if rctx.source_remaining_percentage.is_none() {
-                        rctx.source_remaining_percentage = evaluate_account_quota(
-                            s_acc,
-                            &guard_policy.monitored_model,
-                            post_commit_now,
-                            DEFAULT_QUOTA_MAX_AGE_SECS,
-                        )
-                        .known_value();
+        for (hop_idx, cand_id) in eligible_candidates.iter().enumerate() {
+            if *shutdown_rx.borrow() {
+                loop_exit = StepLoopExit::Shutdown;
+                break;
+            }
+            if tokio::time::Instant::now() >= tick_deadline {
+                loop_exit = StepLoopExit::TimedOut;
+                break;
+            }
+            if hop_idx > 0 && !overrides.step_buffer_delay.is_zero() {
+                enum BufferRace {
+                    Shutdown,
+                    Timeout,
+                    Ready,
+                }
+                let race = tokio::select! {
+                    _ = shutdown_rx.changed() => BufferRace::Shutdown,
+                    _ = tokio::time::sleep_until(tick_deadline) => BufferRace::Timeout,
+                    _ = tokio::time::sleep(overrides.step_buffer_delay) => BufferRace::Ready,
+                };
+                match race {
+                    BufferRace::Shutdown => {
+                        loop_exit = StepLoopExit::Shutdown;
+                        break;
                     }
+                    BufferRace::Timeout => {
+                        loop_exit = StepLoopExit::TimedOut;
+                        break;
+                    }
+                    BufferRace::Ready => {}
                 }
-                if let Some(t_acc) = target_acc {
-                    rctx.target_email = Some(t_acc.email.clone());
-                    rctx.target_remaining_percentage = evaluate_account_quota(
-                        t_acc,
-                        &guard_policy.monitored_model,
-                        post_commit_now,
-                        DEFAULT_QUOTA_MAX_AGE_SECS,
-                    )
-                    .known_value();
-                }
-                if !*shutdown_rx.borrow()
-                    && resolve_effective_notify_enabled(repo, false, overrides.notify_override)
-                {
-                    let from_account = source_acc
-                        .map(format_account_notify_label)
-                        .unwrap_or_else(|| plan.source_account_id.clone());
-                    let to_account = target_acc
-                        .map(format_account_notify_label)
-                        .unwrap_or_else(|| plan.target_account_id.clone());
-                    let source_windows = source_acc
-                        .map(|a| {
-                            evaluate_account_window_quotas(
-                                a,
-                                &guard_policy.monitored_model,
-                                post_commit_now,
-                                DEFAULT_QUOTA_MAX_AGE_SECS,
-                            )
-                        })
-                        .unwrap_or_default();
-                    let target_windows = target_acc
-                        .map(|a| {
-                            evaluate_account_window_quotas(
-                                a,
-                                &guard_policy.monitored_model,
-                                post_commit_now,
-                                DEFAULT_QUOTA_MAX_AGE_SECS,
-                            )
-                        })
-                        .unwrap_or_default();
-                    let persistent_switch = resolve_effective_notify_persistent(repo);
-                    send_daemon_notification_best_effort(
-                        &DaemonNotificationEvent::Switched {
-                            from_account,
-                            to_account,
-                            source_5h_pct: source_windows.short_5h_pct,
-                            source_weekly_pct: source_windows.weekly_pct,
-                            target_5h_pct: target_windows.short_5h_pct,
-                            target_weekly_pct: target_windows.weekly_pct,
-                        },
-                        persistent_switch,
-                        shutdown_rx,
-                    )
-                    .await;
-                }
-                Ok(rctx.into_report(
-                    post_commit_now,
-                    "cooldown",
-                    Some("switch_committed".into()),
-                    TickStageOutcome::CommittedSwitch {
-                        source_id: plan.source_account_id,
-                        target_id: plan.target_account_id,
-                    },
-                ))
             }
-            Err(err) if err.error_code == "runtime_state_unverified" => {
-                self.persist_status(
-                    repo,
-                    &mut pstate,
-                    "hold",
-                    Some("process_state_unverified"),
-                    post_commit_now,
-                )?;
-                Ok(rctx.into_report(
-                    post_commit_now,
-                    "hold",
-                    Some("process_state_unverified".into()),
-                    TickStageOutcome::UncertainHold {
-                        reason: "process_state_unverified".into(),
-                    },
-                ))
-            }
-            Err(err) => {
-                pstate.consecutive_commit_failures =
-                    pstate.consecutive_commit_failures.saturating_add(1);
-                let is_recovery_incomplete = err.error_code == "recovery_incomplete"
-                    || err.exit_code == ExitCode::PartialCommitOrRecovery;
-                let code = safe_daemon_error_code(&err.error_code);
-                let reason = if is_recovery_incomplete {
-                    "incomplete_switch_recovery".to_string()
-                } else {
-                    code.clone()
+
+            // Acquire L1 briefly for offline revalidation + switch only (never held across `agy -p "/usage"`).
+            let existing_needs_kr = journal_on_disk_may_need_keyring(paths);
+            let mut slot_lock = match ActiveSlotLock::try_acquire(
+                paths,
+                backend.uses_keyring() || existing_needs_kr,
+            ) {
+                Ok(l) => l,
+                Err(e) if e.exit_code == ExitCode::LockBusyOrConflict => {
+                    if hop_idx == 0 {
+                        let b_now = active_clock.now_unix();
+                        self.persist_status(
+                            repo,
+                            &mut pstate,
+                            "lock_busy",
+                            Some("slot_lock_busy"),
+                            b_now,
+                        )?;
+                        return Ok(rctx.into_report(
+                            b_now,
+                            "lock_busy",
+                            Some("slot_lock_busy".into()),
+                            TickStageOutcome::UncertainHold {
+                                reason: "slot_lock_busy".into(),
+                            },
+                        ));
+                    }
+                    loop_exit = StepLoopExit::LockBusy;
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            if !slot_lock.includes_keyring_scope() && journal_on_disk_may_need_keyring(paths) {
+                drop(slot_lock);
+                slot_lock = match ActiveSlotLock::try_acquire(paths, true) {
+                    Ok(l) => l,
+                    Err(e) if e.exit_code == ExitCode::LockBusyOrConflict => {
+                        if hop_idx == 0 {
+                            let b_now = active_clock.now_unix();
+                            self.persist_status(
+                                repo,
+                                &mut pstate,
+                                "lock_busy",
+                                Some("slot_lock_busy"),
+                                b_now,
+                            )?;
+                            return Ok(rctx.into_report(
+                                b_now,
+                                "lock_busy",
+                                Some("slot_lock_busy".into()),
+                                TickStageOutcome::UncertainHold {
+                                    reason: "slot_lock_busy".into(),
+                                },
+                            ));
+                        }
+                        loop_exit = StepLoopExit::LockBusy;
+                        break;
+                    }
+                    Err(e) => return Err(e),
                 };
-                if is_recovery_incomplete
-                    || pstate.consecutive_commit_failures >= MAX_CONSECUTIVE_COMMIT_FAILURES
-                {
+            }
+
+            let step_now = active_clock.now_unix();
+            if let Err(err) = reconcile_journal_locked(&slot_lock, repo, backend, false, step_now) {
+                drop(slot_lock);
+                let journal_corrupt = read_journal_readonly(paths).is_err();
+                if err.exit_code == ExitCode::PartialCommitOrRecovery || journal_corrupt {
+                    pstate.consecutive_commit_failures =
+                        pstate.consecutive_commit_failures.saturating_add(1);
                     pstate.paused_on_failure = true;
-                    pstate.paused_reason = Some(if is_recovery_incomplete {
-                        "incomplete_switch_recovery".to_string()
+                    let reason = if journal_corrupt {
+                        "corrupted_switch_journal"
                     } else {
-                        format!("commit_failed: {code}")
-                    });
-                }
-                let paused = pstate.paused_on_failure;
-                let phase = if paused {
-                    "paused_on_failure"
-                } else {
-                    "commit_failed"
-                };
-                let persisted_reason = pstate
-                    .paused_reason
-                    .clone()
-                    .unwrap_or_else(|| reason.clone());
-                self.persist_status(
-                    repo,
-                    &mut pstate,
-                    phase,
-                    Some(&persisted_reason),
-                    post_commit_now,
-                )?;
-                if paused {
-                    let (stage, notify_reason) = if is_recovery_incomplete {
+                        "incomplete_switch_recovery"
+                    }
+                    .to_string();
+                    pstate.paused_reason = Some(reason.clone());
+                    self.persist_status(
+                        repo,
+                        &mut pstate,
+                        "paused_on_failure",
+                        Some(&reason),
+                        step_now,
+                    )?;
+                    let (stage, notify_reason) = if journal_corrupt {
                         (
-                            "Switch commit recovery",
-                            "Incomplete switch recovery requires manual inspection.".to_string(),
+                            "Pre-commit journal check",
+                            "Corrupted switch journal preserved on disk.",
                         )
                     } else {
-                        ("Switch commit", format!("Switch commit failed ({code})."))
+                        (
+                            "Pre-commit journal recovery",
+                            "Incomplete switch recovery requires manual inspection.",
+                        )
                     };
                     notify_paused_on_failure(
                         repo,
                         overrides.notify_override,
                         stage,
-                        Some(&plan.target_account_id),
+                        Some(cand_id),
                         &pstate,
-                        &notify_reason,
+                        notify_reason,
                         shutdown_rx,
                     )
                     .await;
+                    return Ok(rctx.into_report(
+                        step_now,
+                        "paused_on_failure",
+                        Some(reason.clone()),
+                        TickStageOutcome::PausedOnFailure { reason },
+                    ));
                 }
-                Ok(rctx.into_report(
-                    post_commit_now,
-                    phase,
-                    Some(reason.clone()),
-                    TickStageOutcome::CommitFailed { reason, paused },
-                ))
+                return Err(err);
             }
-        }
-    }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn probe_first_qualified_candidate(
-        &mut self,
-        repo: &StoreRepository,
-        transport: &dyn HttpTransport,
-        oauth_endpoints: &OAuthEndpoints,
-        quota_endpoints: &CloudCodeEndpoints,
-        registry: &OAuthClientRegistry,
-        user_agent: &str,
-        policy: &SwitchPolicy,
-        ordered: &[String],
-        clock: &dyn Clock,
-    ) -> CliResult<Option<String>> {
-        // Probe in bounded concurrent batches of <= 3, stopping and cancelling lower-priority
-        // in-flight requests as soon as the highest-priority qualified candidate is confirmed!
-        #[derive(Clone)]
-        enum SlotProbeState {
-            Skipped,
-            Resolved(QuotaEval),
-            InFlight,
-        }
-
-        let min_pct = policy.candidate_min_percentage as f64;
-
-        for chunk in ordered.chunks(3) {
-            let chunk_now = clock.now_unix();
-            let mut states = vec![SlotProbeState::Skipped; chunk.len()];
-            let mut to_refresh: Vec<(usize, String)> = Vec::with_capacity(chunk.len());
-
-            for (idx, cand_id) in chunk.iter().enumerate() {
-                if self
-                    .refresh_backoff_until
-                    .get(cand_id)
-                    .copied()
-                    .unwrap_or(0)
-                    > chunk_now
+            // Revalidate under L1 against concurrent manual edits (`switch` / `delete` / `policy set`)
+            // on EVERY hop (including ABA revisions after hop 0).
+            let live_snap = repo.read_snapshot()?;
+            if live_snap.index.revision != expected_index_revision
+                || live_snap.index.selected_account_id.as_deref() != Some(current_slot_id.as_str())
+            {
+                drop(slot_lock);
+                let cancel_reason = if live_snap.index.selected_account_id.as_deref()
+                    != Some(current_slot_id.as_str())
                 {
-                    continue;
-                }
-                let Ok(acc) = repo.read_account_unchecked(cand_id) else {
-                    continue;
-                };
-                if !acc.is_usable_at(chunk_now) {
-                    continue;
-                }
-                let eval = evaluate_account_quota(
-                    &acc,
-                    &policy.monitored_model,
-                    chunk_now,
-                    DEFAULT_QUOTA_MAX_AGE_SECS,
-                );
-                if matches!(eval, QuotaEval::Unknown { .. } | QuotaEval::Stale { .. }) {
-                    states[idx] = SlotProbeState::InFlight;
-                    to_refresh.push((idx, cand_id.clone()));
+                    "selected_account_changed_manually"
                 } else {
-                    let already_qualified = matches!(
-                        eval,
-                        QuotaEval::Known { remaining_percentage } if remaining_percentage >= min_pct
-                    );
-                    states[idx] = SlotProbeState::Resolved(eval);
-                    if already_qualified {
-                        // No lower-priority candidate in this chunk (> idx) can ever outrank `idx`!
+                    "store_index_revision_changed"
+                };
+                self.persist_status(
+                    repo,
+                    &mut pstate,
+                    "cancelled",
+                    Some(cancel_reason),
+                    step_now,
+                )?;
+                return Ok(rctx.into_report(
+                    step_now,
+                    "cancelled",
+                    Some(cancel_reason.into()),
+                    TickStageOutcome::CancelledStalePlan {
+                        reason: cancel_reason.into(),
+                    },
+                ));
+            }
+            let (live_policy, live_policy_rev) =
+                resolve_effective_daemon_policy(repo, &overrides.policy_overlay)?;
+            if live_policy_rev != decision_policy_revision || !live_policy.enabled {
+                drop(slot_lock);
+                self.persist_status(
+                    repo,
+                    &mut pstate,
+                    "cancelled",
+                    Some("policy_revision_changed_or_disabled"),
+                    step_now,
+                )?;
+                return Ok(rctx.into_report(
+                    step_now,
+                    "cancelled",
+                    Some("policy_revision_changed_or_disabled".into()),
+                    TickStageOutcome::CancelledStalePlan {
+                        reason: "policy_revision_changed_or_disabled".into(),
+                    },
+                ));
+            }
+            let live_replicas = backend.inspect_replicas(paths);
+            if !replica_inspection_matches_expectation(
+                repo,
+                &live_snap,
+                &live_replicas,
+                PreSwitchSlotExpectation::ExactCheckpoint(&expected_checkpoint),
+            ) {
+                drop(slot_lock);
+                self.persist_status(
+                    repo,
+                    &mut pstate,
+                    "cancelled",
+                    Some("active_slot_digest_changed"),
+                    step_now,
+                )?;
+                return Ok(rctx.into_report(
+                    step_now,
+                    "cancelled",
+                    Some("active_slot_digest_changed".into()),
+                    TickStageOutcome::CancelledStalePlan {
+                        reason: "active_slot_digest_changed".into(),
+                    },
+                ));
+            }
+            match observe_runtime_state(paths) {
+                RuntimeState::Idle => {}
+                RuntimeState::Unverified { .. } => {
+                    drop(slot_lock);
+                    if hop_idx == 0 {
+                        self.persist_status(
+                            repo,
+                            &mut pstate,
+                            "hold",
+                            Some("process_state_unverified"),
+                            step_now,
+                        )?;
+                        return Ok(rctx.into_report(
+                            step_now,
+                            "hold",
+                            Some("process_state_unverified".into()),
+                            TickStageOutcome::UncertainHold {
+                                reason: "process_state_unverified".into(),
+                            },
+                        ));
+                    }
+                    loop_exit = StepLoopExit::ProcessUnverified;
+                    break;
+                }
+                RuntimeState::ManagedRunning { .. } | RuntimeState::UnmanagedRunning { .. } => {
+                    if live_policy.mode == PolicyMode::Wait {
+                        drop(slot_lock);
+                        if hop_idx == 0 {
+                            self.persist_status(
+                                repo,
+                                &mut pstate,
+                                "cancelled",
+                                Some("active_process_started_before_commit"),
+                                step_now,
+                            )?;
+                            return Ok(rctx.into_report(
+                                step_now,
+                                "cancelled",
+                                Some("active_process_started_before_commit".into()),
+                                TickStageOutcome::CancelledStalePlan {
+                                    reason: "active_process_started_before_commit".into(),
+                                },
+                            ));
+                        }
+                        loop_exit = StepLoopExit::BlockedByActiveProcess(cand_id.clone());
                         break;
                     }
                 }
             }
-
-            if to_refresh.is_empty() {
-                for (idx, state) in states.iter().enumerate() {
-                    if let SlotProbeState::Resolved(QuotaEval::Known {
-                        remaining_percentage,
-                    }) = state
-                    {
-                        if *remaining_percentage >= min_pct {
-                            return Ok(Some(chunk[idx].clone()));
-                        }
-                    }
-                }
+            let cand_still_valid = live_policy.candidate_account_ids.contains(cand_id)
+                && live_snap
+                    .accounts
+                    .iter()
+                    .find(|a| &a.id == cand_id)
+                    .is_some_and(|a| a.is_usable_at(step_now));
+            if !cand_still_valid {
+                drop(slot_lock);
                 continue;
             }
 
-            type ProbeFuture<'a> = BoxFuture<
-                'a,
-                (
-                    usize,
-                    String,
-                    CliResult<crate::domain::account::AccountRecord>,
-                ),
-            >;
-            let mut in_flight: Vec<Option<ProbeFuture<'_>>> = to_refresh
-                .into_iter()
-                .map(|(idx, cid)| {
-                    let start_ts = clock.now_unix();
-                    let fut: ProbeFuture<'_> = Box::pin(async move {
-                        let res = refresh_account_quota_locked(
+            // Offline switch to `cand_id` (performs automatic Pre-Switch Sync-Back of outgoing slot!)
+            // R2-01 / R3-01: Hand off the full per-replica `expected_checkpoint` directly to the
+            // executor's own `pre_snap` so an external `agy login` on ANY managed replica (file
+            // or keyring) cancels before sync-back, journal write, or slot commit.
+            rctx.target_account_id = Some(cand_id.clone());
+            let switch_res = execute_switch_with_slot_lock_and_guard(
+                &slot_lock,
+                repo,
+                backend,
+                registry,
+                cand_id,
+                guard_mode,
+                false,
+                false,
+                Some(PreSwitchSlotExpectation::ExactCheckpoint(
+                    &expected_checkpoint,
+                )),
+                step_now,
+            );
+            let post_switch_rev = if switch_res.is_ok() {
+                // Capture expected index revision BEFORE releasing L1 (`slot_lock`) so no
+                // concurrent switch can slip into the gap after dropping `slot_lock`.
+                // Per-replica slot checkpoint comes directly from `outcome.committed_checkpoint`
+                // (never an unverified post-commit re-read!).
+                repo.read_snapshot().ok().map(|s| s.index.revision)
+            } else {
+                None
+            };
+            drop(slot_lock);
+
+            match switch_res {
+                Ok(outcome) => {
+                    pstate.consecutive_commit_failures = 0;
+                    current_slot_id = cand_id.clone();
+                    if let Some(r) = post_switch_rev {
+                        expected_index_revision = r;
+                    }
+                    if let Some(cp) = outcome.committed_checkpoint {
+                        expected_checkpoint = cp;
+                    }
+                }
+                Err(err)
+                    if matches!(
+                        err.error_code.as_str(),
+                        "active_slot_digest_changed" | "external_slot_modified"
+                    ) =>
+                {
+                    let c_now = active_clock.now_unix();
+                    self.persist_status(
+                        repo,
+                        &mut pstate,
+                        "cancelled",
+                        Some("active_slot_digest_changed"),
+                        c_now,
+                    )?;
+                    return Ok(rctx.into_report(
+                        c_now,
+                        "cancelled",
+                        Some("active_slot_digest_changed".into()),
+                        TickStageOutcome::CancelledStalePlan {
+                            reason: "active_slot_digest_changed".into(),
+                        },
+                    ));
+                }
+                Err(err) if err.error_code == "runtime_state_unverified" => {
+                    let post_now = active_clock.now_unix();
+                    if hop_idx == 0 {
+                        self.persist_status(
                             repo,
-                            transport,
-                            oauth_endpoints,
-                            quota_endpoints,
-                            registry,
-                            user_agent,
-                            &cid,
-                            start_ts,
+                            &mut pstate,
+                            "hold",
+                            Some("process_state_unverified"),
+                            post_now,
+                        )?;
+                        return Ok(rctx.into_report(
+                            post_now,
+                            "hold",
+                            Some("process_state_unverified".into()),
+                            TickStageOutcome::UncertainHold {
+                                reason: "process_state_unverified".into(),
+                            },
+                        ));
+                    }
+                    loop_exit = StepLoopExit::ProcessUnverified;
+                    break;
+                }
+                Err(err) if err.error_code == "active_agy_running" => {
+                    let post_now = active_clock.now_unix();
+                    if hop_idx == 0 {
+                        self.persist_status(
+                            repo,
+                            &mut pstate,
+                            "blocked_by_active_process",
+                            Some("waiting_for_agy_idle"),
+                            post_now,
+                        )?;
+                        return Ok(rctx.into_report(
+                            post_now,
+                            "blocked_by_active_process",
+                            Some("waiting_for_agy_idle".into()),
+                            TickStageOutcome::BlockedByActiveProcess {
+                                target_id: cand_id.clone(),
+                            },
+                        ));
+                    }
+                    loop_exit = StepLoopExit::BlockedByActiveProcess(cand_id.clone());
+                    break;
+                }
+                Err(err)
+                    if matches!(
+                        err.error_code.as_str(),
+                        "scope_reauth_required"
+                            | "account_reauth_required"
+                            | "account_validation_blocked"
+                    ) =>
+                {
+                    let fail_now = active_clock.now_unix();
+                    self.refresh_backoff_until.insert(
+                        cand_id.clone(),
+                        fail_now
+                            + CANDIDATE_REFRESH_BACKOFF_SECS
+                                .max((overrides.interval_secs as i64).saturating_mul(2)),
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    let post_now = active_clock.now_unix();
+                    return self
+                        .record_commit_failure_and_report(
+                            repo,
+                            &mut pstate,
+                            rctx,
+                            cand_id,
+                            &err,
+                            overrides.notify_override,
+                            post_now,
+                            shutdown_rx,
                         )
                         .await;
-                        (idx, cid, res)
-                    });
-                    Some(fut)
-                })
-                .collect();
+                }
+            }
 
-            let mut winner: Option<String> = None;
-            let mut failed_ids: Vec<String> = Vec::new();
-            let monitored_model = policy.monitored_model.clone();
-
-            std::future::poll_fn(|cx| {
-                let mut any_pending = false;
-                for slot_fut in &mut in_flight {
-                    if let Some(fut) = slot_fut {
-                        match fut.as_mut().poll(cx) {
-                            Poll::Ready((idx, cid, res)) => {
-                                *slot_fut = None;
-                                match res {
-                                    Ok(updated) => {
-                                        let eval = evaluate_account_quota(
-                                            &updated,
-                                            &monitored_model,
-                                            clock.now_unix(),
-                                            DEFAULT_QUOTA_MAX_AGE_SECS,
-                                        );
-                                        states[idx] = SlotProbeState::Resolved(eval);
-                                    }
-                                    Err(_) => {
-                                        failed_ids.push(cid);
-                                        states[idx] = SlotProbeState::Skipped;
-                                    }
+            // Live verification of `cand_id` via official `agy -p "/usage"` (with automatic sync-back!)
+            enum CandProbeRace {
+                Shutdown,
+                Timeout,
+                Done(
+                    Box<
+                        Result<
+                            crate::quota::official_cli::ActiveSlotQuotaRefreshOutcome,
+                            RefreshActiveSlotError,
+                        >,
+                    >,
+                ),
+            }
+            let cand_race = tokio::select! {
+                _ = shutdown_rx.changed() => CandProbeRace::Shutdown,
+                _ = tokio::time::sleep_until(tick_deadline) => CandProbeRace::Timeout,
+                res = refresh_active_slot_quota_detailed(
+                    repo,
+                    backend,
+                    runner,
+                    overrides.explicit_file_backend,
+                    Some(cand_id),
+                    active_clock.now_unix(),
+                ) => CandProbeRace::Done(Box::new(res)),
+            };
+            match cand_race {
+                CandProbeRace::Shutdown => {
+                    loop_exit = StepLoopExit::Shutdown;
+                    break;
+                }
+                CandProbeRace::Timeout => {
+                    loop_exit = StepLoopExit::TimedOut;
+                    break;
+                }
+                CandProbeRace::Done(boxed) => match *boxed {
+                    Ok(refreshed) => {
+                        if let Some(ref verified_cp) = refreshed.verified_checkpoint {
+                            expected_checkpoint.advance_from_verified_probe(verified_cp);
+                        }
+                        let probe_now = active_clock.now_unix();
+                        let cand_eval = evaluate_account_quota(
+                            &refreshed.account,
+                            &policy.monitored_model,
+                            probe_now,
+                            DEFAULT_QUOTA_MAX_AGE_SECS,
+                        );
+                        match cand_eval {
+                            QuotaEval::Known {
+                                remaining_percentage,
+                            } if remaining_percentage >= min_pct_f => {
+                                // ================= LANDED SUCCESSFULLY =================
+                                pstate.cooldown_until =
+                                    probe_now.saturating_add(overrides.cooldown_secs.max(0));
+                                pstate.last_rotated_candidate_id = Some(cand_id.clone());
+                                pstate.consecutive_commit_failures = 0;
+                                pstate.paused_on_failure = false;
+                                pstate.paused_reason = None;
+                                self.last_low_quota_hold_notified_account = None;
+                                self.persist_commit_status(
+                                    repo,
+                                    &mut pstate,
+                                    "cooldown",
+                                    Some("switch_committed"),
+                                    probe_now,
+                                )?;
+                                let snap = repo.read_snapshot().ok();
+                                let source_acc = snap
+                                    .as_ref()
+                                    .and_then(|s| s.accounts.iter().find(|a| a.id == source_id));
+                                let target_acc = Some(&refreshed.account);
+                                rctx.target_account_id = Some(cand_id.clone());
+                                rctx.target_email = Some(refreshed.account.email.clone());
+                                rctx.target_remaining_percentage = Some(remaining_percentage);
+                                if !*shutdown_rx.borrow()
+                                    && resolve_effective_notify_enabled(
+                                        repo,
+                                        false,
+                                        overrides.notify_override,
+                                    )
+                                {
+                                    let from_account = source_acc
+                                        .map(format_account_notify_label)
+                                        .unwrap_or_else(|| source_id.clone());
+                                    let to_account =
+                                        format_account_notify_label(&refreshed.account);
+                                    let source_windows = source_acc
+                                        .map(|a| {
+                                            evaluate_account_window_quotas(
+                                                a,
+                                                &policy.monitored_model,
+                                                probe_now,
+                                                DEFAULT_QUOTA_MAX_AGE_SECS,
+                                            )
+                                        })
+                                        .unwrap_or_default();
+                                    let target_windows = target_acc
+                                        .map(|a| {
+                                            evaluate_account_window_quotas(
+                                                a,
+                                                &policy.monitored_model,
+                                                probe_now,
+                                                DEFAULT_QUOTA_MAX_AGE_SECS,
+                                            )
+                                        })
+                                        .unwrap_or_default();
+                                    let persistent_switch =
+                                        resolve_effective_notify_persistent(repo);
+                                    send_daemon_notification_best_effort(
+                                        &DaemonNotificationEvent::Switched {
+                                            from_account,
+                                            to_account,
+                                            source_5h_pct: source_windows.short_5h_pct,
+                                            source_weekly_pct: source_windows.weekly_pct,
+                                            target_5h_pct: target_windows.short_5h_pct,
+                                            target_weekly_pct: target_windows.weekly_pct,
+                                        },
+                                        persistent_switch,
+                                        shutdown_rx,
+                                    )
+                                    .await;
+                                }
+                                return Ok(rctx.into_report(
+                                    probe_now,
+                                    "cooldown",
+                                    Some("switch_committed".into()),
+                                    TickStageOutcome::CommittedSwitch {
+                                        source_id,
+                                        target_id: cand_id.clone(),
+                                    },
+                                ));
+                            }
+                            QuotaEval::Known {
+                                remaining_percentage,
+                            } => {
+                                // Below candidate_min_percentage: do NOT set switch cooldown; record for hold backoff & best-so-far, then advance!
+                                probed_below_min_ids.push(cand_id.clone());
+                                if remaining_percentage > source_rem
+                                    && best_below_min
+                                        .as_ref()
+                                        .is_none_or(|(_, best)| remaining_percentage > *best)
+                                {
+                                    best_below_min = Some((cand_id.clone(), remaining_percentage));
                                 }
                             }
-                            Poll::Pending => {
-                                any_pending = true;
+                            QuotaEval::Unknown { .. }
+                            | QuotaEval::Stale { .. }
+                            | QuotaEval::Unavailable { .. } => {
+                                self.refresh_backoff_until.insert(
+                                    cand_id.clone(),
+                                    probe_now
+                                        + CANDIDATE_REFRESH_BACKOFF_SECS.max(
+                                            (overrides.interval_secs as i64).saturating_mul(2),
+                                        ),
+                                );
                             }
                         }
                     }
-                }
-
-                // Check in strict priority/round-robin order if a winner is already settled
-                // with zero unresolved higher-priority candidates ahead of it!
-                for (idx, st) in states.iter().enumerate() {
-                    match st {
-                        SlotProbeState::InFlight => break,
-                        SlotProbeState::Resolved(QuotaEval::Known {
-                            remaining_percentage,
-                        }) if *remaining_percentage >= min_pct => {
-                            winner = Some(chunk[idx].clone());
-                            // Dropping `in_flight` on return immediately cancels remaining lower-priority HTTP calls!
-                            return Poll::Ready(());
-                        }
-                        SlotProbeState::Resolved(_) | SlotProbeState::Skipped => {}
+                    Err(RefreshActiveSlotError::PreProbeSlotMismatch(_)) => {
+                        let c_now = active_clock.now_unix();
+                        self.persist_status(
+                            repo,
+                            &mut pstate,
+                            "cancelled",
+                            Some("active_slot_digest_changed"),
+                            c_now,
+                        )?;
+                        return Ok(rctx.into_report(
+                            c_now,
+                            "cancelled",
+                            Some("active_slot_digest_changed".into()),
+                            TickStageOutcome::CancelledStalePlan {
+                                reason: "active_slot_digest_changed".into(),
+                            },
+                        ));
                     }
-                }
-
-                if any_pending {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(())
-                }
-            })
-            .await;
-
-            // Drop remaining futures before mutating `self.refresh_backoff_until`
-            drop(in_flight);
-            let done_now = clock.now_unix();
-            for fid in failed_ids {
-                self.refresh_backoff_until
-                    .insert(fid, done_now + CANDIDATE_REFRESH_BACKOFF_SECS);
-            }
-            if let Some(chosen) = winner {
-                return Ok(Some(chosen));
+                    Err(RefreshActiveSlotError::Cli(ce))
+                        if ce.error_code == "active_slot_changed_during_refresh" =>
+                    {
+                        let c_now = active_clock.now_unix();
+                        self.persist_status(
+                            repo,
+                            &mut pstate,
+                            "cancelled",
+                            Some("selected_account_changed_manually"),
+                            c_now,
+                        )?;
+                        return Ok(rctx.into_report(
+                            c_now,
+                            "cancelled",
+                            Some("selected_account_changed_manually".into()),
+                            TickStageOutcome::CancelledStalePlan {
+                                reason: "selected_account_changed_manually".into(),
+                            },
+                        ));
+                    }
+                    Err(err) => {
+                        if let RefreshActiveSlotError::Probe {
+                            verified_checkpoint: Some(ref verified_cp),
+                            ..
+                        } = err
+                        {
+                            expected_checkpoint.advance_from_verified_probe(verified_cp);
+                        }
+                        // AuthRequired / RateLimited / Timeout / CommandFailed: no cooldown, backoff and advance!
+                        let fail_now = active_clock.now_unix();
+                        self.refresh_backoff_until.insert(
+                            cand_id.clone(),
+                            fail_now
+                                + CANDIDATE_REFRESH_BACKOFF_SECS
+                                    .max((overrides.interval_secs as i64).saturating_mul(2)),
+                        );
+                    }
+                },
             }
         }
 
-        Ok(None)
+        // ================= STAGE 6: STEADY-STATE FINALIZATION =================
+        // Handle mid-hop guards FIRST without switching while an active process or unverified `/proc`
+        // prevents safe slot mutation, and without falsely claiming all candidates were exhausted!
+        match loop_exit {
+            StepLoopExit::BlockedByActiveProcess(target_id) => {
+                let end_now = active_clock.now_unix();
+                rctx.target_account_id = Some(target_id.clone());
+                self.persist_status(
+                    repo,
+                    &mut pstate,
+                    "blocked_by_active_process",
+                    Some("waiting_for_agy_idle"),
+                    end_now,
+                )?;
+                return Ok(rctx.into_report(
+                    end_now,
+                    "blocked_by_active_process",
+                    Some("waiting_for_agy_idle".into()),
+                    TickStageOutcome::BlockedByActiveProcess { target_id },
+                ));
+            }
+            StepLoopExit::ProcessUnverified => {
+                let end_now = active_clock.now_unix();
+                self.persist_status(
+                    repo,
+                    &mut pstate,
+                    "hold",
+                    Some("process_state_unverified"),
+                    end_now,
+                )?;
+                return Ok(rctx.into_report(
+                    end_now,
+                    "hold",
+                    Some("process_state_unverified".into()),
+                    TickStageOutcome::UncertainHold {
+                        reason: "process_state_unverified".into(),
+                    },
+                ));
+            }
+            StepLoopExit::LockBusy => {
+                let end_now = active_clock.now_unix();
+                self.persist_status(
+                    repo,
+                    &mut pstate,
+                    "lock_busy",
+                    Some("slot_lock_busy"),
+                    end_now,
+                )?;
+                return Ok(rctx.into_report(
+                    end_now,
+                    "lock_busy",
+                    Some("slot_lock_busy".into()),
+                    TickStageOutcome::UncertainHold {
+                        reason: "slot_lock_busy".into(),
+                    },
+                ));
+            }
+            StepLoopExit::Exhausted | StepLoopExit::TimedOut | StepLoopExit::Shutdown => {}
+        }
+
+        // Stay on the best probed candidate strictly above `source_rem`, otherwise return to `source_id`.
+        let (final_stay_id, final_stay_rem) = match best_below_min {
+            Some((best_id, best_rem)) if best_rem > source_rem => (best_id, best_rem),
+            _ => (source_id.clone(), source_rem),
+        };
+
+        if current_slot_id != final_stay_id {
+            let existing_needs_kr = journal_on_disk_may_need_keyring(paths);
+            let mut slot_lock = match ActiveSlotLock::try_acquire(
+                paths,
+                backend.uses_keyring() || existing_needs_kr,
+            ) {
+                Ok(l) => l,
+                Err(e) if e.exit_code == ExitCode::LockBusyOrConflict => {
+                    let b_now = active_clock.now_unix();
+                    self.persist_status(
+                        repo,
+                        &mut pstate,
+                        "lock_busy",
+                        Some("slot_lock_busy"),
+                        b_now,
+                    )?;
+                    return Ok(rctx.into_report(
+                        b_now,
+                        "lock_busy",
+                        Some("slot_lock_busy".into()),
+                        TickStageOutcome::UncertainHold {
+                            reason: "slot_lock_busy".into(),
+                        },
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
+            if !slot_lock.includes_keyring_scope() && journal_on_disk_may_need_keyring(paths) {
+                drop(slot_lock);
+                slot_lock = match ActiveSlotLock::try_acquire(paths, true) {
+                    Ok(l) => l,
+                    Err(e) if e.exit_code == ExitCode::LockBusyOrConflict => {
+                        let b_now = active_clock.now_unix();
+                        self.persist_status(
+                            repo,
+                            &mut pstate,
+                            "lock_busy",
+                            Some("slot_lock_busy"),
+                            b_now,
+                        )?;
+                        return Ok(rctx.into_report(
+                            b_now,
+                            "lock_busy",
+                            Some("slot_lock_busy".into()),
+                            TickStageOutcome::UncertainHold {
+                                reason: "slot_lock_busy".into(),
+                            },
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                };
+            }
+
+            // Only settle back if no external manual switch, policy change/disable, or external
+            // slot overwrite intervened!
+            let live_snap = repo.read_snapshot()?;
+            if live_snap.index.selected_account_id.as_deref() != Some(current_slot_id.as_str())
+                || live_snap.index.revision != expected_index_revision
+            {
+                drop(slot_lock);
+                let c_now = active_clock.now_unix();
+                let cancel_reason = if live_snap.index.selected_account_id.as_deref()
+                    != Some(current_slot_id.as_str())
+                {
+                    "selected_account_changed_manually"
+                } else {
+                    "store_index_revision_changed"
+                };
+                self.persist_status(repo, &mut pstate, "cancelled", Some(cancel_reason), c_now)?;
+                return Ok(rctx.into_report(
+                    c_now,
+                    "cancelled",
+                    Some(cancel_reason.into()),
+                    TickStageOutcome::CancelledStalePlan {
+                        reason: cancel_reason.into(),
+                    },
+                ));
+            }
+            let (live_policy, live_policy_rev) =
+                resolve_effective_daemon_policy(repo, &overrides.policy_overlay)?;
+            if live_policy_rev != decision_policy_revision || !live_policy.enabled {
+                drop(slot_lock);
+                let c_now = active_clock.now_unix();
+                self.persist_status(
+                    repo,
+                    &mut pstate,
+                    "cancelled",
+                    Some("policy_revision_changed_or_disabled"),
+                    c_now,
+                )?;
+                return Ok(rctx.into_report(
+                    c_now,
+                    "cancelled",
+                    Some("policy_revision_changed_or_disabled".into()),
+                    TickStageOutcome::CancelledStalePlan {
+                        reason: "policy_revision_changed_or_disabled".into(),
+                    },
+                ));
+            }
+            let settle_pre_slot_expectation = if matches!(loop_exit, StepLoopExit::Exhausted) {
+                PreSwitchSlotExpectation::ExactCheckpoint(&expected_checkpoint)
+            } else {
+                PreSwitchSlotExpectation::CheckpointOrSameAccountRotation {
+                    expected: &expected_checkpoint,
+                    account_id: current_slot_id.as_str(),
+                }
+            };
+            let live_replicas = backend.inspect_replicas(paths);
+            if !replica_inspection_matches_expectation(
+                repo,
+                &live_snap,
+                &live_replicas,
+                settle_pre_slot_expectation,
+            ) {
+                drop(slot_lock);
+                let c_now = active_clock.now_unix();
+                self.persist_status(
+                    repo,
+                    &mut pstate,
+                    "cancelled",
+                    Some("active_slot_digest_changed"),
+                    c_now,
+                )?;
+                return Ok(rctx.into_report(
+                    c_now,
+                    "cancelled",
+                    Some("active_slot_digest_changed".into()),
+                    TickStageOutcome::CancelledStalePlan {
+                        reason: "active_slot_digest_changed".into(),
+                    },
+                ));
+            }
+
+            let allow_val_block = final_stay_id == source_id;
+            let settle_now = active_clock.now_unix();
+            let settle_res = execute_switch_with_slot_lock_and_guard(
+                &slot_lock,
+                repo,
+                backend,
+                registry,
+                &final_stay_id,
+                guard_mode,
+                false,
+                allow_val_block,
+                Some(settle_pre_slot_expectation),
+                settle_now,
+            );
+            drop(slot_lock);
+
+            match settle_res {
+                Ok(_) => {
+                    pstate.consecutive_commit_failures = 0;
+                }
+                Err(err)
+                    if matches!(
+                        err.error_code.as_str(),
+                        "active_slot_digest_changed" | "external_slot_modified"
+                    ) =>
+                {
+                    let c_now = active_clock.now_unix();
+                    self.persist_status(
+                        repo,
+                        &mut pstate,
+                        "cancelled",
+                        Some("active_slot_digest_changed"),
+                        c_now,
+                    )?;
+                    return Ok(rctx.into_report(
+                        c_now,
+                        "cancelled",
+                        Some("active_slot_digest_changed".into()),
+                        TickStageOutcome::CancelledStalePlan {
+                            reason: "active_slot_digest_changed".into(),
+                        },
+                    ));
+                }
+                Err(err) if err.error_code == "active_agy_running" => {
+                    let b_now = active_clock.now_unix();
+                    rctx.target_account_id = Some(final_stay_id.clone());
+                    self.persist_status(
+                        repo,
+                        &mut pstate,
+                        "blocked_by_active_process",
+                        Some("waiting_for_agy_idle"),
+                        b_now,
+                    )?;
+                    return Ok(rctx.into_report(
+                        b_now,
+                        "blocked_by_active_process",
+                        Some("waiting_for_agy_idle".into()),
+                        TickStageOutcome::BlockedByActiveProcess {
+                            target_id: final_stay_id,
+                        },
+                    ));
+                }
+                Err(err) if err.error_code == "runtime_state_unverified" => {
+                    let b_now = active_clock.now_unix();
+                    self.persist_status(
+                        repo,
+                        &mut pstate,
+                        "hold",
+                        Some("process_state_unverified"),
+                        b_now,
+                    )?;
+                    return Ok(rctx.into_report(
+                        b_now,
+                        "hold",
+                        Some("process_state_unverified".into()),
+                        TickStageOutcome::UncertainHold {
+                            reason: "process_state_unverified".into(),
+                        },
+                    ));
+                }
+                Err(err) => {
+                    let post_now = active_clock.now_unix();
+                    rctx.target_account_id = Some(final_stay_id.clone());
+                    return self
+                        .record_commit_failure_and_report(
+                            repo,
+                            &mut pstate,
+                            rctx,
+                            &final_stay_id,
+                            &err,
+                            overrides.notify_override,
+                            post_now,
+                            shutdown_rx,
+                        )
+                        .await;
+                }
+            }
+        }
+
+        let end_now = active_clock.now_unix();
+        if matches!(loop_exit, StepLoopExit::Shutdown) || *shutdown_rx.borrow() {
+            return Ok(rctx.into_report(
+                end_now,
+                "hold",
+                Some("shutdown_signal_received".into()),
+                TickStageOutcome::UncertainHold {
+                    reason: "shutdown_signal_received".into(),
+                },
+            ));
+        }
+        if matches!(loop_exit, StepLoopExit::TimedOut) {
+            self.persist_status(
+                repo,
+                &mut pstate,
+                "hold",
+                Some("tick_budget_timeout"),
+                end_now,
+            )?;
+            return Ok(rctx.into_report(
+                end_now,
+                "hold",
+                Some("tick_budget_timeout".into()),
+                TickStageOutcome::UncertainHold {
+                    reason: "tick_budget_timeout".into(),
+                },
+            ));
+        }
+
+        // Write hold backoff for all probed low candidates + outgoing source (excluding `final_stay_id`
+        // so the active slot can still be re-checked for recovery on the next scheduled tick without
+        // re-hopping/ping-ponging through exhausted dormant accounts).
+        let hold_backoff_secs =
+            CANDIDATE_REFRESH_BACKOFF_SECS.max((overrides.interval_secs as i64).saturating_mul(2));
+        let hold_until = end_now.saturating_add(hold_backoff_secs);
+        for low_id in &probed_below_min_ids {
+            if low_id != &final_stay_id {
+                self.refresh_backoff_until
+                    .insert(low_id.clone(), hold_until);
+            }
+        }
+        if source_id != final_stay_id {
+            self.refresh_backoff_until
+                .insert(source_id.clone(), hold_until);
+        }
+
+        rctx.target_account_id = (final_stay_id != source_id).then_some(final_stay_id.clone());
+        if final_stay_id != source_id {
+            pstate.consecutive_commit_failures = 0;
+            rctx.target_email = repo
+                .read_account_unchecked(&final_stay_id)
+                .ok()
+                .map(|a| a.email);
+            rctx.target_remaining_percentage = Some(final_stay_rem);
+        }
+        self.persist_status(
+            repo,
+            &mut pstate,
+            "no_candidate",
+            Some("no_qualified_candidate"),
+            end_now,
+        )?;
+        self.notify_holding_low_quota_once(
+            repo,
+            overrides.notify_override,
+            &final_stay_id,
+            final_stay_rem,
+            policy.candidate_min_percentage,
+            shutdown_rx,
+        )
+        .await;
+
+        Ok(rctx.into_report(
+            end_now,
+            "no_candidate",
+            Some("no_qualified_candidate".into()),
+            TickStageOutcome::NoQualifiedCandidate {
+                reason: "no_qualified_candidate".into(),
+            },
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_commit_failure_and_report(
+        &mut self,
+        repo: &StoreRepository,
+        pstate: &mut DaemonPersistentState,
+        rctx: TickReportCtx,
+        target_id: &str,
+        err: &CliError,
+        notify_override: Option<bool>,
+        post_now: i64,
+        shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> CliResult<DaemonTickReport> {
+        pstate.consecutive_commit_failures = pstate.consecutive_commit_failures.saturating_add(1);
+        let is_recovery_incomplete = err.error_code == "recovery_incomplete"
+            || err.exit_code == ExitCode::PartialCommitOrRecovery;
+        let code = safe_daemon_error_code(&err.error_code);
+        let reason = if is_recovery_incomplete {
+            "incomplete_switch_recovery".to_string()
+        } else {
+            code.clone()
+        };
+        if is_recovery_incomplete
+            || pstate.consecutive_commit_failures >= MAX_CONSECUTIVE_COMMIT_FAILURES
+        {
+            pstate.paused_on_failure = true;
+            pstate.paused_reason = Some(if is_recovery_incomplete {
+                "incomplete_switch_recovery".to_string()
+            } else {
+                format!("commit_failed: {code}")
+            });
+        }
+        let paused = pstate.paused_on_failure;
+        let phase = if paused {
+            "paused_on_failure"
+        } else {
+            "commit_failed"
+        };
+        let persisted_reason = pstate
+            .paused_reason
+            .clone()
+            .unwrap_or_else(|| reason.clone());
+        self.persist_status(repo, pstate, phase, Some(&persisted_reason), post_now)?;
+        if paused {
+            let (stage, notify_reason) = if is_recovery_incomplete {
+                (
+                    "Switch commit recovery",
+                    "Incomplete switch recovery requires manual inspection.".to_string(),
+                )
+            } else {
+                ("Switch commit", format!("Switch commit failed ({code})."))
+            };
+            notify_paused_on_failure(
+                repo,
+                notify_override,
+                stage,
+                Some(target_id),
+                pstate,
+                &notify_reason,
+                shutdown_rx,
+            )
+            .await;
+        }
+        Ok(rctx.into_report(
+            post_now,
+            phase,
+            Some(reason.clone()),
+            TickStageOutcome::CommitFailed { reason, paused },
+        ))
+    }
+
+    async fn notify_holding_low_quota_once(
+        &mut self,
+        repo: &StoreRepository,
+        notify_override: Option<bool>,
+        staying_account_id: &str,
+        staying_remaining_pct: f64,
+        candidate_min_pct: u8,
+        shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) {
+        if self.last_low_quota_hold_notified_account.as_deref() == Some(staying_account_id) {
+            return;
+        }
+        self.last_low_quota_hold_notified_account = Some(staying_account_id.to_string());
+        if *shutdown_rx.borrow() || !resolve_effective_notify_enabled(repo, false, notify_override)
+        {
+            return;
+        }
+        let snap = repo.read_snapshot().ok();
+        let staying_account = resolve_account_notify_label(snap.as_ref(), staying_account_id);
+        let persistent_switch = resolve_effective_notify_persistent(repo);
+        send_daemon_notification_best_effort(
+            &DaemonNotificationEvent::HoldingLowQuota {
+                staying_account,
+                staying_remaining_pct: staying_remaining_pct.clamp(0.0, 100.0).round() as u8,
+                candidate_min_pct,
+            },
+            persistent_switch,
+            shutdown_rx,
+        )
+        .await;
     }
 
     fn persist_status(
@@ -2315,168 +2837,6 @@ impl DaemonEngine {
     }
 }
 
-enum RevalidateVerdict {
-    Proceed(PolicyMode),
-    HoldUnverified,
-    Cancel(String),
-}
-
-fn revalidate_pending_under_l1(
-    repo: &StoreRepository,
-    backend: &dyn CredentialBackend,
-    plan: &PendingSwitchPlan,
-    overlay: &DaemonPolicyOverlay,
-    source_max_age: i64,
-    commit_now: i64,
-) -> CliResult<RevalidateVerdict> {
-    let paths = repo.paths();
-    let (policy, disk_policy_revision) = resolve_effective_daemon_policy(repo, overlay)?;
-
-    // 1. Re-verify runtime state right under L1 lock:
-    //    - `Unverified` ALWAYS fails closed (`HoldUnverified`) even in `Immediate` mode;
-    //    - Active `agy` processes cancel only in `Wait` mode (`Immediate` updates slot for new terminals).
-    match observe_runtime_state(paths) {
-        RuntimeState::Idle => {}
-        RuntimeState::Unverified { .. } => {
-            return Ok(RevalidateVerdict::HoldUnverified);
-        }
-        RuntimeState::ManagedRunning { .. } | RuntimeState::UnmanagedRunning { .. } => {
-            if policy.mode == PolicyMode::Wait {
-                return Ok(RevalidateVerdict::Cancel(
-                    "active_process_started_before_commit".into(),
-                ));
-            }
-        }
-    }
-
-    // 2. Re-read index & policy revisions against ORIGINAL decision snapshot (detects changes during Prepare too!)
-    let snapshot = repo.read_snapshot()?;
-    if snapshot.index.revision != plan.index_revision {
-        return Ok(RevalidateVerdict::Cancel(
-            "store_index_revision_changed".into(),
-        ));
-    }
-    if snapshot.index.selected_account_id.as_deref() != Some(plan.source_account_id.as_str()) {
-        return Ok(RevalidateVerdict::Cancel(
-            "selected_account_changed_manually".into(),
-        ));
-    }
-
-    if disk_policy_revision != plan.policy_revision || !policy.enabled {
-        return Ok(RevalidateVerdict::Cancel(
-            "policy_revision_changed_or_disabled".into(),
-        ));
-    }
-    if !policy
-        .candidate_account_ids
-        .contains(&plan.target_account_id)
-    {
-        return Ok(RevalidateVerdict::Cancel(
-            "target_removed_from_candidates".into(),
-        ));
-    }
-
-    // Check if any higher-priority candidate was re-enabled OR became qualified while `plan` was pending/waiting!
-    for (higher_id, was_disabled) in &plan.higher_priority_candidate_states {
-        if let Some(higher_acc) = snapshot.accounts.iter().find(|a| a.id == *higher_id) {
-            if *was_disabled && !higher_acc.disabled {
-                return Ok(RevalidateVerdict::Cancel(
-                    "higher_priority_candidate_enabled".into(),
-                ));
-            }
-            if higher_acc.is_usable_at(commit_now) {
-                let h_eval = evaluate_account_quota(
-                    higher_acc,
-                    &policy.monitored_model,
-                    commit_now,
-                    DEFAULT_QUOTA_MAX_AGE_SECS,
-                );
-                if matches!(
-                    h_eval,
-                    QuotaEval::Known { remaining_percentage } if remaining_percentage >= policy.candidate_min_percentage as f64
-                ) {
-                    return Ok(RevalidateVerdict::Cancel(
-                        "higher_priority_candidate_qualified".into(),
-                    ));
-                }
-            }
-        }
-    }
-
-    // 3. Re-verify active slot digest matches pre-prepare source slot
-    let slot_state = backend.inspect_slot(paths);
-    if slot_state.raw_digest() != Some(plan.source_slot_digest.as_str()) {
-        return Ok(RevalidateVerdict::Cancel(
-            "active_slot_digest_changed".into(),
-        ));
-    }
-
-    // 4. Re-verify both source and target accounts at REAL `commit_now` (usability, token expiry, reset_time <= commit_now, age)
-    let Some(source_acc) = snapshot
-        .accounts
-        .iter()
-        .find(|a| a.id == plan.source_account_id)
-    else {
-        return Ok(RevalidateVerdict::Cancel("source_account_deleted".into()));
-    };
-    let Some(target_acc) = snapshot
-        .accounts
-        .iter()
-        .find(|a| a.id == plan.target_account_id)
-    else {
-        return Ok(RevalidateVerdict::Cancel("target_account_deleted".into()));
-    };
-    if !target_acc.is_usable_at(commit_now) {
-        return Ok(RevalidateVerdict::Cancel(
-            "target_account_became_unusable".into(),
-        ));
-    }
-    if target_acc
-        .token
-        .is_expiring_within(commit_now, TOKEN_REFRESH_SKEW_SECONDS)
-    {
-        return Ok(RevalidateVerdict::Cancel(
-            "target_token_expired_before_commit".into(),
-        ));
-    }
-
-    let source_eval = evaluate_account_quota(
-        source_acc,
-        &policy.monitored_model,
-        commit_now,
-        source_max_age,
-    );
-    match source_eval {
-        QuotaEval::Known {
-            remaining_percentage,
-        } if remaining_percentage <= policy.reserve_percentage as f64 => {}
-        _ => {
-            return Ok(RevalidateVerdict::Cancel(
-                "source_quota_no_longer_below_reserve".into(),
-            ))
-        }
-    }
-
-    let target_eval = evaluate_account_quota(
-        target_acc,
-        &policy.monitored_model,
-        commit_now,
-        DEFAULT_QUOTA_MAX_AGE_SECS,
-    );
-    match target_eval {
-        QuotaEval::Known {
-            remaining_percentage,
-        } if remaining_percentage >= policy.candidate_min_percentage as f64 => {}
-        _ => {
-            return Ok(RevalidateVerdict::Cancel(
-                "target_quota_no_longer_meets_minimum".into(),
-            ))
-        }
-    }
-
-    Ok(RevalidateVerdict::Proceed(policy.mode))
-}
-
 /// Apply deterministic basis-point jitter (`-1000..=1000` => `[0.90, 1.10] * base_interval`) per Blueprint §7.2 Rule 1.
 pub fn apply_interval_jitter_bps(base_interval: Duration, jitter_bps: i32) -> Duration {
     let clamped = jitter_bps.clamp(-1000, 1000) as i128;
@@ -2515,45 +2875,34 @@ pub(crate) fn spawn_shutdown_signal_watcher() -> tokio::sync::watch::Receiver<bo
 
 /// Foreground daemon loop (`agy-switch-cli daemon [--interval] [--cooldown] [--once]`).
 /// Never forks into background; handles `SIGINT`/`SIGTERM` cleanly in BOTH `--once` and continuous modes,
-/// uses `MissedTickBehavior::Delay` + true `±10%` jitter, and enforces single-tick hard timeout (`45s`).
-#[allow(clippy::too_many_arguments)]
+/// uses `MissedTickBehavior::Delay` + true `±10%` jitter, and delegates active-slot usage checks to official `agy -p "/usage"`.
 pub async fn run_foreground_daemon(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
-    transport: &dyn HttpTransport,
-    oauth_endpoints: &OAuthEndpoints,
-    quota_endpoints: &CloudCodeEndpoints,
     registry: &OAuthClientRegistry,
-    user_agent: &str,
     overrides: DaemonConfigOverrides,
 ) -> CliResult<()> {
     let daemon_lock = DaemonInstanceLock::try_acquire(repo.paths())?;
     let shutdown_rx = spawn_shutdown_signal_watcher();
+    let runner = SystemOfficialCliRunner::default();
     run_foreground_daemon_with_shutdown(
         daemon_lock,
         repo,
         backend,
-        transport,
-        oauth_endpoints,
-        quota_endpoints,
+        &runner,
         registry,
-        user_agent,
         overrides,
         shutdown_rx,
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run_foreground_daemon_with_shutdown(
     _daemon_lock: DaemonInstanceLock,
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
-    transport: &dyn HttpTransport,
-    oauth_endpoints: &OAuthEndpoints,
-    quota_endpoints: &CloudCodeEndpoints,
+    runner: &dyn OfficialCliQuotaRunner,
     registry: &OAuthClientRegistry,
-    user_agent: &str,
     overrides: DaemonConfigOverrides,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> CliResult<()> {
@@ -2572,11 +2921,8 @@ pub async fn run_foreground_daemon_with_shutdown(
             .run_single_tick_report_with_shutdown(
                 repo,
                 backend,
-                transport,
-                oauth_endpoints,
-                quota_endpoints,
+                runner,
                 registry,
-                user_agent,
                 &overrides,
                 now,
                 &mut shutdown_rx,
@@ -2628,11 +2974,8 @@ pub async fn run_foreground_daemon_with_shutdown(
                     .run_single_tick_report_with_shutdown(
                         repo,
                         backend,
-                        transport,
-                        oauth_endpoints,
-                        quota_endpoints,
+                        runner,
                         registry,
-                        user_agent,
                         &overrides,
                         now,
                         &mut shutdown_rx,

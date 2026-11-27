@@ -2,13 +2,10 @@ use crate::cli::args::{StatsWindowArgs, MAX_STATS_WATCH_INTERVAL_SECS};
 use crate::cli::dto::terminal_text;
 use crate::error::{CliError, CliResult};
 use crate::paths::HeadlessPaths;
-use crate::session::external_slot::ExternalSlotTarget;
 use crate::stats::{
-    collect_token_stats_for_external_target_with_now,
-    collect_token_stats_list_for_external_target_with_now, collect_token_stats_list_with_now,
-    collect_token_stats_with_now, is_strict_normalized_abs_path, resolve_stats_range_spec,
-    truncate_display_width, StatsListViewDto, StatsSource, StatsViewDto, APP_DIR_NAME,
-    CLI_DIR_NAME, CONVERSATIONS_DIR, GEMINI_DIR, TOKEN_ARCHIVE_FILE,
+    collect_token_stats_list_with_now, collect_token_stats_with_now, is_strict_normalized_abs_path,
+    resolve_stats_range_spec, truncate_display_width, StatsListViewDto, StatsSource, StatsViewDto,
+    APP_DIR_NAME, CLI_DIR_NAME, CONVERSATIONS_DIR, GEMINI_DIR, TOKEN_ARCHIVE_FILE,
 };
 use crate::store::fs_atomic::{
     is_single_normal_filename, open_child_dir_nofollow, open_existing_dir_nofollow, ChildDirOpen,
@@ -569,45 +566,10 @@ fn scan_client_dir_fingerprint(
 
 /// Pure read-only, zero-symlink-following metadata fingerprint of watched SQLite sources.
 /// Returns `None` on transient I/O errors so callers conservatively force a full scan.
-#[cfg(test)]
 pub(crate) fn compute_stats_watch_fingerprint(
     home_dir: &Path,
     source: StatsSource,
 ) -> Option<StatsWatchFingerprint> {
-    compute_stats_watch_fingerprint_for_target(home_dir, source, None)
-}
-
-pub(crate) fn compute_stats_watch_fingerprint_for_target(
-    home_dir: &Path,
-    source: StatsSource,
-    external_target_dir: Option<&Path>,
-) -> Option<StatsWatchFingerprint> {
-    if let Some(ext_dir) = external_target_dir {
-        if !is_strict_normalized_abs_path(ext_dir) {
-            return Some(StatsWatchFingerprint {
-                entries: Vec::new(),
-            });
-        }
-        let ext_fd = match open_existing_dir_nofollow(ext_dir) {
-            Ok(Some(fd)) => fd,
-            Ok(None) => {
-                return Some(StatsWatchFingerprint {
-                    entries: Vec::new(),
-                })
-            }
-            Err(e) if e.error_code == "data_error" => {
-                return Some(StatsWatchFingerprint {
-                    entries: Vec::new(),
-                })
-            }
-            Err(_) => return None,
-        };
-        let mut entries = Vec::new();
-        scan_opened_client_dir_fingerprint(&ext_fd, "external", true, &mut entries).ok()?;
-        entries.sort();
-        return Some(StatsWatchFingerprint { entries });
-    }
-
     if !is_strict_normalized_abs_path(home_dir) {
         return Some(StatsWatchFingerprint {
             entries: Vec::new(),
@@ -769,25 +731,14 @@ fn write_ansi_watch_frame(frame: &str) -> CliResult<()> {
 fn collect_snapshot_sync(
     paths: &HeadlessPaths,
     args: &StatsWindowArgs,
-    external_target: Option<&ExternalSlotTarget>,
     view: StatsWatchView,
     now: &jiff::Zoned,
 ) -> CliResult<CachedStatsSnapshot> {
-    match (view, external_target) {
-        (StatsWatchView::Summary, Some(ext)) => {
-            collect_token_stats_for_external_target_with_now(paths, ext, args, now)
-                .map(Box::new)
-                .map(CachedStatsSnapshot::Summary)
-        }
-        (StatsWatchView::List, Some(ext)) => {
-            collect_token_stats_list_for_external_target_with_now(paths, ext, args, now)
-                .map(Box::new)
-                .map(CachedStatsSnapshot::List)
-        }
-        (StatsWatchView::Summary, None) => collect_token_stats_with_now(paths, args, now)
+    match view {
+        StatsWatchView::Summary => collect_token_stats_with_now(paths, args, now)
             .map(Box::new)
             .map(CachedStatsSnapshot::Summary),
-        (StatsWatchView::List, None) => collect_token_stats_list_with_now(paths, args, now)
+        StatsWatchView::List => collect_token_stats_list_with_now(paths, args, now)
             .map(Box::new)
             .map(CachedStatsSnapshot::List),
     }
@@ -805,7 +756,6 @@ fn now_local_hms_and_date() -> (String, jiff::civil::Date) {
 pub async fn run_stats_watch(
     paths: &HeadlessPaths,
     args: &StatsWindowArgs,
-    external_target: Option<&ExternalSlotTarget>,
     initial_view: StatsWatchView,
     interval_secs: u64,
 ) -> CliResult<()> {
@@ -814,10 +764,7 @@ pub async fn run_stats_watch(
             "`--watch` interval must be between 1 and {MAX_STATS_WATCH_INTERVAL_SECS} seconds."
         )));
     }
-    // Fail fast on invalid target directory, invalid range flags, and non-TTY before touching signals or terminal state.
-    if let Some(ext) = external_target {
-        ext.ensure_slot_dir_initialized(paths)?;
-    }
+    // Fail fast on invalid range flags and non-TTY before touching signals or terminal state.
     let _ = resolve_stats_range_spec(args, jiff::Zoned::now().date())?;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(CliError::usage(
@@ -839,12 +786,7 @@ pub async fn run_stats_watch(
     let stop_keys = Arc::new(AtomicBool::new(false));
     let (mut key_rx, key_thread) = spawn_stdin_key_listener(Arc::clone(&stop_keys));
 
-    let source: StatsSource = if external_target.is_some() {
-        StatsSource::External
-    } else {
-        args.effective_source().into()
-    };
-    let external_target_owned = external_target.cloned();
+    let source: StatsSource = args.effective_source().into();
     let mut active_view = initial_view;
     let mut cached_snapshot: Option<CachedStatsSnapshot> = None;
     let mut last_fingerprint: Option<StatsWatchFingerprint> = None;
@@ -863,20 +805,14 @@ pub async fn run_stats_watch(
         if need_scan {
             let paths_c = paths.clone();
             let args_c = args.clone();
-            let ext_c = external_target_owned.clone();
             let view_c = active_view;
             let home_c = paths.home_dir.clone();
 
             let mut scan_handle = tokio::task::spawn_blocking(move || {
                 let scan_now = jiff::Zoned::now();
                 let scan_date = scan_now.date();
-                let fp = compute_stats_watch_fingerprint_for_target(
-                    &home_c,
-                    source,
-                    ext_c.as_ref().map(|e| e.slot_dir.as_path()),
-                );
-                let res =
-                    collect_snapshot_sync(&paths_c, &args_c, ext_c.as_ref(), view_c, &scan_now);
+                let fp = compute_stats_watch_fingerprint(&home_c, source);
+                let res = collect_snapshot_sync(&paths_c, &args_c, view_c, &scan_now);
                 (scan_date, fp, res)
             });
 
@@ -994,9 +930,8 @@ pub async fn run_stats_watch(
             _ = ticker.tick() => {
                 let (hms, today) = now_local_hms_and_date();
                 let home_c = paths.home_dir.clone();
-                let ext_dir_c = external_target_owned.as_ref().map(|e| e.slot_dir.clone());
                 let fp_opt = tokio::task::spawn_blocking(move || {
-                    compute_stats_watch_fingerprint_for_target(&home_c, source, ext_dir_c.as_deref())
+                    compute_stats_watch_fingerprint(&home_c, source)
                 })
                 .await
                 .ok()
@@ -1276,50 +1211,5 @@ mod tests {
             ]),
             vec![WatchKey::Quit]
         );
-    }
-
-    #[test]
-    fn synthetic_v126_watch_fingerprint_tracks_external_target_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let ext_dir = home.join(".t3/userdata/providers/antigravity/synth/antigravity-acp");
-        let conv_dir = ext_dir.join("conversations");
-        fs::create_dir_all(&conv_dir).unwrap();
-
-        let fp0 = compute_stats_watch_fingerprint_for_target(
-            &home,
-            StatsSource::External,
-            Some(&ext_dir),
-        )
-        .unwrap();
-        let db = conv_dir.join("c1.db");
-        fs::write(&db, b"v1").unwrap();
-        let fp1 = compute_stats_watch_fingerprint_for_target(
-            &home,
-            StatsSource::External,
-            Some(&ext_dir),
-        )
-        .unwrap();
-        assert_ne!(fp0, fp1);
-
-        // Unrelated sibling file outside conversations/ does not mutate watched SQLite fingerprint
-        fs::write(ext_dir.join("notes.txt"), b"hello").unwrap();
-        let fp1_same = compute_stats_watch_fingerprint_for_target(
-            &home,
-            StatsSource::External,
-            Some(&ext_dir),
-        )
-        .unwrap();
-        assert_eq!(fp1, fp1_same);
-
-        // Adding WAL file updates fingerprint
-        fs::write(conv_dir.join("c1.db-wal"), b"wal-bytes").unwrap();
-        let fp2 = compute_stats_watch_fingerprint_for_target(
-            &home,
-            StatsSource::External,
-            Some(&ext_dir),
-        )
-        .unwrap();
-        assert_ne!(fp1, fp2);
     }
 }

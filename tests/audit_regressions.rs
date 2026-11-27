@@ -16,7 +16,10 @@ use agy_switch_cli::oauth::refresh::{
 };
 use agy_switch_cli::oauth::registry::OAuthClientRegistry;
 use agy_switch_cli::paths::HeadlessPaths;
-use agy_switch_cli::quota::client::{refresh_account_quota_locked, CloudCodeEndpoints};
+use agy_switch_cli::quota::official_cli::{
+    refresh_active_slot_quota_with_runner, OfficialCliQuotaError, OfficialCliQuotaRunner,
+    OfficialCliUsageOutcome,
+};
 use agy_switch_cli::session::backend::{CredentialBackend, FileSessionBackend, SlotInspectState};
 use agy_switch_cli::session::journal::{read_journal_readonly, reconcile_journal_locked};
 use agy_switch_cli::session::payload::serialize_session_payload;
@@ -167,11 +170,7 @@ impl IsolatedHarness {
             )
             .env("NO_PROXY", "*")
             .env("AGY_SWITCH_CLI_PROXY", "direct")
-            .args([
-                "--data-dir",
-                data_dir.to_str().unwrap(),
-                "--no-remote-version",
-            ]);
+            .args(["--data-dir", data_dir.to_str().unwrap()]);
         c
     }
 }
@@ -206,10 +205,68 @@ fn fast_oauth() -> OAuthEndpoints {
     }
 }
 
-fn fast_quota() -> CloudCodeEndpoints {
-    CloudCodeEndpoints {
-        fallback_delay: Duration::from_millis(5),
-        ..CloudCodeEndpoints::default()
+type AuditSlotUsageFn = dyn Fn(&HeadlessPaths, bool, &str) -> Result<OfficialCliUsageOutcome, OfficialCliQuotaError>
+    + Send
+    + Sync;
+
+struct AuditSlotQuotaRunner {
+    handler: Arc<AuditSlotUsageFn>,
+}
+
+impl AuditSlotQuotaRunner {
+    fn from_handler<F>(f: F) -> Self
+    where
+        F: Fn(&HeadlessPaths, bool, &str) -> Result<OfficialCliUsageOutcome, OfficialCliQuotaError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            handler: Arc::new(f),
+        }
+    }
+}
+
+impl OfficialCliQuotaRunner for AuditSlotQuotaRunner {
+    fn query_active_usage<'a>(
+        &'a self,
+        paths: &'a HeadlessPaths,
+        explicit_file_backend: bool,
+    ) -> BoxFuture<'a, Result<OfficialCliUsageOutcome, OfficialCliQuotaError>> {
+        Box::pin(async move {
+            let slot_text = fs::read_to_string(&paths.active_slot_file).unwrap_or_default();
+            (self.handler)(paths, explicit_file_backend, &slot_text)
+        })
+    }
+}
+
+fn audit_quota_outcome(frac: f64, reset_str: &str) -> OfficialCliUsageOutcome {
+    OfficialCliUsageOutcome::Quota {
+        description: None,
+        groups: vec![agy_switch_cli::domain::quota::QuotaGroup {
+            display_name: "Gemini Models".into(),
+            description: Some("Models within this group: gemini-3.1-pro".into()),
+            buckets: vec![
+                agy_switch_cli::domain::quota::QuotaBucket {
+                    bucket_id: "gemini-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: frac,
+                    remaining_fraction_known: Some(true),
+                    reset_time: reset_str.into(),
+                    display_name: None,
+                    description: None,
+                },
+                agy_switch_cli::domain::quota::QuotaBucket {
+                    bucket_id: "gemini-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: frac,
+                    remaining_fraction_known: Some(true),
+                    reset_time: reset_str.into(),
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        }],
     }
 }
 
@@ -283,7 +340,6 @@ async fn a01_old_backup_import_never_rolls_back_rotated_refresh_token_concurrent
             &tr,
             &fast_oauth(),
             &OAuthClientRegistry::parse_from_raw(None, None),
-            "vscode/1.X.X (Antigravity/4.3.0)",
             "acc-1",
             true,
             now,
@@ -410,7 +466,6 @@ async fn a02_bootstrap_login_and_reauthorize_persist_tokens_durably_before_cance
             &tr1,
             &oauth_ep,
             &reg,
-            "vscode/1.X.X (Antigravity/4.3.0)",
             "1//EXISTING_BEFORE_ADD",
             None,
             None,
@@ -443,7 +498,6 @@ async fn a02_bootstrap_login_and_reauthorize_persist_tokens_durably_before_cance
             &tr2,
             &oauth_ep,
             &reg,
-            "vscode/1.X.X (Antigravity/4.3.0)",
             "1//BRAND_NEW_INPUT_RT",
             None,
             Some("My Label"),
@@ -476,7 +530,6 @@ async fn a02_bootstrap_login_and_reauthorize_persist_tokens_durably_before_cance
         &resume_mock,
         &fast_oauth(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "1//BRAND_NEW_INPUT_RT",
         None,
         Some("My Label"),
@@ -507,7 +560,6 @@ async fn a02_bootstrap_login_and_reauthorize_persist_tokens_durably_before_cance
             &tr3,
             &oauth_ep,
             &reg,
-            "vscode/1.X.X (Antigravity/4.3.0)",
             &target_before_reauth,
             &session,
             "4/reauth-code",
@@ -545,7 +597,6 @@ async fn a02_bootstrap_login_and_reauthorize_persist_tokens_durably_before_cance
             &tr4,
             &oauth_ep,
             &reg,
-            "vscode/1.X.X (Antigravity/4.3.0)",
             &session,
             "4/login-code",
             None,
@@ -615,7 +666,6 @@ async fn a03_and_a20_error_channels_non_utf8_argv_and_http_debug_never_reflect_s
         &mock_unknown_oauth,
         &fast_oauth(),
         &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-err",
         true,
         now,
@@ -958,15 +1008,16 @@ async fn a07_and_a08_daemon_cancels_on_prepare_policy_reorder_and_clock_reset_ex
         .write_slot(&paths, &serialize_session_payload(&src.token).unwrap())
         .unwrap();
 
-    // A07: During `c1` Prepare `/token` call, user reorders policy to `[c2, c1]`!
-    let repo_in_prepare = repo.clone();
+    // A07: User reorders policy to `[c2, c1]` right before Stage 5 Revalidate -> MUST cancel stale plan!
+    let repo_in_revalidate = repo.clone();
     let reordered_flag = Arc::new(AtomicBool::new(false));
     let rf = reordered_flag.clone();
-    let mock_a07 = MockTransport::from_handler(move |_req| {
+    let mut engine = DaemonEngine::new();
+    engine.before_revalidate_hook = Some(Arc::new(move || {
         if !rf.swap(true, Ordering::SeqCst) {
-            repo_in_prepare
+            repo_in_revalidate
                 .with_write_lock(|tx| {
-                    let mut pol = repo_in_prepare.read_policy()?;
+                    let mut pol = repo_in_revalidate.read_policy()?;
                     let prev = pol.revision;
                     pol.candidate_account_ids = vec!["c2".into(), "c1".into()];
                     tx.save_policy(&mut pol, Some(prev), now + 1)?;
@@ -974,50 +1025,32 @@ async fn a07_and_a08_daemon_cancels_on_prepare_policy_reorder_and_clock_reset_ex
                 })
                 .unwrap();
         }
-        Ok(MockTransport::json_response(
-            200,
-            json!({
-                "access_token": "ya29.C1_FRESH",
-                "expires_in": 3600,
-                "token_type": "Bearer",
-                "refresh_token": "1//RT_C1",
-                "scope": "openid https://www.googleapis.com/auth/cloud-platform"
-            }),
-        ))
+    }));
+
+    let runner_a07 = AuditSlotQuotaRunner::from_handler(|_, _, _| {
+        Ok(audit_quota_outcome(0.85, "2099-01-01T00:00:00Z"))
     });
-
-    // Even when a live `agy` process is running under `PolicyMode::Wait`, an in-`Prepare` policy reorder
-    // MUST immediately cancel the stale plan in Stage 4 rather than getting stuck in `BlockedByActiveProcess`!
-    fs::create_dir_all(h.proc_dir.join("9101")).unwrap();
-    fs::write(
-        h.proc_dir.join("9101/stat"),
-        "9101 (agy) S 1 9101 9101 0 -1 0 0 0 0 0 1 1 0 0 20 0 1 0 777111 1000 10",
-    )
-    .unwrap();
-    fs::write(h.proc_dir.join("9101/comm"), "agy\n").unwrap();
-
-    let mut engine = DaemonEngine::new();
     let out_a07 = engine
         .run_single_tick(
             &repo,
             &backend,
-            &mock_a07,
-            &fast_oauth(),
-            &fast_quota(),
+            &runner_a07,
             &reg,
-            "vscode/1.X.X (Antigravity/4.3.0)",
-            &DaemonConfigOverrides::default(),
+            &DaemonConfigOverrides {
+                step_buffer_delay: Duration::ZERO,
+                ..DaemonConfigOverrides::default()
+            },
             now,
         )
         .await
         .unwrap();
-    fs::remove_dir_all(h.proc_dir.join("9101")).unwrap();
+    engine.before_revalidate_hook = None;
     assert_eq!(
         out_a07,
         TickStageOutcome::CancelledStalePlan {
             reason: "policy_revision_changed_or_disabled".into()
         },
-        "In-Prepare policy reorder MUST cancel stale plan to c1!"
+        "In-flight policy reorder MUST cancel stale plan!"
     );
     assert_eq!(
         repo.read_snapshot()
@@ -1028,290 +1061,199 @@ async fn a07_and_a08_daemon_cancels_on_prepare_policy_reorder_and_clock_reset_ex
         Some("src")
     );
 
-    // A08: Candidate `c2` has `reset = now + 1s`; Prepare network advances `ManualClock` by 2s (`now + 2 > reset`)!
+    // A08: Candidate `c2` live `/usage` returns `reset = now + 1s`, while `ManualClock` advances by 2s
+    //      during the probe (`now + 2 > reset`) -> evaluated as `Stale` (NOT qualified) and NOT landed!
     let clock = Arc::new(ManualClock::new(now));
+    let reset_plus_1 = jiff::Timestamp::from_second(now + 1).unwrap().to_string();
+    let clock_in_probe = clock.clone();
+    let reset_for_c2 = reset_plus_1.clone();
+    let runner_a08 = AuditSlotQuotaRunner::from_handler(move |_, _, slot| {
+        if slot.contains("1//RT_C2") {
+            clock_in_probe.advance(2);
+            Ok(audit_quota_outcome(0.90, &reset_for_c2))
+        } else {
+            Ok(audit_quota_outcome(0.05, "2099-01-01T00:00:00Z"))
+        }
+    });
     repo.with_write_lock(|tx| {
-        let mut acc_c2 = tx.load_account_opt("c2")?.unwrap();
-        acc_c2.token.expiry_timestamp = now + 10; // Force Prepare `/token`
-        acc_c2.quota = Some(make_q(0.90, now + 1)); // Resets at `now + 1`!
-        tx.save_account(&acc_c2)
+        let mut pol = repo.read_policy()?;
+        let prev = pol.revision;
+        pol.candidate_account_ids = vec!["c2".into()];
+        tx.save_policy(&mut pol, Some(prev), now + 2)?;
+        Ok(())
     })
     .unwrap();
-
-    let clock_in_net = clock.clone();
-    let mock_a08 = MockTransport::from_handler(move |_req| {
-        // Network latency crosses `reset_time = now + 1` -> clock is now `now + 2`!
-        clock_in_net.advance(2);
-        Ok(MockTransport::json_response(
-            200,
-            json!({
-                "access_token": "ya29.C2_FRESH",
-                "expires_in": 3600,
-                "token_type": "Bearer",
-                "refresh_token": "1//RT_C2",
-                "scope": "openid https://www.googleapis.com/auth/cloud-platform"
-            }),
-        ))
-    });
 
     let mut engine_clock = DaemonEngine::with_clock(clock.clone());
     let out_a08 = engine_clock
         .run_single_tick(
             &repo,
             &backend,
-            &mock_a08,
-            &fast_oauth(),
-            &fast_quota(),
+            &runner_a08,
             &reg,
-            "vscode/1.X.X (Antigravity/4.3.0)",
-            &DaemonConfigOverrides::default(),
+            &DaemonConfigOverrides {
+                step_buffer_delay: Duration::ZERO,
+                ..DaemonConfigOverrides::default()
+            },
             now,
         )
         .await
         .unwrap();
+    assert!(
+        matches!(out_a08, TickStageOutcome::NoQualifiedCandidate { .. }),
+        "Candidate whose reset_time passed during probe MUST NOT land: got {out_a08:?}"
+    );
     assert_eq!(
-        out_a08,
-        TickStageOutcome::CancelledStalePlan {
-            reason: "target_quota_no_longer_meets_minimum".into()
-        },
-        "Candidate whose reset_time passed during Prepare MUST be rejected as Stale in Revalidate!"
+        repo.read_snapshot()
+            .unwrap()
+            .index
+            .selected_account_id
+            .as_deref(),
+        Some("src")
     );
 }
 
 // ============================================================================
-// A09 + A10: Single-env quota context, missing primary fraction, scope/validation/503-403 evidence
+// A09 + A10: Single-env tier guard, missing primary fraction, and OfficialCli validation-block isolation
 // ============================================================================
 #[tokio::test]
 async fn a09_and_a10_quota_single_env_missing_primary_and_error_evidence_chains() {
     let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let repo = StoreRepository::new(h.paths());
-    let reg = OAuthClientRegistry::parse_from_raw(None, None);
+    let backend = FileSessionBackend;
     let now = 1_800_000_000i64;
 
     let acc = make_acc("acc-q", "q@example.invalid", "1//RT_Q", now + 7200, now);
-    repo.with_write_lock(|tx| tx.upsert_account(acc, true, now))
+    repo.with_write_lock(|tx| tx.upsert_account(acc.clone(), true, now))
+        .unwrap();
+    backend
+        .write_slot(&h.paths(), &serialize_session_payload(&acc.token).unwrap())
         .unwrap();
 
-    // 1. A09(A): Primary Daily load=503, fallback load=200 Free, Daily catalog+summary=200 without 5h -> MUST be Unknown!
-    let mock_cross_free = MockTransport::from_handler(|req| {
-        if req.url == "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist" {
-            return Ok(MockTransport::json_response(503, json!({})));
-        }
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"currentTier": {"id": "free", "name": "Free Tier"}}),
-            ));
-        }
-        if req.url == "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels" {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.80, "resetTime": "2099-01-01T00:00:00Z"}}}}),
-            ));
-        }
-        if req.url
-            == "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
-        {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"groups": [{"displayName": "Gemini Models", "buckets": [{"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.80, "resetTime": "2099-01-07T00:00:00Z"}]}]}),
-            ));
-        }
-        panic!("unexpected url {}", req.url);
-    });
-    let res_cross = refresh_account_quota_locked(
-        &repo,
-        &mock_cross_free,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
-        "acc-q",
-        now,
-    )
-    .await
-    .unwrap();
-    let obs_cross = res_cross.quota.unwrap();
-    assert_eq!(obs_cross.source_env, QuotaSourceEnv::Daily);
-    assert_eq!(obs_cross.subscription_tier, None);
+    // 1. A09(A): Cross-env `tier_source_env != source_env` Free tier without 5h bucket MUST stay Unknown!
+    let mut obs_cross = QuotaObservation::new(now, QuotaSourceEnv::Daily);
+    obs_cross.subscription_tier = Some("Free Tier".into());
+    obs_cross.tier_source_env = Some(QuotaSourceEnv::Sandbox);
+    obs_cross
+        .models
+        .push(agy_switch_cli::domain::quota::ModelQuota {
+            name: "gemini-3.8-flash".into(),
+            percentage: 80,
+            percentage_known: Some(true),
+            observed_remaining_fraction: Some(0.80),
+            primary_quota: Some(agy_switch_cli::domain::quota::PrimaryModelQuota {
+                remaining_fraction: Some(0.80),
+                reset_time: "2099-01-01T00:00:00Z".into(),
+            }),
+            quota_bucket_id: Some("gemini-weekly".into()),
+            reset_time: "2099-01-01T00:00:00Z".into(),
+            display_name: None,
+            supports_images: None,
+            supports_thinking: None,
+            thinking_budget: None,
+            recommended: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            supported_mime_types: None,
+        });
+    obs_cross.quota_groups = Some(vec![agy_switch_cli::domain::quota::QuotaGroup {
+        display_name: "Gemini Models".into(),
+        description: None,
+        buckets: vec![agy_switch_cli::domain::quota::QuotaBucket {
+            bucket_id: "gemini-weekly".into(),
+            window: "weekly".into(),
+            remaining_fraction: 0.80,
+            remaining_fraction_known: Some(true),
+            reset_time: "2099-01-07T00:00:00Z".into(),
+            display_name: None,
+            description: None,
+        }],
+    }]);
     assert!(matches!(
         evaluate_quota_observation(&obs_cross, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
         agy_switch_cli::domain::quota::QuotaEval::Unknown { .. }
     ));
 
-    // 2. A09(B): Model `remainingFraction` missing (`None`), summary has both 5h+weekly=80% -> MUST remain Unknown!
-    let mock_missing_primary = MockTransport::from_handler(|req| {
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
-            ));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"resetTime": "2099-01-01T00:00:00Z"}}}}),
-            ));
-        }
-        Ok(MockTransport::json_response(
-            200,
-            json!({"groups": [{"displayName": "Gemini Models", "buckets": [
-                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.80, "resetTime": "2099-01-01T05:00:00Z"},
-                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.80, "resetTime": "2099-01-07T00:00:00Z"}
-            ]}]}),
-        ))
+    // 2. A09(B): Model `primary_quota.remaining_fraction == None` MUST remain Unknown even with complete summary!
+    let mut obs_mp = obs_cross.clone();
+    obs_mp.tier_source_env = Some(QuotaSourceEnv::Daily);
+    obs_mp.subscription_tier = Some("Google AI Pro".into());
+    obs_mp.models[0].primary_quota = Some(agy_switch_cli::domain::quota::PrimaryModelQuota {
+        remaining_fraction: None,
+        reset_time: "2099-01-01T00:00:00Z".into(),
     });
-    let res_mp = refresh_account_quota_locked(
-        &repo,
-        &mock_missing_primary,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
-        "acc-q",
-        now + 1,
-    )
-    .await
-    .unwrap();
+    obs_mp.quota_groups.as_mut().unwrap()[0].buckets.push(
+        agy_switch_cli::domain::quota::QuotaBucket {
+            bucket_id: "gemini-5h".into(),
+            window: "5h".into(),
+            remaining_fraction: 0.80,
+            remaining_fraction_known: Some(true),
+            reset_time: "2099-01-01T05:00:00Z".into(),
+            display_name: None,
+            description: None,
+        },
+    );
     assert!(matches!(
-        evaluate_quota_observation(
-            res_mp.quota.as_ref().unwrap(),
-            "gemini",
-            now + 1,
-            DEFAULT_QUOTA_MAX_AGE_SECS
-        ),
+        evaluate_quota_observation(&obs_mp, "gemini", now + 1, DEFAULT_QUOTA_MAX_AGE_SECS),
         agy_switch_cli::domain::quota::QuotaEval::Unknown { .. }
     ));
 
-    // 3. A10(2): Primary Daily 403 VALIDATION_REQUIRED + fallback 200 -> MUST keep `validation_blocked = true`!
-    let mock_prod_val = MockTransport::from_handler(|req| {
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.googleapis.com")
-        {
-            if req.url.ends_with(":loadCodeAssist") {
-                return Ok(MockTransport::json_response(200, json!({})));
-            }
-            return Ok(MockTransport::json_response(
-                403,
-                json!({"error": {"message": "VALIDATION_REQUIRED", "validationUrl": "https://example.invalid/v"}}),
-            ));
-        }
-        Ok(MockTransport::json_response(200, json!({"models": {}})))
+    // 3. A10: Official CLI `ValidationBlocked` marks `validation_blocked = true`, transient failure preserves it,
+    //    and a clean Official CLI `/usage` clears `validation_blocked = false`!
+    let runner_val = AuditSlotQuotaRunner::from_handler(|_, _, _| {
+        Ok(OfficialCliUsageOutcome::ValidationBlocked {
+            reason: "VALIDATION_REQUIRED".into(),
+        })
     });
-    let blocked_acc = refresh_account_quota_locked(
+    let blocked = refresh_active_slot_quota_with_runner(
         &repo,
-        &mock_prod_val,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
-        "acc-q",
+        &backend,
+        &runner_val,
+        true,
+        Some("acc-q"),
         now + 2,
     )
     .await
-    .unwrap();
-    assert!(blocked_acc.validation_blocked);
+    .unwrap()
+    .account;
+    assert!(blocked.validation_blocked);
 
-    // Even if Primary Daily subsequently returns 503 and fallback returns 200, fallback 200 MUST NOT clear `validation_blocked`!
-    let mock_prod503_daily200 = MockTransport::from_handler(|req| {
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.googleapis.com")
-        {
-            return Ok(MockTransport::json_response(503, json!({})));
-        }
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(200, json!({})));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(200, json!({"models": {}})));
-        }
-        Ok(MockTransport::json_response(404, json!({})))
+    let runner_fail = AuditSlotQuotaRunner::from_handler(|_, _, _| {
+        Err(OfficialCliQuotaError::CommandFailed("transient 503".into()))
     });
-    let still_blocked = refresh_account_quota_locked(
+    assert!(refresh_active_slot_quota_with_runner(
         &repo,
-        &mock_prod503_daily200,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
-        "acc-q",
+        &backend,
+        &runner_fail,
+        true,
+        Some("acc-q"),
         now + 3,
     )
     .await
-    .unwrap();
-    assert!(still_blocked.validation_blocked);
+    .is_err());
+    assert!(
+        repo.read_account_unchecked("acc-q")
+            .unwrap()
+            .validation_blocked,
+        "Transient Official CLI error must never clear validation_blocked"
+    );
 
-    // 4. A10(3): Catalog `[503, 503, 403]` -> MUST return transient error (`quota_network_error`), NOT `is_forbidden = true`!
-    repo.with_write_lock(|tx| tx.mark_account_enabled("acc-q"))
-        .unwrap();
-    let mock_503_503_403 = MockTransport::from_handler(|req| {
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(200, json!({})));
-        }
-        if req.url.contains("sandbox.googleapis.com") {
-            return Ok(MockTransport::json_response(403, json!({})));
-        }
-        Ok(MockTransport::json_response(503, json!({})))
+    let runner_ok = AuditSlotQuotaRunner::from_handler(|_, _, _| {
+        Ok(audit_quota_outcome(0.85, "2099-01-01T00:00:00Z"))
     });
-    let err_503_403 = refresh_account_quota_locked(
+    let cleared = refresh_active_slot_quota_with_runner(
         &repo,
-        &mock_503_503_403,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
-        "acc-q",
+        &backend,
+        &runner_ok,
+        true,
+        Some("acc-q"),
         now + 4,
     )
     .await
-    .unwrap_err();
-    assert_eq!(err_503_403.error_code, "quota_network_error");
-    assert!(
-        !repo
-            .read_account_unchecked("acc-q")
-            .unwrap()
-            .quota
-            .unwrap()
-            .is_forbidden
-    );
-
-    // 5. A10(1): Summary `403 ACCESS_TOKEN_SCOPE_INSUFFICIENT` -> 1 summary attempt, marks `ScopeReauthRequired`!
-    let summary_hits = Arc::new(AtomicUsize::new(0));
-    let sh = summary_hits.clone();
-    let mock_sum_scope = MockTransport::from_handler(move |req| {
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(200, json!({})));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(200, json!({"models": {}})));
-        }
-        sh.fetch_add(1, Ordering::SeqCst);
-        Ok(MockTransport::json_response(
-            403,
-            json!({"error": {"details": [{"reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}),
-        ))
-    });
-    let sum_err = refresh_account_quota_locked(
-        &repo,
-        &mock_sum_scope,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
-        "acc-q",
-        now + 5,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(sum_err.error_code, "scope_reauth_required");
-    assert_eq!(summary_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        repo.read_account_unchecked("acc-q").unwrap().disabled_code,
-        Some(DisableReasonCode::ScopeReauthRequired)
-    );
+    .unwrap()
+    .account;
+    assert!(!cleared.validation_blocked);
 }
 
 // ============================================================================
@@ -1376,7 +1318,6 @@ async fn a11_reauthorize_preserves_manual_disable_and_propagates_state_write_ero
         &mock_reauth,
         &fast_oauth(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         &acc,
         &session,
         "4/ok-code",
@@ -1413,7 +1354,6 @@ async fn a11_reauthorize_preserves_manual_disable_and_propagates_state_write_ero
         &MockTransport::default(),
         &fast_oauth(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-erofs",
         false,
         now,
@@ -1605,21 +1545,21 @@ async fn a16_and_a17_sigterm_graceful_daemon_once_and_pty_tui_echo_restore() {
     let repo = StoreRepository::new(paths.clone());
     let now = jiff::Timestamp::now().as_second();
 
-    // Seed low-quota source account + local hanging HTTP server so `daemon --once` awaits network!
-    let listener = ::tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let connected = Arc::new(Notify::new());
-    let connected_c = connected.clone();
-    let hold_server = ::tokio::spawn(async move {
-        let (_sock, _) = listener.accept().await.unwrap();
-        connected_c.notify_one();
-        std::future::pending::<()>().await;
-    });
+    // Seed low-quota source account + slow synthetic `agy` binary so `daemon --once` blocks in Stage 1 `/usage`!
+    let slow_agy = h.tmp.path().join("slow-daemon-once-agy");
+    let started_marker = h.tmp.path().join("daemon-once-agy-started");
+    fs::write(
+        &slow_agy,
+        format!(
+            "#!/bin/sh\necho started > \"{}\"\nsleep 30\n",
+            started_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&slow_agy, fs::Permissions::from_mode(0o755)).unwrap();
 
     let mut acc = make_acc("acc-d", "d@example.invalid", "1//RT_D", now + 7200, now);
-    acc.quota = None; // Unknown -> Stage 1 triggers network refresh!
+    acc.quota = None; // Unknown -> Stage 1 triggers official CLI probe!
     repo.with_write_lock(|tx| {
         tx.upsert_account(acc.clone(), true, now)?;
         let acc2 = make_acc("acc-d2", "d2@example.invalid", "1//RT_D2", now + 7200, now);
@@ -1637,22 +1577,27 @@ async fn a16_and_a17_sigterm_graceful_daemon_once_and_pty_tui_echo_restore() {
         .write_slot(&paths, &serialize_session_payload(&acc.token).unwrap())
         .unwrap();
 
-    // Route HTTPS_PROXY to our hanging local listener so `daemon --once` blocks in Stage 1 HTTP!
     let mut d_once = h
         .cli()
-        .env_remove("AGY_SWITCH_CLI_PROXY")
-        .env_remove("NO_PROXY")
-        .env("HTTPS_PROXY", format!("http://127.0.0.1:{port}"))
+        .env("AGY_SWITCH_CLI_AGY_BIN", &slow_agy)
         .args(["daemon", "--once"])
         .spawn()
         .unwrap();
 
-    connected.notified().await;
+    for _ in 0..100 {
+        if started_marker.exists() {
+            break;
+        }
+        ::tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        started_marker.exists(),
+        "daemon --once did not invoke synthetic `agy`"
+    );
     unsafe {
         libc::kill(d_once.id() as i32, libc::SIGTERM);
     }
     let st = d_once.wait().unwrap();
-    hold_server.abort();
     assert_eq!(
         st.code(),
         Some(0),
@@ -1774,26 +1719,16 @@ fn real_sigkill_signal_9_after_slot_commit_recovers_cleanly_via_status_and_write
             }
         }
 
-        let rt = ::tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let l1 = ActiveSlotLock::try_acquire(&paths, false).unwrap();
-            let _ = execute_switch_with_slot_lock(
-                &l1,
-                &repo,
-                &PauseAfterSlotWriteBackend { marker },
-                &MockTransport::default(),
-                &OAuthEndpoints::default(),
-                &OAuthClientRegistry::parse_from_raw(None, None),
-                "vscode/1.X.X (Antigravity/4.3.0)",
-                "acc-b",
-                false,
-                1_800_000_000,
-            )
-            .await;
-        });
+        let l1 = ActiveSlotLock::try_acquire(&paths, false).unwrap();
+        let _ = execute_switch_with_slot_lock(
+            &l1,
+            &repo,
+            &PauseAfterSlotWriteBackend { marker },
+            &OAuthClientRegistry::parse_from_raw(None, None),
+            "acc-b",
+            false,
+            1_800_000_000,
+        );
         return;
     }
 
@@ -1982,104 +1917,52 @@ async fn daemon_candidate_budget_cancels_lower_priority_probe_while_preserving_i
         .write_slot(&paths, &serialize_session_payload(&src.token).unwrap())
         .unwrap();
 
-    struct BudgetProbeTransport {
-        active: Arc<AtomicUsize>,
-        peak: Arc<AtomicUsize>,
-        c2_rotated: Arc<Notify>,
-    }
-    impl HttpTransport for BudgetProbeTransport {
-        fn execute<'a>(
-            &'a self,
-            req: HttpRequest,
-        ) -> BoxFuture<'a, Result<HttpResponse, TransportError>> {
-            let active = self.active.clone();
-            let peak = self.peak.clone();
-            let c2_rot = self.c2_rotated.clone();
-            Box::pin(async move {
-                struct DecOnDrop(Arc<AtomicUsize>);
-                impl Drop for DecOnDrop {
-                    fn drop(&mut self) {
-                        self.0.fetch_sub(1, Ordering::SeqCst);
-                    }
-                }
-                let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(cur, Ordering::SeqCst);
-                let _guard = DecOnDrop(active);
-
-                if req.url.contains("oauth2.googleapis.com/token") {
-                    return Ok(MockTransport::json_response(
-                        200,
-                        json!({
-                            "access_token": "ya29.AT_c2_NEW",
-                            "expires_in": 3600,
-                            "token_type": "Bearer",
-                            "refresh_token": "1//C2_ROTATED_SURVIVES_DROP",
-                            "scope": "openid https://www.googleapis.com/auth/cloud-platform"
-                        }),
-                    ));
-                }
-                let auth = req
-                    .headers
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default();
-                assert!(
-                    !auth.contains("AT_c4") && !auth.contains("AT_c5"),
-                    "Chunk 2 candidates c4/c5 must never be queried!"
-                );
-                if auth.contains("AT_c2_NEW") || auth.contains("AT_c3") {
-                    if auth.contains("AT_c2_NEW") {
-                        c2_rot.notify_one();
-                    }
-                    // Hang forever until cancelled when c1 wins!
-                    std::future::pending::<()>().await;
-                    unreachable!()
-                }
-                // `c1` waits until `c2` has rotated & persisted its RT, then returns 85% winner!
-                if req.url.ends_with(":loadCodeAssist") {
-                    c2_rot.notified().await;
-                    return Ok(MockTransport::json_response(
-                        200,
-                        json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
-                    ));
-                }
-                if req.url.ends_with(":fetchAvailableModels") {
-                    return Ok(MockTransport::json_response(
-                        200,
-                        json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.85, "resetTime": "2099-01-01T00:00:00Z"}}}}),
-                    ));
-                }
-                Ok(MockTransport::json_response(
-                    200,
-                    json!({"groups": [{"displayName": "Gemini Models", "buckets": [
-                        {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.85, "resetTime": "2099-01-01T05:00:00Z"},
-                        {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.85, "resetTime": "2099-01-07T00:00:00Z"}
-                    ]}]}),
-                ))
-            })
-        }
-    }
-
+    // Step-and-Verify probes candidates sequentially ONE AT A TIME (`peak == 1`):
+    // `c1` returns 20% (< 50%) AND rotates its refresh_token inside the slot during `/usage` ->
+    // rotated RT is synced back and SURVIVES when Step-and-Verify advances to `c2` (85% winner)!
+    // `c3`, `c4`, `c5` are NEVER probed!
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
-    let tr = BudgetProbeTransport {
-        active: active.clone(),
-        peak: peak.clone(),
-        c2_rotated: Arc::new(Notify::new()),
-    };
+    let active_c = active.clone();
+    let peak_c = peak.clone();
+    let runner = AuditSlotQuotaRunner::from_handler(move |p, _, slot| {
+        let cur = active_c.fetch_add(1, Ordering::SeqCst) + 1;
+        peak_c.fetch_max(cur, Ordering::SeqCst);
+        let res = if slot.contains("1//RT_C1") {
+            // Simulate official `agy` rotating c1's refresh_token during `/usage`!
+            fs::write(
+                &p.active_slot_file,
+                serde_json::to_vec(&json!({
+                    "access_token": "ya29.AT_c1_NEW",
+                    "refresh_token": "1//C1_ROTATED_SURVIVES_HOP",
+                    "token_type": "Bearer",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "id_token_email": "c1@example.invalid"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            Ok(audit_quota_outcome(0.20, "2099-01-01T00:00:00Z"))
+        } else if slot.contains("1//RT_C2_OLD") {
+            Ok(audit_quota_outcome(0.85, "2099-01-01T00:00:00Z"))
+        } else {
+            panic!("Candidates c3/c4/c5 must NEVER be probed after c2 lands! slot={slot}");
+        };
+        active_c.fetch_sub(1, Ordering::SeqCst);
+        res
+    });
 
     let mut engine = DaemonEngine::new();
     let out = engine
         .run_single_tick(
             &repo,
             &backend,
-            &tr,
-            &fast_oauth(),
-            &fast_quota(),
+            &runner,
             &reg,
-            "vscode/1.X.X (Antigravity/4.3.0)",
-            &DaemonConfigOverrides::default(),
+            &DaemonConfigOverrides {
+                step_buffer_delay: Duration::ZERO,
+                ..DaemonConfigOverrides::default()
+            },
             now,
         )
         .await
@@ -2089,22 +1972,18 @@ async fn daemon_candidate_budget_cancels_lower_priority_probe_while_preserving_i
         out,
         TickStageOutcome::CommittedSwitch {
             source_id: "src".into(),
-            target_id: "c1".into()
+            target_id: "c2".into()
         }
     );
-    assert!(peak.load(Ordering::SeqCst) <= 3);
+    assert_eq!(peak.load(Ordering::SeqCst), 1);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    // `c1`'s rotated refresh_token MUST survive advancing to `c2`!
     assert_eq!(
-        active.load(Ordering::SeqCst),
-        0,
-        "All cancelled lower-priority futures must be dropped"
-    );
-    // `c2`'s rotated refresh_token MUST survive cancellation!
-    assert_eq!(
-        repo.read_account_unchecked("c2")
+        repo.read_account_unchecked("c1")
             .unwrap()
             .token
             .refresh_token,
-        "1//C2_ROTATED_SURVIVES_DROP"
+        "1//C1_ROTATED_SURVIVES_HOP"
     );
 }
 
@@ -2208,63 +2087,115 @@ async fn review_r2_quota_eval_supports_group_named_pool0_buckets_rejects_untagge
     let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let repo = StoreRepository::new(h.paths());
-    let reg = OAuthClientRegistry::parse_from_raw(None, None);
+    let backend = FileSessionBackend;
     let now = 1_800_000_000i64;
 
-    // 1. Upstream `pool-0`, `pool-1`, `pool-2` buckets (classified via `group.display_name`) evaluate to `Known`!
-    let mock_pool0 = MockTransport::from_handler(|req| {
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"cloudaicompanionProject": "prod-proj-1", "paidTier": {"id": "pro", "name": "Google AI Pro"}}),
-            ));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"models": {
-                    "gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.90, "resetTime": "2099-01-01T00:00:00Z"}},
-                    "claude-sonnet-4": {"quotaInfo": {"remainingFraction": 0.85, "resetTime": "2099-01-01T00:00:00Z"}},
-                    "gemini-4-argon": {"quotaInfo": {"remainingFraction": 0.70, "resetTime": "2099-01-01T00:00:00Z"}}
-                }}),
-            ));
-        }
-        Ok(MockTransport::json_response(
-            200,
-            json!({"groups": [
-                {"displayName": "Gemini Models", "buckets": [
-                    {"bucketId": "pool-0", "window": "weekly", "remainingFraction": 0.75, "resetTime": "2099-01-07T00:00:00Z"},
-                    {"bucketId": "pool-0", "window": "5h", "remainingFraction": 0.60, "resetTime": "2099-01-01T05:00:00Z"}
-                ]},
-                {"displayName": "Claude / GPT", "buckets": [
-                    {"bucketId": "pool-1", "window": "weekly", "remainingFraction": 0.55, "resetTime": "2099-01-07T00:00:00Z"},
-                    {"bucketId": "pool-1", "window": "5h", "remainingFraction": 0.50, "resetTime": "2099-01-01T05:00:00Z"}
-                ]},
-                {"displayName": "Gemini 4 Argon", "buckets": [
-                    {"bucketId": "pool-2", "window": "weekly", "remainingFraction": 0.40, "resetTime": "2099-01-07T00:00:00Z"}
-                ]}
-            ]}),
-        ))
-    });
-
-    let acc = make_acc("acc-p0", "p0@example.invalid", "1//RT_P0", now + 7200, now);
-    repo.with_write_lock(|tx| tx.upsert_account(acc, true, now))
+    // 1. Official CLI `pool-0`, `pool-1`, `pool-2` buckets (classified via `group.display_name`) evaluate to `Known`!
+    let mut acc = make_acc("acc-p0", "p0@example.invalid", "1//RT_P0", now + 7200, now);
+    acc.token.project_id = Some("prod-proj-1".into());
+    repo.with_write_lock(|tx| tx.upsert_account(acc.clone(), true, now))
+        .unwrap();
+    backend
+        .write_slot(&h.paths(), &serialize_session_payload(&acc.token).unwrap())
         .unwrap();
 
-    let updated = refresh_account_quota_locked(
+    let runner_pool0 = AuditSlotQuotaRunner::from_handler(|p, _, _| {
+        // Official `agy` writes `user_tier` + rotated RT into slot during `/usage`
+        fs::write(
+            &p.active_slot_file,
+            serde_json::to_vec(&json!({
+                "access_token": "ya29.SUM_RENEWED",
+                "refresh_token": "1//RT_P0_ROTATED_IN_AGY",
+                "token_type": "Bearer",
+                "expiry": "2099-01-01T00:00:00Z",
+                "id_token_email": "p0@example.invalid",
+                "user_tier": "Google AI Pro"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Ok(OfficialCliUsageOutcome::Quota {
+            description: None,
+            groups: vec![
+                agy_switch_cli::domain::quota::QuotaGroup {
+                    display_name: "Gemini Models".into(),
+                    description: None,
+                    buckets: vec![
+                        agy_switch_cli::domain::quota::QuotaBucket {
+                            bucket_id: "pool-0".into(),
+                            window: "weekly".into(),
+                            remaining_fraction: 0.75,
+                            remaining_fraction_known: Some(true),
+                            reset_time: "2099-01-07T00:00:00Z".into(),
+                            display_name: None,
+                            description: None,
+                        },
+                        agy_switch_cli::domain::quota::QuotaBucket {
+                            bucket_id: "pool-0".into(),
+                            window: "5h".into(),
+                            remaining_fraction: 0.60,
+                            remaining_fraction_known: Some(true),
+                            reset_time: "2099-01-01T05:00:00Z".into(),
+                            display_name: None,
+                            description: None,
+                        },
+                    ],
+                },
+                agy_switch_cli::domain::quota::QuotaGroup {
+                    display_name: "Claude / GPT".into(),
+                    description: None,
+                    buckets: vec![
+                        agy_switch_cli::domain::quota::QuotaBucket {
+                            bucket_id: "pool-1".into(),
+                            window: "weekly".into(),
+                            remaining_fraction: 0.55,
+                            remaining_fraction_known: Some(true),
+                            reset_time: "2099-01-07T00:00:00Z".into(),
+                            display_name: None,
+                            description: None,
+                        },
+                        agy_switch_cli::domain::quota::QuotaBucket {
+                            bucket_id: "pool-1".into(),
+                            window: "5h".into(),
+                            remaining_fraction: 0.50,
+                            remaining_fraction_known: Some(true),
+                            reset_time: "2099-01-01T05:00:00Z".into(),
+                            display_name: None,
+                            description: None,
+                        },
+                    ],
+                },
+                agy_switch_cli::domain::quota::QuotaGroup {
+                    display_name: "Gemini 4 Argon".into(),
+                    description: None,
+                    buckets: vec![agy_switch_cli::domain::quota::QuotaBucket {
+                        bucket_id: "pool-2".into(),
+                        window: "weekly".into(),
+                        remaining_fraction: 0.40,
+                        remaining_fraction_known: Some(true),
+                        reset_time: "2099-01-07T00:00:00Z".into(),
+                        display_name: None,
+                        description: None,
+                    }],
+                },
+            ],
+        })
+    });
+
+    let updated = refresh_active_slot_quota_with_runner(
         &repo,
-        &mock_pool0,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
-        "acc-p0",
+        &backend,
+        &runner_pool0,
+        true,
+        Some("acc-p0"),
         now,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .account;
     let obs = updated.quota.as_ref().unwrap();
     assert_eq!(updated.token.project_id.as_deref(), Some("prod-proj-1"));
+    assert_eq!(updated.token.refresh_token, "1//RT_P0_ROTATED_IN_AGY");
     assert_eq!(
         evaluate_quota_observation(obs, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
         agy_switch_cli::domain::quota::QuotaEval::Known {
@@ -2308,114 +2239,6 @@ async fn review_r2_quota_eval_supports_group_named_pool0_buckets_rejects_untagge
         evaluate_quota_observation(&untagged_free, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
         agy_switch_cli::domain::quota::QuotaEval::Unknown { .. }
     ));
-
-    // 3. Fallback `Sandbox`/`Production` 200 OK MUST NOT overwrite existing authoritative `prod-proj-1`!
-    let mock_daily_fallback = MockTransport::from_handler(|req| {
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.googleapis.com")
-        {
-            return Ok(MockTransport::json_response(503, json!({})));
-        }
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"cloudaicompanionProject": "daily-staging-proj-999"}),
-            ));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(200, json!({"models": {}})));
-        }
-        Ok(MockTransport::json_response(404, json!({})))
-    });
-    let after_daily = refresh_account_quota_locked(
-        &repo,
-        &mock_daily_fallback,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
-        "acc-p0",
-        now + 1,
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        after_daily.token.project_id.as_deref(),
-        Some("prod-proj-1"),
-        "Fallback Daily project_id must never overwrite existing Production project_id!"
-    );
-
-    // 4. Audit §4.2 #2: `:retrieveUserQuotaSummary` HTTP 401 triggers exactly ONE forced refresh + replay!
-    let force_refreshes = Arc::new(AtomicUsize::new(0));
-    let summary_calls = Arc::new(AtomicUsize::new(0));
-    let fr = force_refreshes.clone();
-    let sc = summary_calls.clone();
-    let mock_sum_401 = MockTransport::from_handler(move |req| {
-        if req.url.contains("oauth2.googleapis.com/token") {
-            fr.fetch_add(1, Ordering::SeqCst);
-            return Ok(MockTransport::json_response(
-                200,
-                json!({
-                    "access_token": "ya29.SUM_401_RENEWED",
-                    "expires_in": 3600,
-                    "token_type": "Bearer",
-                    "refresh_token": "1//RT_P0_ROTATED_ON_SUM401",
-                    "scope": "openid https://www.googleapis.com/auth/cloud-platform"
-                }),
-            ));
-        }
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
-            ));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.80, "resetTime": "2099-01-01T00:00:00Z"}}}}),
-            ));
-        }
-        if sc.fetch_add(1, Ordering::SeqCst) == 0 {
-            return Ok(MockTransport::json_response(
-                401,
-                json!({"error": "unauthenticated"}),
-            ));
-        }
-        Ok(MockTransport::json_response(
-            200,
-            json!({"groups": [{"displayName": "Gemini Models", "buckets": [
-                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.80, "resetTime": "2099-01-01T05:00:00Z"},
-                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.80, "resetTime": "2099-01-07T00:00:00Z"}
-            ]}]}),
-        ))
-    });
-    let sum401_acc = refresh_account_quota_locked(
-        &repo,
-        &mock_sum_401,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
-        "acc-p0",
-        now + 2,
-    )
-    .await
-    .unwrap();
-    assert_eq!(force_refreshes.load(Ordering::SeqCst), 1);
-    assert_eq!(sum401_acc.token.refresh_token, "1//RT_P0_ROTATED_ON_SUM401");
-    assert_eq!(
-        evaluate_quota_observation(
-            sum401_acc.quota.as_ref().unwrap(),
-            "gemini",
-            now + 2,
-            DEFAULT_QUOTA_MAX_AGE_SECS
-        ),
-        agy_switch_cli::domain::quota::QuotaEval::Known {
-            remaining_percentage: 80.0
-        }
-    );
 }
 
 // ============================================================================
@@ -2581,7 +2404,6 @@ async fn review_r4_stale_rt_client_binding_overwrite_disable_recovery_and_pendin
         &zero_net,
         &fast_oauth(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "1//RT_V1",
         Some("other_client"),
         Some("Hijack Label"),
@@ -2599,7 +2421,6 @@ async fn review_r4_stale_rt_client_binding_overwrite_disable_recovery_and_pendin
         &zero_net,
         &fast_oauth(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "1//RT_V2",
         Some("other_client"),
         None,
@@ -2687,7 +2508,6 @@ async fn review_r4_stale_rt_client_binding_overwrite_disable_recovery_and_pendin
         &fail_userinfo,
         &fast_oauth(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         &session,
         "4/one-time-login-code",
         Some("Recovered Login"),
@@ -2733,7 +2553,6 @@ async fn review_r4_stale_rt_client_binding_overwrite_disable_recovery_and_pendin
         &ok_unrelated,
         &fast_oauth(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "1//RT_UNRELATED_INPUT",
         None,
         None,
@@ -2775,7 +2594,6 @@ async fn review_r4_stale_rt_client_binding_overwrite_disable_recovery_and_pendin
         &ok_resume_userinfo,
         &fast_oauth(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         now + 7,
     )
     .await
@@ -2970,20 +2788,23 @@ async fn review_r5_journal_reconcile_uninitialized_slot_usable_priority_wait_qua
 
     let clock = Arc::new(ManualClock::new(now));
     let mut engine = DaemonEngine::with_clock(clock.clone());
+    let runner_r5 = AuditSlotQuotaRunner::from_handler(|_, _, slot| {
+        if slot.contains("1//RT_C1") {
+            Ok(audit_quota_outcome(0.95, "2099-01-01T00:00:00Z"))
+        } else if slot.contains("1//RT_C2") {
+            Ok(audit_quota_outcome(0.85, "2099-01-01T00:00:00Z"))
+        } else {
+            Ok(audit_quota_outcome(0.05, "2099-01-01T00:00:00Z"))
+        }
+    });
+    let r5_overrides = DaemonConfigOverrides {
+        step_buffer_delay: Duration::ZERO,
+        ..DaemonConfigOverrides::default()
+    };
     {
         let _pg = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir);
         let t1 = engine
-            .run_single_tick(
-                &repo,
-                &backend,
-                &MockTransport::default(),
-                &fast_oauth(),
-                &fast_quota(),
-                &reg,
-                "vscode/1.X.X (Antigravity/4.3.0)",
-                &DaemonConfigOverrides::default(),
-                now,
-            )
+            .run_single_tick(&repo, &backend, &runner_r5, &reg, &r5_overrides, now)
             .await
             .unwrap();
         assert_eq!(
@@ -3005,42 +2826,13 @@ async fn review_r5_journal_reconcile_uninitialized_slot_usable_priority_wait_qua
 
     {
         let _pg = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir);
+        // Under Step-and-Verify, Priority order immediately evaluates `c1` first and lands directly on `c1`!
         let t2 = engine
-            .run_single_tick(
-                &repo,
-                &backend,
-                &MockTransport::default(),
-                &fast_oauth(),
-                &fast_quota(),
-                &reg,
-                "vscode/1.X.X (Antigravity/4.3.0)",
-                &DaemonConfigOverrides::default(),
-                now + 1,
-            )
+            .run_single_tick(&repo, &backend, &runner_r5, &reg, &r5_overrides, now + 1)
             .await
             .unwrap();
         assert_eq!(
             t2,
-            TickStageOutcome::CancelledStalePlan {
-                reason: "higher_priority_candidate_qualified".into()
-            }
-        );
-        let t3 = engine
-            .run_single_tick(
-                &repo,
-                &backend,
-                &MockTransport::default(),
-                &fast_oauth(),
-                &fast_quota(),
-                &reg,
-                "vscode/1.X.X (Antigravity/4.3.0)",
-                &DaemonConfigOverrides::default(),
-                now + 2,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            t3,
             TickStageOutcome::CommittedSwitch {
                 source_id: "acc-ok".into(),
                 target_id: "c1".into()
@@ -3048,39 +2840,34 @@ async fn review_r5_journal_reconcile_uninitialized_slot_usable_priority_wait_qua
         );
     }
 
-    // 4. Audit §4.2 #4: Actual foreground `daemon` loop never re-enters concurrently under slow network!
-    let listener = ::tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let active_conns = Arc::new(AtomicUsize::new(0));
-    let peak_conns = Arc::new(AtomicUsize::new(0));
-    let total_conns = Arc::new(AtomicUsize::new(0));
-    let ac = active_conns.clone();
-    let pc = peak_conns.clone();
-    let tc = total_conns.clone();
-    let server = ::tokio::spawn(async move {
-        while let Ok((mut sock, _)) = listener.accept().await {
-            let ac2 = ac.clone();
-            let pc2 = pc.clone();
-            tc.fetch_add(1, Ordering::SeqCst);
-            ::tokio::spawn(async move {
-                let cur = ac2.fetch_add(1, Ordering::SeqCst) + 1;
-                pc2.fetch_max(cur, Ordering::SeqCst);
-                ::tokio::time::sleep(Duration::from_millis(120)).await;
-                let _ = ::tokio::io::AsyncWriteExt::write_all(
-                    &mut sock,
-                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
-                )
-                .await;
-                ac2.fetch_sub(1, Ordering::SeqCst);
-            });
-        }
-    });
+    // 4. Audit §4.2 #4: Actual foreground `daemon` loop never re-enters concurrently under slow `agy -p "/usage"`!
+    let slow_agy = h.tmp.path().join("slow-daemon-agy");
+    let active_lock_dir = h.tmp.path().join("agy-in-flight-lock");
+    let overlap_marker = h.tmp.path().join("agy-overlap-detected");
+    let hit_marker = h.tmp.path().join("agy-hit");
+    fs::write(
+        &slow_agy,
+        format!(
+            "#!/bin/sh\n\
+             if ! mkdir \"{lock}\" 2>/dev/null; then\n\
+               echo overlap > \"{ov}\"\n\
+               exit 1\n\
+             fi\n\
+             echo hit > \"{hit}\"\n\
+             sleep 0.15\n\
+             rmdir \"{lock}\"\n\
+             printf '%s\\n' '{{\"conversation_id\":\"\",\"status\":\"SUCCESS\",\"command\":{{\"name\":\"usage\",\"data\":{{\"groups\":[]}}}}}}'\n",
+            lock = active_lock_dir.display(),
+            ov = overlap_marker.display(),
+            hit = hit_marker.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&slow_agy, fs::Permissions::from_mode(0o755)).unwrap();
 
     repo.with_write_lock(|tx| {
         let mut c1_u = tx.load_account_opt("c1")?.unwrap();
-        c1_u.quota = None; // Trigger Stage 1 network probe
+        c1_u.quota = None; // Trigger Stage 1 official CLI probe
         tx.save_account(&c1_u)?;
         let mut dstate = agy_switch_cli::switching::daemon::read_daemon_state_readonly(tx.paths())?;
         dstate.cooldown_until = 0;
@@ -3090,26 +2877,30 @@ async fn review_r5_journal_reconcile_uninitialized_slot_usable_priority_wait_qua
 
     let mut d_loop = h
         .cli()
-        .env_remove("AGY_SWITCH_CLI_PROXY")
-        .env_remove("NO_PROXY")
-        .env("HTTPS_PROXY", format!("http://127.0.0.1:{port}"))
+        .env("AGY_SWITCH_CLI_AGY_BIN", &slow_agy)
         .args(["daemon", "--interval", "1", "--cooldown", "0"])
         .spawn()
         .unwrap();
     for _ in 0..50 {
-        if total_conns.load(Ordering::SeqCst) >= 1 {
+        if hit_marker.exists() {
             break;
         }
         ::tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    ::tokio::time::sleep(Duration::from_millis(150)).await;
+    ::tokio::time::sleep(Duration::from_millis(200)).await;
     unsafe {
         libc::kill(d_loop.id() as i32, libc::SIGTERM);
     }
     let loop_st = d_loop.wait().unwrap();
-    server.abort();
     assert_eq!(loop_st.code(), Some(0));
-    assert_eq!(peak_conns.load(Ordering::SeqCst), 1);
+    assert!(
+        hit_marker.exists(),
+        "Daemon loop must have invoked synthetic agy"
+    );
+    assert!(
+        !overlap_marker.exists(),
+        "Foreground daemon loop must NEVER overlap two concurrent ticks!"
+    );
 }
 
 // ============================================================================
@@ -3205,15 +2996,11 @@ fn review_r6_real_sigkill_signal_9_prepared_and_index_committed_boundaries() {
                     &l1,
                     &repo,
                     &StagePauseBackend { stage, marker },
-                    &MockTransport::default(),
-                    &OAuthEndpoints::default(),
                     &OAuthClientRegistry::parse_from_raw(None, None),
-                    "vscode/1.X.X (Antigravity/4.3.0)",
                     "acc-b",
                     false,
                     1_800_000_000,
-                )
-                .await;
+                );
             }
         });
         return;
@@ -3437,7 +3224,6 @@ async fn review_r7_single_quote_clap_redaction_client_key_policy_and_daemon_star
         &MockTransport::default(),
         &OAuthEndpoints::default(),
         &OAuthClientRegistry::from_config_and_raw(None, None, None, None, Vec::new()),
-        "ua",
         "1//RT_BOUND_1",
         Some("1//0gAccidentalRefreshTokenInClientFlag44444"),
         None,
@@ -3517,57 +3303,40 @@ async fn review_r7_single_quote_clap_redaction_client_key_policy_and_daemon_star
     assert!(cleaned_pol.candidate_account_ids.is_empty());
     assert!(!cleaned_pol.enabled);
 
-    // 4. `daemon --once` WITHOUT `--no-remote-version` exits `0` gracefully on `SIGTERM` during startup UA HTTP probe!
-    let stall_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let stall_port = stall_listener.local_addr().unwrap().port();
-    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
-    let hold_server = std::thread::spawn(move || {
-        if let Ok((_sock, _)) = stall_listener.accept() {
-            let _ = accepted_tx.send(());
-            std::thread::sleep(Duration::from_secs(5));
-        }
-    });
+    // 4. Under v1.2.7, the legacy remote UA version fetcher is completely removed:
+    //    `daemon --once` makes ZERO startup HTTP connections even when `--proxy` is set, and
+    //    the removed `--no-remote-version` flag exits `2`!
+    let daemon_no_http = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &h.home)
+        .env("XDG_DATA_HOME", h.tmp.path().join("xdg_data"))
+        .env("XDG_CACHE_HOME", &h.cache_dir)
+        .env("XDG_CONFIG_HOME", h.tmp.path().join("xdg_cfg"))
+        .env("XDG_RUNTIME_DIR", &h.runtime_dir)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/no-dbus", h.runtime_dir.display()),
+        )
+        .env("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir)
+        .args([
+            "--data-dir",
+            h.data_dir.to_str().unwrap(),
+            "--proxy",
+            "http://127.0.0.1:1",
+            "daemon",
+            "--once",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(daemon_no_http.status.code(), Some(0));
 
-    let mut daemon_child_guard = KillChildOnDrop::new(
-        Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", &h.home)
-            .env("XDG_DATA_HOME", h.tmp.path().join("xdg_data"))
-            .env("XDG_CACHE_HOME", &h.cache_dir)
-            .env("XDG_CONFIG_HOME", h.tmp.path().join("xdg_cfg"))
-            .env("XDG_RUNTIME_DIR", &h.runtime_dir)
-            .env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={}/no-dbus", h.runtime_dir.display()),
-            )
-            .env("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir)
-            .args([
-                "--data-dir",
-                h.data_dir.to_str().unwrap(),
-                "--proxy",
-                &format!("http://127.0.0.1:{stall_port}"),
-                "daemon",
-                "--once",
-            ])
-            .spawn()
-            .unwrap(),
-    );
-
-    accepted_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("daemon --once did not initiate remote UA HTTP connection via proxy");
-    let mut daemon_child = daemon_child_guard.take();
-    unsafe {
-        libc::kill(daemon_child.id() as i32, libc::SIGTERM);
-    }
-    let daemon_status = daemon_child.wait().unwrap();
-    assert_eq!(
-        daemon_status.code(),
-        Some(0),
-        "daemon --once must exit 0 gracefully on SIGTERM even during startup UA check, got {daemon_status:?}"
-    );
-    drop(hold_server);
+    let removed_flag = h
+        .cli()
+        .args(["--no-remote-version", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(removed_flag.status.code(), Some(2));
 }
 
 #[tokio::test]
@@ -3685,7 +3454,7 @@ async fn r2_01_pending_resume_and_add_interleaving_serializes_and_enforces_cas()
     };
 
     let mut fut_a = Box::pin(resume_pending_auth_records(
-        &repo, &step_a, &endpoints, &reg, "UA", now,
+        &repo, &step_a, &endpoints, &reg, now,
     ));
     tokio::select! {
         _ = entered.notified() => {}
@@ -3703,7 +3472,7 @@ async fn r2_01_pending_resume_and_add_interleaving_serializes_and_enforces_cas()
     let purge_busy = purge_all_pending_auth_records(&repo).unwrap_err();
     assert_eq!(purge_busy.exit_code, ExitCode::LockBusyOrConflict);
 
-    let rep_b = resume_pending_auth_records(&repo, &step_b, &endpoints, &reg, "UA", now)
+    let rep_b = resume_pending_auth_records(&repo, &step_b, &endpoints, &reg, now)
         .await
         .unwrap();
     assert_eq!(b_calls.load(Ordering::SeqCst), 0);
@@ -3797,7 +3566,7 @@ async fn r2_01_pending_resume_and_add_interleaving_serializes_and_enforces_cas()
         200,
         json!({"email": "cas@example.invalid"}),
     ))]);
-    let resumed_v2 = resume_pending_auth_records(&repo, &ok_uinfo, &endpoints, &reg, "UA", now)
+    let resumed_v2 = resume_pending_auth_records(&repo, &ok_uinfo, &endpoints, &reg, now)
         .await
         .unwrap();
     assert_eq!(resumed_v2.resumed_accounts.len(), 1);
@@ -3828,7 +3597,6 @@ async fn r2_01_pending_resume_and_add_interleaving_serializes_and_enforces_cas()
         &add_mock_1,
         &endpoints,
         &reg,
-        "UA",
         "1//add-initial-0",
         Some("antigravity_enterprise"),
         None,
@@ -3852,7 +3620,6 @@ async fn r2_01_pending_resume_and_add_interleaving_serializes_and_enforces_cas()
         &add_step_2,
         &endpoints,
         &reg,
-        "UA",
         "1//add-initial-0",
         Some("antigravity_enterprise"),
         None,
@@ -3862,10 +3629,9 @@ async fn r2_01_pending_resume_and_add_interleaving_serializes_and_enforces_cas()
         _ = add_entered.notified() => {}
         _ = &mut add_fut_2 => panic!("add_fut_2 ended before barrier"),
     }
-    let resume_during_add =
-        resume_pending_auth_records(&repo, &step_b, &endpoints, &reg, "UA", now)
-            .await
-            .unwrap();
+    let resume_during_add = resume_pending_auth_records(&repo, &step_b, &endpoints, &reg, now)
+        .await
+        .unwrap();
     assert_eq!(resume_during_add.failures.len(), 1);
     add_release.notify_one();
     let (bound_add, _) = add_fut_2.await.unwrap();
@@ -4366,7 +4132,6 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
         &t1,
         &endpoints,
         &reg,
-        "UA",
         "1//multi-r0",
         Some("antigravity_enterprise"),
         None,
@@ -4390,7 +4155,7 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
             json!({"error": "userinfo_down"}),
         )),
     ]);
-    let rep1 = resume_pending_auth_records(&repo, &t2, &endpoints, &reg, "UA", now + 10)
+    let rep1 = resume_pending_auth_records(&repo, &t2, &endpoints, &reg, now + 10)
         .await
         .unwrap();
     assert_eq!(rep1.failures.len(), 1);
@@ -4401,7 +4166,6 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
         &MockTransport::default(),
         &endpoints,
         &reg,
-        "UA",
         "1//multi-r1",
         Some("antigravity_enterprise"),
         None,
@@ -4432,7 +4196,6 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
         &t3,
         &endpoints,
         &reg,
-        "UA",
         "1//multi-r2",
         Some("antigravity_enterprise"),
         None,
@@ -4495,7 +4258,6 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
         &tr_re1,
         &endpoints,
         &reg,
-        "UA",
         &bound_multi,
         &mk_sess(14001),
         "c1",
@@ -4524,7 +4286,6 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
         &tr_re2,
         &endpoints,
         &reg,
-        "UA",
         &bound_multi,
         &mk_sess(14002),
         "c2",
@@ -4534,16 +4295,10 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
     .unwrap();
     assert_eq!(re2_acc.token.refresh_token, "1//reauth-newest-2");
     assert!(repo.list_pending_auth_readonly().unwrap().is_empty());
-    let _ = resume_pending_auth_records(
-        &repo,
-        &MockTransport::default(),
-        &endpoints,
-        &reg,
-        "UA",
-        now + 60,
-    )
-    .await
-    .unwrap();
+    let _ =
+        resume_pending_auth_records(&repo, &MockTransport::default(), &endpoints, &reg, now + 60)
+            .await
+            .unwrap();
     let post_re = repo.read_account_unchecked(&bound_multi.id).unwrap();
     assert_eq!(post_re.token.refresh_token, "1//reauth-newest-2");
     assert!(repo
@@ -4568,7 +4323,6 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
         &t_pend,
         &endpoints,
         &reg,
-        "UA",
         "1//pk-init",
         Some("antigravity_enterprise"),
         None,
@@ -4611,10 +4365,9 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
         200,
         json!({"email": "pk@example.invalid"}),
     ))]);
-    let pk_resumed =
-        resume_pending_auth_records(&repo, &ok_pk_uinfo, &endpoints, &reg, "UA", now + 80)
-            .await
-            .unwrap();
+    let pk_resumed = resume_pending_auth_records(&repo, &ok_pk_uinfo, &endpoints, &reg, now + 80)
+        .await
+        .unwrap();
     assert_eq!(pk_resumed.resumed_accounts.len(), 1);
     assert_eq!(
         pk_resumed.resumed_accounts[0].token.refresh_token,
@@ -4638,7 +4391,6 @@ async fn r2_06_multi_step_pending_lineage_reauth_supersede_sigkill_and_corrupt_l
         ]),
         &endpoints,
         &reg,
-        "UA",
         "1//fifo-lock-init",
         Some("antigravity_enterprise"),
         None,
@@ -4893,7 +4645,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &old_fresh_tr,
         &endpoints,
         &reg,
-        "UA",
         &acc_r3,
         &mk_sess(15001),
         "code-old-fresh",
@@ -4921,7 +4672,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &new_tr_a,
         &endpoints,
         &reg,
-        "UA",
         &acc_r3,
         &sess_a,
         "code-new-fresh",
@@ -4946,7 +4696,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &old_resume_tr_a,
         &endpoints,
         &reg,
-        "UA",
         now + 25,
     ));
     // Poll `resume_fut_a` until it holds `PendingAuthLock(old_fresh_pid)` and waits on `L2("acc-r3")`!
@@ -5005,7 +4754,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &old_exp_tr_0,
         &endpoints,
         &reg,
-        "UA",
         &post_a,
         &mk_sess(15003),
         "code-old-exp-0",
@@ -5029,10 +4777,9 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         )),
         Ok(MockTransport::json_response(500, json!({"error": "down"}))),
     ]);
-    let failed_mid =
-        resume_pending_auth_records(&repo, &old_exp_tr_1, &endpoints, &reg, "UA", now + 100)
-            .await
-            .unwrap();
+    let failed_mid = resume_pending_auth_records(&repo, &old_exp_tr_1, &endpoints, &reg, now + 100)
+        .await
+        .unwrap();
     assert_eq!(failed_mid.failures.len(), 1);
     let after_mid_pend = &repo.list_pending_auth_readonly().unwrap()[0];
     assert_eq!(after_mid_pend.auth_seq, old_exp_seq_before_refresh);
@@ -5058,7 +4805,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &new_tr_b,
         &endpoints,
         &reg,
-        "UA",
         &post_a,
         &sess_b,
         "code-new-rot",
@@ -5082,7 +4828,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &old_resume_tr_b,
         &endpoints,
         &reg,
-        "UA",
         now + 200,
     ));
     for _ in 0..20 {
@@ -5196,7 +4941,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         ))]),
         &endpoints,
         &reg,
-        "UA",
         now + 215,
     )
     .await
@@ -5226,7 +4970,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &new_tr_c,
         &endpoints,
         &reg,
-        "UA",
         &leg_after_seq,
         &sess_c,
         "code-leg-new",
@@ -5247,7 +4990,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &old_resume_tr_c,
         &endpoints,
         &reg,
-        "UA",
         now + 225,
     ));
     for _ in 0..20 {
@@ -5294,7 +5036,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &login_fail_tr,
         &endpoints,
         &reg,
-        "UA",
         &mk_sess(15006),
         "code-old-login",
         None,
@@ -5322,7 +5063,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &new_tr_d,
         &endpoints,
         &reg,
-        "UA",
         &post_b,
         &sess_d,
         "code-new-vs-login",
@@ -5345,7 +5085,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &old_login_resume_tr,
         &endpoints,
         &reg,
-        "UA",
         now + 255,
     ));
     for _ in 0..20 {
@@ -5392,7 +5131,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &add_fail_tr,
         &endpoints,
         &reg,
-        "UA",
         "1//r3-old-add-input",
         Some("antigravity_enterprise"),
         None,
@@ -5430,7 +5168,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         ))]),
         &endpoints,
         &reg,
-        "UA",
         now + 275,
     )
     .await
@@ -5469,7 +5206,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &reauth_valid_tr,
         &endpoints,
         &reg,
-        "UA",
         &post_imp,
         &mk_sess(15008),
         "code-survives-routine",
@@ -5504,7 +5240,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
             &routine_tr,
             &endpoints,
             &reg,
-            "UA",
             "acc-r3",
             true,
             now + 280 + idx,
@@ -5524,7 +5259,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         ))]),
         &endpoints,
         &reg,
-        "UA",
         now + 290,
     )
     .await
@@ -5562,7 +5296,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
             &tr,
             &endpoints,
             &reg,
-            "UA",
             &post_routine_reauth,
             &mk_sess(15010 + idx as u16),
             &format!("code-skew-{idx}"),
@@ -5591,7 +5324,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &tr_mismatch,
         &endpoints,
         &reg,
-        "UA",
         &post_routine_reauth,
         &mk_sess(15020),
         "code-mismatch-4",
@@ -5639,7 +5371,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         },
         &endpoints,
         &reg,
-        "UA",
         now + 950,
     )
     .await
@@ -5689,7 +5420,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &tr_reauth_after_mismatch,
         &endpoints,
         &reg,
-        "UA",
         &post_multi,
         &mk_sess(15021),
         "code-after-mismatch-5",
@@ -5718,7 +5448,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         },
         &endpoints,
         &reg,
-        "UA",
         "1//r3-mismatch-other-user-4",
         None,
         None,
@@ -5753,7 +5482,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &tr_live_mismatch,
         &endpoints,
         &reg,
-        "UA",
         &post_after_mismatch,
         &mk_sess(15022),
         "code-live-mm",
@@ -5783,7 +5511,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &tr_live_ok,
         &endpoints,
         &reg,
-        "UA",
         &post_after_mismatch,
         &mk_sess(15023),
         "code-live-ok-6",
@@ -5821,7 +5548,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         },
         &endpoints,
         &reg,
-        "UA",
         "1//preflight-input-rt",
         Some("antigravity_enterprise"),
         None,
@@ -5892,7 +5618,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &tr_login_older,
         &endpoints,
         &reg,
-        "UA",
         &sess_l1,
         "code-bn-older",
         None,
@@ -5923,7 +5648,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &tr_login_newer,
         &endpoints,
         &reg,
-        "UA",
         &mk_sess(15031),
         "code-bn-newer",
         None,
@@ -5967,7 +5691,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &tr_survive,
         &endpoints,
         &reg,
-        "UA",
         &mk_sess(15032),
         "code-survive",
         None,
@@ -5993,7 +5716,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         ))]),
         &endpoints,
         &reg,
-        "UA",
         now + 971,
     )
     .await
@@ -6050,7 +5772,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &tr_recreate,
         &endpoints,
         &reg,
-        "UA",
         &sess_recreate,
         "code-recreate",
         None,
@@ -6131,7 +5852,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         ))]),
         &endpoints,
         &reg,
-        "UA",
         now + 5,
     )
     .await
@@ -6227,7 +5947,6 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
         &MockTransport::from_queue([]),
         &endpoints,
         &reg,
-        "UA",
         now + 10,
     )
     .await
@@ -6238,133 +5957,99 @@ async fn r3_01_busy_old_pending_across_reauthorize_login_add_and_overwrite_never
     assert_eq!(busy_err_rep.failures.len(), 1);
 }
 
-#[tokio::test]
-async fn maint_daily_hub_ua_partial_3p_fallback_and_carbon_disabled_isolation() {
-    let _g = ENV_MUTEX.lock().await;
+#[test]
+fn v127_cli_defaults_token_parser_builtin_client_and_order_contract_regressions() {
+    let _g = ENV_MUTEX.blocking_lock();
     let h = IsolatedHarness::new();
     let repo = StoreRepository::new(h.paths());
-    let reg = OAuthClientRegistry::parse_from_raw(None, None);
-    let now = 1_800_000_000i64;
+    let now = 1_800_010_000i64;
 
-    assert_eq!(
-        agy_switch_cli::quota::client::DEFAULT_CLOUDCODE_ENVIRONMENTS[0],
-        (
-            QuotaSourceEnv::Daily,
-            "https://daily-cloudcode-pa.googleapis.com/v1internal"
-        )
-    );
-    let ua = agy_switch_cli::transport::user_agent::resolve_native_oauth_user_agent(
-        &h.paths(),
-        &MockTransport::default(),
-        false,
-        now,
-    )
-    .await;
-    assert!(
-        ua.starts_with("antigravity/hub/4.3.0 (os_type=linux; arch="),
-        "unexpected UA: {ua}"
-    );
-
-    let acc = make_acc(
-        "acc-maint",
-        "maint@example.invalid",
-        "1//RT_MAINT",
-        now + 7200,
-        now,
-    );
-    repo.with_write_lock(|tx| tx.upsert_account(acc, true, now))
-        .unwrap();
-
-    // Case 1: Daily returns 3p-only summary while Sandbox returns complete Gemini + Carbon + Argon summary ->
-    // selects Sandbox cleanly WITHOUT cross-environment merging!
-    let mock_partial_to_full = MockTransport::from_handler(|req| {
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
-            ));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"models": {
-                    "gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 1.0, "resetTime": "2099-01-01T05:00:00Z"}},
-                    "gemini-4-carbon-high": {"quotaInfo": {"remainingFraction": 1.0, "resetTime": "2099-01-01T05:00:00Z"}},
-                    "gemini-4-hydrogen-disabled": {"displayName": "Gemini 4 Hydrogen"}
-                }}),
-            ));
-        }
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.googleapis.com")
-        {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"groups": [{
-                    "displayName": "Claude and GPT models",
-                    "buckets": [{"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.37, "resetTime": "2099-01-07T00:00:00Z"}]
-                }]}),
-            ));
-        }
-        Ok(MockTransport::json_response(
-            200,
-            json!({"groups": [
-                {
-                    "displayName": "Gemini Models",
-                    "buckets": [
-                        {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.64, "resetTime": "2099-01-07T00:00:00Z"},
-                        {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"}
-                    ]
-                },
-                {
-                    "displayName": "Gemini 4 Carbon",
-                    "buckets": [
-                        {"bucketId": "gemini-carbon-wtu-weekly", "window": "weekly", "remainingFraction": 0.41, "resetTime": "2099-01-07T00:00:00Z"},
-                        {"bucketId": "gemini-carbon-5h", "window": "5h", "remainingFraction": 0.80, "resetTime": "2099-01-01T05:00:00Z"}
-                    ]
-                }
-            ]}),
-        ))
-    });
-
-    let refreshed = refresh_account_quota_locked(
-        &repo,
-        &mock_partial_to_full,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        &ua,
-        "acc-maint",
-        now,
-    )
-    .await
-    .unwrap();
-    let q = refreshed.quota.as_ref().unwrap();
-    assert_eq!(q.source_env, QuotaSourceEnv::Sandbox);
-    assert_eq!(q.summary_source_env, Some(QuotaSourceEnv::Sandbox));
     assert_eq!(DEFAULT_QUOTA_MAX_AGE_SECS, 3600);
     assert_eq!(
         agy_switch_cli::switching::daemon::DEFAULT_DAEMON_INTERVAL_SECS,
-        180
+        900
+    );
+    assert_eq!(
+        agy_switch_cli::switching::daemon::CANDIDATE_REFRESH_BACKOFF_SECS,
+        900
     );
     assert_eq!(
         agy_switch_cli::switching::daemon::DEFAULT_DAEMON_COOLDOWN_SECS,
         3600
     );
+
+    // 1. Unpooled `gemini-4-carbon-high` and `-disabled` models never pollute shared Gemini or evaluate as Known
+    let mut obs = QuotaObservation::new(now, QuotaSourceEnv::OfficialCli);
+    obs.subscription_tier = Some("Google AI Pro".into());
+    obs.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
+    obs.quota_groups = Some(vec![
+        agy_switch_cli::domain::quota::QuotaGroup {
+            display_name: "Gemini Models".into(),
+            description: Some("Models within this group: gemini-3.1-pro".into()),
+            buckets: vec![
+                agy_switch_cli::domain::quota::QuotaBucket {
+                    bucket_id: "gemini-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: 0.64,
+                    remaining_fraction_known: Some(true),
+                    reset_time: "2099-01-07T00:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+                agy_switch_cli::domain::quota::QuotaBucket {
+                    bucket_id: "gemini-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: 0.90,
+                    remaining_fraction_known: Some(true),
+                    reset_time: "2099-01-01T05:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        },
+        agy_switch_cli::domain::quota::QuotaGroup {
+            display_name: "Gemini 4 Carbon".into(),
+            description: None,
+            buckets: vec![
+                agy_switch_cli::domain::quota::QuotaBucket {
+                    bucket_id: "gemini-carbon-wtu-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: 0.41,
+                    remaining_fraction_known: Some(true),
+                    reset_time: "2099-01-07T00:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+                agy_switch_cli::domain::quota::QuotaBucket {
+                    bucket_id: "gemini-carbon-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: 0.80,
+                    remaining_fraction_known: Some(true),
+                    reset_time: "2099-01-01T05:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        },
+    ]);
     assert_eq!(
-        evaluate_quota_observation(q, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
+        evaluate_quota_observation(&obs, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
         agy_switch_cli::domain::quota::QuotaEval::Known {
             remaining_percentage: 64.0
         }
     );
-    // Unpooled `gemini-4-carbon-high` and `-disabled` models never pollute shared Gemini or evaluate as Known
     assert!(matches!(
-        evaluate_quota_observation(q, "gemini-4-carbon-high", now, DEFAULT_QUOTA_MAX_AGE_SECS),
+        evaluate_quota_observation(
+            &obs,
+            "gemini-4-carbon-high",
+            now,
+            DEFAULT_QUOTA_MAX_AGE_SECS
+        ),
         agy_switch_cli::domain::quota::QuotaEval::Unknown { .. }
     ));
     assert!(matches!(
         evaluate_quota_observation(
-            q,
+            &obs,
             "gemini-4-hydrogen-disabled",
             now,
             DEFAULT_QUOTA_MAX_AGE_SECS
@@ -6372,7 +6057,7 @@ async fn maint_daily_hub_ua_partial_3p_fallback_and_carbon_disabled_isolation() 
         agy_switch_cli::domain::quota::QuotaEval::Unknown { .. }
     ));
 
-    // Verify multi-line batch refresh_token parser with inline `# label` comments AND literal `#` without space
+    // 2. Multi-line batch refresh_token parser with inline `# label` comments AND literal `#` without space
     let parsed_batch = agy_switch_cli::cli::secret_input::parse_token_lines_from_text(
         "\n# comment line\n1//synthetic_tok_a  # Work Account\n1//synthetic#literal_b\n\n",
         "test",
@@ -6389,82 +6074,8 @@ async fn maint_daily_hub_ua_partial_3p_fallback_and_carbon_disabled_isolation() 
         ]
     );
 
-    // Case 2: Daily returns 3p-only summary while Sandbox returns 200 catalog + 404 summary (`Unavailable`)
-    // and Production returns 403 VALIDATION_REQUIRED -> MUST retain Daily's valid 3p partial observation!
-    let mock_partial_only = MockTransport::from_handler(|req| {
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.sandbox.googleapis.com")
-        {
-            if req.url.ends_with(":loadCodeAssist") {
-                return Ok(MockTransport::json_response(200, json!({})));
-            }
-            if req.url.ends_with(":fetchAvailableModels") {
-                return Ok(MockTransport::json_response(200, json!({"models": {}})));
-            }
-            return Ok(MockTransport::json_response(404, json!({})));
-        }
-        if req.url.starts_with("https://cloudcode-pa.googleapis.com") {
-            return Ok(MockTransport::json_response(
-                403,
-                json!({"error": {"message": "VALIDATION_REQUIRED"}}),
-            ));
-        }
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(200, json!({})));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"models": {"claude-sonnet-4": {"quotaInfo": {"remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"}}}}),
-            ));
-        }
-        Ok(MockTransport::json_response(
-            200,
-            json!({"groups": [{
-                "displayName": "Claude and GPT models",
-                "buckets": [
-                    {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.37, "resetTime": "2099-01-07T00:00:00Z"},
-                    {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.95, "resetTime": "2099-01-01T05:00:00Z"}
-                ]
-            }]}),
-        ))
-    });
-
-    let partial_refreshed = refresh_account_quota_locked(
-        &repo,
-        &mock_partial_only,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        &ua,
-        "acc-maint",
-        now + 1,
-    )
-    .await
-    .unwrap();
-    let qp = partial_refreshed.quota.as_ref().unwrap();
-    assert_eq!(qp.source_env, QuotaSourceEnv::Daily);
-    assert_eq!(
-        evaluate_quota_observation(qp, "claude", now + 1, DEFAULT_QUOTA_MAX_AGE_SECS),
-        agy_switch_cli::domain::quota::QuotaEval::Known {
-            remaining_percentage: 37.0
-        }
-    );
-}
-
-#[tokio::test]
-async fn synthetic_incremental_v110_middle_catalog_404_and_cli_contract_regressions() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-
-    let _g = ENV_MUTEX.lock().await;
-    let h = IsolatedHarness::new();
-    let repo = StoreRepository::new(h.paths());
-    let reg = OAuthClientRegistry::parse_from_raw(None, None);
-    let now = 1_800_010_000i64;
-    let ua = "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)";
-
+    // 3. Builtin OAuth client key in `config.json` (`antigravity_enterprise`) produces zero warnings,
+    //    and incomplete `accounts list --order` reports the unified `accounts list --order` command name.
     let acc1 = make_acc(
         "acc-inc-1",
         "inc1@example.invalid",
@@ -6479,231 +6090,12 @@ async fn synthetic_incremental_v110_middle_catalog_404_and_cli_contract_regressi
         now + 7200,
         now,
     );
-    let acc3 = make_acc(
-        "acc-inc-3",
-        "inc3@example.invalid",
-        "1//RT_INC_3",
-        now + 7200,
-        now,
-    );
     repo.with_write_lock(|tx| {
         tx.upsert_account(acc1, true, now)?;
-        tx.upsert_account(acc2, false, now)?;
-        tx.upsert_account(acc3, false, now)
+        tx.upsert_account(acc2, false, now)
     })
     .unwrap();
 
-    // 1. Middle environment (`Sandbox`) returning HTTP 404 or malformed JSON on `:fetchAvailableModels`
-    //    MUST NOT stop environment probing early when `Production` can return a full Gemini observation!
-    for sandbox_catalog_mode in ["http_404", "malformed_json"] {
-        let prod_hits = Arc::new(AtomicUsize::new(0));
-        let prod_hits_c = prod_hits.clone();
-        let mode = sandbox_catalog_mode.to_string();
-        let mock = MockTransport::from_handler(move |req| {
-            if req
-                .url
-                .starts_with("https://daily-cloudcode-pa.googleapis.com")
-            {
-                if req.url.ends_with(":loadCodeAssist") {
-                    return Ok(MockTransport::json_response(
-                        200,
-                        json!({
-                            "cloudaicompanionProject": "daily-proj",
-                            "paidTier": {"id": "daily-tier", "name": "Daily Tier"}
-                        }),
-                    ));
-                }
-                if req.url.ends_with(":fetchAvailableModels") {
-                    return Ok(MockTransport::json_response(
-                        200,
-                        json!({"models": {
-                            "claude-sonnet-4": {"quotaInfo": {"remainingFraction": 0.92, "resetTime": "2099-01-01T05:00:00Z"}}
-                        }}),
-                    ));
-                }
-                return Ok(MockTransport::json_response(
-                    200,
-                    json!({"groups": [{
-                        "displayName": "Claude and GPT models",
-                        "buckets": [
-                            {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.37, "resetTime": "2099-01-07T00:00:00Z"},
-                            {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.92, "resetTime": "2099-01-01T05:00:00Z"}
-                        ]
-                    }]}),
-                ));
-            }
-
-            if req
-                .url
-                .starts_with("https://daily-cloudcode-pa.sandbox.googleapis.com")
-            {
-                if req.url.ends_with(":loadCodeAssist") {
-                    return Ok(MockTransport::json_response(200, json!({})));
-                }
-                if req.url.ends_with(":fetchAvailableModels") {
-                    if mode == "http_404" {
-                        return Ok(MockTransport::json_response(404, json!({})));
-                    }
-                    return Ok(agy_switch_cli::transport::client::HttpResponse {
-                        status: 200,
-                        headers: std::collections::HashMap::new(),
-                        body: b"{not-valid-json".to_vec(),
-                    });
-                }
-                return Ok(MockTransport::json_response(404, json!({})));
-            }
-
-            prod_hits_c.fetch_add(1, Ordering::SeqCst);
-            if req.url.ends_with(":loadCodeAssist") {
-                return Ok(MockTransport::json_response(
-                    200,
-                    json!({
-                        "cloudaicompanionProject": "prod-proj",
-                        "paidTier": {"id": "pro", "name": "Google AI Pro"}
-                    }),
-                ));
-            }
-            if req.url.ends_with(":fetchAvailableModels") {
-                return Ok(MockTransport::json_response(
-                    200,
-                    json!({"models": {
-                        "gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"}}
-                    }}),
-                ));
-            }
-            Ok(MockTransport::json_response(
-                200,
-                json!({"groups": [{
-                    "displayName": "Gemini Models",
-                    "buckets": [
-                        {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.64, "resetTime": "2099-01-07T00:00:00Z"},
-                        {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"}
-                    ]
-                }]}),
-            ))
-        });
-
-        let out = refresh_account_quota_locked(
-            &repo,
-            &mock,
-            &fast_oauth(),
-            &fast_quota(),
-            &reg,
-            ua,
-            "acc-inc-1",
-            now,
-        )
-        .await
-        .unwrap();
-        assert!(
-            prod_hits.load(Ordering::SeqCst) >= 3,
-            "mode={sandbox_catalog_mode}: expected Production to be queried"
-        );
-        let q = out.quota.as_ref().unwrap();
-        assert_eq!(q.source_env, QuotaSourceEnv::Production);
-        assert_eq!(q.summary_source_env, Some(QuotaSourceEnv::Production));
-        assert_eq!(q.tier_source_env, Some(QuotaSourceEnv::Production));
-        assert_eq!(q.subscription_tier.as_deref(), Some("Google AI Pro"));
-        assert_eq!(out.token.project_id.as_deref(), Some("prod-proj"));
-        // Strict single-env isolation: Daily's `claude-sonnet-4` was NOT stitched into Production!
-        assert!(q.models.iter().all(|m| m.name != "claude-sonnet-4"));
-        assert_eq!(
-            evaluate_quota_observation(q, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            agy_switch_cli::domain::quota::QuotaEval::Known {
-                remaining_percentage: 64.0
-            }
-        );
-    }
-
-    // 2. When BOTH Sandbox and Production return catalog 404, Daily's 3p partial observation is retained;
-    //    when Production returns account-level InsufficientScope, the error still propagates immediately.
-    let mock_both_later_404 = MockTransport::from_handler(|req| {
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.googleapis.com")
-        {
-            if req.url.ends_with(":loadCodeAssist") {
-                return Ok(MockTransport::json_response(200, json!({})));
-            }
-            if req.url.ends_with(":fetchAvailableModels") {
-                return Ok(MockTransport::json_response(
-                    200,
-                    json!({"models": {"claude-sonnet-4": {"quotaInfo": {"remainingFraction": 0.90, "resetTime": "2099-01-01T05:00:00Z"}}}}),
-                ));
-            }
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"groups": [{
-                    "displayName": "Claude and GPT models",
-                    "buckets": [
-                        {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.37, "resetTime": "2099-01-07T00:00:00Z"},
-                        {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.92, "resetTime": "2099-01-01T05:00:00Z"}
-                    ]
-                }]}),
-            ));
-        }
-        Ok(MockTransport::json_response(404, json!({})))
-    });
-    let retained = refresh_account_quota_locked(
-        &repo,
-        &mock_both_later_404,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        ua,
-        "acc-inc-1",
-        now + 1,
-    )
-    .await
-    .unwrap();
-    assert_eq!(retained.quota.unwrap().source_env, QuotaSourceEnv::Daily);
-
-    let mock_later_scope_err = MockTransport::from_handler(|req| {
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.googleapis.com")
-        {
-            if req.url.ends_with(":loadCodeAssist") {
-                return Ok(MockTransport::json_response(200, json!({})));
-            }
-            if req.url.ends_with(":fetchAvailableModels") {
-                return Ok(MockTransport::json_response(200, json!({"models": {}})));
-            }
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"groups": [{
-                    "displayName": "Claude and GPT models",
-                    "buckets": [{"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.37, "resetTime": "2099-01-07T00:00:00Z"}]
-                }]}),
-            ));
-        }
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.sandbox.googleapis.com")
-        {
-            return Ok(MockTransport::json_response(404, json!({})));
-        }
-        Ok(MockTransport::json_response(
-            403,
-            json!({"error": {"message": "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}}),
-        ))
-    });
-    let scope_err = refresh_account_quota_locked(
-        &repo,
-        &mock_later_scope_err,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        ua,
-        "acc-inc-2",
-        now + 2,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(scope_err.error_code, "scope_reauth_required");
-
-    // 3. Builtin OAuth client key in `config.json` (`antigravity_enterprise`) produces zero warnings,
-    //    and incomplete `accounts list --order` reports the unified `accounts list --order` command name.
     let cfg_path = h.paths().config_file();
     fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
     fs::write(
@@ -6719,11 +6111,7 @@ async fn synthetic_incremental_v110_middle_catalog_404_and_cli_contract_regressi
         .unwrap(),
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&cfg_path, fs::Permissions::from_mode(0o600)).unwrap();
-    }
+    fs::set_permissions(&cfg_path, fs::Permissions::from_mode(0o600)).unwrap();
     let loaded_reg = OAuthClientRegistry::load(&h.paths()).unwrap();
     assert!(
         loaded_reg.warnings().is_empty(),
@@ -6734,10 +6122,7 @@ async fn synthetic_incremental_v110_middle_catalog_404_and_cli_contract_regressi
     let order_err = repo
         .with_write_lock(|tx| tx.reorder_accounts(vec!["acc-inc-1".to_string()], now + 3))
         .unwrap_err();
-    assert_eq!(
-        order_err.exit_code,
-        agy_switch_cli::error::ExitCode::InvalidUsageOrAmbiguous
-    );
+    assert_eq!(order_err.exit_code, ExitCode::InvalidUsageOrAmbiguous);
     assert!(
         order_err
             .message
@@ -6746,248 +6131,4 @@ async fn synthetic_incremental_v110_middle_catalog_404_and_cli_contract_regressi
         order_err.message
     );
     assert!(!order_err.message.contains("`accounts order`"));
-
-    // 4. When `Daily` fails transiently (HTTP 503 -> `partial_env_outcome == None`) and `Sandbox` returns
-    //    catalog HTTP 404, probing MUST still continue to `Production` rather than aborting on `Sandbox`!
-    let mock_503_then_404_then_prod = MockTransport::from_handler(|req| {
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.googleapis.com")
-        {
-            return Ok(MockTransport::json_response(503, json!({})));
-        }
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.sandbox.googleapis.com")
-        {
-            return Ok(MockTransport::json_response(404, json!({})));
-        }
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({
-                    "cloudaicompanionProject": "prod-after-503-404",
-                    "paidTier": {"id": "pro", "name": "Google AI Pro"}
-                }),
-            ));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"models": {
-                    "gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.88, "resetTime": "2099-01-01T05:00:00Z"}}
-                }}),
-            ));
-        }
-        Ok(MockTransport::json_response(
-            200,
-            json!({"groups": [{
-                "displayName": "Gemini Models",
-                "buckets": [
-                    {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.55, "resetTime": "2099-01-07T00:00:00Z"},
-                    {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.88, "resetTime": "2099-01-01T05:00:00Z"}
-                ]
-            }]}),
-        ))
-    });
-    let recovered_prod = refresh_account_quota_locked(
-        &repo,
-        &mock_503_then_404_then_prod,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        ua,
-        "acc-inc-3",
-        now + 4,
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        recovered_prod.quota.as_ref().unwrap().source_env,
-        QuotaSourceEnv::Production
-    );
-    assert_eq!(
-        recovered_prod.token.project_id.as_deref(),
-        Some("prod-after-503-404")
-    );
-
-    // And if `Daily` returns 503 while both `Sandbox` and `Production` return catalog 404,
-    // the primary transient `quota_network_error` is preserved rather than misclassified as `data_error`.
-    let mock_503_then_404_404 = MockTransport::from_handler(|req| {
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.googleapis.com")
-        {
-            return Ok(MockTransport::json_response(503, json!({})));
-        }
-        Ok(MockTransport::json_response(404, json!({})))
-    });
-    let net_err = refresh_account_quota_locked(
-        &repo,
-        &mock_503_then_404_404,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        ua,
-        "acc-inc-3",
-        now + 5,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(net_err.error_code, "quota_network_error");
-
-    // 5. `Daily` (3p partial) -> `Sandbox` (403 strip-project retry -> 404) -> `Production` (401 Unauthorized):
-    //    must trigger the single locked forced OAuth token refresh, persist rotated `refresh_token`, and replay from `Daily`!
-    let token_refresh_hits = Arc::new(AtomicUsize::new(0));
-    let tr_hits_c = token_refresh_hits.clone();
-    let sandbox_catalog_hits = Arc::new(AtomicUsize::new(0));
-    let sb_hits_c = sandbox_catalog_hits.clone();
-    let mock_partial_403_404_401_replay = MockTransport::from_handler(move |req| {
-        if req.url == "https://oauth2.googleapis.com/token" {
-            tr_hits_c.fetch_add(1, Ordering::SeqCst);
-            return Ok(MockTransport::json_response(
-                200,
-                json!({
-                    "access_token": "fresh_replayed_at",
-                    "refresh_token": "1//RT_INC_3_ROTATED",
-                    "expires_in": 3600,
-                    "token_type": "Bearer"
-                }),
-            ));
-        }
-        let is_replayed = req.headers.iter().any(|(k, v)| {
-            k.eq_ignore_ascii_case("authorization") && v == "Bearer fresh_replayed_at"
-        });
-        if is_replayed {
-            if req.url.ends_with(":loadCodeAssist") {
-                return Ok(MockTransport::json_response(
-                    200,
-                    json!({"paidTier": {"id": "pro", "name": "Google AI Pro"}}),
-                ));
-            }
-            if req.url.ends_with(":fetchAvailableModels") {
-                return Ok(MockTransport::json_response(
-                    200,
-                    json!({"models": {
-                        "gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.91, "resetTime": "2099-01-01T05:00:00Z"}}
-                    }}),
-                ));
-            }
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"groups": [{
-                    "displayName": "Gemini Models",
-                    "buckets": [
-                        {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.77, "resetTime": "2099-01-07T00:00:00Z"},
-                        {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.91, "resetTime": "2099-01-01T05:00:00Z"}
-                    ]
-                }]}),
-            ));
-        }
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.googleapis.com")
-        {
-            if req.url.ends_with(":loadCodeAssist") {
-                return Ok(MockTransport::json_response(200, json!({})));
-            }
-            if req.url.ends_with(":fetchAvailableModels") {
-                return Ok(MockTransport::json_response(200, json!({"models": {}})));
-            }
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"groups": [{
-                    "displayName": "Claude and GPT models",
-                    "buckets": [{"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.37, "resetTime": "2099-01-07T00:00:00Z"}]
-                }]}),
-            ));
-        }
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.sandbox.googleapis.com")
-        {
-            if req.url.ends_with(":loadCodeAssist") {
-                return Ok(MockTransport::json_response(
-                    200,
-                    json!({"cloudaicompanionProject": "sb-proj"}),
-                ));
-            }
-            if req.url.ends_with(":fetchAvailableModels") {
-                let hit = sb_hits_c.fetch_add(1, Ordering::SeqCst);
-                if hit == 0 {
-                    return Ok(MockTransport::json_response(403, json!({})));
-                }
-                return Ok(MockTransport::json_response(404, json!({})));
-            }
-            return Ok(MockTransport::json_response(404, json!({})));
-        }
-        Ok(MockTransport::json_response(401, json!({})))
-    });
-    let replayed_acc = refresh_account_quota_locked(
-        &repo,
-        &mock_partial_403_404_401_replay,
-        &fast_oauth(),
-        &fast_quota(),
-        &reg,
-        ua,
-        "acc-inc-3",
-        now + 6,
-    )
-    .await
-    .unwrap();
-    assert_eq!(token_refresh_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(sandbox_catalog_hits.load(Ordering::SeqCst), 2);
-    assert_eq!(replayed_acc.token.refresh_token, "1//RT_INC_3_ROTATED");
-    assert_eq!(
-        replayed_acc.quota.as_ref().unwrap().source_env,
-        QuotaSourceEnv::Daily
-    );
-    assert_eq!(
-        evaluate_quota_observation(
-            replayed_acc.quota.as_ref().unwrap(),
-            "gemini",
-            now + 6,
-            DEFAULT_QUOTA_MAX_AGE_SECS
-        ),
-        agy_switch_cli::domain::quota::QuotaEval::Known {
-            remaining_percentage: 77.0
-        }
-    );
-
-    // 6. Direct `fetch_quota_summary_from_environments` preserves an earlier HTTP 200 3p `partial_fallback`
-    //    when a later environment returns `403 VALIDATION_REQUIRED`.
-    let mock_sum_multi_val = MockTransport::from_handler(|req| {
-        if req
-            .url
-            .starts_with("https://daily-cloudcode-pa.googleapis.com")
-        {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"groups": [{
-                    "displayName": "Claude and GPT models",
-                    "buckets": [{"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.42, "resetTime": "2099-01-07T00:00:00Z"}]
-                }]}),
-            ));
-        }
-        Ok(MockTransport::json_response(
-            403,
-            json!({"error": {"message": "VALIDATION_REQUIRED", "validationUrl": "https://example.invalid/v"}}),
-        ))
-    });
-    let sum_multi = agy_switch_cli::quota::client::fetch_quota_summary_from_environments(
-        &mock_sum_multi_val,
-        &fast_quota().environments,
-        ua,
-        "tok",
-        Some("proj"),
-    )
-    .await
-    .unwrap();
-    match sum_multi {
-        agy_switch_cli::quota::client::SummaryFetchOutcome::Groups(env, groups) => {
-            assert_eq!(env, QuotaSourceEnv::Daily);
-            assert_eq!(groups.len(), 1);
-        }
-        other => panic!("expected Daily partial Groups, got {other:?}"),
-    }
 }

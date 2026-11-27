@@ -1,13 +1,5 @@
-use crate::domain::account::STORE_SCHEMA_VERSION;
-use crate::paths::HeadlessPaths;
-use crate::store::fs_atomic::{
-    ensure_no_symlink_components_under, ensure_private_dir, read_regular_file_opt_bounded,
-    write_atomic_durable,
-};
-use crate::transport::client::{HttpRequest, HttpTransport, TimeoutClass};
+use crate::store::fs_atomic::ensure_private_dir;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
@@ -16,135 +8,14 @@ use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-/// 1. `agy-switch-cli` own package version (`CARGO_PKG_VERSION`), strictly for `--version` and diagnostics.
+/// `agy-switch-cli` own package version (`CARGO_PKG_VERSION`), strictly for `--version` and diagnostics.
 pub const CLI_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Compile-time floor for `UPSTREAM_UA_VERSION` per Blueprint §6.3.
-pub const KNOWN_COMPAT_FLOOR_UA_VERSION: &str = "4.3.0";
-
-pub const REMOTE_UA_VERSION_URL: &str =
-    "https://antigravity-auto-updater-974169037036.us-central1.run.app";
-pub const UA_CACHE_TTL_SECS: i64 = 86_400; // 24 hours
 
 static VERSION_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d+\.\d+\.\d+").expect("valid semver regex"));
 
 pub fn parse_semver_triplet(text: &str) -> Option<String> {
     VERSION_REGEX.find(text).map(|m| m.as_str().to_string())
-}
-
-/// Compare two `X.Y.Z` semantic version strings (`Ordering::Greater` if `v1 > v2`).
-pub fn compare_semver(v1: &str, v2: &str) -> Ordering {
-    let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
-    let p1 = parse(v1);
-    let p2 = parse(v2);
-    for i in 0..p1.len().max(p2.len()) {
-        let a = p1.get(i).copied().unwrap_or(0);
-        let b = p2.get(i).copied().unwrap_or(0);
-        match a.cmp(&b) {
-            Ordering::Equal => continue,
-            other => return other,
-        }
-    }
-    Ordering::Equal
-}
-
-/// SemVer upper-bound UA version selector per Blueprint §6.3:
-/// returns `max(floor_version, cached_remote_version)` using real `compare_semver`.
-pub fn select_ua_version(floor_version: &str, cached_remote_version: Option<&str>) -> String {
-    match cached_remote_version {
-        Some(remote)
-            if parse_semver_triplet(remote).is_some()
-                && compare_semver(remote, floor_version).is_gt() =>
-        {
-            remote.to_string()
-        }
-        _ => floor_version.to_string(),
-    }
-}
-
-pub fn format_hub_user_agent_for_target(ua_version: &str, os: &str, arch: &str) -> String {
-    let os_type = match os {
-        "macos" => "macos",
-        "windows" => "windows",
-        "linux" => "linux",
-        _ => "linux",
-    };
-    let arch_type = match arch {
-        "aarch64" => "arm64",
-        "x86_64" => "amd64",
-        other => other,
-    };
-    format!("antigravity/hub/{ua_version} (os_type={os_type}; arch={arch_type})")
-}
-
-pub fn format_native_oauth_user_agent(ua_version: &str) -> String {
-    format_hub_user_agent_for_target(ua_version, std::env::consts::OS, std::env::consts::ARCH)
-}
-
-pub const SHORT_FALLBACK_USER_AGENT: &str = "antigravity";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UaVersionCache {
-    pub schema_version: u32,
-    pub remote_version: String,
-    pub fetched_at: i64,
-}
-
-pub fn read_cached_ua_version_readonly(paths: &HeadlessPaths, now_unix: i64) -> Option<String> {
-    let cache_path = paths.ua_cache_file();
-    ensure_no_symlink_components_under(&paths.cache_dir, &cache_path).ok()?;
-    let bytes = read_regular_file_opt_bounded(&cache_path, 64 * 1024, "UA cache")
-        .ok()
-        .flatten()?;
-    let cache: UaVersionCache = serde_json::from_slice(&bytes).ok()?;
-    if cache.fetched_at <= now_unix + 60 && now_unix - cache.fetched_at <= UA_CACHE_TTL_SECS {
-        parse_semver_triplet(&cache.remote_version)
-    } else {
-        None
-    }
-}
-
-/// Resolve `NATIVE_OAUTH_USER_AGENT` for network operations.
-/// Never blocks fatally; optionally probes remote version if `allow_remote_probe == true` and cache is expired.
-pub async fn resolve_native_oauth_user_agent(
-    paths: &HeadlessPaths,
-    transport: &dyn HttpTransport,
-    allow_remote_probe: bool,
-    now_unix: i64,
-) -> String {
-    if let Some(cached) = read_cached_ua_version_readonly(paths, now_unix) {
-        let ver = select_ua_version(KNOWN_COMPAT_FLOOR_UA_VERSION, Some(&cached));
-        return format_native_oauth_user_agent(&ver);
-    }
-
-    if allow_remote_probe {
-        let req = HttpRequest::get(REMOTE_UA_VERSION_URL, TimeoutClass::VersionCheck);
-        if let Ok(resp) = transport.execute(req).await {
-            if (200..300).contains(&resp.status) {
-                if let Ok(body_str) = std::str::from_utf8(&resp.body) {
-                    if let Some(remote_ver) = parse_semver_triplet(body_str) {
-                        if ensure_private_dir(&paths.cache_dir).is_ok() {
-                            let cache = UaVersionCache {
-                                schema_version: STORE_SCHEMA_VERSION,
-                                remote_version: remote_ver.clone(),
-                                fetched_at: now_unix,
-                            };
-                            if let Ok(bytes) = serde_json::to_vec_pretty(&cache) {
-                                let _ = write_atomic_durable(&paths.ua_cache_file(), &bytes);
-                            }
-                        }
-                        let ver =
-                            select_ua_version(KNOWN_COMPAT_FLOOR_UA_VERSION, Some(&remote_ver));
-                        return format_native_oauth_user_agent(&ver);
-                    }
-                }
-            }
-        }
-    }
-
-    let ver = select_ua_version(KNOWN_COMPAT_FLOOR_UA_VERSION, None);
-    format_native_oauth_user_agent(&ver)
 }
 
 #[derive(Debug, Clone)]
@@ -645,32 +516,6 @@ mod tests {
         out.resize(out.len() + pad, 0);
         out.extend_from_slice(&payload);
         out
-    }
-
-    #[test]
-    fn select_ua_version_computes_true_semver_upper_bound() {
-        assert_eq!(select_ua_version("4.3.0", None), "4.3.0");
-        // Remote older than floor MUST NOT downgrade floor!
-        assert_eq!(select_ua_version("4.3.0", Some("1.15.8")), "4.3.0");
-        assert_eq!(select_ua_version("4.3.0", Some("4.2.99")), "4.3.0");
-        // Remote newer than floor upgrades UA!
-        assert_eq!(select_ua_version("4.3.0", Some("4.10.2")), "4.10.2");
-        assert_eq!(
-            format_hub_user_agent_for_target(
-                &select_ua_version("4.3.0", Some("4.10.2")),
-                "linux",
-                "x86_64"
-            ),
-            "antigravity/hub/4.10.2 (os_type=linux; arch=amd64)"
-        );
-        assert_eq!(
-            format_hub_user_agent_for_target("4.3.0", "linux", "aarch64"),
-            "antigravity/hub/4.3.0 (os_type=linux; arch=arm64)"
-        );
-        let native_ua = format_native_oauth_user_agent("4.3.0");
-        assert!(native_ua.starts_with("antigravity/hub/4.3.0 (os_type="));
-        assert!(native_ua.contains("; arch="));
-        assert!(native_ua.ends_with(')'));
     }
 
     #[test]

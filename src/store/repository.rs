@@ -2382,9 +2382,6 @@ pub fn read_headless_config_readonly(
             )));
         }
     }
-    for (target_name, raw_target_path) in &cfg.targets {
-        crate::domain::config::validate_target_config_entry(&path, target_name, raw_target_path)?;
-    }
     let mut warnings = Vec::new();
     let mode = meta.permissions().mode() & 0o777;
     let has_sensitive_cfg = !cfg.oauth.clients.is_empty()

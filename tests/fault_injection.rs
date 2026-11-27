@@ -1,24 +1,22 @@
 use agy_switch_cli::domain::account::AccountRecord;
 use agy_switch_cli::domain::token::TokenRecord;
 use agy_switch_cli::error::ExitCode;
-use agy_switch_cli::oauth::refresh::OAuthEndpoints;
 use agy_switch_cli::oauth::registry::OAuthClientRegistry;
 use agy_switch_cli::paths::HeadlessPaths;
 use agy_switch_cli::session::backend::{CredentialBackend, FileSessionBackend};
 use agy_switch_cli::session::journal::{
-    diagnose_journal, read_journal_readonly, reconcile_journal_locked, JournalDiagnosis,
+    diagnose_journal, read_journal_readonly, reconcile_journal_locked, write_journal,
+    JournalDiagnosis, SwitchJournal,
 };
 use agy_switch_cli::session::payload::serialize_session_payload;
 use agy_switch_cli::store::locks::ActiveSlotLock;
 use agy_switch_cli::store::repository::StoreRepository;
 use agy_switch_cli::switching::executor::{execute_switch, SwitchOptions};
-use agy_switch_cli::transport::client::MockTransport;
 use serde_json::json;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
-use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
 static FAULT_ENV_MUTEX: AsyncMutex<()> = AsyncMutex::const_new(());
@@ -113,20 +111,18 @@ async fn rotated_refresh_token_is_never_rolled_back_when_slot_write_fails_with_e
         Ok(())
     })
     .unwrap();
-    let initial_slot_payload = serialize_session_payload(&acc_old.token).unwrap();
-    backend.write_slot(&paths, &initial_slot_payload).unwrap();
-
-    // Mock Google OAuth returning a ROTATED refresh_token!
-    let mock = MockTransport::from_queue([Ok(MockTransport::json_response(
-        200,
-        json!({
-            "access_token": "ya29.NEW_TARGET_AT",
-            "expires_in": 3600,
-            "token_type": "Bearer",
-            "refresh_token": "1//SERVER_ROTATED_NEW_RT",
-            "scope": "openid https://www.googleapis.com/auth/cloud-platform"
-        }),
-    ))]);
+    // Official `agy` rotated `acc-old`'s refresh_token and access_token inside the active slot!
+    let rotated_old_slot_payload = serde_json::to_string(&json!({
+        "access_token": "ya29.NEW_OLD_AT",
+        "refresh_token": "1//SERVER_ROTATED_NEW_RT",
+        "token_type": "Bearer",
+        "expiry": "2099-01-01T00:00:00Z",
+        "id_token_email": "old@example.invalid",
+    }))
+    .unwrap();
+    backend
+        .write_slot(&paths, &rotated_old_slot_payload)
+        .unwrap();
 
     // Inject ENOSPC specifically on `antigravity-oauth-token` write!
     let fault_guard = ScopedEnvVar::set(
@@ -137,21 +133,14 @@ async fn rotated_refresh_token_is_never_rolled_back_when_slot_write_fails_with_e
     let res = execute_switch(
         &repo,
         &backend,
-        &mock,
-        &OAuthEndpoints {
-            base_backoff: Duration::from_millis(5),
-            ..OAuthEndpoints::default()
-        },
         &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-target",
         &SwitchOptions {
             dry_run: false,
             allow_running: false,
         },
         now,
-    )
-    .await;
+    );
 
     drop(fault_guard);
 
@@ -161,7 +150,7 @@ async fn rotated_refresh_token_is_never_rolled_back_when_slot_write_fails_with_e
     // 1. Active slot retains acc-old untouched
     assert_eq!(
         fs::read_to_string(&paths.active_slot_file).unwrap(),
-        initial_slot_payload
+        rotated_old_slot_payload
     );
     // 2. Local index still selects acc-old
     assert_eq!(
@@ -172,10 +161,11 @@ async fn rotated_refresh_token_is_never_rolled_back_when_slot_write_fails_with_e
             .as_deref(),
         Some("acc-old")
     );
-    // 3. CRITICAL INVARIANT: `acc-target` on disk MUST retain `1//SERVER_ROTATED_NEW_RT`, NEVER rolled back!
-    let saved_target = repo.read_account_unchecked("acc-target").unwrap();
-    assert_eq!(saved_target.token.refresh_token, "1//SERVER_ROTATED_NEW_RT");
-    assert_eq!(saved_target.token.access_token, "ya29.NEW_TARGET_AT");
+    // 3. CRITICAL INVARIANT: Pre-Switch Sync-Back already persisted `1//SERVER_ROTATED_NEW_RT`
+    //    into `acc-old` on disk and MUST retain it (NEVER rolled back even when target write fails)!
+    let saved_old = repo.read_account_unchecked("acc-old").unwrap();
+    assert_eq!(saved_old.token.refresh_token, "1//SERVER_ROTATED_NEW_RT");
+    assert_eq!(saved_old.token.access_token, "ya29.NEW_OLD_AT");
 }
 
 #[tokio::test]
@@ -207,10 +197,7 @@ async fn index_failure_after_slot_commit_returns_exit_7_committed_index_pending_
     let err = execute_switch(
         &repo,
         &backend,
-        &MockTransport::default(),
-        &OAuthEndpoints::default(),
         &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-b",
         &SwitchOptions {
             dry_run: false,
@@ -218,7 +205,6 @@ async fn index_failure_after_slot_commit_returns_exit_7_committed_index_pending_
         },
         now,
     )
-    .await
     .unwrap_err();
 
     drop(fault_guard);
@@ -298,10 +284,7 @@ async fn failed_slot_readback_and_failed_rollback_records_recovery_incomplete_ex
     let err = execute_switch(
         &repo,
         &backend,
-        &MockTransport::default(),
-        &OAuthEndpoints::default(),
         &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-b",
         &SwitchOptions {
             dry_run: false,
@@ -309,7 +292,6 @@ async fn failed_slot_readback_and_failed_rollback_records_recovery_incomplete_ex
         },
         now,
     )
-    .await
     .unwrap_err();
 
     drop(fault_guard);
@@ -349,10 +331,7 @@ async fn failed_slot_readback_and_failed_rollback_records_recovery_incomplete_ex
     let dry_blocked = execute_switch(
         &repo,
         &backend,
-        &MockTransport::default(),
-        &OAuthEndpoints::default(),
         &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-b",
         &SwitchOptions {
             dry_run: true,
@@ -360,17 +339,13 @@ async fn failed_slot_readback_and_failed_rollback_records_recovery_incomplete_ex
         },
         now + 5,
     )
-    .await
     .unwrap_err();
     assert_eq!(dry_blocked.exit_code, ExitCode::PartialCommitOrRecovery);
 
     let sw_healed = execute_switch(
         &repo,
         &backend,
-        &MockTransport::default(),
-        &OAuthEndpoints::default(),
         &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-b",
         &SwitchOptions {
             dry_run: false,
@@ -378,7 +353,6 @@ async fn failed_slot_readback_and_failed_rollback_records_recovery_incomplete_ex
         },
         now + 6,
     )
-    .await
     .unwrap();
     assert_eq!(sw_healed.target_account_id, "acc-b");
     assert!(read_journal_readonly(&paths).unwrap().is_none());
@@ -503,7 +477,7 @@ async fn journal_reconcile_unwedges_recovery_incomplete_with_bare_imported_prev_
     let backend = FileSessionBackend;
     let now = 1_800_000_000i64;
 
-    // `acc-imported` has empty `access_token` (as created by `accounts import` from bare refresh_token)
+    // `acc-imported` starts as a valid bare imported account (`access_token == ""`, `expiry_timestamp == 1`)
     let mut acc_imported = make_account("acc-imported", "imp@example.invalid", "1//RT_IMP", 1, now);
     acc_imported.token.access_token.clear();
     // `acc-target` has valid access_token
@@ -530,10 +504,7 @@ async fn journal_reconcile_unwedges_recovery_incomplete_with_bare_imported_prev_
     let err = execute_switch(
         &repo,
         &backend,
-        &MockTransport::default(),
-        &OAuthEndpoints::default(),
         &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-target",
         &SwitchOptions {
             dry_run: false,
@@ -541,13 +512,20 @@ async fn journal_reconcile_unwedges_recovery_incomplete_with_bare_imported_prev_
         },
         now,
     )
-    .await
     .unwrap_err();
     drop(fault_guard1);
     assert_eq!(err.error_code, "recovery_incomplete");
 
-    // `reconcile_journal_locked` MUST skip unserializable `acc-imported` (`access_token == ""`)
+    // Simulate an unserializable `acc-imported` record on disk (`expiry_timestamp == 0`):
+    // `reconcile_journal_locked` MUST skip unserializable `acc-imported`
     // and repair cleanly using `acc-target` instead of failing!
+    let mut corrupt_prev = repo.read_account_unchecked("acc-imported").unwrap();
+    corrupt_prev.token.expiry_timestamp = 0;
+    fs::write(
+        paths.account_file("acc-imported"),
+        serde_json::to_string_pretty(&corrupt_prev).unwrap(),
+    )
+    .unwrap();
     let l1 = ActiveSlotLock::try_acquire(&paths, false).unwrap();
     reconcile_journal_locked(&l1, &repo, &backend, true, now + 5).unwrap();
     drop(l1);
@@ -578,10 +556,7 @@ async fn journal_reconcile_unwedges_recovery_incomplete_with_bare_imported_prev_
     let err2 = execute_switch(
         &repo,
         &backend,
-        &MockTransport::default(),
-        &OAuthEndpoints::default(),
         &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-deleted",
         &SwitchOptions {
             dry_run: false,
@@ -589,7 +564,6 @@ async fn journal_reconcile_unwedges_recovery_incomplete_with_bare_imported_prev_
         },
         now + 7,
     )
-    .await
     .unwrap_err();
     drop(fault_guard2);
     assert_eq!(err2.error_code, "committed_index_pending");
@@ -642,11 +616,7 @@ async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slo
             )
             .env("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir)
             .env("AGY_SWITCH_CLI_AGY_BIN", &no_agy)
-            .args([
-                "--data-dir",
-                paths.data_dir.to_str().unwrap(),
-                "--no-remote-version",
-            ]);
+            .args(["--data-dir", paths.data_dir.to_str().unwrap()]);
         c
     };
 
@@ -943,45 +913,19 @@ async fn concurrent_non_slot_store_writes_succeed_during_slow_network_switch_wit
         .write_slot(&paths, &serialize_session_payload(&acc_a.token).unwrap())
         .unwrap();
 
-    // Slow OAuth transport taking 450ms (> 250ms!) while `switch_journal.json` is in `Prepared` phase under L1!
-    let slow_oauth = MockTransport::from_queue([Ok(MockTransport::json_response(
-        200,
-        json!({
-            "access_token": "ya29.ACC_B_FRESH",
-            "expires_in": 3600,
-            "token_type": "Bearer",
-            "refresh_token": "1//RT_B_ROTATED",
-            "scope": "openid https://www.googleapis.com/auth/cloud-platform"
-        }),
-    ))])
-    .with_delay(Duration::from_millis(700));
-
-    let repo_sw = repo.clone();
-    let switch_task = tokio::spawn(async move {
-        execute_switch(
-            &repo_sw,
-            &FileSessionBackend,
-            &slow_oauth,
-            &OAuthEndpoints::default(),
-            &OAuthClientRegistry::parse_from_raw(None, None),
-            "vscode/1.X.X (Antigravity/4.3.0)",
-            "acc-b",
-            &SwitchOptions {
-                dry_run: false,
-                allow_running: false,
-            },
-            now,
-        )
-        .await
-    });
-
-    // Wait until `switch_journal.json` (`Prepared`) is on disk while `switch_task` is mid-network-await
-    for _ in 0..40 {
-        if paths.switch_journal_file().exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // Hold L1 with an active `Prepared` switch journal (simulating an in-flight switch under L1)
+    let l1_hold = ActiveSlotLock::try_acquire(&paths, false).unwrap();
+    let prepared_journal = SwitchJournal::new_prepared(
+        "op-concurrent-l1".into(),
+        Some("acc-a".into()),
+        "acc-b".into(),
+        backend
+            .inspect_slot(&paths)
+            .raw_digest()
+            .map(str::to_string),
+        now,
+    );
+    write_journal(&paths, &prepared_journal).unwrap();
     assert!(paths.switch_journal_file().exists());
 
     let cli = || {
@@ -996,11 +940,7 @@ async fn concurrent_non_slot_store_writes_succeed_during_slow_network_switch_wit
                 format!("unix:path={}/no-dbus", run_dir.display()),
             )
             .env("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir)
-            .args([
-                "--data-dir",
-                paths.data_dir.to_str().unwrap(),
-                "--no-remote-version",
-            ]);
+            .args(["--data-dir", paths.data_dir.to_str().unwrap()]);
         c
     };
 
@@ -1012,7 +952,7 @@ async fn concurrent_non_slot_store_writes_succeed_during_slow_network_switch_wit
     assert_eq!(
         pol_res.status.code(),
         Some(0),
-        "policy set failed during slow network switch: stderr={}",
+        "policy set failed during held L1 Prepared journal: stderr={}",
         String::from_utf8_lossy(&pol_res.stderr)
     );
     let enable_res = cli()
@@ -1022,7 +962,7 @@ async fn concurrent_non_slot_store_writes_succeed_during_slow_network_switch_wit
     assert_eq!(
         enable_res.status.code(),
         Some(0),
-        "accounts enable failed during slow network switch: stderr={}",
+        "accounts enable failed during held L1 Prepared journal: stderr={}",
         String::from_utf8_lossy(&enable_res.stderr)
     );
 
@@ -1030,9 +970,21 @@ async fn concurrent_non_slot_store_writes_succeed_during_slow_network_switch_wit
     let competing_sw = cli().args(["switch", "acc-c"]).output().unwrap();
     assert_eq!(competing_sw.status.code(), Some(5));
 
-    let sw_outcome = switch_task.await.unwrap().unwrap();
+    // Release L1 and execute the offline switch to `acc-b` cleanly!
+    drop(l1_hold);
+    let sw_outcome = execute_switch(
+        &repo,
+        &FileSessionBackend,
+        &OAuthClientRegistry::parse_from_raw(None, None),
+        "acc-b",
+        &SwitchOptions {
+            dry_run: false,
+            allow_running: false,
+        },
+        now,
+    )
+    .unwrap();
     assert_eq!(sw_outcome.target_account_id, "acc-b");
-    assert!(sw_outcome.refresh_token_rotated);
 
     // Verify all concurrent mutations survived cleanly via field-level merge!
     let final_snap = repo.read_snapshot().unwrap();
@@ -1042,13 +994,6 @@ async fn concurrent_non_slot_store_writes_succeed_during_slow_network_switch_wit
     );
     assert_eq!(repo.read_policy().unwrap().reserve_percentage, 22);
     assert!(!repo.read_account_unchecked("acc-c").unwrap().disabled);
-    assert_eq!(
-        repo.read_account_unchecked("acc-b")
-            .unwrap()
-            .token
-            .refresh_token,
-        "1//RT_B_ROTATED"
-    );
 }
 
 #[tokio::test]
@@ -1099,7 +1044,6 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
                 paths.data_dir.to_str().unwrap(),
                 "--backend",
                 "file",
-                "--no-remote-version",
             ]);
         c
     };
@@ -1500,7 +1444,6 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
                 paths.data_dir.to_str().unwrap(),
                 "--backend",
                 "file",
-                "--no-remote-version",
             ]);
         c
     };
@@ -2035,7 +1978,6 @@ async fn synthetic_v123_r401_rejects_file_prev_uniform_false_and_allows_omitted_
                 paths.data_dir.to_str().unwrap(),
                 "--backend",
                 "file",
-                "--no-remote-version",
             ]);
         c
     };

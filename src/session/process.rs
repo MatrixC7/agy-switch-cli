@@ -947,41 +947,41 @@ mod tests {
             ))
         );
 
-        // `agy acp --gemini-dir <abs> --app-data-dir antigravity-acp`
+        // `agy --gemini-dir <abs> --app-data-dir custom-slot`
         assert_eq!(
             parse_agy_cmdline_slot_dir(
-                b"/usr/bin/agy\0acp\0--gemini-dir\0/home/alice/.t3/userdata/providers/antigravity/hash1\0--app-data-dir\0antigravity-acp\0",
+                b"/usr/bin/agy\0--gemini-dir\0/home/alice/.custom/profiles/p1\0--app-data-dir\0custom-slot\0",
                 home,
                 None,
             ),
             ParsedCmdlineSlotDir::Explicit(PathBuf::from(
-                "/home/alice/.t3/userdata/providers/antigravity/hash1/antigravity-acp"
+                "/home/alice/.custom/profiles/p1/custom-slot"
             ))
         );
 
         // `=` and underscore single-dash forms
         assert_eq!(
             parse_agy_cmdline_slot_dir(
-                b"/usr/bin/agy\0acp\0--gemini_dir=/var/lib/harness/p1\0-app_data_dir=custom-acp\0",
+                b"/usr/bin/agy\0--gemini_dir=/var/lib/harness/p1\0-app_data_dir=custom-slot\0",
                 home,
                 None,
             ),
-            ParsedCmdlineSlotDir::Explicit(PathBuf::from("/var/lib/harness/p1/custom-acp"))
+            ParsedCmdlineSlotDir::Explicit(PathBuf::from("/var/lib/harness/p1/custom-slot"))
         );
 
         // Relative `--gemini-dir` WITH verified absolute `cwd` resolves deterministically;
         // WITHOUT verified absolute `cwd` MUST fail closed (`Indeterminate`), never guess `HOME`!
         assert_eq!(
             parse_agy_cmdline_slot_dir(
-                b"/usr/bin/agy\0acp\0--gemini-dir\0./profile\0--app-data-dir\0antigravity-acp\0",
+                b"/usr/bin/agy\0--gemini-dir\0./profile\0--app-data-dir\0custom-slot\0",
                 home,
                 Some(Path::new("/srv/runner")),
             ),
-            ParsedCmdlineSlotDir::Explicit(PathBuf::from("/srv/runner/profile/antigravity-acp"))
+            ParsedCmdlineSlotDir::Explicit(PathBuf::from("/srv/runner/profile/custom-slot"))
         );
         assert!(matches!(
             parse_agy_cmdline_slot_dir(
-                b"/usr/bin/agy\0acp\0--gemini-dir\0./profile\0--app-data-dir\0antigravity-acp\0",
+                b"/usr/bin/agy\0--gemini-dir\0./profile\0--app-data-dir\0custom-slot\0",
                 home,
                 None,
             ),
@@ -989,7 +989,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_agy_cmdline_slot_dir(
-                b"/usr/bin/agy\0acp\0--gemini-dir\0.gemini\0--app-data-dir\0antigravity-acp\0",
+                b"/usr/bin/agy\0--gemini-dir\0.gemini\0--app-data-dir\0custom-slot\0",
                 home,
                 Some(Path::new("relative/cwd")),
             ),
@@ -999,11 +999,11 @@ mod tests {
         // Incomplete or empty directory flags MUST fail closed (`Indeterminate`), never look like default!
         for bad_cmdline in [
             &b""[..],
-            &b"/usr/bin/agy\0acp\0--gemini-dir\0"[..],
-            &b"/usr/bin/agy\0acp\0--gemini-dir=\0--app-data-dir\0antigravity-acp\0"[..],
-            &b"/usr/bin/agy\0acp\0--gemini-dir\0--app-data-dir\0antigravity-acp\0"[..],
-            &b"/usr/bin/agy\0acp\0--gemini-dir\0/var/p\0--app-data-dir=\0"[..],
-            &b"/usr/bin/agy\0acp\0--gemini-dir\0/var/p\0--app-data-dir\0"[..],
+            &b"/usr/bin/agy\0--gemini-dir\0"[..],
+            &b"/usr/bin/agy\0--gemini-dir=\0--app-data-dir\0custom-slot\0"[..],
+            &b"/usr/bin/agy\0--gemini-dir\0--app-data-dir\0custom-slot\0"[..],
+            &b"/usr/bin/agy\0--gemini-dir\0/var/p\0--app-data-dir=\0"[..],
+            &b"/usr/bin/agy\0--gemini-dir\0/var/p\0--app-data-dir\0"[..],
         ] {
             assert!(
                 matches!(

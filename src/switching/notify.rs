@@ -29,6 +29,11 @@ pub enum DaemonNotificationEvent {
         max_failures: u32,
         reason: String,
     },
+    HoldingLowQuota {
+        staying_account: String,
+        staying_remaining_pct: u8,
+        candidate_min_pct: u8,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +255,31 @@ pub fn format_notification_payload(
                 icon: "dialog-warning",
                 urgency: 2,
                 expire_timeout_ms: NOTIFY_EXPIRE_PERSISTENT_MS,
+            }
+        }
+        DaemonNotificationEvent::HoldingLowQuota {
+            staying_account,
+            staying_remaining_pct,
+            candidate_min_pct,
+        } => {
+            let staying_clean =
+                sanitize_notify_field(staying_account, MAX_NOTIFY_ACCOUNT_CHARS, supports_markup);
+            let line1 = format!("All candidate accounts are below {candidate_min_pct}% minimum.");
+            let line2 = if supports_markup {
+                format!("Staying on <b>{staying_clean}</b> ({staying_remaining_pct}%).")
+            } else {
+                format!("Staying on {staying_clean} ({staying_remaining_pct}%).")
+            };
+            NotificationPayload {
+                summary: "Auto-Switch Holding (Low Quota)".to_string(),
+                body: format!("{line1}\n{line2}"),
+                icon: "dialog-warning",
+                urgency: 1,
+                expire_timeout_ms: if persistent_switch {
+                    NOTIFY_EXPIRE_PERSISTENT_MS
+                } else {
+                    NOTIFY_EXPIRE_SERVER_DEFAULT_MS
+                },
             }
         }
     }
@@ -616,6 +646,32 @@ mod tests {
             "■ Journal check · 1/3 failed\n\
              Corrupt switch journal <raw>\n\
              Run agy-switch-cli status to inspect."
+        );
+
+        let hold_event = DaemonNotificationEvent::HoldingLowQuota {
+            staying_account: "bob&<tag>@example.com (bak)".into(),
+            staying_remaining_pct: 18,
+            candidate_min_pct: 30,
+        };
+        let hold_markup = format_notification_payload(&hold_event, true, true);
+        assert_eq!(hold_markup.summary, "Auto-Switch Holding (Low Quota)");
+        assert_eq!(hold_markup.icon, "dialog-warning");
+        assert_eq!(hold_markup.urgency, 1);
+        assert_eq!(hold_markup.expire_timeout_ms, NOTIFY_EXPIRE_PERSISTENT_MS);
+        assert_eq!(
+            hold_markup.body,
+            "All candidate accounts are below 30% minimum.\n\
+             Staying on <b>bob&amp;&lt;tag&gt;@example.com (bak)</b> (18%)."
+        );
+        let hold_plain = format_notification_payload(&hold_event, false, false);
+        assert_eq!(
+            hold_plain.expire_timeout_ms,
+            NOTIFY_EXPIRE_SERVER_DEFAULT_MS
+        );
+        assert_eq!(
+            hold_plain.body,
+            "All candidate accounts are below 30% minimum.\n\
+             Staying on bob&<tag>@example.com (bak) (18%)."
         );
     }
 }

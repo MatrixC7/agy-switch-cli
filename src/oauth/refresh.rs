@@ -321,7 +321,6 @@ pub fn persist_disable_or_report_io_error(
 async fn execute_token_form_with_backoff(
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
-    user_agent: &str,
     client: &OAuthClientConfig,
     form: Vec<(String, String)>,
 ) -> Result<RawTokenResponse, StructuredOAuthError> {
@@ -331,12 +330,12 @@ async fn execute_token_form_with_backoff(
     let mut attempt = 0usize;
 
     loop {
+        // Option U1: send NO custom `User-Agent` header on standard Google OAuth requests.
         let req = HttpRequest::post_form(
             endpoints.token_url.clone(),
             form.clone(),
             TimeoutClass::OAuthToken,
-        )
-        .with_header("User-Agent", user_agent);
+        );
 
         let outcome = match transport.execute(req).await {
             Ok(resp) if (200..300).contains(&resp.status) => serde_json::from_slice::<
@@ -395,7 +394,6 @@ async fn execute_token_form_with_backoff(
 pub async fn exchange_authorization_code(
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
-    user_agent: &str,
     session: &PreparedAuthSession,
     code: &str,
     now_unix: i64,
@@ -410,10 +408,9 @@ pub async fn exchange_authorization_code(
         ("grant_type".into(), "authorization_code".into()),
     ];
 
-    let raw =
-        execute_token_form_with_backoff(transport, endpoints, user_agent, &session.client, form)
-            .await
-            .map_err(StructuredOAuthError::into_cli_error)?;
+    let raw = execute_token_form_with_backoff(transport, endpoints, &session.client, form)
+        .await
+        .map_err(StructuredOAuthError::into_cli_error)?;
 
     let post_now = clock.now_unix();
     let refresh_token = raw
@@ -451,90 +448,14 @@ pub async fn exchange_authorization_code(
     })
 }
 
-pub struct StandaloneRefreshOutcome {
-    pub token: TokenRecord,
-    pub refresh_token_rotated: bool,
-}
-
-/// Refresh an unpooled / standalone `refresh_token` directly via the specified OAuth client
-/// without modifying the local account store (`accounts/` or `index.json`).
-pub async fn refresh_standalone_refresh_token(
-    transport: &dyn HttpTransport,
-    endpoints: &OAuthEndpoints,
-    client: &OAuthClientConfig,
-    user_agent: &str,
-    refresh_token: &str,
-    previous_id_token: Option<&str>,
-    now_unix: i64,
-) -> CliResult<StandaloneRefreshOutcome> {
-    let clock = AnchoredClock::new(now_unix);
-    let form = vec![
-        ("client_id".into(), client.client_id.clone()),
-        ("client_secret".into(), client.client_secret.clone()),
-        ("refresh_token".into(), refresh_token.to_string()),
-        ("grant_type".into(), "refresh_token".into()),
-    ];
-    let raw = execute_token_form_with_backoff(transport, endpoints, user_agent, client, form)
-        .await
-        .map_err(StructuredOAuthError::into_cli_error)?;
-    let post_now = clock.now_unix();
-    let access_token = raw.access_token.trim().to_string();
-    if access_token.is_empty() {
-        return Err(CliError::auth(
-            "oauth_protocol_error",
-            "OAuth token refresh response returned an empty `access_token`.",
-        ));
-    }
-    let rotated_rt = raw
-        .refresh_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-    let refresh_token_rotated = rotated_rt
-        .as_deref()
-        .is_some_and(|next| next != refresh_token);
-    let effective_rt = rotated_rt.unwrap_or_else(|| refresh_token.to_string());
-    let expires_in = raw.expires_in.max(60);
-    let expiry_timestamp = post_now.saturating_add(expires_in).max(1);
-    let id_token = raw
-        .id_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .or_else(|| previous_id_token.map(str::to_owned));
-
-    Ok(StandaloneRefreshOutcome {
-        token: TokenRecord {
-            access_token,
-            refresh_token: effective_rt,
-            expires_in,
-            expiry_timestamp,
-            token_type: if raw.token_type.trim().is_empty() {
-                "Bearer".into()
-            } else {
-                raw.token_type
-            },
-            id_token,
-            oauth_client_key: Some(client.key.clone()),
-            granted_scopes: parse_scope_string(raw.scope.as_deref()),
-            project_id: None,
-            is_gcp_tos: true,
-        },
-        refresh_token_rotated,
-    })
-}
-
 pub async fn fetch_userinfo(
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
-    user_agent: &str,
     access_token: &str,
 ) -> CliResult<UserInfo> {
+    // Option U1: send NO custom `User-Agent` header on standard Google OAuth requests.
     let req = HttpRequest::get(endpoints.userinfo_url.clone(), TimeoutClass::StandardApi)
-        .with_bearer_auth(access_token)
-        .with_header("User-Agent", user_agent);
+        .with_bearer_auth(access_token);
 
     let resp = transport.execute(req).await.map_err(|e| {
         CliError::io(
@@ -918,7 +839,6 @@ async fn refresh_existing_account_for_add(
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
     registry: &OAuthClientRegistry,
-    user_agent: &str,
     existing_id: &str,
     rt_trimmed: &str,
     explicit_client_key: Option<&str>,
@@ -957,23 +877,16 @@ async fn refresh_existing_account_for_add(
                     }
                 }
                 let client = registry.require_bound_client(bound_key)?;
-                refresh_raw_with_client(transport, endpoints, user_agent, &client, &effective_rt)
+                refresh_raw_with_client(transport, endpoints, &client, &effective_rt)
                     .await
                     .map(|raw| (raw, client.key))
             } else if let Some(key) = explicit_client_key {
                 let client = registry.select_for_login(Some(key))?;
-                refresh_raw_with_client(transport, endpoints, user_agent, &client, &effective_rt)
+                refresh_raw_with_client(transport, endpoints, &client, &effective_rt)
                     .await
                     .map(|raw| (raw, client.key))
             } else {
-                probe_refresh_unknown_client(
-                    transport,
-                    endpoints,
-                    registry,
-                    user_agent,
-                    &effective_rt,
-                )
-                .await
+                probe_refresh_unknown_client(transport, endpoints, registry, &effective_rt).await
             };
 
             let (raw, used_client_key) = match refresh_res {
@@ -1074,14 +987,7 @@ async fn refresh_existing_account_for_add(
             }
 
             // Auxiliary `userinfo` AFTER rotated token is already durably saved on disk!
-            match fetch_userinfo(
-                transport,
-                endpoints,
-                user_agent,
-                &saved_acc.token.access_token,
-            )
-            .await
-            {
+            match fetch_userinfo(transport, endpoints, &saved_acc.token.access_token).await {
                 Ok(u) => {
                     saved_acc = repo.with_write_lock(|tx| {
                         tx.update_account_identity_metadata(
@@ -1161,7 +1067,6 @@ pub async fn bootstrap_and_persist_refresh_token(
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
     registry: &OAuthClientRegistry,
-    user_agent: &str,
     refresh_token: &str,
     explicit_client_key: Option<&str>,
     custom_label: Option<&str>,
@@ -1191,7 +1096,6 @@ pub async fn bootstrap_and_persist_refresh_token(
             transport,
             endpoints,
             registry,
-            user_agent,
             &existing_acc.id,
             rt_trimmed,
             explicit_client_key,
@@ -1234,7 +1138,6 @@ pub async fn bootstrap_and_persist_refresh_token(
                     transport,
                     endpoints,
                     registry,
-                    user_agent,
                     &existing_acc.id,
                     rt_trimmed,
                     explicit_client_key,
@@ -1295,7 +1198,6 @@ pub async fn bootstrap_and_persist_refresh_token(
                             let raw = refresh_raw_with_client(
                                 transport,
                                 endpoints,
-                                user_agent,
                                 &client,
                                 &effective_rt,
                             )
@@ -1307,7 +1209,6 @@ pub async fn bootstrap_and_persist_refresh_token(
                             let raw = refresh_raw_with_client(
                                 transport,
                                 endpoints,
-                                user_agent,
                                 &client,
                                 &effective_rt,
                             )
@@ -1319,7 +1220,6 @@ pub async fn bootstrap_and_persist_refresh_token(
                                 transport,
                                 endpoints,
                                 registry,
-                                user_agent,
                                 &effective_rt,
                             )
                             .await
@@ -1382,18 +1282,15 @@ pub async fn bootstrap_and_persist_refresh_token(
                     })?
                     .unwrap_or(2);
                 let (raw, used_client_key) = if let Some(client) = preselected_client {
-                    let raw = refresh_raw_with_client(
-                        transport, endpoints, user_agent, &client, rt_trimmed,
-                    )
-                    .await
-                    .map_err(StructuredOAuthError::into_cli_error)?;
+                    let raw =
+                        refresh_raw_with_client(transport, endpoints, &client, rt_trimmed)
+                            .await
+                            .map_err(StructuredOAuthError::into_cli_error)?;
                     (raw, client.key)
                 } else {
-                    probe_refresh_unknown_client(
-                        transport, endpoints, registry, user_agent, rt_trimmed,
-                    )
-                    .await
-                    .map_err(StructuredOAuthError::into_cli_error)?
+                    probe_refresh_unknown_client(transport, endpoints, registry, rt_trimmed)
+                        .await
+                        .map_err(StructuredOAuthError::into_cli_error)?
                 };
 
                 let post_now = clock.now_unix();
@@ -1456,8 +1353,7 @@ pub async fn bootstrap_and_persist_refresh_token(
             };
 
             let missing = registry.missing_required_scopes(&token);
-            let userinfo_res =
-                fetch_userinfo(transport, endpoints, user_agent, &token.access_token).await;
+            let userinfo_res = fetch_userinfo(transport, endpoints, &token.access_token).await;
 
             match userinfo_res {
                 Ok(user_info) => {
@@ -1516,7 +1412,6 @@ pub async fn complete_login_exchange_locked(
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
     registry: &OAuthClientRegistry,
-    user_agent: &str,
     session: &PreparedAuthSession,
     code: &str,
     custom_label: Option<&str>,
@@ -1533,10 +1428,8 @@ pub async fn complete_login_exchange_locked(
             let reserved_seq = repo
                 .with_write_lock(|tx| tx.preflight_pending_auth_staging(&pending_id, true))?
                 .unwrap_or(2);
-            let token = exchange_authorization_code(
-                transport, endpoints, user_agent, session, code, now_unix,
-            )
-            .await?;
+            let token =
+                exchange_authorization_code(transport, endpoints, session, code, now_unix).await?;
             let post_now = clock.now_unix();
 
             // CRITICAL: Immediately persist `0600` durable `PendingAuthRecord` with monotonic `auth_seq` BEFORE `fetch_userinfo` await!
@@ -1570,8 +1463,7 @@ pub async fn complete_login_exchange_locked(
                 .map_err(|e| wrap_unpersisted_token_exchange_error(e, true))?;
 
             let missing = registry.missing_required_scopes(&token);
-            let userinfo_res =
-                fetch_userinfo(transport, endpoints, user_agent, &token.access_token).await;
+            let userinfo_res = fetch_userinfo(transport, endpoints, &token.access_token).await;
 
             match userinfo_res {
                 Ok(user_info) => {
@@ -1624,7 +1516,6 @@ pub async fn complete_login_exchange_locked(
 async fn refresh_raw_with_client(
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
-    user_agent: &str,
     client: &OAuthClientConfig,
     refresh_token: &str,
 ) -> Result<RawTokenResponse, StructuredOAuthError> {
@@ -1635,14 +1526,13 @@ async fn refresh_raw_with_client(
         ("refresh_token".into(), refresh_token.to_string()),
         ("grant_type".into(), "refresh_token".into()),
     ];
-    execute_token_form_with_backoff(transport, endpoints, user_agent, client, form).await
+    execute_token_form_with_backoff(transport, endpoints, client, form).await
 }
 
 async fn probe_refresh_unknown_client(
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
     registry: &OAuthClientRegistry,
-    user_agent: &str,
     refresh_token: &str,
 ) -> Result<(RawTokenResponse, String), StructuredOAuthError> {
     let candidates = registry.legacy_probe_candidates();
@@ -1650,8 +1540,7 @@ async fn probe_refresh_unknown_client(
 
     for (idx, client) in candidates.iter().enumerate() {
         let has_more = idx + 1 < candidates.len();
-        match refresh_raw_with_client(transport, endpoints, user_agent, client, refresh_token).await
-        {
+        match refresh_raw_with_client(transport, endpoints, client, refresh_token).await {
             Ok(raw) => return Ok((raw, client.key.clone())),
             Err(err) => {
                 // Controlled probe ONLY continues on explicit `ClientAuthMismatch`!
@@ -1691,7 +1580,6 @@ pub async fn ensure_account_token_fresh_locked(
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
     registry: &OAuthClientRegistry,
-    user_agent: &str,
     account_id: &str,
     force_refresh: bool,
     now_unix: i64,
@@ -1701,7 +1589,6 @@ pub async fn ensure_account_token_fresh_locked(
         transport,
         endpoints,
         registry,
-        user_agent,
         account_id,
         force_refresh,
         now_unix,
@@ -1712,15 +1599,13 @@ pub async fn ensure_account_token_fresh_locked(
 
 /// Same as `ensure_account_token_fresh_locked`, invoking `on_token_persisted` immediately after
 /// durable pool token persistence under L3 (`merge_refreshed_token`) and BEFORE any subsequent
-/// scope rejection or optional `userinfo` call so decoupled external slots always receive newly
-/// rotated tokens even when a post-rotation check returns an early error.
+/// scope rejection or optional `userinfo` call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ensure_account_token_fresh_locked_with_hook<F>(
     repo: &StoreRepository,
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
     registry: &OAuthClientRegistry,
-    user_agent: &str,
     account_id: &str,
     force_refresh: bool,
     now_unix: i64,
@@ -1781,7 +1666,6 @@ where
             refresh_raw_with_client(
                 transport,
                 endpoints,
-                user_agent,
                 &client,
                 &current_acc.token.refresh_token,
             )
@@ -1792,7 +1676,6 @@ where
                 transport,
                 endpoints,
                 registry,
-                user_agent,
                 &current_acc.token.refresh_token,
             )
             .await
@@ -1904,9 +1787,7 @@ where
             .unwrap_or("")
             .is_empty()
         {
-            match fetch_userinfo(transport, endpoints, user_agent, &updated_acc.token.access_token)
-                .await
-            {
+            match fetch_userinfo(transport, endpoints, &updated_acc.token.access_token).await {
                 Ok(u) => {
                     if let Some(name) = u.display_name() {
                         let _ = repo
@@ -1948,7 +1829,6 @@ pub async fn complete_reauthorize_exchange_locked(
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
     registry: &OAuthClientRegistry,
-    user_agent: &str,
     existing: &AccountRecord,
     session: &PreparedAuthSession,
     code: &str,
@@ -1977,7 +1857,6 @@ pub async fn complete_reauthorize_exchange_locked(
                     let mut new_token = exchange_authorization_code(
                         transport,
                         endpoints,
-                        user_agent,
                         session,
                         code,
                         clock.now_unix(),
@@ -2023,7 +1902,6 @@ pub async fn complete_reauthorize_exchange_locked(
                     let user_info = match fetch_userinfo(
                         transport,
                         endpoints,
-                        user_agent,
                         &new_token.access_token,
                     )
                     .await
@@ -2130,7 +2008,6 @@ async fn refresh_pending_record_token(
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
     registry: &OAuthClientRegistry,
-    user_agent: &str,
     rec: &PendingAuthRecord,
     expected_prev_fp: &str,
     clock: &AnchoredClock,
@@ -2144,26 +2021,14 @@ async fn refresh_pending_record_token(
     repo.with_write_lock(|tx| tx.preflight_pending_auth_staging(&pending_id_for_preflight, false))?;
 
     let (raw, used_key) = if let Some(client) = bound_client {
-        refresh_raw_with_client(
-            transport,
-            endpoints,
-            user_agent,
-            &client,
-            &active_token.refresh_token,
-        )
-        .await
-        .map(|raw| (raw, client.key))
-        .map_err(StructuredOAuthError::into_cli_error)?
+        refresh_raw_with_client(transport, endpoints, &client, &active_token.refresh_token)
+            .await
+            .map(|raw| (raw, client.key))
+            .map_err(StructuredOAuthError::into_cli_error)?
     } else {
-        probe_refresh_unknown_client(
-            transport,
-            endpoints,
-            registry,
-            user_agent,
-            &active_token.refresh_token,
-        )
-        .await
-        .map_err(StructuredOAuthError::into_cli_error)?
+        probe_refresh_unknown_client(transport, endpoints, registry, &active_token.refresh_token)
+            .await
+            .map_err(StructuredOAuthError::into_cli_error)?
     };
 
     let post_now = clock.now_unix();
@@ -2219,7 +2084,6 @@ pub async fn resume_pending_auth_records(
     transport: &dyn HttpTransport,
     endpoints: &OAuthEndpoints,
     registry: &OAuthClientRegistry,
-    user_agent: &str,
     now_unix: i64,
 ) -> CliResult<PendingResumeReport> {
     let clock = AnchoredClock::new(now_unix);
@@ -2328,7 +2192,6 @@ pub async fn resume_pending_auth_records(
                                 transport,
                                 endpoints,
                                 registry,
-                                user_agent,
                                 &rec,
                                 &expected_fp,
                                 &clock,
@@ -2343,7 +2206,6 @@ pub async fn resume_pending_auth_records(
                         let user_info = fetch_userinfo(
                             transport,
                             endpoints,
-                            user_agent,
                             &active_token.access_token,
                         )
                         .await?;
@@ -2417,7 +2279,6 @@ pub async fn resume_pending_auth_records(
                                         transport,
                                         endpoints,
                                         registry,
-                                        user_agent,
                                         &rec_l2,
                                         &expected_fp,
                                         &clock,
@@ -2432,7 +2293,6 @@ pub async fn resume_pending_auth_records(
                                 let user_info = match fetch_userinfo(
                                     transport,
                                     endpoints,
-                                    user_agent,
                                     &active_token.access_token,
                                 )
                                 .await
@@ -2638,4 +2498,72 @@ pub fn purge_all_pending_auth_records(repo: &StoreRepository) -> CliResult<usize
         drop(held_locks);
         Ok(removed)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::client::MockTransport;
+
+    #[tokio::test]
+    async fn option_u1_oauth_requests_attach_zero_custom_user_agent_header() {
+        let transport = MockTransport::from_queue(vec![
+            Ok(MockTransport::json_response(
+                200,
+                serde_json::json!({
+                    "access_token": "ya29.u1-at",
+                    "refresh_token": "1//u1-rt",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                    "scope": "openid https://www.googleapis.com/auth/cloud-platform"
+                }),
+            )),
+            Ok(MockTransport::json_response(
+                200,
+                serde_json::json!({
+                    "email": "alice@example.com",
+                    "name": "Alice"
+                }),
+            )),
+        ]);
+        let endpoints = OAuthEndpoints {
+            base_backoff: Duration::from_millis(1),
+            ..OAuthEndpoints::default()
+        };
+        let client = OAuthClientConfig {
+            key: "antigravity_enterprise".into(),
+            label: "Test".into(),
+            client_id: "cid".into(),
+            client_secret: "csec".into(),
+            is_builtin: true,
+            request_scopes: crate::oauth::registry::default_request_scopes(),
+            required_scopes: crate::oauth::registry::default_required_scopes(),
+        };
+        let session = crate::oauth::flow::build_authorization_session(
+            client,
+            54545,
+            crate::oauth::flow::GOOGLE_AUTH_URL,
+        )
+        .unwrap();
+        let tok =
+            exchange_authorization_code(&transport, &endpoints, &session, "4/code", 1_900_000_000)
+                .await
+                .unwrap();
+        let info = fetch_userinfo(&transport, &endpoints, &tok.access_token)
+            .await
+            .unwrap();
+        assert_eq!(info.email, "alice@example.com");
+
+        let reqs = transport.recorded_requests();
+        assert_eq!(reqs.len(), 2);
+        for req in &reqs {
+            assert!(
+                !req.headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("user-agent")),
+                "Option U1 forbids custom User-Agent header on OAuth request: {:?}",
+                req.headers
+            );
+        }
+    }
 }

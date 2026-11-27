@@ -86,11 +86,7 @@ impl IsolatedEnv {
                 "AGY_SWITCH_CLI_ANTIGRAVITY_APP_DIR",
                 self._tmp.path().join("no-host-antigravity-app"),
             )
-            .args([
-                "--data-dir",
-                data_dir.to_str().unwrap(),
-                "--no-remote-version",
-            ]);
+            .args(["--data-dir", data_dir.to_str().unwrap()]);
         cmd
     }
 }
@@ -1544,8 +1540,10 @@ GLib.MainLoop().run()
         assert!(env.paths().active_slot_file.exists());
 
         // Put invalid JSON in disk `antigravity-oauth-token` while keyring holds valid `acc-kr2` payload:
-        // `auto_cli() accounts add --from-local` MUST read from keyring first (advancing past local parse to OAuth transport),
-        // whereas `--backend file` hits `data_error` on the corrupt disk file!
+        // Under v1.2.7 Option 1B (`--from-local` is strictly offline) + S4 metadata preservation,
+        // `auto` MUST read the valid keyring payload FIRST (including `id_token_email` preserved by
+        // `switch`) and succeed offline with exit 0, whereas `--backend file` hits disk JSON parse
+        // error on the corrupt file!
         fs::write(&env.paths().active_slot_file, b"{corrupt-disk-json").unwrap();
         let add_kr = auto_cli()
             .args([
@@ -1558,8 +1556,15 @@ GLib.MainLoop().run()
             ])
             .output()
             .unwrap();
-        let add_kr_err: serde_json::Value = serde_json::from_slice(&add_kr.stderr).unwrap();
-        assert_eq!(add_kr_err["error_code"], "oauth_network_error");
+        assert_eq!(
+            add_kr.status.code(),
+            Some(0),
+            "auto --from-local must read valid keyring payload first (not corrupt disk JSON), stderr={}",
+            String::from_utf8_lossy(&add_kr.stderr)
+        );
+        let add_kr_ok: serde_json::Value = serde_json::from_slice(&add_kr.stdout).unwrap();
+        assert_eq!(add_kr_ok["created"], false);
+        assert_eq!(add_kr_ok["account"]["id"], "acc-kr2");
 
         let add_file = auto_cli()
             .args([
@@ -1576,6 +1581,13 @@ GLib.MainLoop().run()
             .unwrap();
         let add_file_err: serde_json::Value = serde_json::from_slice(&add_file.stderr).unwrap();
         assert_eq!(add_file_err["error_code"], "data_error");
+        assert!(
+            !add_file_err["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("email"),
+            "file --from-local must fail on corrupt disk JSON parse, got: {add_file_err}"
+        );
 
         // Remove corrupt disk file before restoring synced `acc-kr1`
         fs::remove_file(&env.paths().active_slot_file).unwrap();
@@ -1800,17 +1812,12 @@ fn synthetic_human_timestamps_session_id_strip_and_pty_tui_batch_shortcuts_work_
         pending_created_at
     );
 
-    // 5. Real PTY TUI end-to-end verification (`C` add all / clear+disable, `cand #2 (skip)`, `5h / W`, `Plan` short, `R` + `SIGTERM`)!
+    // 5. Real PTY TUI end-to-end verification (`C` add all / clear+disable, `cand #2 (skip)`, Layout A1, Interaction T2, `r` + `SIGTERM`/`Ctrl+C`)!
     #[cfg(feature = "tui")]
     {
         use std::io::Read;
-        use std::net::TcpListener;
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::process::CommandExt;
-        use std::sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        };
         use std::time::Duration;
 
         let win = libc::winsize {
@@ -1872,20 +1879,20 @@ fn synthetic_human_timestamps_session_id_strip_and_pty_tui_batch_shortcuts_work_
         let mut screen = Vec::new();
         for _ in 0..50 {
             drain(&mut master, &mut screen);
-            if String::from_utf8_lossy(&screen).contains("Gemini (5h / W)") {
+            if String::from_utf8_lossy(&screen).contains("Last Quota") {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         let initial_txt = String::from_utf8_lossy(&screen).into_owned();
-        assert!(initial_txt.contains("Gemini (5h / W)"));
-        assert!(initial_txt.contains("Claude/GPT (5h / W)"));
+        assert!(initial_txt.contains("Last Quota"));
+        assert!(initial_txt.contains("Quota ("));
         assert!(initial_txt.contains(&format!(
             "matched (alice@example.invalid, expires {expected_exp_local})"
         )));
         assert!(!initial_txt.contains("Google AI"));
         assert!(initial_txt.contains("Keys   : ↑/↓ select · g/G top/end · [/] reorder"));
-        assert!(initial_txt.contains("Manage : r/R refresh · c/C cand"));
+        assert!(initial_txt.contains("Manage : r refresh (on *) · c/C cand"));
 
         // Press 'C' -> adds both enabled accounts (`acc-ts-1`, `acc-ts-2`) in list order; then 'p' -> enables policy!
         master.write_all(b"Cp").unwrap();
@@ -1935,21 +1942,23 @@ fn synthetic_human_timestamps_session_id_strip_and_pty_tui_batch_shortcuts_work_
         assert!(pol_cleared.candidate_account_ids.is_empty());
         assert!(!pol_cleared.enabled);
 
-        // Boundary check: disable BOTH accounts (`d`, Up arrow `\x1b[A`, `d`), then press 'R' and 'C' -> clean status notices with 0 network calls!
+        // Interaction T2 check: cursor is on dormant row #2 (`acc-ts-2`), so pressing `r` makes
+        // zero requests and shows the gentle switch-first status hint; `R` is a no-op!
         screen.clear();
-        master.write_all(b"d\x1b[AdR").unwrap();
+        master.write_all(b"r").unwrap();
         master.flush().unwrap();
         for _ in 0..50 {
             drain(&mut master, &mut screen);
-            if String::from_utf8_lossy(&screen).contains("No enabled accounts to refresh.") {
+            if String::from_utf8_lossy(&screen).contains("Switch to this account first") {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(String::from_utf8_lossy(&screen).contains("No enabled accounts to refresh."));
+        assert!(String::from_utf8_lossy(&screen).contains("Switch to this account first"));
 
+        // Boundary check: disable BOTH accounts (`d`, Up arrow `\x1b[A`, `d`), then press 'C' -> clean status notice!
         screen.clear();
-        master.write_all(b"C").unwrap();
+        master.write_all(b"d\x1b[AdC").unwrap();
         master.flush().unwrap();
         for _ in 0..50 {
             drain(&mut master, &mut screen);
@@ -1974,19 +1983,19 @@ fn synthetic_human_timestamps_session_id_strip_and_pty_tui_batch_shortcuts_work_
         );
         assert_ne!(post_q.c_lflag & libc::ECHO, 0);
 
-        // 6. Launch TUI pointed at a local hanging proxy, press 'R' (batch refresh), verify bottom-bar progress
-        //    AND verify `SIGTERM` interrupts batch refresh cleanly and restores PTY `ECHO`!
-        let hold_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let proxy_port = hold_listener.local_addr().unwrap().port();
-        let proxy_hit = Arc::new(AtomicBool::new(false));
-        let proxy_hit_bg = proxy_hit.clone();
-        let _proxy_thread = std::thread::spawn(move || {
-            let mut held = Vec::new();
-            while let Ok((sock, _)) = hold_listener.accept() {
-                proxy_hit_bg.store(true, Ordering::SeqCst);
-                held.push(sock);
-            }
-        });
+        // 6. Launch TUI pointed at a slow synthetic `agy`, press 'r' on active `*` account, verify
+        //    bottom-bar progress AND verify `SIGTERM` interrupts cleanly and restores PTY `ECHO`!
+        let slow_agy = env._tmp.path().join("slow-tui-agy");
+        let slow_agy_hit = env._tmp.path().join("slow-tui-agy-hit");
+        fs::write(
+            &slow_agy,
+            format!(
+                "#!/bin/sh\necho hit > \"{}\"\nsleep 30\n",
+                slow_agy_hit.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&slow_agy, fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut master2_fd: libc::c_int = -1;
         let mut slave2_fd: libc::c_int = -1;
@@ -2010,9 +2019,8 @@ fn synthetic_human_timestamps_session_id_strip_and_pty_tui_batch_shortcuts_work_
         let mut master2 = unsafe { fs::File::from_raw_fd(master2_fd) };
 
         let mut cmd2 = env.cli_cmd();
-        cmd2.env_remove("NO_PROXY")
-            .env_remove("AGY_SWITCH_CLI_PROXY")
-            .args(["--proxy", &format!("http://127.0.0.1:{proxy_port}"), "tui"])
+        cmd2.env("AGY_SWITCH_CLI_AGY_BIN", &slow_agy)
+            .args(["tui"])
             .stdin(Stdio::from(slave2_in))
             .stdout(Stdio::from(slave2_out))
             .stderr(Stdio::piped());
@@ -2039,24 +2047,24 @@ fn synthetic_human_timestamps_session_id_strip_and_pty_tui_batch_shortcuts_work_
         }
 
         screen2.clear();
-        master2.write_all(b"R").unwrap();
+        master2.write_all(b"r").unwrap();
         master2.flush().unwrap();
         for _ in 0..60 {
             drain(&mut master2, &mut screen2);
-            if proxy_hit.load(Ordering::SeqCst)
-                && String::from_utf8_lossy(&screen2).contains("Refreshing 2 enabled account(s)")
+            if slow_agy_hit.exists()
+                && String::from_utf8_lossy(&screen2).contains("Refreshing active quota")
             {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            String::from_utf8_lossy(&screen2).contains("Refreshing 2 enabled account(s)"),
-            "Expected real-time bottom-bar batch refresh status on 'R'"
+            String::from_utf8_lossy(&screen2).contains("Refreshing active quota"),
+            "Expected bottom-bar active refresh status on 'r'"
         );
         assert!(
-            proxy_hit.load(Ordering::SeqCst),
-            "Expected 'R' to initiate bounded network refresh against local mock proxy"
+            slow_agy_hit.exists(),
+            "Expected 'r' on active '*' account to spawn synthetic `agy -p \"/usage\"`"
         );
 
         unsafe {
@@ -2073,12 +2081,12 @@ fn synthetic_human_timestamps_session_id_strip_and_pty_tui_batch_shortcuts_work_
         assert_ne!(
             post2.c_lflag & libc::ECHO,
             0,
-            "SIGTERM during 'R' batch refresh MUST restore PTY ECHO!"
+            "SIGTERM during 'r' refresh MUST restore PTY ECHO!"
         );
 
         // 7. Also verify raw-mode keyboard Ctrl+C (`\x03` on PTY master, where `ISIG` is disabled)
-        //    immediately aborts in-flight 'R' batch refresh, exits 0, and restores PTY `ECHO`!
-        proxy_hit.store(false, Ordering::SeqCst);
+        //    immediately aborts in-flight 'r' refresh, exits 0, and restores PTY `ECHO`!
+        let _ = fs::remove_file(&slow_agy_hit);
         let mut master3_fd: libc::c_int = -1;
         let mut slave3_fd: libc::c_int = -1;
         assert_eq!(
@@ -2101,9 +2109,8 @@ fn synthetic_human_timestamps_session_id_strip_and_pty_tui_batch_shortcuts_work_
         let mut master3 = unsafe { fs::File::from_raw_fd(master3_fd) };
 
         let mut cmd3 = env.cli_cmd();
-        cmd3.env_remove("NO_PROXY")
-            .env_remove("AGY_SWITCH_CLI_PROXY")
-            .args(["--proxy", &format!("http://127.0.0.1:{proxy_port}"), "tui"])
+        cmd3.env("AGY_SWITCH_CLI_AGY_BIN", &slow_agy)
+            .args(["tui"])
             .stdin(Stdio::from(slave3_in))
             .stdout(Stdio::from(slave3_out))
             .stderr(Stdio::piped());
@@ -2130,18 +2137,18 @@ fn synthetic_human_timestamps_session_id_strip_and_pty_tui_batch_shortcuts_work_
         }
 
         screen3.clear();
-        master3.write_all(b"R").unwrap();
+        master3.write_all(b"r").unwrap();
         master3.flush().unwrap();
         for _ in 0..60 {
             drain(&mut master3, &mut screen3);
-            if proxy_hit.load(Ordering::SeqCst)
-                && String::from_utf8_lossy(&screen3).contains("Refreshing 2 enabled account(s)")
+            if slow_agy_hit.exists()
+                && String::from_utf8_lossy(&screen3).contains("Refreshing active quota")
             {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(proxy_hit.load(Ordering::SeqCst));
+        assert!(slow_agy_hit.exists());
 
         // Send raw `\x03` (`Ctrl+C`) over PTY master (no external `kill` signal!)
         master3.write_all(b"\x03").unwrap();
@@ -2157,7 +2164,7 @@ fn synthetic_human_timestamps_session_id_strip_and_pty_tui_batch_shortcuts_work_
         assert_ne!(
             post3.c_lflag & libc::ECHO,
             0,
-            "Raw-mode Ctrl+C (`\\x03`) during 'R' batch refresh MUST restore PTY ECHO!"
+            "Raw-mode Ctrl+C (`\\x03`) during 'r' refresh MUST restore PTY ECHO!"
         );
     }
 }
@@ -4391,7 +4398,8 @@ GLib.MainLoop().run()
     repo.with_write_lock(|tx| tx.upsert_account(acc3.clone(), false, now))
         .unwrap();
     env.init_agy_slot_dir();
-    let payload_ko1 = serialize_session_payload(&acc1.token).unwrap();
+    let payload_ko1 =
+        agy_switch_cli::session::payload::serialize_session_payload_for_account(&acc1).unwrap();
     FileSessionBackend
         .write_slot(&env.paths(), &payload_ko1)
         .unwrap();
@@ -5212,7 +5220,9 @@ fn synthetic_v120_signoff_round2_exact_backend_literals_tui_json_and_uninstall_d
         master.write_all(b"r").unwrap();
         for _ in 0..60 {
             drain_pty(&mut master, &mut pty_buf);
-            if String::from_utf8_lossy(&pty_buf).contains("HTTPS_PROXY") {
+            if String::from_utf8_lossy(&pty_buf).contains("Refresh error:")
+                || String::from_utf8_lossy(&pty_buf).contains("Refreshed quota")
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -5223,12 +5233,38 @@ fn synthetic_v120_signoff_round2_exact_backend_literals_tui_json_and_uninstall_d
         drain_pty(&mut master, &mut pty_buf);
         let pty_txt = String::from_utf8_lossy(&pty_buf);
         assert!(
-            pty_txt.contains("HTTPS_PROXY"),
-            "Expected TUI status bar to surface variable-name-only proxy warning, got:\n{pty_txt}"
-        );
-        assert!(
             !pty_txt.contains("TUI_PROXY_SECRET_777"),
             "Leaked malformed proxy secret in TUI output!"
+        );
+        // Verify malformed `HTTPS_PROXY` on an OAuth CLI path emits variable-name-only warning without leaking secret!
+        let mut add_proxy_child = env
+            .cli_cmd()
+            .env(
+                "HTTPS_PROXY",
+                "badscheme://TUI_PROXY_SECRET_777@example.invalid:8080",
+            )
+            .env("ALL_PROXY", "http://127.0.0.1:9")
+            .args(["accounts", "add", "--from-stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        add_proxy_child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"1//SYNTHETIC_RT_PROXY_TEST\n")
+            .unwrap();
+        let add_proxy_out = add_proxy_child.wait_with_output().unwrap();
+        let add_proxy_err = String::from_utf8_lossy(&add_proxy_out.stderr);
+        assert!(
+            add_proxy_err.contains("HTTPS_PROXY"),
+            "Expected variable-name-only proxy warning on OAuth path, got: {add_proxy_err}"
+        );
+        assert!(
+            !add_proxy_err.contains("TUI_PROXY_SECRET_777"),
+            "Leaked malformed proxy secret in stderr: {add_proxy_err}"
         );
     }
 }
@@ -6667,100 +6703,36 @@ fn synthetic_v120_status_probe_stats_list_streaming_refresh_and_tui_reorder_dele
         assert_eq!(sr_j["summary"]["total_output_tokens"], 3_432);
     }
 
-    // 4. Real-time subprocess streaming `refresh --all`: `[1/2]` flushes BEFORE connection #1 finishes!
+    // 4. Option 3A single-slot refresh guards: removed batch/non-active refresh flags exit 2!
     {
-        use std::io::{BufRead, BufReader};
-        use std::net::TcpListener;
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc, Barrier,
-        };
-
-        let stream_env = IsolatedEnv::new();
-        let stream_repo = StoreRepository::new(stream_env.paths());
-        let mut s1 = sample_account("acc-slow", "alice@example.com", now);
-        s1.token.expiry_timestamp = 1;
-        let mut s2 = sample_account("acc-fast", "bob@example.com", now);
-        s2.token.expiry_timestamp = 1;
-        stream_repo
+        let guard_env = IsolatedEnv::new();
+        let guard_repo = StoreRepository::new(guard_env.paths());
+        let s1 = sample_account("acc-active", "alice@example.com", now);
+        let s2 = sample_account("acc-dormant", "bob@example.com", now);
+        guard_repo
             .with_write_lock(|tx| {
                 tx.upsert_account(s1, true, now)?;
                 tx.upsert_account(s2, false, now)
             })
             .unwrap();
-
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        let conn_seq = Arc::new(AtomicUsize::new(0));
-        let release_first = Arc::new(Barrier::new(2));
-        let seq_bg = conn_seq.clone();
-        let rel_bg = release_first.clone();
-
-        let proxy_thread = std::thread::spawn(move || {
-            let mut held_first = None;
-            for stream_res in proxy_listener.incoming() {
-                let Ok(mut stream) = stream_res else {
-                    break;
-                };
-                let idx = seq_bg.fetch_add(1, Ordering::SeqCst);
-                if idx == 0 {
-                    // Hold connection #1 open until main thread reads `[1/2]` from child stderr!
-                    let mut hold_thread_stream = stream;
-                    let rel_c = rel_bg.clone();
-                    held_first = Some(std::thread::spawn(move || {
-                        rel_c.wait();
-                        let _ = hold_thread_stream.write_all(
-                            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        );
-                    }));
-                } else {
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    );
-                }
-                if idx >= 3 {
-                    break;
-                }
-            }
-            if let Some(h) = held_first {
-                let _ = h.join();
-            }
-        });
-
-        let mut child = stream_env
-            .cli_cmd()
-            .args([
-                "--proxy",
-                &format!("http://127.0.0.1:{proxy_port}"),
-                "refresh",
-                "--all",
-                "--concurrency",
-                "2",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-
-        let mut stderr_reader = BufReader::new(child.stderr.take().unwrap());
-        let mut first_progress_line = String::new();
-        stderr_reader.read_line(&mut first_progress_line).unwrap();
-        assert!(
-            first_progress_line.starts_with("[1/2] Failed "),
-            "Expected `[1/2]` progress line BEFORE releasing blocked connection #1, got: {first_progress_line:?}"
-        );
-        // Release blocked connection #1 only AFTER `[1/2]` has already streamed!
-        release_first.wait();
-
-        let mut rest_stderr = String::new();
-        std::io::Read::read_to_string(&mut stderr_reader, &mut rest_stderr).unwrap();
-        let wait_st = child.wait().unwrap();
-        assert_eq!(wait_st.code(), Some(1));
-        assert!(
-            rest_stderr.contains("[2/2] Failed "),
-            "Expected `[2/2]` progress line after releasing connection #1, got: {rest_stderr:?}"
-        );
-        drop(proxy_thread);
+        for bad_args in [
+            vec!["refresh", "--all"],
+            vec!["refresh", "--concurrency", "2"],
+            vec!["refresh", "acc-dormant"],
+            vec!["quota", "--refresh", "--all"],
+            vec!["quota", "acc-active", "--refresh"],
+            vec!["quota", "--refresh", "--concurrency", "2"],
+        ] {
+            let out = guard_env.cli_cmd().args(&bad_args).output().unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "expected exit 2 for {:?}, got {:?}, stderr={}",
+                bad_args,
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     // 5. Real PTY TUI: `Free` abbreviation for `Antigravity Starter Quota`, `↑/↓` select, `[/]` reorder,
@@ -7671,6 +7643,19 @@ fn synthetic_v124_daemon_reset_cooldown_boundary_2a_standalone_once_and_install(
         let repo = StoreRepository::new(paths.clone());
         let acc_a = make_acc("acc-a", "alice@example.com", 0.02, now);
         let acc_b = make_acc("acc-b", "bob@example.com", 0.90, now);
+        let fake_agy = env._tmp.path().join("no-host-agy");
+        let agy_script = format!(
+            r#"#!/bin/sh
+if grep -q "SECRET_REFRESH_TOKEN_acc-b" "{slot}" 2>/dev/null; then
+  printf '%s\n' '{{"conversation_id":"","status":"SUCCESS","command":{{"name":"usage","data":{{"groups":[{{"name":"Gemini Models","buckets":[{{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.90,"reset_time":"2099-01-07T00:00:00Z"}},{{"id":"gemini-5h","window":"5h","remaining_fraction":0.90,"reset_time":"2099-01-01T05:00:00Z"}}]}}]}}}}}}'
+else
+  printf '%s\n' '{{"conversation_id":"","status":"SUCCESS","command":{{"name":"usage","data":{{"groups":[{{"name":"Gemini Models","buckets":[{{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.02,"reset_time":"2099-01-07T00:00:00Z"}},{{"id":"gemini-5h","window":"5h","remaining_fraction":0.02,"reset_time":"2099-01-01T05:00:00Z"}}]}}]}}}}}}'
+fi
+"#,
+            slot = paths.active_slot_file.display()
+        );
+        fs::write(&fake_agy, agy_script).unwrap();
+        fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
         repo.with_write_lock(|tx| {
             tx.upsert_account(acc_a.clone(), true, now)?;
             tx.upsert_account(acc_b.clone(), false, now)?;
@@ -8030,6 +8015,19 @@ fn daemon_desktop_notifications_dbus_lifecycle_headless_optout_pause_dedup_and_t
         let repo = StoreRepository::new(paths.clone());
         let acc_a = make_dual_window_acc("acc-a", "alice@example.com", 0.02, 0.40, now);
         let acc_b = make_dual_window_acc("acc-b", "bob@example.com", 1.00, 0.85, now);
+        let fake_agy = env._tmp.path().join("no-host-agy");
+        let agy_script = format!(
+            r#"#!/bin/sh
+if grep -q "SECRET_REFRESH_TOKEN_acc-b" "{slot}" 2>/dev/null; then
+  printf '%s\n' '{{"conversation_id":"","status":"SUCCESS","command":{{"name":"usage","data":{{"groups":[{{"name":"Gemini Models","buckets":[{{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.85,"reset_time":"2099-01-07T00:00:00Z"}},{{"id":"gemini-5h","window":"5h","remaining_fraction":1.00,"reset_time":"1970-01-01T00:00:00Z"}}]}}]}}}}}}'
+else
+  printf '%s\n' '{{"conversation_id":"","status":"SUCCESS","command":{{"name":"usage","data":{{"groups":[{{"name":"Gemini Models","buckets":[{{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.40,"reset_time":"2099-01-07T00:00:00Z"}},{{"id":"gemini-5h","window":"5h","remaining_fraction":0.02,"reset_time":"2099-01-01T05:00:00Z"}}]}}]}}}}}}'
+fi
+"#,
+            slot = paths.active_slot_file.display()
+        );
+        fs::write(&fake_agy, agy_script).unwrap();
+        fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
         repo.with_write_lock(|tx| {
             tx.upsert_account(acc_a.clone(), true, now)?;
             tx.upsert_account(acc_b.clone(), false, now)?;
@@ -10185,11 +10183,9 @@ fn synthetic_v125_stats_cleared_canceled_interrupted_cli_contract() {
 }
 
 #[test]
-fn synthetic_v126_external_slot_cli_contract_switch_current_quota_proc_and_guards() {
+fn synthetic_v127_official_cli_usage_delegation_offline_switch_sync_back_and_from_local() {
     use agy_switch_cli::domain::account::AccountRecord;
-    use agy_switch_cli::domain::quota::{ModelQuota, QuotaObservation, QuotaSourceEnv};
     use agy_switch_cli::domain::token::TokenRecord;
-    use agy_switch_cli::session::payload::serialize_session_payload;
     use agy_switch_cli::store::repository::StoreRepository;
     use std::os::unix::fs::PermissionsExt;
 
@@ -10198,1182 +10194,1099 @@ fn synthetic_v126_external_slot_cli_contract_switch_current_quota_proc_and_guard
     let repo = StoreRepository::new(paths.clone());
     let now = agy_switch_cli::domain::clock::current_unix_seconds();
 
-    let ext_profile = env
-        .home
-        .join(".t3/userdata/providers/antigravity/synthetic_profile");
-    let ext_slot_dir = ext_profile.join("antigravity-acp");
-    let ext_slot_file = ext_slot_dir.join("antigravity-oauth-token");
-    fs::create_dir_all(&ext_slot_dir).unwrap();
     fs::create_dir_all(&paths.active_slot_dir).unwrap();
+    fs::create_dir_all(&paths.data_dir).unwrap();
 
-    // Seed two fresh pool accounts (future expiry -> switch needs zero network calls)
-    let make_acc = |id: &str, email: &str, rt: &str, pct: i32| {
-        let tok = TokenRecord {
-            access_token: format!("ya29.{id}"),
-            refresh_token: rt.to_string(),
-            expires_in: 3600,
-            expiry_timestamp: now + 3600,
+    // 1. Legacy `config.json` containing `"targets"` MUST be silently ignored without breaking CLI!
+    let legacy_cfg = serde_json::json!({
+        "schema_version": 1,
+        "targets": {
+            "legacy_alias": "~/.legacy-removed/slot"
+        }
+    });
+    fs::write(
+        paths.config_file(),
+        serde_json::to_vec_pretty(&legacy_cfg).unwrap(),
+    )
+    .unwrap();
+    let st_legacy = env.cli_cmd().args(["--json", "status"]).output().unwrap();
+    assert_eq!(
+        st_legacy.status.code(),
+        Some(0),
+        "legacy config with `targets` must be silently ignored: stderr={}",
+        String::from_utf8_lossy(&st_legacy.stderr)
+    );
+
+    // 2. Pure-offline `accounts add --from-local`: reads compact `id_token_email` + `user_tier`
+    //    with zero network even when proxy points to an unreachable port!
+    let local_slot_a = serde_json::json!({
+        "access_token": "ya29.LOCAL_A_INIT",
+        "refresh_token": "1//LOCAL_A_RT_1",
+        "token_type": "Bearer",
+        "expiry": "2099-01-01T00:00:00Z",
+        "id_token_email": "alice@example.com",
+        "user_tier": "g1-pro-tier"
+    });
+    fs::write(
+        &paths.active_slot_file,
+        serde_json::to_vec(&local_slot_a).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&paths.active_slot_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let add_local = env
+        .cli_cmd()
+        .args([
+            "--proxy",
+            "http://127.0.0.1:1",
+            "--json",
+            "accounts",
+            "add",
+            "--from-local",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        add_local.status.code(),
+        Some(0),
+        "offline --from-local failed: stderr={}",
+        String::from_utf8_lossy(&add_local.stderr)
+    );
+    let add_json: serde_json::Value = serde_json::from_slice(&add_local.stdout).unwrap();
+    let acc_a_id = add_json["account"]["id"].as_str().unwrap().to_string();
+    assert_eq!(add_json["account"]["email"], "alice@example.com");
+    let rec_a = repo.read_account_unchecked(&acc_a_id).unwrap();
+    assert_eq!(
+        rec_a
+            .quota
+            .as_ref()
+            .and_then(|q| q.subscription_tier.as_deref()),
+        Some("g1-pro-tier")
+    );
+
+    // 3. Create synthetic `agy` executable script to test real subprocess `agy -p "/usage" --output-format json`!
+    let fake_agy = env._tmp.path().join("fake-agy");
+    let mode_file = env._tmp.path().join("fake-agy-mode");
+    let env_dump = env._tmp.path().join("fake-agy-dbus-env");
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s' "$DBUS_SESSION_BUS_ADDRESS" > "{env_dump}"
+MODE="$(cat "{mode_file}" 2>/dev/null || echo ok)"
+SLOT="{slot_file}"
+case "$MODE" in
+  ok)
+    # Simulate official agy rotating refresh_token + fresher access_token during /usage!
+    cat > "$SLOT" <<'EOF_SLOT'
+{{"access_token":"ya29.AGY_REFRESHED_A","refresh_token":"1//AGY_ROTATED_A_2","token_type":"Bearer","expiry":"2099-06-01T00:00:00Z","id_token_email":"alice@example.com","user_tier":"g1-ultra-tier"}}
+EOF_SLOT
+    cat <<'EOF_JSON'
+{{"conversation_id":"","status":"SUCCESS","response":"usage ok","duration_seconds":0,"num_turns":0,"usage":{{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0}},"command":{{"name":"usage","data":{{"description":"Usage summary","groups":[{{"name":"Gemini Models","description":"Models within this group: gemini-3.1-pro, gemini-3-flash","buckets":[{{"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.97,"reset_time":"2099-12-03T07:17:01Z"}},{{"id":"gemini-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":0.96,"reset_time":"2099-11-27T11:18:26Z"}}]}},{{"name":"Claude and GPT models","description":"Models within this group: claude-sonnet-4-6, gpt-oss-120b","buckets":[{{"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":1.0,"reset_time":"1970-01-01T00:00:00Z"}},{{"id":"3p-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":1.0,"reset_time":"1970-01-01T00:00:00Z"}}]}}]}}}}}}
+EOF_JSON
+    exit 0
+    ;;
+  auth_hang)
+    echo "Authentication required. Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=synthetic" >&2
+    sleep 30
+    exit 1
+    ;;
+  validation_blocked)
+    echo '{{"status":"ERROR","error":"403 VALIDATION_REQUIRED: account requires verification","command":{{"name":"usage"}}}}'
+    exit 1
+    ;;
+esac
+"#,
+        env_dump = env_dump.display(),
+        mode_file = mode_file.display(),
+        slot_file = paths.active_slot_file.display(),
+    );
+    fs::write(&fake_agy, script).unwrap();
+    fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(&mode_file, "ok").unwrap();
+
+    // 3a. `quota --refresh --json` with explicit `--backend file` and live dummy DBUS_SESSION_BUS_ADDRESS:
+    //     must normalize epoch-0 full unused buckets, sync back rotated RT + user_tier, AND mask D-Bus!
+    let q_ref = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &fake_agy)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/tmp/synthetic-desktop-bus",
+        )
+        .args(["--backend", "file", "--json", "quota", "--refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        q_ref.status.code(),
+        Some(0),
+        "quota --refresh failed: stderr={}",
+        String::from_utf8_lossy(&q_ref.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&env_dump).unwrap(),
+        "unix:path=/dev/null",
+        "explicit --backend file MUST mask DBUS_SESSION_BUS_ADDRESS when invoking agy"
+    );
+    let q_json: serde_json::Value = serde_json::from_slice(&q_ref.stdout).unwrap();
+    assert_eq!(q_json["quota"]["source_env"], "official_cli");
+    assert_eq!(q_json["quota"]["subscription_tier"], "g1-ultra-tier");
+    assert_eq!(
+        q_json["quota"]["quota_groups"][1]["buckets"][0]["reset_time"],
+        ""
+    );
+    assert_eq!(
+        q_json["quota"]["quota_groups"][0]["description"],
+        "Models within this group: gemini-3.1-pro, gemini-3-flash"
+    );
+    let synced_a = repo.read_account_unchecked(&acc_a_id).unwrap();
+    assert_eq!(synced_a.token.refresh_token, "1//AGY_ROTATED_A_2");
+    assert_eq!(synced_a.token.access_token, "ya29.AGY_REFRESHED_A");
+
+    // 3b. Early stderr abort on interactive login prompt -> structured exit 6 (`auth_required`) in < 5s!
+    fs::write(&mode_file, "auth_hang").unwrap();
+    let t0 = std::time::Instant::now();
+    let auth_out = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &fake_agy)
+        .args(["--json", "refresh"])
+        .output()
+        .unwrap();
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(5),
+        "auth prompt abort should complete promptly without waiting 30s timeout"
+    );
+    assert_eq!(auth_out.status.code(), Some(6));
+    let auth_err: serde_json::Value = serde_json::from_slice(&auth_out.stderr).unwrap();
+    assert_eq!(auth_err["error_code"], "official_cli_auth_required");
+
+    // 3c. ValidationBlocked persists `validation_blocked = true` & `is_forbidden = true`,
+    //     then clean `/usage` clears `validation_blocked = false`!
+    fs::write(&mode_file, "validation_blocked").unwrap();
+    let vb_out = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &fake_agy)
+        .args(["--json", "refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(vb_out.status.code(), Some(0));
+    let vb_json: serde_json::Value = serde_json::from_slice(&vb_out.stdout).unwrap();
+    assert_eq!(vb_json["refreshed"][0]["validation_blocked"], true);
+    assert!(
+        repo.read_account_unchecked(&acc_a_id)
+            .unwrap()
+            .validation_blocked
+    );
+
+    fs::write(&mode_file, "ok").unwrap();
+    let cleared_out = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &fake_agy)
+        .args(["--json", "refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(cleared_out.status.code(), Some(0));
+    assert!(
+        !repo
+            .read_account_unchecked(&acc_a_id)
+            .unwrap()
+            .validation_blocked
+    );
+
+    // 4. Offline `switch` onto transfer-bundle account (`access_token == ""`, `expiry_timestamp == 1`)
+    //    with unreachable proxy + Pre-Switch Sync-Back of fresher slot credentials!
+    let mut acc_b = AccountRecord::new(
+        "acc-0002".into(),
+        "bob@example.com".into(),
+        TokenRecord {
+            access_token: String::new(), // transfer-bundle empty access_token
+            refresh_token: "1//BOB_RT_BARE".into(),
+            expires_in: 0,
+            expiry_timestamp: 1,
             token_type: "Bearer".into(),
             id_token: None,
             oauth_client_key: None,
             granted_scopes: None,
             project_id: None,
             is_gcp_tos: true,
-        };
-        let mut acc = AccountRecord::new(id.into(), email.into(), tok, now);
-        let mut obs = QuotaObservation::new(now, QuotaSourceEnv::Daily);
-        obs.subscription_tier = Some("PRO".into());
-        let frac = f64::from(pct) / 100.0;
-        obs.models.push(ModelQuota {
-            name: "gemini-3.8-flash".into(),
-            percentage: pct,
-            percentage_known: Some(true),
-            observed_remaining_fraction: Some(frac),
-            primary_quota: None,
-            quota_bucket_id: Some("gemini-5h".into()),
-            reset_time: "2099-01-01T00:00:00Z".into(),
-            display_name: Some("Gemini 3.8 Flash".into()),
-            supports_images: None,
-            supports_thinking: None,
-            thinking_budget: None,
-            recommended: Some(true),
-            max_tokens: None,
-            max_output_tokens: None,
-            supported_mime_types: None,
-        });
-        obs.quota_groups = Some(vec![QuotaGroup {
-            display_name: "Gemini Models".into(),
-            description: None,
-            buckets: vec![
-                QuotaBucket {
-                    bucket_id: "gemini-5h".into(),
-                    window: "5h".into(),
-                    remaining_fraction: frac,
-                    remaining_fraction_known: Some(true),
-                    reset_time: "2099-01-01T00:00:00Z".into(),
-                    display_name: None,
-                    description: None,
-                },
-                QuotaBucket {
-                    bucket_id: "gemini-weekly".into(),
-                    window: "weekly".into(),
-                    remaining_fraction: frac,
-                    remaining_fraction_known: Some(true),
-                    reset_time: "2099-01-07T00:00:00Z".into(),
-                    display_name: None,
-                    description: None,
-                },
-            ],
-        }]);
-        acc.quota = Some(obs);
-        acc
-    };
-    let acc1 = make_acc("acc-0001", "alice@example.com", "1//rt-alice-1", 90);
-    let acc2 = make_acc("acc-0002", "bob@example.com", "1//rt-bob-2", 75);
-    let acc1_payload = serialize_session_payload(&acc1.token).unwrap();
-    repo.with_write_lock(|tx| {
-        tx.upsert_account(acc1, true, now)?;
-        tx.upsert_account(acc2, false, now)?;
-        Ok(())
-    })
-    .unwrap();
-    fs::write(&paths.active_slot_file, &acc1_payload).unwrap();
-
-    // Configure `config.json` with `backend: "dual"` (with dead D-Bus, across ALL feature tiers
-    // including `--no-default-features`) + `targets.t3` alias:
-    // proves external slot commands stay 100% pure-file and independent of official backend capability!
-    let cfg = serde_json::json!({
-        "schema_version": 1,
-        "backend": "dual",
-        "targets": {
-            "t3": "~/.t3/userdata/providers/antigravity/synthetic_profile/antigravity-acp"
-        }
-    });
-    fs::write(
-        paths.config_file(),
-        serde_json::to_vec_pretty(&cfg).unwrap(),
-    )
-    .unwrap();
-
-    // Fake `/proc` fixture with ONLY an unrelated native `agy` process (bound to `~/.gemini/antigravity-cli`)
-    let fake_agy_bin = env._tmp.path().join("fake_agy");
-    fs::write(&fake_agy_bin, b"#!/bin/sh\nexit 0\n").unwrap();
-    let fake_proc = env.proc_dir.clone();
-    fs::create_dir_all(fake_proc.join("4201")).unwrap();
-    fs::write(
-        fake_proc.join("4201/stat"),
-        "4201 (agy) S 1 4201 4201 0 -1 0 0 0 0 0 0 0 0 20 0 1 0 12345 1000 10",
-    )
-    .unwrap();
-    fs::write(fake_proc.join("4201/comm"), "agy\n").unwrap();
-    std::os::unix::fs::symlink(&fake_agy_bin, fake_proc.join("4201/exe")).unwrap();
-    fs::write(fake_proc.join("4201/cmdline"), b"/usr/bin/agy\0").unwrap();
-
-    let base_cmd = || {
-        let mut c = env.cli_cmd();
-        c.env("AGY_SWITCH_CLI_PROC_ROOT", &fake_proc)
-            .env("AGY_SWITCH_CLI_AGY_BIN", &fake_agy_bin);
-        c
-    };
-
-    // 1. `current --target t3 --json` on empty initialized dir -> `absent`, `idle`, zero file created
-    let cur_absent = base_cmd()
-        .args(["--json", "current", "--target", "t3"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        cur_absent.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&cur_absent.stderr)
-    );
-    let ca: serde_json::Value = serde_json::from_slice(&cur_absent.stdout).unwrap();
-    assert_eq!(ca["target"]["name"], "t3");
-    assert_eq!(ca["target"]["backend"], "file");
-    assert_eq!(ca["slot_state"]["status"], "absent");
-    assert_eq!(ca["runtime_state"]["state"], "idle");
-    assert!(!ext_slot_file.exists());
-
-    // 2. `switch acc-0002 --target t3 --dry-run --require-idle --json`:
-    //    succeeds even though native `agy` PID 4201 is running, and writes nothing!
-    let sw_dry = base_cmd()
-        .args([
-            "--json",
-            "switch",
-            "acc-0002",
-            "--target",
-            "t3",
-            "--dry-run",
-            "--require-idle",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(
-        sw_dry.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&sw_dry.stderr)
-    );
-    let sd: serde_json::Value = serde_json::from_slice(&sw_dry.stdout).unwrap();
-    assert_eq!(sd["switch"]["dry_run"], true);
-    assert_eq!(sd["switch"]["target"]["name"], "t3");
-    assert_eq!(sd["switch"]["target_account_id"], "acc-0002");
-    assert!(!ext_slot_file.exists());
-
-    // 3. Real `switch acc-0002 --target t3 --require-idle --json`:
-    //    writes 0600 external token file, leaves official slot & `selected_account_id` untouched!
-    let sw_ok = base_cmd()
-        .args([
-            "--json",
-            "switch",
-            "acc-0002",
-            "--target",
-            "t3",
-            "--require-idle",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(
-        sw_ok.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&sw_ok.stderr)
-    );
-    let sj: serde_json::Value = serde_json::from_slice(&sw_ok.stdout).unwrap();
-    assert_eq!(sj["switch"]["target"]["name"], "t3");
-    assert_eq!(sj["switch"]["previous_slot_state"], "absent");
-    assert_eq!(sj["switch"]["target_account_id"], "acc-0002");
-    assert_eq!(
-        fs::metadata(&ext_slot_file).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    assert_eq!(
-        fs::read_to_string(&paths.active_slot_file).unwrap(),
-        acc1_payload
-    );
-    assert_eq!(
-        repo.read_snapshot()
-            .unwrap()
-            .index
-            .selected_account_id
-            .as_deref(),
-        Some("acc-0001")
-    );
-    assert!(!paths.switch_journal_file().exists());
-
-    // 4. `current --target t3 --json` -> `matched_pool` (NOT Drifted!) & `quota --target t3 --json` (zero network)
-    let cur_matched = base_cmd()
-        .args(["--json", "current", "--target", "t3"])
-        .output()
-        .unwrap();
-    assert_eq!(cur_matched.status.code(), Some(0));
-    let cm: serde_json::Value = serde_json::from_slice(&cur_matched.stdout).unwrap();
-    assert_eq!(cm["slot_state"]["status"], "matched_pool");
-    assert_eq!(cm["matched_account"]["id"], "acc-0002");
-    assert_eq!(cm["matched_account"]["email"], "bob@example.com");
-
-    let quota_ext = base_cmd()
-        .args(["--json", "quota", "--target", "t3"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        quota_ext.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&quota_ext.stderr)
-    );
-    let qj: serde_json::Value = serde_json::from_slice(&quota_ext.stdout).unwrap();
-    assert_eq!(qj["pooled"], true);
-    assert_eq!(qj["target"]["name"], "t3");
-    assert_eq!(qj["account_id"], "acc-0002");
-
-    // 5. Add a slot-bound `agy acp` process PID 4202 in fake `/proc`:
-    //    `--require-idle` MUST fail (exit 6), default switch succeeds with targeted runtime_warning!
-    fs::create_dir_all(fake_proc.join("4202")).unwrap();
-    fs::write(
-        fake_proc.join("4202/stat"),
-        "4202 (agy) S 1 4202 4202 0 -1 0 0 0 0 0 0 0 0 20 0 1 0 54321 1000 10",
-    )
-    .unwrap();
-    fs::write(fake_proc.join("4202/comm"), "agy\n").unwrap();
-    std::os::unix::fs::symlink(&fake_agy_bin, fake_proc.join("4202/exe")).unwrap();
-    let acp_cmdline = format!(
-        "/usr/bin/agy\0acp\0--gemini-dir\0{}\0--app-data-dir\0antigravity-acp\0",
-        ext_profile.display()
-    );
-    fs::write(fake_proc.join("4202/cmdline"), acp_cmdline.as_bytes()).unwrap();
-
-    let sw_blocked = base_cmd()
-        .args([
-            "--json",
-            "switch",
-            "acc-0001",
-            "--target",
-            "t3",
-            "--require-idle",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(sw_blocked.status.code(), Some(8));
-    let sbj: serde_json::Value = serde_json::from_slice(&sw_blocked.stderr).unwrap();
-    assert_eq!(sbj["error_code"], "active_agy_running");
-
-    let sw_warn = base_cmd()
-        .args(["--json", "switch", "acc-0001", "--target", "t3"])
-        .output()
-        .unwrap();
-    assert_eq!(sw_warn.status.code(), Some(0));
-    let swj: serde_json::Value = serde_json::from_slice(&sw_warn.stdout).unwrap();
-    assert_eq!(swj["switch"]["previous_slot_account_id"], "acc-0002");
-    assert_eq!(swj["switch"]["target_account_id"], "acc-0001");
-    assert!(swj["switch"]["runtime_warning"]
-        .as_str()
-        .unwrap()
-        .contains("4202"));
-
-    // 6. Standalone unpooled external dir via `--target-dir` with `agy 1.5+` compact `id_token_email` + `user_tier`
-    //    matching a pool account's email (but with a different refresh_token):
-    //    `current` reports `external` with email_hint, user_tier, and `same_email_pool_account_ids` without impersonation;
-    //    `quota` (offline) exits 4 (`no_cached_quota`).
-    let standalone_dir = env.home.join("standalone_acp");
-    let standalone_file = standalone_dir.join("antigravity-oauth-token");
-    fs::create_dir_all(&standalone_dir).unwrap();
-    fs::write(
-        &standalone_file,
-        r#"{"token":{"access_token":"ya29.solo","token_type":"Bearer","refresh_token":"1//rt-solo","expiry":"2099-01-01T00:00:00.000000Z"},"auth_method":"consumer","id_token_email":"alice@example.com","user_tier":"PRO"}"#,
-    )
-    .unwrap();
-    let cur_solo = base_cmd()
-        .args([
-            "--json",
-            "current",
-            "--target-dir",
-            standalone_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(cur_solo.status.code(), Some(0));
-    let csj: serde_json::Value = serde_json::from_slice(&cur_solo.stdout).unwrap();
-    assert_eq!(csj["slot_state"]["status"], "external");
-    assert_eq!(csj["slot_state"]["email_hint"], "alice@example.com");
-    assert_eq!(csj["slot_state"]["user_tier"], "PRO");
-    assert_eq!(
-        csj["slot_state"]["same_email_pool_account_ids"],
-        serde_json::json!(["acc-0001"])
-    );
-    assert!(csj["matched_account"].is_null());
-
-    // Human `current --target t3` renders concise `Target slot      : t3 (...)  [file]` (no duplicate `target`)
-    let cur_human = base_cmd()
-        .args(["current", "--target", "t3"])
-        .output()
-        .unwrap();
-    assert_eq!(cur_human.status.code(), Some(0));
-    let cur_human_txt = String::from_utf8_lossy(&cur_human.stdout);
-    assert!(
-        cur_human_txt.contains("Target slot      : t3 (")
-            && !cur_human_txt.contains("Target slot      : target `t3`"),
-        "unexpected human current target line:\n{cur_human_txt}"
-    );
-    let cur_solo_human = base_cmd()
-        .args(["current", "--target-dir", standalone_dir.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert_eq!(cur_solo_human.status.code(), Some(0));
-    let cur_solo_txt = String::from_utf8_lossy(&cur_solo_human.stdout);
-    assert!(
-        cur_solo_txt.contains("alice@example.com [PRO], not in pool")
-            && cur_solo_txt
-                .contains("different refresh_token from pool account alice@example.com (acc-0001)"),
-        "unexpected human standalone current output:\n{cur_solo_txt}"
-    );
-
-    let quota_solo = base_cmd()
-        .args([
-            "--json",
-            "quota",
-            "--target-dir",
-            standalone_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(quota_solo.status.code(), Some(4));
-    let qsj: serde_json::Value = serde_json::from_slice(&quota_solo.stderr).unwrap();
-    assert_eq!(qsj["error_code"], "no_cached_quota");
-
-    // 7. Strict safety & CLI conflict rejections (all exit 2)
-    for bad_args in [
-        vec![
-            "--backend",
-            "keyring",
-            "switch",
-            "acc-0002",
-            "--target",
-            "t3",
-        ],
-        vec!["--backend", "keyring", "current", "--target", "t3"],
-        vec!["--backend", "keyring", "quota", "--target", "t3"],
-        vec!["--backend", "keyring", "refresh", "--target", "t3"],
-        vec![
-            "--backend",
-            "keyring",
-            "accounts",
-            "add",
-            "--from-local",
-            "--target",
-            "t3",
-        ],
-        vec![
-            "switch",
-            "acc-0002",
-            "--target-dir",
-            paths.active_slot_dir.to_str().unwrap(),
-        ],
-        vec![
-            "switch",
-            "acc-0002",
-            "--target-dir",
-            ext_slot_file.to_str().unwrap(),
-        ],
-        vec!["accounts", "add", "--target", "t3"],
-        vec!["quota", "acc-0001", "--target", "t3"],
-        vec!["quota", "--all", "--target", "t3"],
-        vec!["refresh", "--all", "--target", "t3"],
-        vec!["switch", "acc-0002", "--target", "nonexistent"],
-    ] {
-        let out = base_cmd().args(&bad_args).output().unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(2),
-            "expected usage error exit 2 for {:?}, got {:?}, stderr={}",
-            bad_args,
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    // 8. `accounts add --from-local --target-dir <dir without token>` cleanly exits env_not_ready (8)
-    let empty_dir = env.home.join("empty_acp");
-    fs::create_dir_all(&empty_dir).unwrap();
-    let add_missing = base_cmd()
-        .args([
-            "--json",
-            "accounts",
-            "add",
-            "--from-local",
-            "--target-dir",
-            empty_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(add_missing.status.code(), Some(8));
-    let amj: serde_json::Value = serde_json::from_slice(&add_missing.stderr).unwrap();
-    assert_eq!(amj["error_code"], "external_credential_missing");
-
-    // 9. P1-01: `--target` business validation MUST NOT echo raw alias input in human or JSON streams
-    for (alias, expected_code) in [
-        ("missing_alias_marker_999", "unknown_target"),
-        ("1//0gSYNTH_ALIAS_SECRET_999", "invalid_usage"),
-        ("GOCSPX-SYNTH_ALIAS_SECRET_999", "invalid_usage"),
-        ("ya29.SYNTH_ALIAS_SECRET_999", "invalid_usage"),
-        ("bad alias!SYNTH_INVALID_999", "invalid_usage"),
-    ] {
-        for json_flag in [false, true] {
-            let mut args = Vec::new();
-            if json_flag {
-                args.push("--json");
-            }
-            args.extend(["current", "--target", alias]);
-            let out = base_cmd().args(&args).output().unwrap();
-            assert_eq!(out.status.code(), Some(2), "alias={alias} json={json_flag}");
-            let stdout_s = String::from_utf8_lossy(&out.stdout);
-            let stderr_s = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                !stdout_s.contains(alias) && !stderr_s.contains(alias),
-                "alias leaked into output (json={json_flag}): stdout={stdout_s} stderr={stderr_s}"
-            );
-            if json_flag {
-                let err_j: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
-                assert_eq!(err_j["error_code"], expected_code);
-            }
-        }
-    }
-
-    // 10. P2-02: `config.json` with `backend: "keyring"` MUST STILL allow pure-file external
-    //     commands across ALL feature tiers (including `--no-default-features` and `tui,stats`)!
-    let keyring_cfg = serde_json::json!({
-        "schema_version": 1,
-        "backend": "keyring",
-        "targets": {
-            "t3": "~/.t3/userdata/providers/antigravity/synthetic_profile/antigravity-acp"
-        }
-    });
-    fs::write(
-        paths.config_file(),
-        serde_json::to_vec_pretty(&keyring_cfg).unwrap(),
-    )
-    .unwrap();
-    for ok_args in [
-        vec!["--json", "current", "--target", "t3"],
-        vec!["--json", "quota", "--target", "t3"],
-    ] {
-        let out = base_cmd().args(&ok_args).output().unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "expected exit 0 under config backend=keyring for {:?}, stderr={}",
-            ok_args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    // 11. P2-01: Bidirectional reserved collision + uninitialized target fails BEFORE creating lock dir
-    for bad_dir in [
-        env.home.join(".gemini"),
-        paths.active_slot_dir.join("conversations"),
-        env._tmp.path().to_path_buf(),
-    ] {
-        let out = base_cmd()
-            .args([
-                "--json",
-                "current",
-                "--target-dir",
-                bad_dir.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(2),
-            "expected bidirectional reserved collision exit 2 for '{}'",
-            bad_dir.display()
-        );
-    }
-    let fresh_env = IsolatedEnv::new();
-    let fresh_paths = fresh_env.paths();
-    let fresh_repo = StoreRepository::new(fresh_paths.clone());
-    let fresh_acc = make_acc("acc-0009", "eve@example.com", "1//rt-eve-9", 80);
-    fresh_repo
-        .with_write_lock(|tx| {
-            tx.upsert_account(fresh_acc, true, now)?;
-            Ok(())
-        })
-        .unwrap();
-    let uninit_dir = fresh_env.home.join("never_created_acp");
-    let uninit_sw = fresh_env
-        .cli_cmd()
-        .args([
-            "--json",
-            "switch",
-            "acc-0009",
-            "--target-dir",
-            uninit_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(uninit_sw.status.code(), Some(8));
-    let uninit_j: serde_json::Value = serde_json::from_slice(&uninit_sw.stderr).unwrap();
-    assert_eq!(uninit_j["error_code"], "slot_dir_uninitialized");
-    assert!(
-        !fresh_paths.global_locks_dir().exists(),
-        "uninitialized external target must fail before creating cache/locks/"
-    );
-
-    // 12. P2-03: Relative `--gemini-dir` without verified `cwd` and incomplete flag MUST fail closed (`Unverified`)
-    let rel_pid = fake_proc.join("4209");
-    fs::create_dir_all(&rel_pid).unwrap();
-    fs::write(
-        rel_pid.join("stat"),
-        "4209 (agy) S 1 4209 4209 0 -1 0 0 0 0 0 0 0 0 20 0 1 0 12399 1000 10",
-    )
-    .unwrap();
-    fs::write(rel_pid.join("comm"), "agy\n").unwrap();
-    std::os::unix::fs::symlink(&fake_agy_bin, rel_pid.join("exe")).unwrap();
-    fs::write(
-        rel_pid.join("cmdline"),
-        b"/usr/bin/agy\0acp\0--gemini-dir\0./relative_profile\0--app-data-dir\0antigravity-acp\0",
-    )
-    .unwrap();
-    let rel_unv = base_cmd()
-        .args(["--json", "switch", "acc-0002", "--target", "t3"])
-        .output()
-        .unwrap();
-    assert_eq!(rel_unv.status.code(), Some(8));
-    let rel_unv_j: serde_json::Value = serde_json::from_slice(&rel_unv.stderr).unwrap();
-    assert_eq!(rel_unv_j["error_code"], "runtime_state_unverified");
-
-    // Incomplete trailing `--gemini-dir` without value also fails closed
-    fs::write(
-        rel_pid.join("cmdline"),
-        b"/usr/bin/agy\0acp\0--gemini-dir\0",
-    )
-    .unwrap();
-    let inc_unv = base_cmd()
-        .args(["--json", "switch", "acc-0002", "--target", "t3"])
-        .output()
-        .unwrap();
-    assert_eq!(inc_unv.status.code(), Some(8));
-    let inc_unv_j: serde_json::Value = serde_json::from_slice(&inc_unv.stderr).unwrap();
-    assert_eq!(inc_unv_j["error_code"], "runtime_state_unverified");
-
-    // `--allow-running` explicitly overrides `Unverified`
-    let inc_allow = base_cmd()
-        .args([
-            "--json",
-            "switch",
-            "acc-0002",
-            "--target",
-            "t3",
-            "--allow-running",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(inc_allow.status.code(), Some(0));
-    fs::remove_dir_all(&rel_pid).unwrap();
-
-    // 13. P1-02: `accounts add --from-local --target t3` with a pending official `switch_journal.json`
-    //     MUST NOT resolve official keyring backend, connect to D-Bus, or auto-reconcile official credentials/index/journal!
-    let dbus_probe_sock = env._tmp.path().join("run/probe-dbus.sock");
-    let dbus_probe_listener = std::os::unix::net::UnixListener::bind(&dbus_probe_sock).unwrap();
-    dbus_probe_listener.set_nonblocking(true).unwrap();
-    let dbus_probe_addr = format!("unix:path={}", dbus_probe_sock.display());
-
-    let official_before = fs::read(&paths.active_slot_file).unwrap();
-    let index_before = fs::read(paths.index_file()).unwrap();
-    let acc1_digest = agy_switch_cli::session::payload::bytes_sha256_hex(&official_before);
-    let mut pending_j = agy_switch_cli::session::journal::SwitchJournal::new_prepared(
-        "txn-synth-p102".into(),
-        Some("acc-0001".into()),
-        "acc-0002".into(),
-        Some(acc1_digest.clone()),
+        },
         now,
     );
-    pending_j.phase = agy_switch_cli::session::journal::JournalPhase::CommittedIndexPending;
-    pending_j.target_slot_digest = Some(acc1_digest.clone());
-    let pending_meta = agy_switch_cli::session::journal::JournalReplicaRecord {
-        backend: "dual".into(),
-        uses_file: true,
-        file: agy_switch_cli::session::journal::JournalReplicaSnapshot {
-            prev_present: true,
-            prev_digest: Some(acc1_digest.clone()),
-            prev_uniform: true,
-            collections: Vec::new(),
-        },
-        keyring: Some(agy_switch_cli::session::journal::JournalReplicaSnapshot {
-            prev_present: true,
-            prev_digest: Some(acc1_digest.clone()),
-            prev_uniform: true,
-            collections: vec![
-                agy_switch_cli::session::journal::JournalCollectionSnapshot {
-                    path: "/org/freedesktop/secrets/collection/login".into(),
-                    prev_present: true,
-                    prev_digest: Some(acc1_digest),
-                },
-            ],
-        }),
-    };
-    agy_switch_cli::session::journal::write_journal_with_replicas(
-        &paths,
-        &pending_j,
-        Some(&pending_meta),
-    )
-    .unwrap();
-    let journal_bytes = fs::read(paths.switch_journal_file()).unwrap();
-
-    let blocked_import = base_cmd()
-        .env("DBUS_SESSION_BUS_ADDRESS", &dbus_probe_addr)
-        .args([
-            "--json",
-            "accounts",
-            "add",
-            "--from-local",
-            "--target",
-            "t3",
-        ])
-        .output()
+    acc_b.custom_label = Some("bak".into());
+    repo.with_write_lock(|tx| tx.upsert_account(acc_b.clone(), false, now))
         .unwrap();
-    assert_eq!(
-        blocked_import.status.code(),
-        Some(7),
-        "expected exit 7 pending_official_journal, stderr={}",
-        String::from_utf8_lossy(&blocked_import.stderr)
-    );
-    let bij: serde_json::Value = serde_json::from_slice(&blocked_import.stderr).unwrap();
-    assert_eq!(bij["error_code"], "pending_official_journal");
-    // Official slot, index.json, and switch_journal.json MUST remain byte-for-byte untouched!
-    assert_eq!(fs::read(&paths.active_slot_file).unwrap(), official_before);
-    assert_eq!(fs::read(paths.index_file()).unwrap(), index_before);
-    assert_eq!(
-        fs::read(paths.switch_journal_file()).unwrap(),
-        journal_bytes
-    );
-    // And ZERO connection attempts may reach the verified local D-Bus session socket!
-    assert!(
-        matches!(
-            dbus_probe_listener.accept(),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-        ),
-        "external `accounts add --from-local --target` MUST NEVER connect to D-Bus/Keyring!"
-    );
 
-    // Clear the journal and verify normal external import path also makes ZERO D-Bus connections
-    // (reaching pure-file `external_credential_missing` without touching Keyring even under `backend: "keyring"`).
-    fs::remove_file(paths.switch_journal_file()).unwrap();
-    let no_journal_import = base_cmd()
-        .env("DBUS_SESSION_BUS_ADDRESS", &dbus_probe_addr)
-        .args([
-            "--json",
-            "accounts",
-            "add",
-            "--from-local",
-            "--target-dir",
-            empty_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(no_journal_import.status.code(), Some(8));
-    let nj_err: serde_json::Value = serde_json::from_slice(&no_journal_import.stderr).unwrap();
-    assert_eq!(nj_err["error_code"], "external_credential_missing");
-    assert!(
-        matches!(
-            dbus_probe_listener.accept(),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-        ),
-        "normal external `accounts add --from-local` MUST NEVER connect to D-Bus/Keyring!"
-    );
-
-    // 14. R2-02: Selected `config.json` aliases normalizing via `..` to `/`, token leaf, or pointing to a
-    //     regular file MUST uniformly exit `2/invalid_usage` (consistent with `--target-dir`).
-    let reg_file_target = env.home.join("not_a_dir.json");
-    fs::write(&reg_file_target, b"{}").unwrap();
-    let r2_alias_cfg = serde_json::json!({
-        "schema_version": 1,
-        "targets": {
-            "norm_root": "/a/..",
-            "norm_leaf": "~/.t3/userdata/providers/antigravity/synthetic_profile/antigravity-acp/antigravity-oauth-token/sub/..",
-            "reg_file": reg_file_target.to_str().unwrap()
-        }
-    });
+    // Official `agy` wrote a rotated token for Alice into the active slot before we switch to Bob
     fs::write(
-        paths.config_file(),
-        serde_json::to_vec_pretty(&r2_alias_cfg).unwrap(),
-    )
-    .unwrap();
-    for alias in ["norm_root", "norm_leaf", "reg_file"] {
-        let out = base_cmd()
-            .args(["--json", "current", "--target", alias])
-            .output()
-            .unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(2),
-            "alias `{alias}` must return exit 2, got {:?}, stderr={}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let ej: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
-        assert_eq!(ej["error_code"], "invalid_usage", "alias={alias}");
-    }
-
-    // 15. R2-03: Trailing LF in JWT email / `user_tier` MUST be rejected BEFORE `trim()` (falling back
-    //     to compact email and omitting `user_tier`), and trailing LF in raw credentials marks `corrupt` with zero echo.
-    let lf_dir = env.home.join("lf_payload_acp");
-    fs::create_dir_all(&lf_dir).unwrap();
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    let lf_jwt = format!(
-        "{}.{}.sig",
-        URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#),
-        URL_SAFE_NO_PAD
-            .encode(serde_json::json!({"email": "trailing-lf@example.com\n"}).to_string())
-    );
-    fs::write(
-        lf_dir.join("antigravity-oauth-token"),
+        &paths.active_slot_file,
         serde_json::to_vec(&serde_json::json!({
-            "token": {
-                "access_token": "ya29.clean-at",
-                "token_type": "Bearer",
-                "refresh_token": "1//rt-clean-lf-test",
-                "expiry": "2099-01-01T00:00:00Z"
-            },
-            "auth_method": "consumer",
-            "id_token": lf_jwt,
-            "id_token_email": "fallback@example.com",
-            "user_tier": "PRO\n"
+            "access_token": "ya29.ALICE_PRE_SWITCH_FRESH",
+            "refresh_token": "1//ALICE_RT_3_SYNCED",
+            "token_type": "Bearer",
+            "expiry": "2099-09-01T00:00:00Z",
+            "id_token_email": "alice@example.com"
         }))
         .unwrap(),
     )
     .unwrap();
-    let cur_lf = base_cmd()
-        .args([
-            "--json",
-            "current",
-            "--target-dir",
-            lf_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(cur_lf.status.code(), Some(0));
-    let cur_lf_j: serde_json::Value = serde_json::from_slice(&cur_lf.stdout).unwrap();
-    assert_eq!(cur_lf_j["slot_state"]["status"], "external");
-    assert_eq!(cur_lf_j["slot_state"]["email_hint"], "fallback@example.com");
-    assert!(cur_lf_j["slot_state"].get("user_tier").is_none());
 
-    // Raw refresh_token with trailing LF -> `slot_state.status == "corrupt"` (exit 0) and zero echo!
-    fs::write(
-        lf_dir.join("antigravity-oauth-token"),
-        serde_json::to_vec(&serde_json::json!({
-            "token": {
-                "access_token": "ya29.clean-at",
-                "token_type": "Bearer",
-                "refresh_token": "1//LF_RAW_SECRET_999\n",
-                "expiry": "2099-01-01T00:00:00Z"
-            }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let cur_bad_rt = base_cmd()
-        .args([
-            "--json",
-            "current",
-            "--target-dir",
-            lf_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(cur_bad_rt.status.code(), Some(0));
-    let bad_rt_out = String::from_utf8_lossy(&cur_bad_rt.stdout);
-    assert!(!bad_rt_out.contains("LF_RAW_SECRET_999"));
-    let cur_bad_rt_j: serde_json::Value = serde_json::from_slice(&cur_bad_rt.stdout).unwrap();
-    assert_eq!(cur_bad_rt_j["slot_state"]["status"], "corrupt");
-
-    // 16. R2-03 residual: `accounts add --from-local --target/--target-dir` (and direct
-    //     `ExternalSlotTarget::read_raw_refresh_token`) MUST reject bad optional `access_token` /
-    //     `id_token` (control chars or > MAX_SECRET_BYTES) with exit `1/data_error` and zero echo,
-    //     while still accepting refresh-only, compact `agy 1.5+`, and exact boundary payloads.
-    let lf_alias_cfg = serde_json::json!({
-        "schema_version": 1,
-        "targets": {
-            "lf_slot": lf_dir.to_str().unwrap()
-        }
-    });
-    fs::write(
-        paths.config_file(),
-        serde_json::to_vec_pretty(&lf_alias_cfg).unwrap(),
-    )
-    .unwrap();
-    let max_secret = agy_switch_cli::cli::secret_input::MAX_SECRET_BYTES;
-    let overlong_secret = format!("SECRET_OVERLONG_{}", "a".repeat(max_secret));
-    let lf_slot_file = lf_dir.join("antigravity-oauth-token");
-    let resolved_lf = agy_switch_cli::session::external_slot::ExternalSlotTarget::resolve(
-        &paths,
-        &agy_switch_cli::domain::config::HeadlessConfig::default(),
-        None,
-        None,
-        Some(&lf_dir),
-        true,
-    )
-    .unwrap()
-    .unwrap();
-
-    for (label, marker, payload) in [
-        (
-            "bad_at_lf",
-            "BAD_AT_LF_SECRET",
-            serde_json::json!({
-                "token": {
-                    "refresh_token": "1//rt-valid-for-import",
-                    "access_token": "ya29.BAD_AT_LF_SECRET\n"
-                }
-            }),
-        ),
-        (
-            "bad_top_at_tab",
-            "BAD_TOP_AT_SECRET",
-            serde_json::json!({
-                "refresh_token": "1//rt-valid-for-import",
-                "access_token": "ya29.BAD_TOP_AT_SECRET\t"
-            }),
-        ),
-        (
-            "bad_at_overlong",
-            "SECRET_OVERLONG_",
-            serde_json::json!({
-                "token": {
-                    "refresh_token": "1//rt-valid-for-import",
-                    "access_token": overlong_secret
-                }
-            }),
-        ),
-        (
-            "bad_id_cr",
-            "BAD_ID_CR_SECRET",
-            serde_json::json!({
-                "token": {
-                    "refresh_token": "1//rt-valid-for-import",
-                    "access_token": "ya29.clean"
-                },
-                "id_token": "eyJ.BAD_ID_CR_SECRET\r"
-            }),
-        ),
-        (
-            "bad_id_overlong",
-            "SECRET_OVERLONG_",
-            serde_json::json!({
-                "token": {
-                    "refresh_token": "1//rt-valid-for-import",
-                    "access_token": "ya29.clean"
-                },
-                "id_token": overlong_secret
-            }),
-        ),
-    ] {
-        let raw_bytes = serde_json::to_vec(&payload).unwrap();
-        fs::write(&lf_slot_file, &raw_bytes).unwrap();
-
-        let direct_err = resolved_lf
-            .read_raw_refresh_token(&paths)
-            .expect_err(&format!("{label} should fail read_raw_refresh_token"));
-        assert_eq!(direct_err.exit_code.as_i32(), 1, "label={label}");
-        assert_eq!(direct_err.error_code, "data_error", "label={label}");
-        assert!(
-            !direct_err.message.contains(marker),
-            "secret leaked in direct error for {label}: {}",
-            direct_err.message
-        );
-
-        for (mode, args) in [
-            (
-                "json_target",
-                vec![
-                    "--json",
-                    "accounts",
-                    "add",
-                    "--from-local",
-                    "--target",
-                    "lf_slot",
-                ],
-            ),
-            (
-                "human_target_dir",
-                vec![
-                    "accounts",
-                    "add",
-                    "--from-local",
-                    "--target-dir",
-                    lf_dir.to_str().unwrap(),
-                ],
-            ),
-        ] {
-            let out = base_cmd().args(&args).output().unwrap();
-            assert_eq!(
-                out.status.code(),
-                Some(1),
-                "label={label} mode={mode} stderr={}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let stdout_str = String::from_utf8_lossy(&out.stdout);
-            let stderr_str = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                !stdout_str.contains(marker) && !stderr_str.contains(marker),
-                "secret marker `{marker}` leaked for {label}/{mode}"
-            );
-            if mode == "json_target" {
-                let ej: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
-                assert_eq!(ej["error_code"], "data_error", "label={label}");
-            }
-        }
-        assert_eq!(
-            fs::read(&lf_slot_file).unwrap(),
-            raw_bytes,
-            "read-only rejection must not mutate external file ({label})"
-        );
-    }
-
-    // Positive offline extraction checks through `ExternalSlotTarget::read_raw_refresh_token`:
-    // omitted optional fields, compact `agy 1.5+` payloads, and exact `MAX_SECRET_BYTES` boundaries.
-    let exact_max_secret = "b".repeat(max_secret);
-    for (label, payload, expected_rt) in [
-        (
-            "refresh_only",
-            serde_json::json!({"token": {"refresh_token": " 1//rt-only-ext "}}),
-            "1//rt-only-ext",
-        ),
-        (
-            "compact_ext",
-            serde_json::json!({
-                "token": {"access_token": "ya29.clean", "refresh_token": "1//rt-compact-ext"},
-                "id_token_email": "alice@example.com",
-                "user_tier": "PRO"
-            }),
-            "1//rt-compact-ext",
-        ),
-        (
-            "exact_max_boundary",
-            serde_json::json!({
-                "token": {
-                    "refresh_token": exact_max_secret,
-                    "access_token": exact_max_secret
-                },
-                "id_token": exact_max_secret
-            }),
-            exact_max_secret.as_str(),
-        ),
-    ] {
-        fs::write(&lf_slot_file, serde_json::to_vec(&payload).unwrap()).unwrap();
-        let got = resolved_lf
-            .read_raw_refresh_token(&paths)
-            .unwrap_or_else(|e| panic!("{label} should succeed: {}", e.message));
-        assert_eq!(got, expected_rt, "label={label}");
-    }
-}
-
-#[cfg(feature = "stats")]
-#[test]
-fn synthetic_v126_stats_external_target_and_target_dir_cli_contract() {
-    let env = IsolatedEnv::new();
-    let paths = env.paths();
-
-    let cli_conv = env.home.join(".gemini/antigravity-cli/conversations");
-    let ext_dir = env
-        .home
-        .join(".t3/userdata/providers/antigravity/synth_stats/antigravity-acp");
-    let ext_conv = ext_dir.join("conversations");
-    fs::create_dir_all(&cli_conv).unwrap();
-    fs::create_dir_all(&ext_conv).unwrap();
-    fs::create_dir_all(env.home.join(".gemini/antigravity")).unwrap();
-
-    let cfg = serde_json::json!({
-        "schema_version": 1,
-        "targets": {
-            "t3": "~/.t3/userdata/providers/antigravity/synth_stats/antigravity-acp"
-        }
-    });
-    fs::create_dir_all(&paths.data_dir).unwrap();
-    fs::write(
-        paths.config_file(),
-        serde_json::to_vec_pretty(&cfg).unwrap(),
-    )
-    .unwrap();
-
-    let vi = |mut v: u64| -> Vec<u8> {
-        let mut b = Vec::new();
-        loop {
-            let n = (v & 0x7f) as u8;
-            v >>= 7;
-            b.push(if v == 0 { n } else { n | 0x80 });
-            if v == 0 {
-                return b;
-            }
-        }
-    };
-    let pb_v = |num: u32, v: u64| -> Vec<u8> { [vi(u64::from(num) << 3), vi(v)].concat() };
-    let pb_b = |num: u32, v: &[u8]| -> Vec<u8> {
-        [
-            vi((u64::from(num) << 3) | 2),
-            vi(v.len() as u64),
-            v.to_vec(),
-        ]
-        .concat()
-    };
-    let make_blob = |model: &[u8], out_tok: u64, ts: u64| -> Vec<u8> {
-        let usage = [pb_v(1, 500), pb_v(2, 100), pb_v(3, out_tok), pb_v(5, 1_000)].concat();
-        let timing = pb_b(4, &pb_v(1, ts));
-        let wrapped = [
-            pb_b(4, &usage),
-            pb_b(9, &timing),
-            pb_b(11, &pb_v(1, 1)),
-            pb_b(12, &pb_v(1, 4)),
-            pb_b(19, model),
-        ]
-        .concat();
-        pb_b(1, &wrapped)
-    };
-    let valid_payload = pb_b(20, &pb_b(1, b"done"));
-    let t0 = "2026-11-22T10:00:00Z"
-        .parse::<jiff::Timestamp>()
-        .unwrap()
-        .as_second() as u64;
-
-    // Seed official CLI db (1 call, output=200) and separate external t3 db (2 calls, output=300+400=700)
-    let write_db = |db_path: &Path, rows: &[(i64, &[u8], u64, u64)]| {
-        let conn = rusqlite::Connection::open(db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB, status INTEGER, step_payload BLOB);
-             CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
-        )
-        .unwrap();
-        for &(idx, model, out_tok, ts) in rows {
-            conn.execute(
-                "INSERT INTO steps VALUES (?1, 15, NULL, 3, ?2)",
-                rusqlite::params![idx, &valid_payload],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO gen_metadata VALUES (?1, ?2)",
-                rusqlite::params![idx, make_blob(model, out_tok, ts)],
-            )
-            .unwrap();
-        }
-    };
-    write_db(
-        &cli_conv.join("official_cli.db"),
-        &[(1, b"gemini-3.1-pro", 200, t0)],
-    );
-    write_db(
-        &ext_conv.join("t3_session.db"),
-        &[
-            (1, b"claude-sonnet-4-6", 300, t0 + 10),
-            (2, b"claude-sonnet-4-6", 400, t0 + 20),
-        ],
-    );
-
-    // 1. Default `stats summary --range all --json` scans ONLY official sources (200 output, 1 request)
-    let official_sum = env
-        .cli_cmd()
-        .args(["--json", "stats", "summary", "--range", "all"])
-        .output()
-        .unwrap();
-    assert_eq!(official_sum.status.code(), Some(0));
-    let osj: serde_json::Value = serde_json::from_slice(&official_sum.stdout).unwrap();
-    assert_eq!(osj["source"], "all");
-    assert!(osj.get("target").is_none());
-    assert_eq!(osj["summary"]["request_count"], 1);
-    assert_eq!(osj["summary"]["total_output_tokens"], 200);
-
-    // 2. `stats summary --target t3 --range all --json` scans ONLY external `t3` dir (700 output, 2 requests)
-    let ext_sum = env
+    let sw_out = env
         .cli_cmd()
         .args([
-            "--json", "stats", "summary", "--target", "t3", "--range", "all",
+            "--proxy",
+            "http://127.0.0.1:1",
+            "--json",
+            "switch",
+            "acc-0002",
         ])
         .output()
         .unwrap();
     assert_eq!(
-        ext_sum.status.code(),
+        sw_out.status.code(),
         Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&ext_sum.stderr)
+        "offline switch to bare transfer-bundle account failed: stderr={}",
+        String::from_utf8_lossy(&sw_out.stderr)
     );
-    let esj: serde_json::Value = serde_json::from_slice(&ext_sum.stdout).unwrap();
-    assert_eq!(esj["source"], "external");
-    assert_eq!(esj["target"]["name"], "t3");
-    assert_eq!(esj["summary"]["request_count"], 2);
-    assert_eq!(esj["summary"]["total_output_tokens"], 700);
-
-    // 3. Human `stats summary --target t3 --range all` & `stats list --target-dir <DIR> --range all`
-    let ext_sum_human = env
-        .cli_cmd()
-        .args(["stats", "summary", "--target", "t3", "--range", "all"])
-        .output()
-        .unwrap();
-    assert_eq!(ext_sum_human.status.code(), Some(0));
-    let esh = String::from_utf8_lossy(&ext_sum_human.stdout);
-    assert!(
-        esh.contains(
-            "Source : t3 (~/.t3/userdata/providers/antigravity/synth_stats/antigravity-acp)"
-        ),
-        "missing external target header in summary:\n{esh}"
+    let alice_after = repo.read_account_unchecked(&acc_a_id).unwrap();
+    assert_eq!(alice_after.token.refresh_token, "1//ALICE_RT_3_SYNCED");
+    assert_eq!(
+        alice_after.token.access_token,
+        "ya29.ALICE_PRE_SWITCH_FRESH"
     );
+    assert!(fs::read_to_string(&paths.active_slot_file)
+        .unwrap()
+        .contains("1//BOB_RT_BARE"));
 
-    let ext_list_json = env
-        .cli_cmd()
-        .args([
-            "--json",
-            "stats",
-            "list",
-            "--target-dir",
-            ext_dir.to_str().unwrap(),
-            "--range",
-            "all",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(ext_list_json.status.code(), Some(0));
-    let elj: serde_json::Value = serde_json::from_slice(&ext_list_json.stdout).unwrap();
-    assert_eq!(elj["source"], "external");
-    assert!(elj["target"]["name"].is_null());
-    assert_eq!(elj["items"].as_array().unwrap().len(), 2);
-
-    // 4. Rejections: `--source` + `--target`, official CLI/App collision, `--watch --json`, nonexistent dir
+    // 5. All removed v1.2.6 / batch / remote-version flags strictly exit 2!
     for bad in [
-        vec!["stats", "summary", "--source", "cli", "--target", "t3"],
-        vec![
-            "stats",
-            "summary",
-            "--target-dir",
-            paths.active_slot_dir.to_str().unwrap(),
-        ],
-        vec![
-            "stats",
-            "list",
-            "--target-dir",
-            env.home.join(".gemini/antigravity").to_str().unwrap(),
-        ],
-        vec!["--json", "stats", "summary", "--target", "t3", "--watch"],
+        vec!["--no-remote-version", "status"],
+        vec!["switch", "acc-0002", "--target", "t3"],
+        vec!["switch", "acc-0002", "--target-dir", "/tmp/x"],
+        vec!["current", "--target", "t3"],
+        vec!["quota", "--target", "t3"],
+        vec!["quota", "--refresh", "--all"],
+        vec!["quota", "acc-0002", "--refresh"],
+        vec!["refresh", "--all"],
+        vec!["refresh", "--concurrency", "2"],
+        vec!["refresh", &acc_a_id], // non-active account rejected!
+        vec!["accounts", "add", "--from-local", "--target", "t3"],
+        vec!["stats", "summary", "--target", "t3"],
+        vec!["stats", "list", "--target-dir", "/tmp/x"],
     ] {
         let out = env.cli_cmd().args(&bad).output().unwrap();
         assert_eq!(
             out.status.code(),
             Some(2),
-            "expected exit 2 for {:?}, got {:?}, stderr={}",
+            "expected exit 2 for removed flag/combo {:?}, got {:?}, stderr={}",
             bad,
             out.status.code(),
             String::from_utf8_lossy(&out.stderr)
         );
     }
 
-    let missing_dir = env.home.join("no_such_target_dir");
-    let out_missing = env
+    // 6. Adversarial v1.2.7 regressions:
+    //    Build a second fake `agy` binary that does NOT overwrite `$SLOT` with an older RT.
+    let proxy_dump = env._tmp.path().join("fake-agy-proxy-env");
+    let adv_agy = env._tmp.path().join("adv-fake-agy");
+    let adv_mode = env._tmp.path().join("adv-fake-agy-mode");
+    let adv_script = format!(
+        r#"#!/bin/sh
+printf '%s' "$HTTPS_PROXY" > "{proxy_dump}"
+MODE="$(cat "{adv_mode}" 2>/dev/null || echo ok)"
+case "$MODE" in
+  ok)
+    cat <<'EOF_JSON'
+Warning: non-JSON preamble line
+{{"status":"SUCCESS","response":"ok","command":{{"name":"usage","data":{{"groups":[{{"name":"Gemini Models","buckets":[{{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.91,"reset_time":"2099-12-03T07:17:01Z"}},{{"id":"gemini-5h","window":"5h","remaining_fraction":0.90,"reset_time":"2099-11-27T11:18:26Z"}}]}}]}}}}}}
+EOF_JSON
+    exit 0
+    ;;
+  validation_blocked)
+    echo '{{"status":"ERROR","error":"403 VALIDATION_REQUIRED: account requires verification","command":{{"name":"usage"}}}}'
+    exit 1
+    ;;
+  overflow_hang)
+    trap '' PIPE
+    dd if=/dev/zero bs=4096 count=160 2>/dev/null | tr '\0' 'A'
+    sleep 20
+    exit 0
+    ;;
+  stdout_auth_hang)
+    echo "Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=synth"
+    sleep 20
+    exit 1
+    ;;
+esac
+"#,
+        proxy_dump = proxy_dump.display(),
+        adv_mode = adv_mode.display(),
+    );
+    fs::write(&adv_agy, adv_script).unwrap();
+    fs::set_permissions(&adv_agy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    //    6a. `refresh <drifted_active_id>` succeeds when actual slot holds Alice (`acc_a_id`) while
+    //        `index.selected_account_id` is Bob (`acc-0002`), AND `refresh acc-0002` exits 2!
+    fs::write(
+        &paths.active_slot_file,
+        serde_json::to_vec(&serde_json::json!({
+            "token": {
+                "access_token": "ya29.ALICE_DRIFT_AT",
+                "token_type": "Bearer",
+                "refresh_token": "1//ALICE_RT_3_SYNCED",
+                "expiry": "2099-09-01T00:00:00Z"
+            },
+            "id_token_email": "alice@example.com",
+            "user_tier": "g1-ultra-tier"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(&adv_mode, "ok").unwrap();
+    let drift_wrong = env
         .cli_cmd()
-        .args([
-            "--json",
-            "stats",
-            "summary",
-            "--target-dir",
-            missing_dir.to_str().unwrap(),
-        ])
+        .env("AGY_SWITCH_CLI_AGY_BIN", &adv_agy)
+        .args(["refresh", "acc-0002"])
         .output()
         .unwrap();
-    assert_eq!(out_missing.status.code(), Some(8));
+    assert_eq!(drift_wrong.status.code(), Some(2));
+    let drift_ok = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &adv_agy)
+        .args(["refresh", &acc_a_id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        drift_ok.status.code(),
+        Some(0),
+        "refresh on drifted active slot account must succeed: stderr={}",
+        String::from_utf8_lossy(&drift_ok.stderr)
+    );
+
+    //    6b. Human `refresh` on `VALIDATION_REQUIRED` emits `verify-blocked` note on stderr!
+    fs::write(&adv_mode, "validation_blocked").unwrap();
+    let vb_human = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &adv_agy)
+        .args(["refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        vb_human.status.code(),
+        Some(0),
+        "human refresh validation_blocked failed: stderr={}",
+        String::from_utf8_lossy(&vb_human.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&vb_human.stderr).contains("verify-blocked"),
+        "expected verify-blocked warning on human refresh stderr: {}",
+        String::from_utf8_lossy(&vb_human.stderr)
+    );
+
+    //    6b-2. `quota --refresh` (both human and `--json`) and cached `quota` on `VALIDATION_REQUIRED`
+    //          must exit with code 4, emit clear verify-blocked guidance (not "Cached quota ... Switch to it"),
+    //          preserve `--json` `details` contract, and never expose `validation_url`!
+    let vb_quota_human = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &adv_agy)
+        .args(["quota", "--refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(vb_quota_human.status.code(), Some(4));
+    let vb_quota_stderr = String::from_utf8_lossy(&vb_quota_human.stderr);
+    assert!(
+        vb_quota_stderr.contains("verify-blocked")
+            && vb_quota_stderr.contains("complete Google verification"),
+        "quota --refresh on validation_blocked must guide user to verify in agy: {vb_quota_stderr}"
+    );
+    assert!(
+        !vb_quota_stderr.contains("Cached quota")
+            && !vb_quota_stderr.contains("Switch to it and run"),
+        "quota --refresh on validation_blocked must NOT fall through to cached switch hint: {vb_quota_stderr}"
+    );
+    assert!(
+        !vb_quota_stderr.contains("https://"),
+        "quota --refresh must never leak validation_url: {vb_quota_stderr}"
+    );
+
+    let vb_quota_json = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &adv_agy)
+        .args(["--json", "quota", "--refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(vb_quota_json.status.code(), Some(4));
+    assert!(
+        vb_quota_json.stdout.is_empty(),
+        "failed --json quota --refresh must keep stdout empty"
+    );
+    let vb_q_err: serde_json::Value = serde_json::from_slice(&vb_quota_json.stderr).unwrap();
+    assert_eq!(vb_q_err["ok"], false);
+    assert_eq!(vb_q_err["exit_code"], 4);
+    assert_eq!(vb_q_err["error_code"], "quota_stale_or_unknown");
+    assert!(vb_q_err["message"]
+        .as_str()
+        .unwrap()
+        .contains("verify-blocked"));
+    assert_eq!(vb_q_err["details"]["account_id"], acc_a_id);
+    assert_eq!(vb_q_err["details"]["email"], "alice@example.com");
+    assert_eq!(vb_q_err["details"]["evaluation"]["status"], "unavailable");
+    assert_eq!(
+        vb_q_err["details"]["evaluation"]["reason"],
+        "validation_blocked"
+    );
+    assert!(vb_q_err["details"]["quota"].is_object());
+
+    // Cached `quota <ID>` (without `--refresh`) on the validation-blocked account also gives
+    // accurate verify-blocked guidance and exit code 4 (with backwards-compatible error_code).
+    let vb_quota_cached = env
+        .cli_cmd()
+        .args(["--json", "quota", &acc_a_id])
+        .output()
+        .unwrap();
+    assert_eq!(vb_quota_cached.status.code(), Some(4));
+    let vb_cached_err: serde_json::Value = serde_json::from_slice(&vb_quota_cached.stderr).unwrap();
+    assert_eq!(vb_cached_err["error_code"], "quota_stale_or_unknown");
+    assert_eq!(
+        vb_cached_err["details"]["evaluation"]["reason"],
+        "validation_blocked"
+    );
+    assert!(vb_cached_err["message"]
+        .as_str()
+        .unwrap()
+        .contains("verify-blocked"));
+
+    // Account that is BOTH `disabled == true` AND receives `validation_blocked` from `quota --refresh`:
+    // MUST preserve `details.evaluation.reason == "account_disabled"` with consistent `error_code`,
+    // while ALSO surfacing the `verify-blocked` warning in `message` (and never leaking URLs).
+    assert_eq!(
+        env.cli_cmd()
+            .args(["accounts", "disable", &acc_a_id])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(0)
+    );
+    let dis_vb_json = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &adv_agy)
+        .args(["--json", "quota", "--refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(dis_vb_json.status.code(), Some(4));
+    let dis_vb_err: serde_json::Value = serde_json::from_slice(&dis_vb_json.stderr).unwrap();
+    assert_eq!(dis_vb_err["error_code"], "quota_stale_or_unknown");
+    assert_eq!(
+        dis_vb_err["details"]["evaluation"]["reason"],
+        "account_disabled"
+    );
+    let dis_vb_msg = dis_vb_err["message"].as_str().unwrap();
+    assert!(
+        dis_vb_msg.contains("account_disabled") && dis_vb_msg.contains("verify-blocked"),
+        "disabled + validation_blocked quota --refresh must report both causes: {dis_vb_msg}"
+    );
+    assert!(
+        !dis_vb_msg.contains("https://"),
+        "disabled + validation_blocked must never leak URLs: {dis_vb_msg}"
+    );
+    assert_eq!(
+        env.cli_cmd()
+            .args(["accounts", "enable", &acc_a_id])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(0)
+    );
+
+    //    6c. Proxy propagation (`--proxy` & `config.json` `network.proxy_url`) into official `agy`
+    //        subprocess, plus fast fail on >512 KiB stdout overflow and stdout auth prompt!
+    fs::write(&adv_mode, "ok").unwrap();
+    let proxy_out = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &adv_agy)
+        .args(["--proxy", "http://127.0.0.1:7890", "--json", "refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        proxy_out.status.code(),
+        Some(0),
+        "refresh with --proxy failed: stderr={}",
+        String::from_utf8_lossy(&proxy_out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&proxy_dump).unwrap(),
+        "http://127.0.0.1:7890"
+    );
+
+    // `config.json` `network.proxy_url` ALSO propagates when AGY_SWITCH_CLI_PROXY is unset!
+    fs::write(
+        paths.config_file(),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "network": { "proxy_url": "http://127.0.0.1:8899" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let cfg_proxy_out = env
+        .cli_cmd()
+        .env_remove("AGY_SWITCH_CLI_PROXY")
+        .env("AGY_SWITCH_CLI_AGY_BIN", &adv_agy)
+        .args(["--json", "refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        cfg_proxy_out.status.code(),
+        Some(0),
+        "refresh with config.json proxy failed: stderr={}",
+        String::from_utf8_lossy(&cfg_proxy_out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&proxy_dump).unwrap(),
+        "http://127.0.0.1:8899"
+    );
+    let _ = fs::remove_file(paths.config_file());
+
+    // Invalid `--proxy` fails immediately with exit 2!
+    let bad_proxy = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &adv_agy)
+        .args(["--proxy", "ftp://127.0.0.1:21", "refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(bad_proxy.status.code(), Some(2));
+
+    // >512 KiB stdout overflow with SIGPIPE ignored aborts immediately (< 5s, NOT 30s timeout) with exit 1!
+    fs::write(&adv_mode, "overflow_hang").unwrap();
+    let t_ov = std::time::Instant::now();
+    let ov_out = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &adv_agy)
+        .args(["--json", "refresh"])
+        .output()
+        .unwrap();
+    assert!(
+        t_ov.elapsed() < std::time::Duration::from_secs(5),
+        "stdout overflow must abort immediately instead of hanging until timeout: {:?}",
+        t_ov.elapsed()
+    );
+    assert_eq!(ov_out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&ov_out.stderr).contains("512 KiB"));
+
+    // Interactive login prompt on stdout also aborts immediately (< 5s) with exit 6!
+    fs::write(&adv_mode, "stdout_auth_hang").unwrap();
+    let t_sa = std::time::Instant::now();
+    let sa_out = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &adv_agy)
+        .args(["--json", "refresh"])
+        .output()
+        .unwrap();
+    assert!(
+        t_sa.elapsed() < std::time::Duration::from_secs(5),
+        "stdout auth prompt must abort immediately: {:?}",
+        t_sa.elapsed()
+    );
+    assert_eq!(sa_out.status.code(), Some(6));
+    let sa_err: serde_json::Value = serde_json::from_slice(&sa_out.stderr).unwrap();
+    assert_eq!(sa_err["error_code"], "official_cli_auth_required");
+
+    //    6d. Offline `--from-local` preserves fresher `access_token` when local slot has same RT
+    //        with an older expired `access_token`!
+    fs::write(
+        &paths.active_slot_file,
+        serde_json::to_vec(&serde_json::json!({
+            "token": {
+                "access_token": "ya29.OLDER_STALE_ACCESS",
+                "token_type": "Bearer",
+                "refresh_token": "1//ALICE_RT_3_SYNCED",
+                "expiry": "2020-01-01T00:00:00Z"
+            },
+            "id_token_email": "alice@example.com"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let fl_preserve = env
+        .cli_cmd()
+        .args(["--json", "accounts", "add", "--from-local"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        fl_preserve.status.code(),
+        Some(0),
+        "offline --from-local preserve failed: stderr={}",
+        String::from_utf8_lossy(&fl_preserve.stderr)
+    );
+    let alice_preserved = repo.read_account_unchecked(&acc_a_id).unwrap();
+    assert_ne!(
+        alice_preserved.token.access_token, "ya29.OLDER_STALE_ACCESS",
+        "offline --from-local must not regress fresher stored access_token to an older slot token"
+    );
+
+    //    6e. Pre-Switch Sync-Back preserves `user_tier` written by official `agy` onto outgoing account!
+    let _ = env.cli_cmd().args(["switch", "acc-0002"]).output().unwrap();
+    fs::write(
+        &paths.active_slot_file,
+        serde_json::to_vec(&serde_json::json!({
+            "token": {
+                "access_token": "ya29.BOB_FRESH_BY_AGY",
+                "token_type": "Bearer",
+                "refresh_token": "1//BOB_RT_BARE",
+                "expiry": "2099-09-01T00:00:00Z"
+            },
+            "id_token_email": "bob@example.com",
+            "user_tier": "g1-pro-tier"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let sw_back = env.cli_cmd().args(["switch", &acc_a_id]).output().unwrap();
+    assert_eq!(sw_back.status.code(), Some(0));
+    let bob_synced = repo.read_account_unchecked("acc-0002").unwrap();
+    assert_eq!(bob_synced.token.access_token, "ya29.BOB_FRESH_BY_AGY");
+    assert_eq!(
+        bob_synced
+            .quota
+            .as_ref()
+            .and_then(|q| q.subscription_tier.as_deref()),
+        Some("g1-pro-tier")
+    );
+
+    //    6f. Upgrade from v1.2.6 (`tier_source_env == Some(Production)`) across `switch` (which
+    //        serializes without `user_tier`) + `quota --refresh` (`OfficialCli`):
+    //        - Upgraded Pro account retains its `Plan` / `subscription_tier`;
+    //        - Upgraded Free account with weekly-only `/usage` buckets (no `5h` bucket) retains its
+    //          Free tier and evaluates to `Known` (exit 0) instead of `Unknown("missing_5h_bucket")`!
+    let free_weekly_only_agy = env.home.join("fake-agy-free-weekly.sh");
+    fs::write(
+        &free_weekly_only_agy,
+        r#"#!/bin/sh
+cat <<'EOF'
+{"conversation_id":"","status":"SUCCESS","response":"ok","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"command":{"name":"usage","data":{"description":"Free tier summary","groups":[{"name":"Gemini Models","description":"Gemini family","buckets":[{"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.84,"reset_time":"2099-12-03T07:17:01Z"}]}]}}}
+EOF
+exit 0
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&free_weekly_only_agy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Seed Bob as a v1.2.6 Production Free account and Alice as a v1.2.6 Production Pro account.
+    repo.with_write_lock(|tx| {
+        let mut bob_rec = tx.load_account_opt("acc-0002")?.unwrap();
+        let mut v126_free = agy_switch_cli::domain::quota::QuotaObservation::new(
+            1_700_000_000,
+            agy_switch_cli::domain::quota::QuotaSourceEnv::Production,
+        );
+        v126_free.subscription_tier = Some("FREE".into());
+        v126_free.tier_source_env = Some(agy_switch_cli::domain::quota::QuotaSourceEnv::Production);
+        bob_rec.quota = Some(v126_free);
+        tx.save_account(&bob_rec)?;
+
+        let mut alice_rec = tx.load_account_opt(&acc_a_id)?.unwrap();
+        let mut v126_pro = agy_switch_cli::domain::quota::QuotaObservation::new(
+            1_700_000_000,
+            agy_switch_cli::domain::quota::QuotaSourceEnv::Production,
+        );
+        v126_pro.subscription_tier = Some("PRO".into());
+        v126_pro.tier_source_env = Some(agy_switch_cli::domain::quota::QuotaSourceEnv::Production);
+        alice_rec.quota = Some(v126_pro);
+        tx.save_account(&alice_rec)?;
+        Ok(())
+    })
+    .unwrap();
+
+    let slot_file = paths.active_slot_file.clone();
+    // Simulate a legacy v1.2.6 slot (no `user_tier`) before switching out of Alice so Pre-Switch
+    // Sync-Back does not carry step 6e's older `"g1-ultra-tier"` over onto the freshly seeded v1.2.6 record.
+    let mut alice_pre_slot_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&slot_file).unwrap()).unwrap();
+    alice_pre_slot_json
+        .as_object_mut()
+        .unwrap()
+        .remove("user_tier");
+    fs::write(
+        &slot_file,
+        serde_json::to_vec(&alice_pre_slot_json).unwrap(),
+    )
+    .unwrap();
+    // Switch to Bob, then strip `user_tier` from the slot to verify pure Production->OfficialCli
+    // inheritance even when the slot carries no `user_tier`, and run `quota --refresh` with weekly-only buckets.
+    assert_eq!(
+        env.cli_cmd()
+            .args(["switch", "acc-0002"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(0)
+    );
+    let mut bob_slot_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&slot_file).unwrap()).unwrap();
+    bob_slot_json.as_object_mut().unwrap().remove("user_tier");
+    fs::write(&slot_file, serde_json::to_vec(&bob_slot_json).unwrap()).unwrap();
+    let free_q = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &free_weekly_only_agy)
+        .args(["--json", "quota", "--refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        free_q.status.code(),
+        Some(0),
+        "upgraded Free account with weekly-only buckets must evaluate Known (exit 0), stderr={}",
+        String::from_utf8_lossy(&free_q.stderr)
+    );
+    let free_q_json: serde_json::Value = serde_json::from_slice(&free_q.stdout).unwrap();
+    assert_eq!(free_q_json["evaluation"]["status"], "known");
+    assert_eq!(free_q_json["quota"]["subscription_tier"], "FREE");
+
+    // Switch to Alice, strip `user_tier` to test pure Production->OfficialCli inheritance, and run `quota --refresh`: Pro Plan preserved!
+    assert_eq!(
+        env.cli_cmd()
+            .args(["switch", &acc_a_id])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(0)
+    );
+    let mut alice_slot_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&slot_file).unwrap()).unwrap();
+    alice_slot_json.as_object_mut().unwrap().remove("user_tier");
+    fs::write(&slot_file, serde_json::to_vec(&alice_slot_json).unwrap()).unwrap();
+    fs::write(&adv_mode, "ok").unwrap();
+    let pro_q = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &adv_agy)
+        .args(["--json", "quota", "--refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        pro_q.status.code(),
+        Some(0),
+        "upgraded Pro account quota --refresh failed, stderr={}",
+        String::from_utf8_lossy(&pro_q.stderr)
+    );
+    let pro_q_json: serde_json::Value = serde_json::from_slice(&pro_q.stdout).unwrap();
+    assert_eq!(pro_q_json["quota"]["subscription_tier"], "PRO");
+
+    // 7. S4 compact 1.5+ payload round-trip (`accounts add --from-local` -> `switch` ->
+    //    `accounts add --from-local` again, offline, zero network) + S3 AT/expiry pairing +
+    //    S5 Production->PRO tier upgrade + S6 empty-groups SUCCESS benign stderr isolation:
+    //    7a. S4: compact payload with `id_token_email` & `user_tier` and NO `id_token` survives `switch`
+    //        and remains directly re-importable offline!
+    let compact_slot = serde_json::json!({
+        "token": {
+            "access_token": "ya29.s4_compact",
+            "token_type": "Bearer",
+            "refresh_token": "1//RT_S4_COMPACT",
+            "expiry": "2050-01-01T00:00:00Z"
+        },
+        "auth_method": "consumer",
+        "id_token_email": "compact-rt@example.com",
+        "user_tier": "PRO"
+    });
+    fs::write(&slot_file, serde_json::to_vec(&compact_slot).unwrap()).unwrap();
+    let imp1 = env
+        .cli_cmd()
+        .args(["--json", "accounts", "add", "--from-local"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        imp1.status.code(),
+        Some(0),
+        "S4 initial compact import failed: {}",
+        String::from_utf8_lossy(&imp1.stderr)
+    );
+    let imp1_json: serde_json::Value = serde_json::from_slice(&imp1.stdout).unwrap();
+    let s4_id = imp1_json["account"]["id"].as_str().unwrap().to_string();
+    assert_eq!(imp1_json["account"]["quota"]["subscription_tier"], "PRO");
+
+    assert_eq!(
+        env.cli_cmd()
+            .args(["switch", &s4_id])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(0)
+    );
+    let rewritten_slot: serde_json::Value =
+        serde_json::from_slice(&fs::read(&slot_file).unwrap()).unwrap();
+    assert_eq!(rewritten_slot["id_token_email"], "compact-rt@example.com");
+    assert_eq!(rewritten_slot["user_tier"], "PRO");
+
+    let imp2 = env
+        .cli_cmd()
+        .args(["--json", "accounts", "add", "--from-local"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        imp2.status.code(),
+        Some(0),
+        "S4 second offline --from-local after switch must succeed: {}",
+        String::from_utf8_lossy(&imp2.stderr)
+    );
+    let imp2_json: serde_json::Value = serde_json::from_slice(&imp2.stdout).unwrap();
+    assert_eq!(imp2_json["created"], false);
+    assert_eq!(imp2_json["account"]["id"], s4_id);
+
+    //    7b. S3 CLI regression: same RT, fresher stored AT/expiry (`2050000000`), older slot AT
+    //        (`1700000000`) + newly added synthetic `id_token` -> `switch` MUST keep fresher stored
+    //        AT & expiry while merging `id_token`!
+    repo.with_write_lock(|tx| {
+        let mut r = tx.load_account_opt(&s4_id)?.unwrap();
+        r.token.access_token = "ya29.s3_fresher_store".into();
+        r.token.expiry_timestamp = 2_050_000_000;
+        r.token.id_token = None;
+        tx.save_account(&r)?;
+        Ok(())
+    })
+    .unwrap();
+    let s3_jwt_payload = <base64::engine::GeneralPurpose as base64::Engine>::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        br#"{"email":"compact-rt@example.com"}"#,
+    );
+    let s3_jwt = format!("eyJhbGciOiJub25lIn0.{s3_jwt_payload}.sig");
+    fs::write(
+        &slot_file,
+        serde_json::to_vec(&serde_json::json!({
+            "token": {
+                "access_token": "ya29.s3_older_slot",
+                "token_type": "Bearer",
+                "refresh_token": "1//RT_S4_COMPACT",
+                "expiry": "2023-11-14T22:13:20Z"
+            },
+            "auth_method": "consumer",
+            "id_token": s3_jwt,
+            "id_token_email": "compact-rt@example.com"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        env.cli_cmd()
+            .args(["switch", "acc-0002"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(0)
+    );
+    let s4_after_s3 = repo.read_account_unchecked(&s4_id).unwrap();
+    assert_eq!(s4_after_s3.token.access_token, "ya29.s3_fresher_store");
+    assert_eq!(s4_after_s3.token.expiry_timestamp, 2_050_000_000);
+    assert_eq!(s4_after_s3.token.id_token.as_deref(), Some(s3_jwt.as_str()));
+
+    //    7c. S5 CLI regression: v1.2.6 `Production/FREE` account whose active slot carries `PRO`
+    //        updates to `PRO` / `OfficialCli` on `switch` out AND on `accounts add --from-local`
+    //        WITHOUT altering `source_env` or `last_updated`!
+    repo.with_write_lock(|tx| {
+        let mut r = tx.load_account_opt(&s4_id)?.unwrap();
+        let mut prod_free = agy_switch_cli::domain::quota::QuotaObservation::new(
+            1_700_000_123,
+            agy_switch_cli::domain::quota::QuotaSourceEnv::Production,
+        );
+        prod_free.subscription_tier = Some("FREE".into());
+        prod_free.tier_source_env = Some(agy_switch_cli::domain::quota::QuotaSourceEnv::Production);
+        r.quota = Some(prod_free);
+        tx.save_account(&r)?;
+        Ok(())
+    })
+    .unwrap();
+    fs::write(&slot_file, serde_json::to_vec(&compact_slot).unwrap()).unwrap();
+    assert_eq!(
+        env.cli_cmd()
+            .args(["switch", "acc-0002"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(0)
+    );
+    let s4_after_s5 = repo.read_account_unchecked(&s4_id).unwrap();
+    let q_s5 = s4_after_s5.quota.as_ref().unwrap();
+    assert_eq!(q_s5.subscription_tier.as_deref(), Some("PRO"));
+    assert_eq!(
+        q_s5.tier_source_env,
+        Some(agy_switch_cli::domain::quota::QuotaSourceEnv::OfficialCli)
+    );
+    assert_eq!(
+        q_s5.source_env,
+        agy_switch_cli::domain::quota::QuotaSourceEnv::Production
+    );
+    assert_eq!(q_s5.last_updated, 1_700_000_123);
+
+    // Also verify `accounts add --from-local` overrides stale `Production/FREE` -> `PRO`.
+    repo.with_write_lock(|tx| {
+        let mut r = tx.load_account_opt(&s4_id)?.unwrap();
+        let mut prod_free = agy_switch_cli::domain::quota::QuotaObservation::new(
+            1_700_000_456,
+            agy_switch_cli::domain::quota::QuotaSourceEnv::Production,
+        );
+        prod_free.subscription_tier = Some("FREE".into());
+        prod_free.tier_source_env = Some(agy_switch_cli::domain::quota::QuotaSourceEnv::Production);
+        r.quota = Some(prod_free);
+        tx.save_account(&r)?;
+        Ok(())
+    })
+    .unwrap();
+    fs::write(&slot_file, serde_json::to_vec(&compact_slot).unwrap()).unwrap();
+    assert_eq!(
+        env.cli_cmd()
+            .args(["accounts", "add", "--from-local"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(0)
+    );
+    let s4_after_imp_s5 = repo.read_account_unchecked(&s4_id).unwrap();
+    let q_imp_s5 = s4_after_imp_s5.quota.as_ref().unwrap();
+    assert_eq!(q_imp_s5.subscription_tier.as_deref(), Some("PRO"));
+    assert_eq!(
+        q_imp_s5.tier_source_env,
+        Some(agy_switch_cli::domain::quota::QuotaSourceEnv::OfficialCli)
+    );
+    assert_eq!(
+        q_imp_s5.source_env,
+        agy_switch_cli::domain::quota::QuotaSourceEnv::Production
+    );
+    assert_eq!(q_imp_s5.last_updated, 1_700_000_456);
+
+    //    7d. S6 CLI regression: structured `SUCCESS` with `groups: []` + benign stderr containing
+    //        `validation_url` MUST return `Unknown(unknown_pool)` and keep `validation_blocked=false`!
+    let empty_groups_agy = env.home.join("fake-agy-empty-groups-benign-stderr.sh");
+    fs::write(
+        &empty_groups_agy,
+        r#"#!/bin/sh
+echo "debug: validation_url check passed" >&2
+cat <<'EOF'
+{"conversation_id":"","status":"SUCCESS","response":"ok","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"command":{"name":"usage","data":{"description":"Empty","groups":[]}}}
+EOF
+exit 0
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&empty_groups_agy, fs::Permissions::from_mode(0o755)).unwrap();
+    let s6_q = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_AGY_BIN", &empty_groups_agy)
+        .args(["--json", "quota", "--refresh"])
+        .output()
+        .unwrap();
+    assert_eq!(s6_q.status.code(), Some(4));
+    let s6_json: serde_json::Value = serde_json::from_slice(&s6_q.stderr).unwrap();
+    assert_eq!(s6_json["error_code"], "quota_stale_or_unknown");
+    assert_eq!(s6_json["details"]["evaluation"]["status"], "unknown");
+    assert_eq!(s6_json["details"]["evaluation"]["reason"], "unknown_pool");
+    assert!(
+        !repo
+            .read_account_unchecked(&s4_id)
+            .unwrap()
+            .validation_blocked
+    );
+
+    //    7e. R2-02 CLI regression: rotated RT + non-empty new AT + MISSING `expiry` in active slot
+    //        MUST NOT borrow the old AT's future `expiry_timestamp` (`2050000000`) on `switch` out;
+    //        both `switch` sync-back and offline `accounts add --from-local` must persist `(1, 0)`!
+    let r202_slot_missing_expiry = serde_json::json!({
+        "token": {
+            "access_token": "ya29.r202_new_at_no_expiry",
+            "token_type": "Bearer",
+            "refresh_token": "1//RT_R202_ROTATED_1"
+        },
+        "auth_method": "consumer",
+        "id_token_email": "compact-rt@example.com"
+    });
+    repo.with_write_lock(|tx| {
+        let mut r = tx.load_account_opt(&s4_id)?.unwrap();
+        r.token.access_token = "ya29.r202_old_at".into();
+        r.token.refresh_token = "1//RT_R202_OLD_1".into();
+        r.token.expiry_timestamp = 2_050_000_000;
+        r.token.expires_in = 3600;
+        tx.save_account(&r)?;
+        tx.commit_selected_account(&s4_id, 1_900_000_000)?;
+        Ok(())
+    })
+    .unwrap();
+    fs::write(
+        &slot_file,
+        serde_json::to_vec(&r202_slot_missing_expiry).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        env.cli_cmd()
+            .args(["switch", "acc-0002"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(0)
+    );
+    let r202_after_sw = repo.read_account_unchecked(&s4_id).unwrap();
+    assert_eq!(r202_after_sw.token.refresh_token, "1//RT_R202_ROTATED_1");
+    assert_eq!(
+        r202_after_sw.token.access_token,
+        "ya29.r202_new_at_no_expiry"
+    );
+    assert_eq!(r202_after_sw.token.expiry_timestamp, 1);
+    assert_eq!(r202_after_sw.token.expires_in, 0);
+    assert!(r202_after_sw.has_superseded_refresh_token("1//RT_R202_OLD_1"));
+
+    // Switching back to `s4_id` must serialize epoch-1 expiry, NOT the old 2034-12-17 future date!
+    assert_eq!(
+        env.cli_cmd()
+            .args(["switch", &s4_id])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(0)
+    );
+    let r202_rewritten: serde_json::Value =
+        serde_json::from_slice(&fs::read(&slot_file).unwrap()).unwrap();
+    assert_eq!(
+        r202_rewritten["token"]["expiry"],
+        "1970-01-01T00:00:01.000000Z"
+    );
+
+    // Parity check via `accounts add --from-local` from identical initial state: also persists (1, 0).
+    let r202_slot_missing_expiry_2 = serde_json::json!({
+        "token": {
+            "access_token": "ya29.r202_new_at_no_expiry_2",
+            "token_type": "Bearer",
+            "refresh_token": "1//RT_R202_ROTATED_2"
+        },
+        "auth_method": "consumer",
+        "id_token_email": "compact-rt@example.com"
+    });
+    repo.with_write_lock(|tx| {
+        let mut r = tx.load_account_opt(&s4_id)?.unwrap();
+        r.token.access_token = "ya29.r202_old_at_2".into();
+        r.token.expiry_timestamp = 2_050_000_000;
+        r.token.expires_in = 3600;
+        tx.save_account(&r)?;
+        Ok(())
+    })
+    .unwrap();
+    fs::write(
+        &slot_file,
+        serde_json::to_vec(&r202_slot_missing_expiry_2).unwrap(),
+    )
+    .unwrap();
+    let imp_r202 = env
+        .cli_cmd()
+        .args(["--json", "accounts", "add", "--from-local"])
+        .output()
+        .unwrap();
+    assert_eq!(imp_r202.status.code(), Some(0));
+    let r202_after_imp = repo.read_account_unchecked(&s4_id).unwrap();
+    assert_eq!(r202_after_imp.token.refresh_token, "1//RT_R202_ROTATED_2");
+    assert_eq!(
+        r202_after_imp.token.access_token,
+        "ya29.r202_new_at_no_expiry_2"
+    );
+    assert_eq!(r202_after_imp.token.expiry_timestamp, 1);
+    assert_eq!(r202_after_imp.token.expires_in, 0);
 }

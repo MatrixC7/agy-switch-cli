@@ -3,33 +3,27 @@ use crate::domain::account::{AccountRecord, DisableReasonCode, RuntimeState};
 use crate::domain::clock::{AnchoredClock, Clock};
 use crate::domain::policy::PolicyStrategy;
 use crate::error::{CliError, CliResult};
-use crate::oauth::refresh::{
-    persist_disable_or_report_io_error, OAuthEndpoints, TOKEN_REFRESH_SKEW_SECONDS,
-};
+use crate::oauth::refresh::persist_disable_or_report_io_error;
 use crate::oauth::registry::OAuthClientRegistry;
 use crate::session::backend::{
     should_isolate_child_dbus_for_explicit_file_backend, BackendReplicaInspection,
     CredentialBackend,
 };
 use crate::session::journal::reconcile_pending_journal_for_slot_consumer;
-use crate::session::payload::{bytes_sha256_hex, serialize_session_payload};
+use crate::session::payload::{bytes_sha256_hex, serialize_session_payload_for_account};
 use crate::session::process::{observe_runtime_state, remove_process_lease, write_process_lease};
 use crate::store::repository::{StoreRepository, StoreSnapshot};
 use crate::switching::executor::{execute_switch, validate_target_usable, SwitchOptions};
-use crate::transport::client::HttpTransport;
 use crate::transport::user_agent::resolve_agy_executable;
 use std::path::PathBuf;
 use std::process::Stdio;
 
 /// Optional managed credential/backend wrapper (`agy-switch-cli [--backend file] run [--account <SEL>] -- agy [<ARGS>...]`).
-#[allow(clippy::too_many_arguments)]
+/// Strictly zero-network offline: writes the target credential slot locally and lets official `agy` refresh tokens on launch.
 pub async fn run_managed_agy(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
-    transport: &dyn HttpTransport,
-    oauth_endpoints: &OAuthEndpoints,
     registry: &OAuthClientRegistry,
-    user_agent: &str,
     explicit_account: Option<&str>,
     explicit_file_backend: bool,
     command_args: &[String],
@@ -98,23 +92,13 @@ pub async fn run_managed_agy(
         RuntimeState::Idle | RuntimeState::ManagedRunning { .. } => {}
     }
 
-    let (active_account_id, target_validation_blocked) = prepare_account_before_spawn(
-        repo,
-        backend,
-        transport,
-        oauth_endpoints,
-        registry,
-        user_agent,
-        explicit_account,
-        &runtime,
-        &clock,
-    )
-    .await?;
+    let (active_account_id, target_validation_blocked) =
+        prepare_account_before_spawn(repo, backend, registry, explicit_account, &runtime, &clock)?;
 
     if target_validation_blocked {
         let safe_id = terminal_text(&active_account_id);
         eprintln!(
-            "Note: account `{safe_id}` is currently marked verification-required (`verify-blocked`) and remains excluded from daemon auto-switching. Complete Google verification in `agy`, then run `agy-switch-cli refresh {safe_id}` to clear this status."
+            "Note: account `{safe_id}` is currently marked verification-required (`verify-blocked`) and remains excluded from daemon auto-switching. Complete Google verification in `agy`, then run `agy-switch-cli refresh` (or `agy-switch-cli quota --refresh`) to clear this status."
         );
     }
 
@@ -191,14 +175,10 @@ fn exit_status_to_code(status: std::process::ExitStatus) -> i32 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn prepare_account_before_spawn(
+fn prepare_account_before_spawn(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
-    transport: &dyn HttpTransport,
-    oauth_endpoints: &OAuthEndpoints,
     registry: &OAuthClientRegistry,
-    user_agent: &str,
     explicit_account: Option<&str>,
     runtime: &RuntimeState,
     clock: &dyn Clock,
@@ -220,22 +200,18 @@ async fn prepare_account_before_spawn(
     ensure_no_conflicting_managed_session(runtime, &target_id)?;
 
     let replicas = backend.inspect_replicas(paths);
-    let validation_blocked = if !is_slot_synced_and_fresh(&replicas, &snapshot, target, ts) {
+    let validation_blocked = if !is_slot_synced(&replicas, &snapshot, target) {
         let outcome = execute_switch(
             repo,
             backend,
-            transport,
-            oauth_endpoints,
             registry,
-            user_agent,
             &target_id,
             &SwitchOptions {
                 dry_run: false,
                 allow_running: true, // Same-account managed session (and verified `/proc`) was already confirmed above
             },
             clock.now_unix(),
-        )
-        .await?;
+        )?;
         outcome.validation_blocked
     } else {
         target.is_validation_blocked_at(ts)
@@ -280,25 +256,18 @@ fn ensure_account_usable_and_scoped(
     Ok(())
 }
 
-/// Verify that `index.json` selects `target`, `target.token` is not near expiry, AND ALL replicas
-/// managed by the active backend (`file`, `keyring`, or `dual`) match `serialize_session_payload(&target.token)`.
-/// Prevents spawning `agy` with a stale `access_token` or diverged replica!
-fn is_slot_synced_and_fresh(
+/// Verify that `index.json` selects `target` AND ALL replicas managed by the active backend
+/// (`file`, `keyring`, or `dual`) match `serialize_session_payload_for_account(target)`.
+/// Offline Option 1B never forces OAuth renewal here — official `agy` refreshes expiring tokens on launch.
+fn is_slot_synced(
     replicas: &BackendReplicaInspection,
     snapshot: &StoreSnapshot,
     target: &AccountRecord,
-    now_unix: i64,
 ) -> bool {
     if snapshot.index.selected_account_id.as_deref() != Some(target.id.as_str()) {
         return false;
     }
-    if target
-        .token
-        .is_expiring_within(now_unix, TOKEN_REFRESH_SKEW_SECONDS)
-    {
-        return false;
-    }
-    let Ok(expected_payload) = serialize_session_payload(&target.token) else {
+    let Ok(expected_payload) = serialize_session_payload_for_account(target) else {
         return false;
     };
     let expected_digest = bytes_sha256_hex(expected_payload.as_bytes());

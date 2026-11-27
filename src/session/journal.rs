@@ -6,7 +6,7 @@ use crate::session::backend::{
     KeyringCollectionDigest, ReplicaCasExpectation, SlotInspectState,
 };
 use crate::session::payload::{
-    bytes_sha256_hex, parse_session_payload_bytes, serialize_session_payload,
+    bytes_sha256_hex, parse_session_payload_bytes, serialize_session_payload_for_account,
 };
 use crate::store::fs_atomic::{
     check_fault_injection, confirm_dir_entries_durable_under,
@@ -1751,7 +1751,7 @@ pub fn reconcile_journal_locked(
             let mut fallback_choice: Option<(String, String)> = None;
             for cid in &candidate_ids {
                 if let Ok(acc) = repo.read_account_unchecked(cid) {
-                    if let Ok(payload) = serialize_session_payload(&acc.token) {
+                    if let Ok(payload) = serialize_session_payload_for_account(&acc) {
                         if acc.is_usable_at(now_unix) {
                             usable_choice = Some((cid.clone(), payload));
                             break;
@@ -1928,7 +1928,7 @@ mod tests {
         assert!(read_journal_readonly(&paths).unwrap().is_none());
         assert_eq!(
             std::fs::read_to_string(&paths.active_slot_file).unwrap(),
-            serialize_session_payload(&acc.token).unwrap()
+            serialize_session_payload_for_account(&acc).unwrap()
         );
     }
 

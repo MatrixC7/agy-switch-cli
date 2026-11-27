@@ -1,5 +1,5 @@
 use agy_switch_cli::domain::account::{AccountRecord, DisableReasonCode};
-use agy_switch_cli::domain::quota::QuotaSourceEnv;
+use agy_switch_cli::domain::quota::{QuotaBucket, QuotaGroup};
 use agy_switch_cli::domain::token::TokenRecord;
 use agy_switch_cli::error::ExitCode;
 use agy_switch_cli::oauth::flow::{
@@ -12,7 +12,12 @@ use agy_switch_cli::oauth::refresh::{
 };
 use agy_switch_cli::oauth::registry::OAuthClientRegistry;
 use agy_switch_cli::paths::HeadlessPaths;
-use agy_switch_cli::quota::client::{refresh_account_quota_locked, CloudCodeEndpoints};
+use agy_switch_cli::quota::official_cli::{
+    refresh_active_slot_quota_with_runner, OfficialCliQuotaError, OfficialCliQuotaRunner,
+    OfficialCliUsageOutcome,
+};
+use agy_switch_cli::session::backend::{CredentialBackend, FileSessionBackend};
+use agy_switch_cli::session::payload::serialize_session_payload;
 use agy_switch_cli::store::repository::StoreRepository;
 use agy_switch_cli::transport::client::{HttpResponse, MockTransport, RequestBody, TransportError};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -31,13 +36,6 @@ fn fast_oauth_endpoints() -> OAuthEndpoints {
     OAuthEndpoints {
         base_backoff: Duration::from_millis(5),
         ..OAuthEndpoints::default()
-    }
-}
-
-fn fast_quota_endpoints() -> CloudCodeEndpoints {
-    CloudCodeEndpoints {
-        fallback_delay: Duration::from_millis(5),
-        ..CloudCodeEndpoints::default()
     }
 }
 
@@ -154,7 +152,6 @@ async fn loopback_oauth_ignores_stray_requests_verifies_pkce_s256_and_records_tr
     let token = exchange_authorization_code(
         &mock,
         &fast_oauth_endpoints(),
-        "vscode/1.X.X (Antigravity/4.3.0)",
         &session,
         &code,
         1_800_000_000,
@@ -252,7 +249,6 @@ async fn concurrent_same_account_refresh_serializes_cleanly_under_strict_token_r
                 &m,
                 &fast_oauth_endpoints(),
                 &rg,
-                "vscode/1.X.X (Antigravity/4.3.0)",
                 "acc-rot",
                 true, // force_refresh = true so all 5 hit rotation sequentially!
                 now,
@@ -306,7 +302,6 @@ async fn client_binding_invalid_grant_single_shot_and_429_5xx_backoff_behave_per
         &mock_empty,
         &fast_oauth_endpoints(),
         &reg_default,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-bound",
         true,
         now,
@@ -331,7 +326,6 @@ async fn client_binding_invalid_grant_single_shot_and_429_5xx_backoff_behave_per
         &mock_mismatch,
         &fast_oauth_endpoints(),
         &reg_two,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-bound",
         true,
         now,
@@ -378,7 +372,6 @@ async fn client_binding_invalid_grant_single_shot_and_429_5xx_backoff_behave_per
         &mock_backoff,
         &fast_oauth_endpoints(),
         &reg_two,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-bound",
         true,
         now,
@@ -400,7 +393,6 @@ async fn client_binding_invalid_grant_single_shot_and_429_5xx_backoff_behave_per
         &mock_revoked,
         &fast_oauth_endpoints(),
         &reg_two,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-bound",
         true,
         now,
@@ -415,212 +407,6 @@ async fn client_binding_invalid_grant_single_shot_and_429_5xx_backoff_behave_per
         disabled_acc.disabled_code,
         Some(DisableReasonCode::RevokedOrExpiredGrant)
     );
-}
-
-#[tokio::test]
-async fn quota_401_triggers_single_forced_token_refresh_persists_rotation_and_uses_production_first(
-) {
-    let _env_guard = OAUTH_ENV_MUTEX.lock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = new_repo(tmp.path());
-    let now = 1_800_000_000i64;
-
-    // Account has a seemingly unexpired access_token ("ya29.stale_revoked_at"), so initial pre-check does NOT refresh,
-    // forcing CloudCode HTTP 401 to exercise the repaired 401 -> forced refresh -> retry loop!
-    let acc = AccountRecord::new(
-        "acc-q".into(),
-        "q@example.invalid".into(),
-        TokenRecord {
-            access_token: "ya29.stale_revoked_at".into(),
-            refresh_token: "1//initial_q_rt".into(),
-            expires_in: 7200,
-            expiry_timestamp: now + 7200,
-            token_type: "Bearer".into(),
-            id_token: None,
-            oauth_client_key: Some("antigravity_enterprise".into()),
-            granted_scopes: None,
-            project_id: Some("bad-proj".into()),
-            is_gcp_tos: true,
-        },
-        now,
-    );
-    repo.with_write_lock(|tx| tx.upsert_account(acc, true, now))
-        .unwrap();
-
-    let call_seq = Arc::new(AtomicUsize::new(0));
-    let seq = call_seq.clone();
-    let mock = MockTransport::from_handler(move |req| {
-        let step = seq.fetch_add(1, Ordering::SeqCst);
-        match step {
-            // Step 0: loadCodeAssist MUST hit Daily first (`daily-cloudcode-pa.googleapis.com`) -> returns 401!
-            0 => {
-                assert_eq!(
-                    req.url,
-                    "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
-                );
-                Ok(MockTransport::json_response(
-                    401,
-                    json!({"error": "UNAUTHENTICATED"}),
-                ))
-            }
-            // Step 1: Forced OAuth refresh triggered by 401 -> returns rotated RT!
-            1 => {
-                assert!(req.url.contains("oauth2.googleapis.com/token"));
-                Ok(MockTransport::json_response(
-                    200,
-                    json!({
-                        "access_token": "ya29.fresh_after_401",
-                        "expires_in": 3600,
-                        "token_type": "Bearer",
-                        "refresh_token": "1//rotated_after_401"
-                    }),
-                ))
-            }
-            // Step 2: Optional userinfo lookup
-            2 if req.url.contains("userinfo") => Ok(MockTransport::json_response(
-                200,
-                json!({"email": "q@example.invalid", "name": "Quota User"}),
-            )),
-            // Replay loadCodeAssist on Daily
-            2 | 3 if req.url.ends_with(":loadCodeAssist") => {
-                assert_eq!(
-                    req.url,
-                    "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
-                );
-                Ok(MockTransport::json_response(
-                    200,
-                    json!({
-                        "cloudaicompanionProject": "proj-restricted",
-                        "paidTier": {"id": "g1-pro-tier", "name": "Google AI Pro"}
-                    }),
-                ))
-            }
-            // Replay fetchAvailableModels with project -> 403 triggers same-endpoint `{}` strip-project retry!
-            n if req.url.ends_with(":fetchAvailableModels") => {
-                assert_eq!(
-                    req.url,
-                    "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
-                );
-                if let RequestBody::Json(ref val) = req.body {
-                    if val.get("project").is_some() {
-                        return Ok(MockTransport::json_response(403, json!({})));
-                    }
-                }
-                let _ = n;
-                Ok(MockTransport::json_response(
-                    200,
-                    json!({
-                        "models": {
-                            "gemini-3.8-flash": {
-                                "displayName": "Gemini 3.8 Flash",
-                                "quotaInfo": {"remainingFraction": 0.42, "resetTime": "2099-01-01T02:00:00Z"}
-                            }
-                        }
-                    }),
-                ))
-            }
-            // retrieveUserQuotaSummary on Daily: first 403 retries with short UA `"antigravity"` -> 200!
-            _ if req.url.ends_with(":retrieveUserQuotaSummary") => {
-                assert_eq!(
-                    req.url,
-                    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
-                );
-                let ua = req
-                    .headers
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
-                    .unwrap()
-                    .1
-                    .as_str();
-                if ua != "antigravity" {
-                    return Ok(MockTransport::json_response(403, json!({})));
-                }
-                Ok(MockTransport::json_response(
-                    200,
-                    json!({
-                        "groups": [{
-                            "displayName": "Gemini Models",
-                            "buckets": [
-                                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.80, "resetTime": "2099-01-01T05:00:00Z"},
-                                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.60, "resetTime": "2099-01-07T00:00:00Z"}
-                            ]
-                        }]
-                    }),
-                ))
-            }
-            other => panic!("unexpected mock call step {other}: {:?}", req),
-        }
-    });
-
-    let updated = refresh_account_quota_locked(
-        &repo,
-        &mock,
-        &fast_oauth_endpoints(),
-        &fast_quota_endpoints(),
-        &OAuthClientRegistry::parse_from_raw(None, None),
-        "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)",
-        "acc-q",
-        now,
-    )
-    .await
-    .unwrap();
-
-    // Rotated refresh_token WAS persisted AND NOT clobbered by subsequent quota merge!
-    assert_eq!(updated.token.refresh_token, "1//rotated_after_401");
-    assert_eq!(updated.token.access_token, "ya29.fresh_after_401");
-    let q = updated.quota.unwrap();
-    assert_eq!(q.source_env, QuotaSourceEnv::Daily);
-    assert_eq!(q.summary_source_env, Some(QuotaSourceEnv::Daily));
-    assert_eq!(q.subscription_tier.as_deref(), Some("Google AI Pro"));
-    // Primary model fraction (42%) is lower than summary (60%/80%), so primary limit 42% is preserved!
-    assert_eq!(q.models[0].percentage, 42);
-}
-
-#[tokio::test]
-async fn quota_all_endpoints_transport_failure_terminates_cleanly_after_three_environments() {
-    let _env_guard = OAUTH_ENV_MUTEX.lock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = new_repo(tmp.path());
-    let now = 1_800_000_000i64;
-
-    let acc = AccountRecord::new(
-        "acc-netfail".into(),
-        "netfail@example.invalid".into(),
-        TokenRecord {
-            access_token: "ya29.valid".into(),
-            refresh_token: "1//rt_valid".into(),
-            expires_in: 7200,
-            expiry_timestamp: now + 7200,
-            token_type: "Bearer".into(),
-            id_token: None,
-            oauth_client_key: Some("antigravity_enterprise".into()),
-            granted_scopes: None,
-            project_id: None,
-            is_gcp_tos: true,
-        },
-        now,
-    );
-    repo.with_write_lock(|tx| tx.upsert_account(acc, true, now))
-        .unwrap();
-
-    // Empty MockTransport returns TransportError on every call
-    let mock = MockTransport::default();
-    let err = refresh_account_quota_locked(
-        &repo,
-        &mock,
-        &fast_oauth_endpoints(),
-        &fast_quota_endpoints(),
-        &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
-        "acc-netfail",
-        now,
-    )
-    .await
-    .unwrap_err();
-
-    assert_eq!(err.error_code, "quota_network_error");
-    // 3 loadCodeAssist attempts + 3 fetchAvailableModels attempts = 6 bounded requests!
-    assert_eq!(mock.recorded_requests().len(), 6);
 }
 
 #[tokio::test]
@@ -684,7 +470,6 @@ async fn rotated_refresh_token_is_persisted_immediately_before_slow_or_cancelled
             &SlowUserinfoTransport,
             &fast_oauth_endpoints(),
             &OAuthClientRegistry::parse_from_raw(None, None),
-            "vscode/1.X.X (Antigravity/4.3.0)",
             "acc-cancel",
             true,
             now,
@@ -763,71 +548,96 @@ async fn validation_required_403_marks_blocked_hides_url_clears_on_200_and_merge
     .unwrap();
     assert_eq!(repo.read_snapshot().unwrap().accounts.len(), 1);
 
-    // 2. CloudCode 403 `VALIDATION_REQUIRED` sets `validation_blocked = true` and hides `validation_url` from DTOs
-    let mock_403 = MockTransport::from_handler(|req| {
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(200, json!({})));
+    // 2. Official CLI `ValidationBlocked` sets `validation_blocked = true` and hides `validation_url` from DTOs
+    struct StaticOfficialRunner(OfficialCliUsageOutcome);
+    impl OfficialCliQuotaRunner for StaticOfficialRunner {
+        fn query_active_usage<'a>(
+            &'a self,
+            _paths: &'a HeadlessPaths,
+            _explicit_file_backend: bool,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<OfficialCliUsageOutcome, OfficialCliQuotaError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let out = self.0.clone();
+            Box::pin(async move { Ok(out) })
         }
-        Ok(MockTransport::json_response(
-            403,
-            json!({
-                "error": {
-                    "status": "PERMISSION_DENIED",
-                    "message": "Verify your account to continue (VALIDATION_REQUIRED)",
-                    "details": [{"validationUrl": "https://accounts.google.com/SECRET_VERIFY_TOKEN_999"}]
-                }
-            }),
-        ))
-    });
+    }
 
-    let blocked = refresh_account_quota_locked(
+    let backend = FileSessionBackend;
+    let active_rec = repo.read_account_unchecked("acc-leg").unwrap();
+    std::fs::create_dir_all(&repo.paths().active_slot_dir).unwrap();
+    backend
+        .write_slot(
+            repo.paths(),
+            &serialize_session_payload(&active_rec.token).unwrap(),
+        )
+        .unwrap();
+
+    let runner_blocked = StaticOfficialRunner(OfficialCliUsageOutcome::ValidationBlocked {
+        reason: "Verify your account to continue (VALIDATION_REQUIRED)".into(),
+    });
+    let blocked = refresh_active_slot_quota_with_runner(
         &repo,
-        &mock_403,
-        &fast_oauth_endpoints(),
-        &fast_quota_endpoints(),
-        &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
-        "acc-leg",
+        &backend,
+        &runner_blocked,
+        true,
+        Some("acc-leg"),
         now + 2,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .account;
     assert!(blocked.validation_blocked);
-    assert_eq!(
-        blocked.validation_url.as_deref(),
-        Some("https://accounts.google.com/SECRET_VERIFY_TOKEN_999")
-    );
     let dto_json = serde_json::to_string(
         &agy_switch_cli::cli::dto::AccountViewDto::from_record_at(&blocked, true, now + 2),
     )
     .unwrap();
-    assert!(!dto_json.contains("SECRET_VERIFY_TOKEN_999"));
+    assert!(!dto_json.contains("validation_url"));
 
-    // 3. Subsequent HTTP 200 quota refresh automatically clears `validation_blocked` and `validation_url`!
-    let mock_200 = MockTransport::from_handler(|req| {
-        if req.url.ends_with(":loadCodeAssist") {
-            return Ok(MockTransport::json_response(200, json!({})));
-        }
-        if req.url.ends_with(":fetchAvailableModels") {
-            return Ok(MockTransport::json_response(
-                200,
-                json!({"models": {"gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.9, "resetTime": "2099-01-01T00:00:00Z"}}}}),
-            ));
-        }
-        Ok(MockTransport::json_response(404, json!({})))
+    // 3. Subsequent clean Official CLI `/usage` response automatically clears `validation_blocked`!
+    let runner_ok = StaticOfficialRunner(OfficialCliUsageOutcome::Quota {
+        description: None,
+        groups: vec![QuotaGroup {
+            display_name: "Gemini Models".into(),
+            description: Some("Models within this group: gemini-3.1-pro".into()),
+            buckets: vec![
+                QuotaBucket {
+                    bucket_id: "gemini-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: 0.9,
+                    remaining_fraction_known: Some(true),
+                    reset_time: "2099-01-01T00:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+                QuotaBucket {
+                    bucket_id: "gemini-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: 0.9,
+                    remaining_fraction_known: Some(true),
+                    reset_time: "2099-01-07T00:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        }],
     });
-    let cleared = refresh_account_quota_locked(
+    let cleared = refresh_active_slot_quota_with_runner(
         &repo,
-        &mock_200,
-        &fast_oauth_endpoints(),
-        &fast_quota_endpoints(),
-        &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
-        "acc-leg",
+        &backend,
+        &runner_ok,
+        true,
+        Some("acc-leg"),
         now + 10,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .account;
     assert!(!cleared.validation_blocked);
     assert!(cleared.validation_url.is_none());
 }
@@ -871,7 +681,6 @@ async fn scope_reauth_required_is_set_on_missing_known_scopes_and_upstream_insuf
         &MockTransport::default(),
         &fast_oauth_endpoints(),
         &default_reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-missing-cp",
         false,
         now,
@@ -958,7 +767,6 @@ async fn scope_reauth_required_is_set_on_missing_known_scopes_and_upstream_insuf
         &mock_narrow_scope,
         &fast_oauth_endpoints(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         "acc-scope-known",
         false,
         now,
@@ -982,70 +790,7 @@ async fn scope_reauth_required_is_set_on_missing_known_scopes_and_upstream_insuf
         Some(DisableReasonCode::ScopeReauthRequired)
     );
 
-    // 2. Imported bare-token account (`granted_scopes: None`) hitting CloudCode HTTP 403 `ACCESS_TOKEN_SCOPE_INSUFFICIENT`
-    let acc_upstream_403 = AccountRecord::new(
-        "acc-scope-upstream".into(),
-        "scope2@example.invalid".into(),
-        TokenRecord {
-            access_token: "ya29.valid_at_missing_scope".into(),
-            refresh_token: "1//BARE_IMPORT_RT".into(),
-            expires_in: 7200,
-            expiry_timestamp: now + 7200,
-            token_type: "Bearer".into(),
-            id_token: None,
-            oauth_client_key: Some("antigravity_enterprise".into()),
-            granted_scopes: None, // Unknown locally!
-            project_id: None,
-            is_gcp_tos: true,
-        },
-        now,
-    );
-    repo.with_write_lock(|tx| tx.upsert_account(acc_upstream_403, false, now))
-        .unwrap();
-
-    let mock_cloudcode_scope = MockTransport::from_queue([Ok(MockTransport::json_response(
-        403,
-        json!({
-            "error": {
-                "code": 403,
-                "status": "PERMISSION_DENIED",
-                "message": "Request had insufficient authentication scopes.",
-                "details": [{"reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]
-            }
-        }),
-    ))]);
-
-    let err_upstream = refresh_account_quota_locked(
-        &repo,
-        &mock_cloudcode_scope,
-        &fast_oauth_endpoints(),
-        &fast_quota_endpoints(),
-        &OAuthClientRegistry::parse_from_raw(None, None),
-        "vscode/1.X.X (Antigravity/4.3.0)",
-        "acc-scope-upstream",
-        now,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err_upstream.exit_code, ExitCode::AuthOrClientError);
-    assert_eq!(err_upstream.error_code, "scope_reauth_required");
-    assert!(err_upstream
-        .message
-        .contains("auth reauthorize acc-scope-upstream"));
-    assert_eq!(
-        mock_cloudcode_scope.recorded_requests().len(),
-        1,
-        "Insufficient-scope 403 must fail immediately without cross-endpoint retries"
-    );
-
-    let saved2 = repo.read_account_unchecked("acc-scope-upstream").unwrap();
-    assert!(saved2.disabled);
-    assert_eq!(
-        saved2.disabled_code,
-        Some(DisableReasonCode::ScopeReauthRequired)
-    );
-
-    // 3. `auth reauthorize` (`complete_reauthorize_exchange_locked`):
+    // 2. `auth reauthorize` (`complete_reauthorize_exchange_locked`):
     //    - If user still leaves required `aicode` unchecked on consent screen, MUST save newly issued
     //      `refresh_token`, keep `disabled = true` + `ScopeReauthRequired`, and fail with exit code 6!
     //    - Once user approves all required scopes, clears `disabled` cleanly!
@@ -1076,7 +821,6 @@ async fn scope_reauth_required_is_set_on_missing_known_scopes_and_upstream_insuf
         &mock_reauth_incomplete,
         &fast_oauth_endpoints(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         &existing_scope_acc,
         &reauth_session,
         "4/reauth-incomplete-code",
@@ -1122,7 +866,6 @@ async fn scope_reauth_required_is_set_on_missing_known_scopes_and_upstream_insuf
         &mock_reauth_full,
         &fast_oauth_endpoints(),
         &reg,
-        "vscode/1.X.X (Antigravity/4.3.0)",
         &still_disabled,
         &reauth_session,
         "4/reauth-full-code",
@@ -1623,7 +1366,6 @@ async fn synthetic_accounts_add_from_local_reads_agy_slot_and_rejects_symlinks()
         &transport,
         &fast_oauth_endpoints(),
         &registry,
-        "antigravity/1.5.7 linux/amd64",
         &rt_agy,
         None,
         Some("local-main"),
@@ -1689,7 +1431,6 @@ async fn synthetic_v120_preflight_blocks_token_exchange_on_unwritable_store_and_
             &real_transport,
             &endpoints,
             &registry,
-            "antigravity/1.5.7 linux/amd64",
             "1//ORIG_LOCAL_RT_SECRET_777",
             None,
             None,
@@ -1740,7 +1481,6 @@ async fn synthetic_v120_preflight_blocks_token_exchange_on_unwritable_store_and_
         &transport,
         &fast_oauth_endpoints(),
         &registry,
-        "antigravity/1.5.7 linux/amd64",
         "1//synthetic-unbuilt-local-rt",
         None,
         None,
@@ -1817,7 +1557,7 @@ async fn synthetic_v120_preflight_blocks_token_exchange_on_unwritable_store_and_
 
     // Use `ALL_PROXY` = unreachable `http://127.0.0.1:9` so no external traffic ever leaves localhost,
     // plus malformed `HTTPS_PROXY="badscheme://PROXY_SECRET_CRED_555@bad"` to trigger fallback warning!
-    let human_out = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
+    let mut human_child = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &home3)
@@ -1835,11 +1575,21 @@ async fn synthetic_v120_preflight_blocks_token_exchange_on_unwritable_store_and_
         .args([
             "--data-dir",
             data3.to_str().unwrap(),
-            "--no-remote-version",
-            "refresh",
+            "accounts",
+            "add",
+            "--from-stdin",
         ])
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    std::io::Write::write_all(
+        human_child.stdin.as_mut().unwrap(),
+        b"1//SYNTHETIC_RT_PROXY_WARN\n",
+    )
+    .unwrap();
+    let human_out = human_child.wait_with_output().unwrap();
     let human_stderr = String::from_utf8_lossy(&human_out.stderr);
     assert!(
         human_stderr
@@ -1851,7 +1601,7 @@ async fn synthetic_v120_preflight_blocks_token_exchange_on_unwritable_store_and_
         "Leaked proxy secret in human stderr: {human_stderr}"
     );
 
-    let json_out = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
+    let mut json_child = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &home3)
@@ -1869,12 +1619,22 @@ async fn synthetic_v120_preflight_blocks_token_exchange_on_unwritable_store_and_
         .args([
             "--data-dir",
             data3.to_str().unwrap(),
-            "--no-remote-version",
             "--json",
-            "refresh",
+            "accounts",
+            "add",
+            "--from-stdin",
         ])
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    std::io::Write::write_all(
+        json_child.stdin.as_mut().unwrap(),
+        b"1//SYNTHETIC_RT_PROXY_WARN\n",
+    )
+    .unwrap();
+    let json_out = json_child.wait_with_output().unwrap();
     let json_stderr = String::from_utf8_lossy(&json_out.stderr);
     assert_eq!(
         json_stderr.trim().lines().count(),
@@ -1987,7 +1747,6 @@ async fn synthetic_v120_signoff_round2_renewal_preflight_lineage_and_unpersisted
             &transport,
             &fast_oauth_endpoints(),
             &registry,
-            "antigravity/1.5.7 linux/amd64",
             "acc-target-enospc",
             false,
             now,
@@ -2041,16 +1800,10 @@ async fn synthetic_v120_signoff_round2_renewal_preflight_lineage_and_unpersisted
         .unwrap();
         std::fs::set_permissions(&pend_seeded_path, std::fs::Permissions::from_mode(0o600))
             .unwrap();
-        let resume_rep = resume_pending_auth_records(
-            &repo,
-            &transport,
-            &fast_oauth_endpoints(),
-            &registry,
-            "antigravity/1.5.7 linux/amd64",
-            now,
-        )
-        .await
-        .unwrap();
+        let resume_rep =
+            resume_pending_auth_records(&repo, &transport, &fast_oauth_endpoints(), &registry, now)
+                .await
+                .unwrap();
         let unp = resume_rep
             .unpersisted_error
             .expect("Expected unpersisted_error on post-rotation ENOSPC in pending resume");
@@ -2144,7 +1897,6 @@ async fn synthetic_v120_signoff_round2_renewal_preflight_lineage_and_unpersisted
         &transport1,
         &fast_oauth_endpoints(),
         &registry,
-        "antigravity/1.5.7 linux/amd64",
         "acc-lin1",
         false,
         now,
@@ -2219,7 +1971,6 @@ async fn synthetic_v120_signoff_round2_renewal_preflight_lineage_and_unpersisted
         &transport_p,
         &fast_oauth_endpoints(),
         &registry,
-        "antigravity/1.5.7 linux/amd64",
         now,
     )
     .await
@@ -2341,7 +2092,6 @@ async fn synthetic_v120_signoff_round2_renewal_preflight_lineage_and_unpersisted
         &transport_l3,
         &fast_oauth_endpoints(),
         &registry,
-        "antigravity/1.5.7 linux/amd64",
         "1//INPUT_RT_BEFORE_L3_BUSY",
         None,
         None,
@@ -2407,7 +2157,6 @@ async fn synthetic_v120_round3_r304_pending_resume_short_circuits_on_exit_7_and_
             &transport,
             &fast_oauth_endpoints(),
             &registry,
-            "antigravity/1.5.7 linux/amd64",
             "1//safe-input-rt",
             None,
             None,
@@ -2488,16 +2237,10 @@ async fn synthetic_v120_round3_r304_pending_resume_short_circuits_on_exit_7_and_
             ))
         });
         let registry = OAuthClientRegistry::parse_from_raw(None, None);
-        let rep = resume_pending_auth_records(
-            &repo,
-            &transport,
-            &fast_oauth_endpoints(),
-            &registry,
-            "antigravity/1.5.7 linux/amd64",
-            now,
-        )
-        .await
-        .unwrap();
+        let rep =
+            resume_pending_auth_records(&repo, &transport, &fast_oauth_endpoints(), &registry, now)
+                .await
+                .unwrap();
         let unp = rep
             .unpersisted_error
             .expect("Expected unpersisted_error from pend-01-enospc");
@@ -2632,7 +2375,6 @@ async fn synthetic_v120_a02a_reauthorize_preflight_blocks_unwritable_dirs_and_pr
             &transport,
             &fast_oauth_endpoints(),
             &reg,
-            "antigravity/1.5.9 linux/amd64",
             &acc,
             &session,
             "4/code-probe-fail",
@@ -2680,7 +2422,6 @@ async fn synthetic_v120_a02a_reauthorize_preflight_blocks_unwritable_dirs_and_pr
             &transport,
             &fast_oauth_endpoints(),
             &reg,
-            "antigravity/1.5.9 linux/amd64",
             &acc,
             &session,
             "4/code-enospc",
@@ -2720,7 +2461,6 @@ async fn synthetic_v120_a02a_reauthorize_preflight_blocks_unwritable_dirs_and_pr
             &transport,
             &fast_oauth_endpoints(),
             &reg,
-            "antigravity/1.5.9 linux/amd64",
             &acc,
             &session,
             "4/code-symlink",
@@ -2814,7 +2554,6 @@ async fn synthetic_v120_a02a_reauthorize_preflight_blocks_unwritable_dirs_and_pr
             &transport,
             &fast_oauth_endpoints(),
             &reg,
-            "antigravity/1.5.9 linux/amd64",
             &acc,
             &session,
             "4/code-ok",

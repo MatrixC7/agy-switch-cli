@@ -611,7 +611,8 @@ mod tests {
                     "--data-dir",
                     "/tmp/d",
                     "accounts",
-                    "--no-remote-version",
+                    "--backend",
+                    "file",
                     "add",
                     "1//0gInterleavedSecret",
                 ],
@@ -960,7 +961,6 @@ mod tests {
             );
         }
         for ph in [
-            "<CONCURRENCY>",
             "<ENABLED>",
             "<STRATEGY>",
             "<MODE>",
@@ -980,7 +980,18 @@ mod tests {
         }
 
         // Verify removed/unknown flags, fake placeholders, and secret shapes are strictly excluded.
-        for bad_flag in ["--reason", "--manual", "--stdin", "--ids", "-z", "--secret"] {
+        for bad_flag in [
+            "--reason",
+            "--manual",
+            "--stdin",
+            "--ids",
+            "-z",
+            "--secret",
+            "--no-remote-version",
+            "--target",
+            "--target-dir",
+            "--concurrency",
+        ] {
             assert!(
                 !allowlist.is_known_flag(bad_flag),
                 "Removed/unknown flag '{bad_flag}' must not be allowlisted"

@@ -20,10 +20,6 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "BACKEND")]
     pub backend: Option<String>,
 
-    /// Disable optional cached remote User-Agent version lookup on network commands
-    #[arg(long, global = true)]
-    pub no_remote_version: bool,
-
     /// Output machine-readable JSON (`schema_version: 1`)
     #[arg(long, global = true)]
     pub json: bool,
@@ -45,26 +41,26 @@ pub enum Commands {
     #[command(subcommand)]
     Accounts(AccountsCommand),
 
-    /// Inspect current selected account, active `agy` slot sync, live runtime state, and supported models
-    Current(CurrentArgs),
+    /// Inspect current selected account, active `agy` slot sync, live runtime state, and cached model groups
+    Current,
 
-    /// Switch active `agy` credential slot to the selected account (applies to new `agy` invocations)
+    /// Switch active `agy` credential slot offline to the selected account (applies to new `agy` invocations)
     Switch(SwitchArgs),
 
     /// Optional managed launcher for official `agy` (`--account` / `--backend` credential wrapper)
     Run(RunArgs),
 
-    /// View pool quota table (pure local read by default; pass `--refresh` to fetch live quota first)
+    /// View pool quota table (pure local read by default; pass `--refresh` to query active slot via official `agy`)
     Quota(QuotaArgs),
 
-    /// Refresh OAuth tokens and CloudCode quotas over the network
+    /// Refresh quota for the currently active official `agy` slot via official `agy -p "/usage"`
     Refresh(RefreshArgs),
 
     /// Auto-switch policy configuration and dry-run evaluation
     #[command(subcommand)]
     Policy(PolicyCommand),
 
-    /// Foreground 7-stage auto-switch daemon (managed by systemd --user or container init)
+    /// Foreground step-and-verify auto-switch daemon (managed by systemd --user or container init)
     Daemon(DaemonArgs),
 
     /// Read-only local SQLite token usage statistics (`summary` and `list`)
@@ -192,7 +188,7 @@ pub struct AccountsListArgs {
 
 #[derive(Debug, Args)]
 pub struct AccountsAddArgs {
-    /// Import the currently signed-in local Antigravity account (from desktop keyring or `~/.gemini/antigravity-cli/antigravity-oauth-token`, or an external `--target` / `--target-dir`)
+    /// Import the currently signed-in local Antigravity account offline (from desktop keyring or `~/.gemini/antigravity-cli/antigravity-oauth-token`)
     #[arg(long, conflicts_with_all = ["from_stdin", "from_file"])]
     pub from_local: bool,
 
@@ -203,24 +199,6 @@ pub struct AccountsAddArgs {
     /// Read one or more refresh tokens (one per line; `# label` comments supported) from a `0600` regular file
     #[arg(long, value_name = "PATH", conflicts_with_all = ["from_stdin", "from_local"])]
     pub from_file: Option<PathBuf>,
-
-    /// Named external target directory from `config.json` (`targets.<NAME>`) for `--from-local`
-    #[arg(
-        long,
-        value_name = "NAME",
-        requires = "from_local",
-        conflicts_with = "target_dir"
-    )]
-    pub target: Option<String>,
-
-    /// Explicit external target application data directory (containing `antigravity-oauth-token`) for `--from-local`
-    #[arg(
-        long,
-        value_name = "DIR",
-        requires = "from_local",
-        conflicts_with = "target"
-    )]
-    pub target_dir: Option<PathBuf>,
 
     /// Optional default custom label
     #[arg(long, value_name = "TEXT")]
@@ -279,30 +257,11 @@ pub struct AccountsDeleteArgs {
     pub force: bool,
 }
 
-#[derive(Debug, Default, Args)]
-pub struct CurrentArgs {
-    /// Inspect a named external target directory from `config.json` (`targets.<NAME>`)
-    #[arg(long, value_name = "NAME", conflicts_with = "target_dir")]
-    pub target: Option<String>,
-
-    /// Inspect an explicit external target application data directory (containing `antigravity-oauth-token`)
-    #[arg(long, value_name = "DIR", conflicts_with = "target")]
-    pub target_dir: Option<PathBuf>,
-}
-
 #[derive(Debug, Args)]
 pub struct SwitchArgs {
     /// Account ID or case-insensitive Email
     #[arg(value_name = "ID|EMAIL")]
     pub selector: String,
-
-    /// Switch a named external target directory from `config.json` (`targets.<NAME>`) instead of the official `agy` slot
-    #[arg(long, value_name = "NAME", conflicts_with = "target_dir")]
-    pub target: Option<String>,
-
-    /// Switch an explicit external target application data directory (containing `antigravity-oauth-token`) instead of the official `agy` slot
-    #[arg(long, value_name = "DIR", conflicts_with = "target")]
-    pub target_dir: Option<PathBuf>,
 
     /// Validate preconditions without modifying any files or making network calls
     #[arg(long)]
@@ -330,50 +289,23 @@ pub struct RunArgs {
 
 #[derive(Debug, Args)]
 pub struct QuotaArgs {
-    #[arg(value_name = "ID|EMAIL", conflicts_with_all = ["all", "target", "target_dir"])]
+    #[arg(value_name = "ID|EMAIL", conflicts_with_all = ["all", "refresh"])]
     pub selector: Option<String>,
 
-    /// Show quotas for all saved accounts
-    #[arg(long, conflicts_with_all = ["selector", "target", "target_dir"])]
+    /// Show cached quotas for all saved accounts (pure local read)
+    #[arg(long, conflicts_with_all = ["selector", "refresh"])]
     pub all: bool,
 
-    /// Inspect quota for the account in a named external target directory from `config.json` (`targets.<NAME>`)
-    #[arg(long, value_name = "NAME", conflicts_with_all = ["target_dir", "selector", "all"])]
-    pub target: Option<String>,
-
-    /// Inspect quota for the account in an explicit external target application data directory
-    #[arg(long, value_name = "DIR", conflicts_with_all = ["target", "selector", "all"])]
-    pub target_dir: Option<PathBuf>,
-
-    /// Refresh CloudCode quota over the network first before displaying the quota table
-    #[arg(long)]
+    /// Refresh the currently active official `agy` slot via `agy -p "/usage"` before displaying the quota table
+    #[arg(long, conflicts_with_all = ["selector", "all"])]
     pub refresh: bool,
-
-    /// Bounded concurrency when refreshing multiple accounts with `--refresh --all` (`1..=5`, default `2`)
-    #[arg(long, default_value_t = 2, requires = "refresh", value_parser = clap::value_parser!(u8).range(1..=5))]
-    pub concurrency: u8,
 }
 
 #[derive(Debug, Args)]
 pub struct RefreshArgs {
-    #[arg(value_name = "ID|EMAIL", conflicts_with_all = ["all", "target", "target_dir"])]
+    /// Optional account selector (must match the currently active official `agy` slot; dormant accounts exit 2)
+    #[arg(value_name = "ID|EMAIL")]
     pub selector: Option<String>,
-
-    /// Refresh all enabled accounts
-    #[arg(long, conflicts_with_all = ["selector", "target", "target_dir"])]
-    pub all: bool,
-
-    /// Refresh the account in a named external target directory from `config.json` (`targets.<NAME>`)
-    #[arg(long, value_name = "NAME", conflicts_with_all = ["target_dir", "selector", "all"])]
-    pub target: Option<String>,
-
-    /// Refresh the account in an explicit external target application data directory
-    #[arg(long, value_name = "DIR", conflicts_with_all = ["target", "selector", "all"])]
-    pub target_dir: Option<PathBuf>,
-
-    /// Bounded concurrency for multi-account refresh (`1..=5`, default `2`)
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=5))]
-    pub concurrency: u8,
 }
 
 #[derive(Debug, Subcommand)]
@@ -442,7 +374,7 @@ pub struct PolicySetArgs {
 
 #[derive(Debug, Args)]
 pub struct DaemonArgs {
-    /// Poll interval in seconds (default: 180 / 3 minutes; in-memory unless persisted via `--install` or `AGY_SWITCH_CLI_INTERVAL`)
+    /// Poll interval in seconds (default: 900 / 15 minutes; in-memory unless persisted via `--install` or `AGY_SWITCH_CLI_INTERVAL`)
     #[arg(
         long,
         env = "AGY_SWITCH_CLI_INTERVAL",
@@ -460,7 +392,7 @@ pub struct DaemonArgs {
     )]
     pub cooldown: Option<i64>,
 
-    /// Run a single 7-stage evaluation/commit tick and exit
+    /// Run a single step-and-verify evaluation/switch tick and exit
     #[arg(long, conflicts_with_all = ["install", "uninstall"])]
     pub once: bool,
 
@@ -568,29 +500,8 @@ pub enum StatsCommand {
 #[derive(Debug, Clone, Args)]
 pub struct StatsWindowArgs {
     /// Conversation database source (`all` [default], `cli`, or `app`)
-    #[arg(
-        long,
-        value_enum,
-        value_name = "SOURCE",
-        conflicts_with_all = ["target", "target_dir"]
-    )]
+    #[arg(long, value_enum, value_name = "SOURCE")]
     pub source: Option<CliStatsSource>,
-
-    /// Named external target directory from `config.json` (`targets.<NAME>`) to scan `conversations/*.db`
-    #[arg(
-        long,
-        value_name = "NAME",
-        conflicts_with_all = ["target_dir", "source"]
-    )]
-    pub target: Option<String>,
-
-    /// Explicit external target application data directory (containing `conversations/*.db`)
-    #[arg(
-        long,
-        value_name = "DIR",
-        conflicts_with_all = ["target", "source"]
-    )]
-    pub target_dir: Option<PathBuf>,
 
     /// Preset local-date range (`today`, `yesterday`, `all`, or `<N>d` such as `1d`, `3d`, `7d`, `30d`)
     #[arg(

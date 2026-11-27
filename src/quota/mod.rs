@@ -1,2 +1,1 @@
-pub mod client;
-pub mod fusion;
+pub mod official_cli;

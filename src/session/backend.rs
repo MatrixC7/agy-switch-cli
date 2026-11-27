@@ -1,8 +1,8 @@
 use crate::error::{CliError, CliResult};
 use crate::paths::HeadlessPaths;
 use crate::session::payload::{
-    bytes_sha256_hex, extract_raw_refresh_token_from_session_bytes, parse_session_payload_bytes,
-    ParsedSessionPayload,
+    bytes_sha256_hex, extract_session_token_from_bytes, parse_session_payload_bytes,
+    ExtractedSessionToken, ParsedSessionPayload,
 };
 use crate::store::fs_atomic::{
     check_fault_injection, ensure_no_symlink_components_under, fsync_pinned_dir_fd,
@@ -1057,21 +1057,18 @@ pub fn resolve_credential_backend_with_config(
     }
 }
 
-/// Read the currently signed-in local `agy` `refresh_token` following the active backend's boundary:
+/// Read the full parsed local `agy` credential payload following the active backend's boundary:
 /// - `keyring`: reads ONLY Linux Secret Service keyring (`service="gemini", username="antigravity"`), never touching disk;
 /// - `dual` / `auto`: reads Linux Secret Service keyring first, falling back to `~/.gemini/antigravity-cli/antigravity-oauth-token`;
 /// - `file`: reads ONLY `~/.gemini/antigravity-cli/antigravity-oauth-token`.
-pub fn read_local_active_refresh_token(
+pub fn read_local_active_session_token(
     paths: &HeadlessPaths,
     backend: &dyn CredentialBackend,
-) -> CliResult<(String, &'static str)> {
+) -> CliResult<(ExtractedSessionToken, &'static str)> {
     if backend.uses_keyring() {
         if let Some(bytes) = backend.read_raw_keyring_secret()? {
-            let rt = extract_raw_refresh_token_from_session_bytes(
-                &bytes,
-                "Linux Secret Service keyring",
-            )?;
-            return Ok((rt, "secret_service_keyring"));
+            let parsed = extract_session_token_from_bytes(&bytes, "Linux Secret Service keyring")?;
+            return Ok((parsed, "secret_service_keyring"));
         }
         if !backend.uses_file() {
             return Err(CliError::not_found(
@@ -1086,8 +1083,8 @@ pub fn read_local_active_refresh_token(
         MAX_STORE_FILE_BYTES,
         "Local agy session file",
     )? {
-        let rt = extract_raw_refresh_token_from_session_bytes(&bytes, "Local agy session file")?;
-        return Ok((rt, "agy_session_file"));
+        let parsed = extract_session_token_from_bytes(&bytes, "Local agy session file")?;
+        return Ok((parsed, "agy_session_file"));
     }
 
     if !backend.uses_keyring() && detect_dbus_session_socket_warning().is_some() {
@@ -1101,6 +1098,15 @@ pub fn read_local_active_refresh_token(
         "No local agy credential found at '{}'. Sign in with `agy` first or add an account via `agy-switch-cli auth login`.",
         paths.active_slot_file.display()
     )))
+}
+
+/// Read the currently signed-in local `agy` `refresh_token` following the active backend's boundary.
+pub fn read_local_active_refresh_token(
+    paths: &HeadlessPaths,
+    backend: &dyn CredentialBackend,
+) -> CliResult<(String, &'static str)> {
+    let (parsed, src) = read_local_active_session_token(paths, backend)?;
+    Ok((parsed.refresh_token, src))
 }
 
 /// Non-GUI D-Bus Secret Service backend (`--features secret-service-backend`), supporting both

@@ -1,18 +1,19 @@
 use crate::cli::dto::{
-    extract_supported_models, format_bar_and_pct, format_pct, format_relative_age,
-    format_reset_local, format_runtime_state_human, format_session_identity_human,
-    format_unix_local_minute, format_window_label, terminal_text, AccountViewDto,
+    extract_quota_group_descriptions, extract_supported_models, format_bar_and_pct, format_pct,
+    format_relative_age, format_reset_local, format_runtime_state_human,
+    format_session_identity_human, format_unix_local_minute, format_window_label, terminal_text,
+    AccountViewDto,
 };
 use crate::domain::account::DisableReasonCode;
 use crate::domain::policy::SwitchPolicy;
 use crate::domain::quota::{
-    evaluate_account_quota, observed_quota_percentage, quota_pool, QuotaEval, QuotaPool,
-    DEFAULT_QUOTA_MAX_AGE_SECS,
+    evaluate_account_quota, is_tier_only_placeholder, is_unused_full_bucket_reset_time,
+    observed_quota_percentage, quota_pool, summarize_last_quota_status, LastQuotaStatus, QuotaEval,
+    QuotaPool, DEFAULT_QUOTA_MAX_AGE_SECS,
 };
 use crate::error::{CliError, CliResult};
-use crate::oauth::refresh::OAuthEndpoints;
 use crate::oauth::registry::OAuthClientRegistry;
-use crate::quota::client::{refresh_account_quota_locked, CloudCodeEndpoints};
+use crate::quota::official_cli::refresh_active_slot_quota_via_official_cli_with_proxy;
 use crate::session::backend::CredentialBackend;
 use crate::session::journal::reconcile_pending_journal_before_write;
 use crate::session::payload::resolve_session_identity;
@@ -24,9 +25,6 @@ use crate::switching::daemon::{
     read_daemon_state_readonly, reset_daemon_cooldown, DaemonPersistentState,
 };
 use crate::switching::executor::{execute_account_delete, execute_switch, SwitchOptions};
-use crate::transport::client::{HttpTransport, ReqwestTransport};
-use crate::transport::proxy::ProxyMode;
-use crate::transport::user_agent::resolve_native_oauth_user_agent;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, CellAlignment, ContentArrangement, Table};
 use crossterm::{
     cursor,
@@ -34,13 +32,11 @@ use crossterm::{
     execute,
     terminal::{self, Clear, ClearType},
 };
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -145,12 +141,15 @@ impl Drop for RawModeGuard {
 pub const TUI_KEYS_LINE_1: &str =
     "Keys   : ↑/↓ select · g/G top/end · [/] reorder · Space mark · Enter/s switch · i info · q/Esc quit";
 pub const TUI_KEYS_LINE_2: &str =
-    "Manage : r/R refresh · c/C cand · p policy · k cd · e/E enable · d/D disable · l label · o/O export · x delete";
+    "Manage : r refresh (on *) · c/C cand · p policy · k cd · e/E enable · d/D disable · l label · o/O export · x delete";
 pub const TUI_KEYS_HELP_LINE: &str =
-    "Keys: ↑/↓ select · g/G top/end · [/] reorder · Space mark · Enter/s switch · i info · r/R refresh · c/C cand · p policy · k cd · e/E enable · d/D disable · l label · o/O export · x delete · q/Esc quit";
-const TUI_DETAIL_KEYS_LINE: &str =
+    "Keys: ↑/↓ select · g/G top/end · [/] reorder · Space mark · Enter/s switch · i info · r refresh (*) · c/C cand · p policy · k cd · e/E enable · d/D disable · l label · o/O export · x delete · q/Esc quit";
+const TUI_DETAIL_KEYS_LINE_ACTIVE: &str =
     "Keys   : ←/→ account · ↑/↓ scroll · Space mark · l label · r refresh · k cd · Enter/s switch · i/Esc back · q quit";
-const TUI_BATCH_REFRESH_CONCURRENCY: usize = 2;
+const TUI_DETAIL_KEYS_LINE_DORMANT: &str =
+    "Keys   : ←/→ account · ↑/↓ scroll · Space mark · l label · k cd · Enter/s switch · i/Esc back · q quit";
+const TUI_DORMANT_REFRESH_HINT: &str =
+    "Switch to this account first (press 's'), then press 'r' to refresh active quota.";
 const TRANSIENT_INFO_TTL: Duration = Duration::from_secs(3);
 const TRANSIENT_ERROR_TTL: Duration = Duration::from_secs(5);
 const MAX_TUI_LABEL_CHARS: usize = 64;
@@ -563,14 +562,15 @@ fn apply_pending_input_key(
 
 /// Optional interactive SSH dashboard (`#[cfg(feature = "tui")]`).
 /// Strictly delegates ALL mutations to the application service layer (`execute_switch`,
-/// `refresh_account_quota_locked`, `repo.with_write_lock`, `export_transfer_bundle_file`,
-/// `reset_daemon_cooldown`) and integrates OS signal streams (`SIGTERM`, `SIGINT`, `SIGHUP`,
-/// `SIGQUIT`) so terminal `ECHO` and alternate screen are reliably restored even on external
-/// signal termination!
+/// `refresh_active_slot_quota_via_official_cli`, `repo.with_write_lock`,
+/// `export_transfer_bundle_file`, `reset_daemon_cooldown`) and integrates OS signal streams
+/// (`SIGTERM`, `SIGINT`, `SIGHUP`, `SIGQUIT`) so terminal `ECHO` and alternate screen are reliably
+/// restored even on external signal termination!
 pub async fn run_interactive_tui(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
-    cli_proxy: Option<&str>,
+    explicit_file_backend: bool,
+    proxy_override: Option<String>,
 ) -> CliResult<()> {
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
@@ -997,7 +997,6 @@ pub async fn run_interactive_tui(
                         run_single_switch_in_tui(
                             repo,
                             backend,
-                            cli_proxy,
                             &snap,
                             &cur_policy,
                             &session_id,
@@ -1010,15 +1009,15 @@ pub async fn run_interactive_tui(
                             &mut scroll_offset,
                             target,
                             &mut transient_status,
-                        )
-                        .await;
+                        );
                     }
                 }
                 KeyCode::Char('r') => {
                     let interrupted = run_r_refresh_in_tui(
                         repo,
                         backend,
-                        cli_proxy,
+                        explicit_file_backend,
+                        proxy_override.as_deref(),
                         &snap,
                         &cur_policy,
                         &session_id,
@@ -1178,7 +1177,6 @@ pub async fn run_interactive_tui(
                     run_single_switch_in_tui(
                         repo,
                         backend,
-                        cli_proxy,
                         &snap,
                         &cur_policy,
                         &session_id,
@@ -1191,15 +1189,15 @@ pub async fn run_interactive_tui(
                         &mut scroll_offset,
                         target,
                         &mut transient_status,
-                    )
-                    .await;
+                    );
                 }
             }
             KeyCode::Char('r') => {
                 let interrupted = run_r_refresh_in_tui(
                     repo,
                     backend,
-                    cli_proxy,
+                    explicit_file_backend,
+                    proxy_override.as_deref(),
                     &snap,
                     &cur_policy,
                     &session_id,
@@ -1218,57 +1216,6 @@ pub async fn run_interactive_tui(
                 .await;
                 if interrupted {
                     break;
-                }
-            }
-            KeyCode::Char('R') => {
-                let targets: Vec<(String, String)> = snap
-                    .accounts
-                    .iter()
-                    .filter(|a| !a.disabled)
-                    .map(|a| (a.id.clone(), a.email.clone()))
-                    .collect();
-                if targets.is_empty() {
-                    transient_status
-                        .set_info("No enabled accounts to refresh.".into(), Instant::now());
-                } else {
-                    let total = targets.len();
-                    let init_msg = format!("Refreshing {total} enabled account(s) (0/{total})...");
-                    let _ = render_dashboard_full(&mut TuiFrameView {
-                        accounts: &snap.accounts,
-                        selected_id: snap.index.selected_account_id.as_deref(),
-                        policy: &cur_policy,
-                        session_id: &session_id,
-                        runtime_st: &runtime_st,
-                        backend_tag: backend.name(),
-                        daemon_state: daemon_state.as_ref(),
-                        marked_ids: &marked_ids,
-                        detail_view: false,
-                        detail_scroll: &mut detail_scroll,
-                        cursor_idx,
-                        scroll_offset: &mut scroll_offset,
-                        transient_notice: Some(&init_msg),
-                        now_unix: crate::domain::clock::current_unix_seconds(),
-                    });
-                    let interrupted = run_batch_refresh_in_tui(
-                        repo,
-                        backend,
-                        cli_proxy,
-                        &targets,
-                        "enabled",
-                        &marked_ids,
-                        false,
-                        &mut detail_scroll,
-                        cursor_idx,
-                        &mut scroll_offset,
-                        &mut transient_status,
-                        &mut sigterm,
-                        &mut sigint,
-                        &mut sighup,
-                    )
-                    .await;
-                    if interrupted {
-                        break;
-                    }
                 }
             }
             KeyCode::Char('c') => {
@@ -1415,10 +1362,9 @@ pub async fn run_interactive_tui(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_single_switch_in_tui(
+fn run_single_switch_in_tui(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
-    cli_proxy: Option<&str>,
     snap: &crate::store::repository::StoreSnapshot,
     cur_policy: &SwitchPolicy,
     session_id: &crate::domain::account::SessionIdentity,
@@ -1449,23 +1395,12 @@ async fn run_single_switch_in_tui(
         transient_notice: Some(&switching_msg),
         now_unix: crate::domain::clock::current_unix_seconds(),
     });
-    let now_unix = crate::domain::clock::current_unix_seconds();
-    let mut proxy_warnings = Vec::new();
-    let res = async {
-        let cfg = repo.read_config()?;
+    let res = (|| {
         let registry = OAuthClientRegistry::load(repo.paths())?;
-        let (proxy_mode, warns) =
-            ProxyMode::resolve_with_config_and_warnings(cli_proxy, Some(&cfg.network))?;
-        proxy_warnings = warns;
-        let transport = ReqwestTransport::build(proxy_mode)?;
-        let ua = resolve_native_oauth_user_agent(repo.paths(), &transport, false, now_unix).await;
         execute_switch(
             repo,
             backend,
-            &transport,
-            &OAuthEndpoints::default(),
             &registry,
-            &ua,
             &target.id,
             &SwitchOptions {
                 dry_run: false,
@@ -1473,18 +1408,15 @@ async fn run_single_switch_in_tui(
             },
             crate::domain::clock::current_unix_seconds(),
         )
-        .await
-    }
-    .await;
-    let proxy_prefix = format_tui_proxy_warning_prefix(&proxy_warnings);
+    })();
     let done_at = Instant::now();
     match res {
         Ok(out) => {
-            let msg = format_tui_switch_status_notice(&proxy_prefix, &out);
+            let msg = format_tui_switch_status_notice("", &out);
             transient_status.set_info(msg, done_at);
         }
         Err(e) => transient_status.set_error(
-            format!("{proxy_prefix}Switch error: {}", terminal_text(&e.message)),
+            format!("Switch error: {}", terminal_text(&e.message)),
             done_at,
         ),
     }
@@ -1494,7 +1426,8 @@ async fn run_single_switch_in_tui(
 async fn run_single_refresh_in_tui(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
-    cli_proxy: Option<&str>,
+    explicit_file_backend: bool,
+    proxy_override: Option<&str>,
     snap: &crate::store::repository::StoreSnapshot,
     cur_policy: &SwitchPolicy,
     session_id: &crate::domain::account::SessionIdentity,
@@ -1511,7 +1444,10 @@ async fn run_single_refresh_in_tui(
     sigint: &mut Option<tokio::signal::unix::Signal>,
     sighup: &mut Option<tokio::signal::unix::Signal>,
 ) -> bool {
-    let refreshing_msg = format!("Refreshing quota for {}...", terminal_text(&target.email));
+    let refreshing_msg = format!(
+        "Refreshing active quota for {} via official agy...",
+        terminal_text(&target.email)
+    );
     let _ = render_dashboard_full(&mut TuiFrameView {
         accounts: &snap.accounts,
         selected_id: snap.index.selected_account_id.as_deref(),
@@ -1529,24 +1465,15 @@ async fn run_single_refresh_in_tui(
         now_unix: crate::domain::clock::current_unix_seconds(),
     });
     let now_unix = crate::domain::clock::current_unix_seconds();
-    let proxy_warnings_r = std::sync::Mutex::new(Vec::new());
+    let proxy_owned = proxy_override.map(str::to_owned);
     let mut refresh_fut = std::pin::pin!(async {
         reconcile_pending_journal_before_write(repo, backend, now_unix)?;
-        let cfg = repo.read_config()?;
-        let registry = OAuthClientRegistry::load(repo.paths())?;
-        let (proxy_mode, warns) =
-            ProxyMode::resolve_with_config_and_warnings(cli_proxy, Some(&cfg.network))?;
-        *proxy_warnings_r.lock().unwrap() = warns;
-        let transport = ReqwestTransport::build(proxy_mode)?;
-        let ua = resolve_native_oauth_user_agent(repo.paths(), &transport, false, now_unix).await;
-        refresh_account_quota_locked(
+        refresh_active_slot_quota_via_official_cli_with_proxy(
             repo,
-            &transport,
-            &OAuthEndpoints::default(),
-            &CloudCodeEndpoints::default(),
-            &registry,
-            &ua,
-            &target.id,
+            backend,
+            explicit_file_backend,
+            proxy_owned,
+            Some(&target.id),
             crate::domain::clock::current_unix_seconds(),
         )
         .await
@@ -1607,18 +1534,18 @@ async fn run_single_refresh_in_tui(
         return true;
     }
     if let Some(res) = refresh_res {
-        let proxy_prefix = format_tui_proxy_warning_prefix(&proxy_warnings_r.lock().unwrap());
         let done_at = Instant::now();
         match res {
-            Ok(acc) => transient_status.set_info(
-                format!(
-                    "{proxy_prefix}Refreshed quota for {}.",
-                    terminal_text(&acc.email)
-                ),
-                done_at,
-            ),
+            Ok(outcome) => {
+                let msg = format_tui_refresh_status_notice(&outcome);
+                if outcome.validation_blocked {
+                    transient_status.set_error(msg, done_at);
+                } else {
+                    transient_status.set_info(msg, done_at);
+                }
+            }
             Err(e) => transient_status.set_error(
-                format!("{proxy_prefix}Refresh error: {}", terminal_text(&e.message)),
+                format!("Refresh error: {}", terminal_text(&e.message)),
                 done_at,
             ),
         }
@@ -2107,58 +2034,291 @@ fn format_pct_padded(value: Option<i32>) -> String {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct PoolWindowPair {
-    weekly: Option<i32>,
-    short_5h: Option<i32>,
-    has_bucket: bool,
+fn format_compact_age(updated_unix: i64, now_unix: i64) -> String {
+    if updated_unix <= 0 {
+        return "unknown".into();
+    }
+    let diff = now_unix.saturating_sub(updated_unix);
+    if diff < -30 {
+        "future".into()
+    } else if diff <= 2 {
+        "just now".into()
+    } else if diff < 60 {
+        format!("{diff}s ago")
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86_400 {
+        format!("{}h ago", diff / 3600)
+    } else {
+        format!("{}d ago", diff / 86_400)
+    }
 }
 
-impl PoolWindowPair {
-    fn format_dual_aligned(&self) -> String {
-        if self.short_5h.is_none() && self.weekly.is_none() {
-            "—".into()
-        } else {
+fn format_compact_reset_duration(reset_unix: i64, now_unix: i64) -> String {
+    let rem = reset_unix.saturating_sub(now_unix);
+    if rem <= 0 {
+        "expired".into()
+    } else if rem >= 86_400 {
+        format!("{}d{:02}h", rem / 86_400, (rem % 86_400) / 3600)
+    } else if rem >= 3600 {
+        format!("{}h{:02}m", rem / 3600, (rem % 3600) / 60)
+    } else {
+        format!("{}m", (rem / 60).max(1))
+    }
+}
+
+fn format_last_quota_cell(
+    acc: &crate::domain::account::AccountRecord,
+    policy: &SwitchPolicy,
+    now_unix: i64,
+) -> String {
+    match summarize_last_quota_status(
+        acc,
+        &policy.monitored_model,
+        policy.candidate_min_percentage,
+        now_unix,
+    ) {
+        LastQuotaStatus::NeverRefreshed => "—".into(),
+        LastQuotaStatus::Forbidden => "forbidden".into(),
+        LastQuotaStatus::LowBeforeReset {
+            percentage,
+            reset_unix,
+            ..
+        } => format!(
+            "low {:.0}% (resets in {})",
+            percentage.clamp(0.0, 100.0),
+            format_compact_reset_duration(reset_unix, now_unix)
+        ),
+        LastQuotaStatus::ResetPassed { last_updated } => {
             format!(
-                "{} / {}",
-                format_pct_padded(self.short_5h),
-                format_pct_padded(self.weekly)
+                "reset passed ({})",
+                format_compact_age(last_updated, now_unix)
             )
         }
-    }
-
-    fn format_dual_compact(&self) -> String {
-        if self.short_5h.is_none() && self.weekly.is_none() {
-            "—".into()
-        } else {
-            format!(
-                "{} / {}",
-                format_pct(self.short_5h),
-                format_pct(self.weekly)
-            )
-        }
-    }
-
-    fn format_weekly_aligned(&self) -> String {
-        format_pct_padded(self.weekly)
-    }
-
-    fn format_weekly_compact(&self) -> String {
-        format_pct(self.weekly)
-    }
-}
-
-struct AbortTasksOnDrop(Vec<tokio::task::JoinHandle<()>>);
-
-impl Drop for AbortTasksOnDrop {
-    fn drop(&mut self) {
-        for handle in &self.0 {
-            handle.abort();
+        LastQuotaStatus::Known {
+            percentage,
+            last_updated,
+        } => format!(
+            "{:.0}% ({})",
+            percentage.clamp(0.0, 100.0),
+            format_compact_age(last_updated, now_unix)
+        ),
+        LastQuotaStatus::Unknown { last_updated } => {
+            format!("unknown ({})", format_compact_age(last_updated, now_unix))
         }
     }
 }
 
-/// Poll non-blocking raw-mode terminal events while an async refresh (`r` / `R`) is in flight.
+fn account_plan_label(acc: &crate::domain::account::AccountRecord) -> String {
+    let Some(ref q) = acc.quota else {
+        return "—".into();
+    };
+    let Some(raw) = q.subscription_tier.as_deref() else {
+        return "—".into();
+    };
+    let clean = terminal_text(raw);
+    if clean.trim().is_empty() {
+        "—".into()
+    } else {
+        short_plan_label(&clean)
+    }
+}
+
+struct ActiveQuotaHeader {
+    label: String,
+    expanded_lines: Vec<String>,
+    compact_summary: String,
+}
+
+fn resolve_active_slot_account_id<'a>(
+    session_id: &'a crate::domain::account::SessionIdentity,
+    selected_id: Option<&'a str>,
+) -> Option<&'a str> {
+    match session_id {
+        crate::domain::account::SessionIdentity::Matched { account_id, .. }
+        | crate::domain::account::SessionIdentity::DriftedKnown { account_id, .. } => {
+            Some(account_id.as_str())
+        }
+        _ => selected_id,
+    }
+}
+
+fn resolve_active_account<'a>(
+    accounts: &'a [crate::domain::account::AccountRecord],
+    selected_id: Option<&str>,
+    session_id: &crate::domain::account::SessionIdentity,
+) -> Option<&'a crate::domain::account::AccountRecord> {
+    resolve_active_slot_account_id(session_id, selected_id)
+        .and_then(|id| accounts.iter().find(|a| a.id == id))
+}
+
+fn build_active_quota_header(
+    active_acc: Option<&crate::domain::account::AccountRecord>,
+    now_unix: i64,
+) -> ActiveQuotaHeader {
+    let Some(acc) = active_acc else {
+        return ActiveQuotaHeader {
+            label: "Quota".into(),
+            expanded_lines: vec!["— (no active account)".into()],
+            compact_summary: "—".into(),
+        };
+    };
+    let Some(ref q) = acc.quota else {
+        return ActiveQuotaHeader {
+            label: "Quota".into(),
+            expanded_lines: vec!["— (press 'r' on * to refresh)".into()],
+            compact_summary: "—".into(),
+        };
+    };
+    if is_tier_only_placeholder(q) {
+        return ActiveQuotaHeader {
+            label: "Quota".into(),
+            expanded_lines: vec!["— (press 'r' on * to refresh)".into()],
+            compact_summary: "—".into(),
+        };
+    }
+    let label = format!("Quota ({})", format_compact_age(q.last_updated, now_unix));
+    if q.is_forbidden {
+        return ActiveQuotaHeader {
+            label,
+            expanded_lines: vec!["forbidden (HTTP 403)".into()],
+            compact_summary: "forbidden".into(),
+        };
+    }
+
+    struct PoolHeaderBuckets {
+        name: &'static str,
+        short_tag: &'static str,
+        short_5h: Option<(i32, String)>,
+        weekly: Option<(i32, String)>,
+    }
+
+    let extract_bucket_reset = |b: &crate::domain::quota::QuotaBucket| -> String {
+        if is_unused_full_bucket_reset_time(
+            &b.reset_time,
+            b.remaining_fraction,
+            b.remaining_fraction_known,
+        ) {
+            return "—".into();
+        }
+        match crate::domain::clock::parse_rfc3339_unix_seconds(&b.reset_time) {
+            Some(ts) => format_compact_reset_duration(ts, now_unix),
+            None => "—".into(),
+        }
+    };
+
+    let mut pools: Vec<PoolHeaderBuckets> = Vec::new();
+    if let Some(ref groups) = q.quota_groups {
+        for (target_pool, name, short_tag) in [
+            (QuotaPool::Gemini, "Gemini", "Gem"),
+            (QuotaPool::ThirdParty, "Claude/GPT", "3P"),
+            (QuotaPool::Argon, "Argon", "Arg"),
+        ] {
+            let mut short_5h: Option<(i32, String)> = None;
+            let mut weekly: Option<(i32, String)> = None;
+            let mut has_any = false;
+            for g in groups {
+                for b in &g.buckets {
+                    if quota_pool(&b.bucket_id, &g.display_name) != Some(target_pool) {
+                        continue;
+                    }
+                    has_any = true;
+                    let Some(pct) =
+                        observed_quota_percentage(b.remaining_fraction, b.remaining_fraction_known)
+                    else {
+                        continue;
+                    };
+                    let reset_tag = extract_bucket_reset(b);
+                    let w_low = b.window.trim().to_ascii_lowercase();
+                    let id_low = b.bucket_id.trim().to_ascii_lowercase();
+                    if w_low == "weekly" || id_low.ends_with("-weekly") {
+                        if weekly.as_ref().is_none_or(|(old_p, _)| pct < *old_p) {
+                            weekly = Some((pct, reset_tag));
+                        }
+                    } else if (w_low == "5h" || id_low.ends_with("-5h"))
+                        && short_5h.as_ref().is_none_or(|(old_p, _)| pct < *old_p)
+                    {
+                        short_5h = Some((pct, reset_tag));
+                    }
+                }
+            }
+            if has_any && (short_5h.is_some() || weekly.is_some()) {
+                pools.push(PoolHeaderBuckets {
+                    name,
+                    short_tag,
+                    short_5h,
+                    weekly,
+                });
+            }
+        }
+    }
+
+    if pools.is_empty() {
+        return ActiveQuotaHeader {
+            label,
+            expanded_lines: vec!["— (no quota buckets cached)".into()],
+            compact_summary: "—".into(),
+        };
+    }
+
+    let max_5h_w = pools
+        .iter()
+        .filter_map(|p| {
+            p.short_5h.as_ref().map(|(pct, rst)| {
+                display_width(&format!("5h {} ({rst})", format_pct_padded(Some(*pct))))
+            })
+        })
+        .max()
+        .unwrap_or(0);
+
+    let mut expanded_lines = Vec::with_capacity(pools.len());
+    let mut compact_parts = Vec::with_capacity(pools.len());
+    for p in &pools {
+        match (&p.short_5h, &p.weekly) {
+            (Some((p5, r5)), Some((pw, rw))) => {
+                let s5 = format!("5h {} ({r5})", format_pct_padded(Some(*p5)));
+                let pad = max_5h_w.saturating_sub(display_width(&s5));
+                expanded_lines.push(format!(
+                    "{:<10}  {s5}{}  · Weekly {} ({rw})",
+                    p.name,
+                    " ".repeat(pad),
+                    format_pct_padded(Some(*pw))
+                ));
+                compact_parts.push(format!(
+                    "{} {}/{}",
+                    p.short_tag,
+                    format_pct(Some(*p5)),
+                    format_pct(Some(*pw))
+                ));
+            }
+            (None, Some((pw, rw))) => {
+                expanded_lines.push(format!(
+                    "{:<10}  Weekly {} ({rw})",
+                    p.name,
+                    format_pct_padded(Some(*pw))
+                ));
+                compact_parts.push(format!("{} {}", p.short_tag, format_pct(Some(*pw))));
+            }
+            (Some((p5, r5)), None) => {
+                expanded_lines.push(format!(
+                    "{:<10}  5h {} ({r5})",
+                    p.name,
+                    format_pct_padded(Some(*p5))
+                ));
+                compact_parts.push(format!("{} {}", p.short_tag, format_pct(Some(*p5))));
+            }
+            (None, None) => {}
+        }
+    }
+
+    ActiveQuotaHeader {
+        label,
+        expanded_lines,
+        compact_summary: compact_parts.join(" · "),
+    }
+}
+
+/// Poll non-blocking raw-mode terminal events while an async refresh (`r`) is in flight.
 /// Because `enable_raw_mode()` clears `ISIG`, pressing `Ctrl+C` on the keyboard delivers `0x03`
 /// on `stdin` rather than an OS `SIGINT` signal. Returns `(should_exit_tui, saw_resize)`.
 fn poll_raw_tty_interrupt_or_resize() -> (bool, bool) {
@@ -2187,11 +2347,31 @@ fn poll_raw_tty_interrupt_or_resize() -> (bool, bool) {
     (false, saw_resize)
 }
 
+/// Interaction T2: `r` is completely decoupled from `Space` multi-select and ONLY refreshes when
+/// the cursor is on the currently active (`*`) official-slot account; pressing `r` on a dormant
+/// account makes zero requests and shows a gentle status hint to switch with `s` first.
+fn resolve_r_refresh_target<'a>(
+    accounts: &'a [crate::domain::account::AccountRecord],
+    session_id: &crate::domain::account::SessionIdentity,
+    selected_id: Option<&str>,
+    cursor_idx: usize,
+) -> Result<&'a crate::domain::account::AccountRecord, &'static str> {
+    let Some(target) = accounts.get(cursor_idx) else {
+        return Err("No account selected.");
+    };
+    if resolve_active_slot_account_id(session_id, selected_id) == Some(target.id.as_str()) {
+        Ok(target)
+    } else {
+        Err(TUI_DORMANT_REFRESH_HINT)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_r_refresh_in_tui(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
-    cli_proxy: Option<&str>,
+    explicit_file_backend: bool,
+    proxy_override: Option<&str>,
     snap: &crate::store::repository::StoreSnapshot,
     cur_policy: &SwitchPolicy,
     session_id: &crate::domain::account::SessionIdentity,
@@ -2207,505 +2387,40 @@ async fn run_r_refresh_in_tui(
     sigint: &mut Option<tokio::signal::unix::Signal>,
     sighup: &mut Option<tokio::signal::unix::Signal>,
 ) -> bool {
-    let (targets, from_marked) = resolve_tui_targets(&snap.accounts, cursor_idx, marked_ids);
-    if targets.len() >= 2 {
-        let pairs: Vec<(String, String)> = targets
-            .iter()
-            .map(|a| (a.id.clone(), a.email.clone()))
-            .collect();
-        let total = pairs.len();
-        let init_msg = format!("Refreshing {total} marked account(s) (0/{total})...");
-        let _ = render_dashboard_full(&mut TuiFrameView {
-            accounts: &snap.accounts,
-            selected_id: snap.index.selected_account_id.as_deref(),
-            policy: cur_policy,
-            session_id,
-            runtime_st,
-            backend_tag: backend.name(),
-            daemon_state,
-            marked_ids,
-            detail_view,
-            detail_scroll,
-            cursor_idx,
-            scroll_offset,
-            transient_notice: Some(&init_msg),
-            now_unix: crate::domain::clock::current_unix_seconds(),
-        });
-        run_batch_refresh_in_tui(
-            repo,
-            backend,
-            cli_proxy,
-            &pairs,
-            if from_marked { "marked" } else { "enabled" },
-            marked_ids,
-            detail_view,
-            detail_scroll,
-            cursor_idx,
-            scroll_offset,
-            transient_status,
-            sigterm,
-            sigint,
-            sighup,
-        )
-        .await
-    } else if let Some(target) = targets.first().copied() {
-        run_single_refresh_in_tui(
-            repo,
-            backend,
-            cli_proxy,
-            snap,
-            cur_policy,
-            session_id,
-            runtime_st,
-            daemon_state,
-            marked_ids,
-            detail_view,
-            detail_scroll,
-            cursor_idx,
-            scroll_offset,
-            target,
-            transient_status,
-            sigterm,
-            sigint,
-            sighup,
-        )
-        .await
-    } else {
-        false
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_live_batch_progress(
-    repo: &StoreRepository,
-    backend: &dyn CredentialBackend,
-    scope_label: &str,
-    marked_ids: &HashSet<String>,
-    detail_view: bool,
-    detail_scroll: &mut usize,
-    cursor_idx: usize,
-    scroll_offset: &mut usize,
-    completed: usize,
-    total: usize,
-) {
-    if let (Ok(live_snap), Ok(live_pol)) = (repo.read_snapshot(), repo.read_policy()) {
-        let slot_st = backend.inspect_slot(repo.paths());
-        let sess_id = resolve_session_identity(&slot_st, &live_snap);
-        let run_st = observe_runtime_state(repo.paths());
-        let daemon_st = read_daemon_state_readonly(repo.paths()).ok();
-        let cur_bounded = if live_snap.accounts.is_empty() {
-            0
-        } else {
-            cursor_idx.min(live_snap.accounts.len() - 1)
-        };
-        let prog_msg =
-            format!("Refreshing {total} {scope_label} account(s) ({completed}/{total})...");
-        let _ = render_dashboard_full(&mut TuiFrameView {
-            accounts: &live_snap.accounts,
-            selected_id: live_snap.index.selected_account_id.as_deref(),
-            policy: &live_pol,
-            session_id: &sess_id,
-            runtime_st: &run_st,
-            backend_tag: backend.name(),
-            daemon_state: daemon_st.as_ref(),
-            marked_ids,
-            detail_view,
-            detail_scroll,
-            cursor_idx: cur_bounded,
-            scroll_offset,
-            transient_notice: Some(&prog_msg),
-            now_unix: crate::domain::clock::current_unix_seconds(),
-        });
-    }
-}
-
-fn format_tui_proxy_warning_prefix(warnings: &[String]) -> String {
-    if warnings.is_empty() {
-        String::new()
-    } else {
-        let joined = warnings
-            .iter()
-            .map(|w| terminal_text(w))
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!("[warning: {joined}] ")
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_batch_refresh_in_tui(
-    repo: &StoreRepository,
-    backend: &dyn CredentialBackend,
-    cli_proxy: Option<&str>,
-    targets: &[(String, String)],
-    scope_label: &str,
-    marked_ids: &HashSet<String>,
-    detail_view: bool,
-    detail_scroll: &mut usize,
-    cursor_idx: usize,
-    scroll_offset: &mut usize,
-    transient_status: &mut TransientStatus,
-    sigterm: &mut Option<tokio::signal::unix::Signal>,
-    sigint: &mut Option<tokio::signal::unix::Signal>,
-    sighup: &mut Option<tokio::signal::unix::Signal>,
-) -> bool {
-    let now_unix = crate::domain::clock::current_unix_seconds();
-    let prep_proxy_warnings = std::sync::Mutex::new(Vec::new());
-    let mut prep = std::pin::pin!(async {
-        reconcile_pending_journal_before_write(repo, backend, now_unix)?;
-        let cfg = repo.read_config()?;
-        let registry = OAuthClientRegistry::load(repo.paths())?;
-        let (proxy_mode, warns) =
-            ProxyMode::resolve_with_config_and_warnings(cli_proxy, Some(&cfg.network))?;
-        *prep_proxy_warnings.lock().unwrap() = warns;
-        let transport = ReqwestTransport::build(proxy_mode)?;
-        let ua = resolve_native_oauth_user_agent(repo.paths(), &transport, false, now_unix).await;
-        Ok::<_, CliError>((Arc::new(transport), Arc::new(registry), ua))
-    });
-
-    let (transport, registry, ua) = loop {
-        tokio::select! {
-            _ = async {
-                if let Some(ref mut s) = sigterm { let _ = s.recv().await; }
-                else { std::future::pending::<()>().await; }
-            } => return true,
-            _ = async {
-                if let Some(ref mut s) = sigint { let _ = s.recv().await; }
-                else { std::future::pending::<()>().await; }
-            } => return true,
-            _ = async {
-                if let Some(ref mut s) = sighup { let _ = s.recv().await; }
-                else { std::future::pending::<()>().await; }
-            } => return true,
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {
-                let (should_exit, saw_resize) = poll_raw_tty_interrupt_or_resize();
-                if should_exit {
-                    return true;
-                }
-                if saw_resize {
-                    render_live_batch_progress(
-                        repo,
-                        backend,
-                        scope_label,
-                        marked_ids,
-                        detail_view,
-                        detail_scroll,
-                        cursor_idx,
-                        scroll_offset,
-                        0,
-                        targets.len(),
-                    );
-                }
-            }
-            res = &mut prep => break match res {
-                Ok(v) => v,
-                Err(e) => {
-                    let proxy_prefix =
-                        format_tui_proxy_warning_prefix(&prep_proxy_warnings.lock().unwrap());
-                    transient_status.set_error(
-                        format!(
-                            "{proxy_prefix}Refresh error: {}",
-                            terminal_text(&e.message)
-                        ),
-                        Instant::now(),
-                    );
-                    return false;
-                }
-            },
-        }
-    };
-
-    let total = targets.len();
-    let oauth_ep = Arc::new(OAuthEndpoints::default());
-    let quota_ep = Arc::new(CloudCodeEndpoints::default());
-    let transport_dyn: Arc<dyn HttpTransport> = transport;
-    let outcome = run_tui_batch_refresh_loop_with_marks(
-        repo,
-        backend,
-        targets.to_vec(),
-        scope_label,
-        marked_ids,
-        detail_view,
-        detail_scroll,
-        transport_dyn,
-        registry,
-        oauth_ep,
-        quota_ep,
-        ua,
-        TUI_BATCH_REFRESH_CONCURRENCY,
+    match resolve_r_refresh_target(
+        &snap.accounts,
+        session_id,
+        snap.index.selected_account_id.as_deref(),
         cursor_idx,
-        scroll_offset,
-        true,
-        sigterm,
-        sigint,
-        sighup,
-    )
-    .await;
-    if outcome.interrupted {
-        return true;
-    }
-
-    let proxy_prefix = format_tui_proxy_warning_prefix(&prep_proxy_warnings.lock().unwrap());
-    let done_at = Instant::now();
-    if let Some((rec_email, rec_err)) = outcome.recovery_error {
-        transient_status.set_error(
-            format!(
-                "{proxy_prefix}Stopped batch refresh after recovery error on {}: {} ({} ok, {} skipped).",
-                terminal_text(&rec_email),
-                terminal_text(&rec_err.message),
-                outcome.ok_count,
-                outcome.skipped_after_recovery,
-            ),
-            done_at,
-        );
-    } else if outcome.failures.is_empty() {
-        transient_status.set_info(
-            format!(
-                "{proxy_prefix}Refreshed {}/{total} {scope_label} account(s).",
-                outcome.ok_count
-            ),
-            done_at,
-        );
-    } else {
-        let (first_email, first_err) = &outcome.failures[0];
-        transient_status.set_error(
-            format!(
-                "{proxy_prefix}Refreshed {}/{total} ({} failed; {}: {}).",
-                outcome.ok_count,
-                outcome.failures.len(),
-                terminal_text(first_email),
-                terminal_text(first_err)
-            ),
-            done_at,
-        );
-    }
-    false
-}
-
-struct TuiBatchRefreshLoopOutcome {
-    interrupted: bool,
-    ok_count: usize,
-    failures: Vec<(String, String)>,
-    recovery_error: Option<(String, CliError)>,
-    skipped_after_recovery: usize,
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-async fn run_tui_batch_refresh_loop(
-    repo: &StoreRepository,
-    backend: &dyn CredentialBackend,
-    targets: Vec<(String, String)>,
-    transport: Arc<dyn HttpTransport>,
-    registry: Arc<OAuthClientRegistry>,
-    oauth_ep: Arc<OAuthEndpoints>,
-    quota_ep: Arc<CloudCodeEndpoints>,
-    ua: String,
-    concurrency: usize,
-    cursor_idx: usize,
-    scroll_offset: &mut usize,
-    render_tty_progress: bool,
-    sigterm: &mut Option<tokio::signal::unix::Signal>,
-    sigint: &mut Option<tokio::signal::unix::Signal>,
-    sighup: &mut Option<tokio::signal::unix::Signal>,
-) -> TuiBatchRefreshLoopOutcome {
-    let empty_marks = HashSet::new();
-    let mut dummy_detail_scroll = 0usize;
-    run_tui_batch_refresh_loop_with_marks(
-        repo,
-        backend,
-        targets,
-        "enabled",
-        &empty_marks,
-        false,
-        &mut dummy_detail_scroll,
-        transport,
-        registry,
-        oauth_ep,
-        quota_ep,
-        ua,
-        concurrency,
-        cursor_idx,
-        scroll_offset,
-        render_tty_progress,
-        sigterm,
-        sigint,
-        sighup,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_tui_batch_refresh_loop_with_marks(
-    repo: &StoreRepository,
-    backend: &dyn CredentialBackend,
-    targets: Vec<(String, String)>,
-    scope_label: &str,
-    marked_ids: &HashSet<String>,
-    detail_view: bool,
-    detail_scroll: &mut usize,
-    transport: Arc<dyn HttpTransport>,
-    registry: Arc<OAuthClientRegistry>,
-    oauth_ep: Arc<OAuthEndpoints>,
-    quota_ep: Arc<CloudCodeEndpoints>,
-    ua: String,
-    concurrency: usize,
-    cursor_idx: usize,
-    scroll_offset: &mut usize,
-    render_tty_progress: bool,
-    sigterm: &mut Option<tokio::signal::unix::Signal>,
-    sigint: &mut Option<tokio::signal::unix::Signal>,
-    sighup: &mut Option<tokio::signal::unix::Signal>,
-) -> TuiBatchRefreshLoopOutcome {
-    let total = targets.len();
-    let max_in_flight = concurrency.max(1);
-    let (tx, mut rx) =
-        mpsc::unbounded_channel::<(String, CliResult<crate::domain::account::AccountRecord>)>();
-
-    let mut queue: VecDeque<(String, String)> = targets.into_iter().collect();
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(total);
-    let mut in_flight = 0usize;
-
-    let spawn_next = |queue: &mut VecDeque<(String, String)>,
-                      handles: &mut Vec<tokio::task::JoinHandle<()>>,
-                      in_flight: &mut usize| {
-        if let Some((id_c, email_c)) = queue.pop_front() {
-            let repo_c = repo.clone();
-            let tr_c = transport.clone();
-            let reg_c = registry.clone();
-            let oe_c = oauth_ep.clone();
-            let qe_c = quota_ep.clone();
-            let ua_c = ua.clone();
-            let tx_c = tx.clone();
-            handles.push(tokio::spawn(async move {
-                let res = refresh_account_quota_locked(
-                    &repo_c,
-                    tr_c.as_ref(),
-                    &oe_c,
-                    &qe_c,
-                    &reg_c,
-                    &ua_c,
-                    &id_c,
-                    crate::domain::clock::current_unix_seconds(),
-                )
-                .await;
-                let _ = tx_c.send((email_c, res));
-            }));
-            *in_flight += 1;
-        }
-    };
-
-    // Dispatch ONLY up to `max_in_flight` tasks initially; any `PartialCommitOrRecovery` (`7`)
-    // immediately clears `queue` so remaining accounts issue zero further `/token` exchanges while
-    // already-in-flight tasks safely finish persisting their responses!
-    while in_flight < max_in_flight && !queue.is_empty() {
-        spawn_next(&mut queue, &mut handles, &mut in_flight);
-    }
-
-    let mut completed = 0usize;
-    let mut ok_count = 0usize;
-    let mut failures: Vec<(String, String)> = Vec::new();
-    let mut recovery_error: Option<(String, CliError)> = None;
-    let mut skipped_after_recovery = 0usize;
-    let mut interrupted = false;
-
-    while in_flight > 0 {
-        let next_item = if render_tty_progress {
-            tokio::select! {
-                _ = async {
-                    if let Some(ref mut s) = sigterm { let _ = s.recv().await; }
-                    else { std::future::pending::<()>().await; }
-                } => { interrupted = true; break; }
-                _ = async {
-                    if let Some(ref mut s) = sigint { let _ = s.recv().await; }
-                    else { std::future::pending::<()>().await; }
-                } => { interrupted = true; break; }
-                _ = async {
-                    if let Some(ref mut s) = sighup { let _ = s.recv().await; }
-                    else { std::future::pending::<()>().await; }
-                } => { interrupted = true; break; }
-                _ = tokio::time::sleep(Duration::from_millis(20)) => {
-                    let (should_exit, saw_resize) = poll_raw_tty_interrupt_or_resize();
-                    if should_exit {
-                        interrupted = true;
-                        break;
-                    }
-                    if saw_resize {
-                        render_live_batch_progress(
-                            repo,
-                            backend,
-                            scope_label,
-                            marked_ids,
-                            detail_view,
-                            detail_scroll,
-                            cursor_idx,
-                            scroll_offset,
-                            completed,
-                            total,
-                        );
-                    }
-                    continue;
-                }
-                item = rx.recv() => item,
-            }
-        } else {
-            rx.recv().await
-        };
-
-        let Some((email, res)) = next_item else {
-            break;
-        };
-        in_flight = in_flight.saturating_sub(1);
-        completed += 1;
-        match res {
-            Ok(_) => ok_count += 1,
-            Err(e) => {
-                if e.exit_code == crate::error::ExitCode::PartialCommitOrRecovery {
-                    if recovery_error.is_none() {
-                        recovery_error = Some((email.clone(), e.clone()));
-                    }
-                    skipped_after_recovery += queue.len();
-                    queue.clear();
-                }
-                failures.push((email, e.message));
-            }
-        }
-        if recovery_error.is_none() {
-            while in_flight < max_in_flight && !queue.is_empty() {
-                spawn_next(&mut queue, &mut handles, &mut in_flight);
-            }
-        }
-        if render_tty_progress && completed < total && recovery_error.is_none() {
-            render_live_batch_progress(
+    ) {
+        Ok(target) => {
+            run_single_refresh_in_tui(
                 repo,
                 backend,
-                scope_label,
+                explicit_file_backend,
+                proxy_override,
+                snap,
+                cur_policy,
+                session_id,
+                runtime_st,
+                daemon_state,
                 marked_ids,
                 detail_view,
                 detail_scroll,
                 cursor_idx,
                 scroll_offset,
-                completed,
-                total,
-            );
+                target,
+                transient_status,
+                sigterm,
+                sigint,
+                sighup,
+            )
+            .await
         }
-    }
-
-    drop(tx);
-    if interrupted {
-        let _abort_guard = AbortTasksOnDrop(handles);
-    } else {
-        for h in handles {
-            let _ = h.await;
+        Err(hint) => {
+            transient_status.set_info(hint.to_string(), Instant::now());
+            false
         }
-    }
-
-    TuiBatchRefreshLoopOutcome {
-        interrupted,
-        ok_count,
-        failures,
-        recovery_error,
-        skipped_after_recovery,
     }
 }
 
@@ -2882,14 +2597,6 @@ fn toggle_policy_enabled_in_tui(
     }
 }
 
-#[derive(Debug, Clone)]
-struct AccountPoolSummary {
-    plan: String,
-    gemini: PoolWindowPair,
-    third_party: PoolWindowPair,
-    argon: PoolWindowPair,
-}
-
 fn current_terminal_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0
@@ -3022,6 +2729,18 @@ fn format_tui_switch_status_notice(
         )
     } else {
         format!("{proxy_prefix}Switched active slot to {id} ({email}).")
+    }
+}
+
+fn format_tui_refresh_status_notice(
+    outcome: &crate::quota::official_cli::ActiveSlotQuotaRefreshOutcome,
+) -> String {
+    let id = terminal_text(&outcome.account.id);
+    let email = terminal_text(&outcome.account.email);
+    if outcome.validation_blocked {
+        format!("Refresh blocked (verify-blocked): open agy to verify, press r — {email} ({id})")
+    } else {
+        format!("Refreshed quota for {email}.")
     }
 }
 
@@ -3233,6 +2952,75 @@ fn wrap_family_models_lines(family_label: &str, items: &[&str], max_cols: usize)
     out
 }
 
+fn wrap_labeled_text_lines(label: &str, text: &str, max_cols: usize) -> Vec<String> {
+    let clean_label = terminal_text(label);
+    let words: Vec<String> = terminal_text(text)
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect();
+    if words.is_empty() || max_cols == 0 {
+        return Vec::new();
+    }
+    let inline_prefix = format!("  {clean_label:<10} : ");
+    let inline_prefix_w = display_width(&inline_prefix);
+    let mut out = Vec::new();
+    let (first_prefix, cont_indent, content_budget) = if max_cols >= inline_prefix_w + 8 {
+        (
+            inline_prefix,
+            " ".repeat(inline_prefix_w),
+            max_cols - inline_prefix_w,
+        )
+    } else {
+        out.push(truncate_to_cols(&format!("  {clean_label}:"), max_cols));
+        let indent = if max_cols >= 6 { "    " } else { "" };
+        let indent_w = display_width(indent);
+        (
+            indent.to_string(),
+            indent.to_string(),
+            max_cols.saturating_sub(indent_w).max(1),
+        )
+    };
+
+    let mut cur_line = String::new();
+    let mut first = true;
+    let push_line = |out: &mut Vec<String>, first: &mut bool, line_text: String| {
+        if *first {
+            out.push(format!("{first_prefix}{line_text}"));
+            *first = false;
+        } else {
+            out.push(format!("{cont_indent}{line_text}"));
+        }
+    };
+
+    for word in words {
+        if !cur_line.is_empty()
+            && display_width(&cur_line) + 1 + display_width(&word) <= content_budget
+        {
+            cur_line.push(' ');
+            cur_line.push_str(&word);
+        } else {
+            if !cur_line.is_empty() {
+                push_line(&mut out, &mut first, std::mem::take(&mut cur_line));
+            }
+            if display_width(&word) <= content_budget {
+                cur_line = word;
+            } else {
+                let mut chunks = split_grapheme_chunks(&word, content_budget);
+                if let Some(last) = chunks.pop() {
+                    for chunk in chunks {
+                        push_line(&mut out, &mut first, chunk);
+                    }
+                    cur_line = last;
+                }
+            }
+        }
+    }
+    if !cur_line.is_empty() {
+        push_line(&mut out, &mut first, cur_line);
+    }
+    out
+}
+
 fn build_account_detail_lines(
     acc: &crate::domain::account::AccountRecord,
     policy: &SwitchPolicy,
@@ -3321,7 +3109,7 @@ fn build_account_detail_lines(
         format_token_expiry_countdown(acc.token.expiry_timestamp, now_unix)
     ));
 
-    if let Some(ref q) = acc.quota {
+    if let Some(q) = acc.quota.as_ref().filter(|q| !is_tier_only_placeholder(q)) {
         let eval_tag = match evaluate_account_quota(
             acc,
             &policy.monitored_model,
@@ -3346,8 +3134,10 @@ fn build_account_detail_lines(
             format_relative_age(q.last_updated, now_unix),
             q.source_env,
         ));
-    } else {
+    } else if is_selected {
         lines.push("Updated : never refreshed (press r to fetch)".into());
+    } else {
+        lines.push("Updated : never refreshed (switch with s, then press r)".into());
     }
 
     lines.push(String::new());
@@ -3378,7 +3168,15 @@ fn build_account_detail_lines(
                             b.remaining_fraction,
                             b.remaining_fraction_known,
                         );
-                        let reset_str = format_reset_local(&b.reset_time, now_unix);
+                        let reset_str = if is_unused_full_bucket_reset_time(
+                            &b.reset_time,
+                            b.remaining_fraction,
+                            b.remaining_fraction_known,
+                        ) {
+                            "—".into()
+                        } else {
+                            format_reset_local(&b.reset_time, now_unix)
+                        };
                         rows_for_pool.push((sort_key, win, pct, reset_str));
                     }
                 }
@@ -3397,38 +3195,56 @@ fn build_account_detail_lines(
         }
     }
     if !rendered_any_bucket {
-        lines.push("  (no cached quota buckets — press r to refresh)".into());
+        if is_selected {
+            lines.push("  (no cached quota buckets — press r to refresh)".into());
+        } else {
+            lines.push("  (no cached quota buckets — press s to switch, then r to refresh)".into());
+        }
     }
 
     lines.push(String::new());
-    match acc.quota.as_ref().map(extract_supported_models) {
+    match acc.quota.as_ref().filter(|q| !is_tier_only_placeholder(q)) {
         None => {
-            lines.push("Models  : unknown (press r to refresh)".into());
-        }
-        Some(models) if models.is_empty() => {
-            lines.push("Models  : none reported".into());
-        }
-        Some(models) => {
-            lines.push(format!("Models ({} available):", models.len()));
-            let mut gemini = Vec::new();
-            let mut third_party = Vec::new();
-            let mut other = Vec::new();
-            for m in &models {
-                let lower = m.to_ascii_lowercase();
-                if lower.starts_with("gemini") {
-                    gemini.push(m.as_str());
-                } else if lower.starts_with("claude") || lower.starts_with("gpt") {
-                    third_party.push(m.as_str());
-                } else {
-                    other.push(m.as_str());
-                }
+            if is_selected {
+                lines.push("Models  : unknown (press r to refresh)".into());
+            } else {
+                lines.push("Models  : unknown (switch with s, then press r)".into());
             }
-            for (family, items) in [
-                ("Gemini", gemini),
-                ("Claude/GPT", third_party),
-                ("Other", other),
-            ] {
-                lines.extend(wrap_family_models_lines(family, &items, inner_width));
+        }
+        Some(q) => {
+            let models = extract_supported_models(q);
+            if !models.is_empty() {
+                lines.push(format!("Models ({} available):", models.len()));
+                let mut gemini = Vec::new();
+                let mut third_party = Vec::new();
+                let mut other = Vec::new();
+                for m in &models {
+                    let lower = m.to_ascii_lowercase();
+                    if lower.starts_with("gemini") {
+                        gemini.push(m.as_str());
+                    } else if lower.starts_with("claude") || lower.starts_with("gpt") {
+                        third_party.push(m.as_str());
+                    } else {
+                        other.push(m.as_str());
+                    }
+                }
+                for (family, items) in [
+                    ("Gemini", gemini),
+                    ("Claude/GPT", third_party),
+                    ("Other", other),
+                ] {
+                    lines.extend(wrap_family_models_lines(family, &items, inner_width));
+                }
+            } else {
+                let group_descs = extract_quota_group_descriptions(q);
+                if !group_descs.is_empty() {
+                    lines.push("Groups  :".into());
+                    for (group_name, desc) in &group_descs {
+                        lines.extend(wrap_labeled_text_lines(group_name, desc, inner_width));
+                    }
+                } else {
+                    lines.push("Models  : none reported".into());
+                }
             }
         }
     }
@@ -3537,15 +3353,25 @@ fn render_detail_card_lines(
     }
 }
 
-fn detail_keys_help_for_width(cols: usize) -> String {
-    let candidate = if cols >= display_width(TUI_DETAIL_KEYS_LINE) {
-        TUI_DETAIL_KEYS_LINE
+fn detail_keys_help_for_width(cols: usize, is_active: bool) -> String {
+    let candidate = if is_active {
+        if cols >= display_width(TUI_DETAIL_KEYS_LINE_ACTIVE) {
+            TUI_DETAIL_KEYS_LINE_ACTIVE
+        } else if cols >= 80 {
+            "Keys   : ←/→ account · ↑/↓ scroll · Space mark · l lbl · r ref · k cd · s sw · i/Esc back"
+        } else if cols >= 56 {
+            "Keys   : ←/→ acc · ↑/↓ scr · Spc · l · r · k · s · i/Esc"
+        } else {
+            "Keys: ←/→ · ↑/↓ · l · r · s · i/Esc back"
+        }
+    } else if cols >= display_width(TUI_DETAIL_KEYS_LINE_DORMANT) {
+        TUI_DETAIL_KEYS_LINE_DORMANT
     } else if cols >= 80 {
-        "Keys   : ←/→ account · ↑/↓ scroll · Space mark · l lbl · r ref · k cd · s sw · i/Esc back"
+        "Keys   : ←/→ account · ↑/↓ scroll · Space mark · l lbl · k cd · s sw · i/Esc back"
     } else if cols >= 56 {
-        "Keys   : ←/→ acc · ↑/↓ scr · Spc · l · r · k · s · i/Esc"
+        "Keys   : ←/→ acc · ↑/↓ scr · Spc · l · k · s · i/Esc"
     } else {
-        "Keys: ←/→ · ↑/↓ · l · r · s · i/Esc back"
+        "Keys: ←/→ · ↑/↓ · l · s · i/Esc back"
     };
     truncate_to_cols(candidate, cols)
 }
@@ -3586,10 +3412,29 @@ fn build_dashboard_frame_full(
         _ => "file",
     };
 
-    let summaries: Vec<AccountPoolSummary> = accounts.iter().map(summarize_pools).collect();
-    let show_argon = summaries.iter().any(|s| s.argon.has_bucket);
+    let active_slot_id = resolve_active_slot_account_id(session_id, selected_id);
+    let active_acc = resolve_active_account(accounts, selected_id, session_id);
+    let active_plan_suffix = if matches!(
+        session_id,
+        crate::domain::account::SessionIdentity::Matched { .. }
+            | crate::domain::account::SessionIdentity::DriftedKnown { .. }
+    ) {
+        active_acc
+            .map(account_plan_label)
+            .filter(|p| p != "—")
+            .map(|p| format!(" · {p}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let quota_hdr = build_active_quota_header(active_acc, now_unix);
+
+    let plan_cells: Vec<String> = accounts.iter().map(account_plan_label).collect();
+    let last_quota_cells: Vec<String> = accounts
+        .iter()
+        .map(|acc| format_last_quota_cell(acc, policy, now_unix))
+        .collect();
     let show_id_col = cols >= 152;
-    let compact_cols = cols < 116;
 
     let state_tag = if policy.enabled { "ON" } else { "off" };
     let daemon_suffix = format_daemon_policy_suffix(daemon_state, now_unix);
@@ -3602,26 +3447,35 @@ fn build_dashboard_frame_full(
         terminal_text(&policy.monitored_model)
     );
     let sess_label = format!("Session [{clean_backend_tag}]");
-    let label_w = sess_label.len();
+    let use_three_line_header = rows >= 11;
+    let use_expanded_quota_header = !detail_view && rows >= 14;
+    let show_folded_quota_line = !detail_view && !use_expanded_quota_header && rows >= 7;
+    let label_w = if detail_view {
+        sess_label.len()
+    } else {
+        sess_label
+            .len()
+            .max(quota_hdr.label.len())
+            .max("Runtime".len())
+            .max("Policy".len())
+    };
+    let session_human = format!(
+        "{}{}",
+        format_session_identity_human(session_id),
+        active_plan_suffix
+    );
     let compact_session_line = truncate_to_cols(
         &format!(
-            "{sess_label}: {} | Runtime: {} | Policy: {}",
-            format_session_identity_human(session_id),
+            "{sess_label}: {session_human} | Runtime: {} | Policy: {}",
             format_runtime_state_human(runtime_st),
             policy_header
         ),
         cols,
     );
-    let use_three_line_header = rows >= 11;
-    let status_header_lines: Vec<String> = if use_three_line_header {
+
+    let mut status_header_lines: Vec<String> = if use_three_line_header {
         vec![
-            truncate_to_cols(
-                &format!(
-                    "{sess_label} : {}",
-                    format_session_identity_human(session_id)
-                ),
-                cols,
-            ),
+            truncate_to_cols(&format!("{sess_label:<label_w$} : {session_human}"), cols),
             truncate_to_cols(
                 &format!(
                     "{:<label_w$} : {}",
@@ -3635,9 +3489,41 @@ fn build_dashboard_frame_full(
     } else {
         vec![compact_session_line.clone()]
     };
+
+    if use_expanded_quota_header {
+        let indent = " ".repeat(label_w + 3);
+        for (idx, qline) in quota_hdr.expanded_lines.iter().enumerate() {
+            if idx == 0 {
+                status_header_lines.push(truncate_to_cols(
+                    &format!("{:<label_w$} : {qline}", quota_hdr.label),
+                    cols,
+                ));
+            } else {
+                status_header_lines.push(truncate_to_cols(&format!("{indent}{qline}"), cols));
+            }
+        }
+    } else if show_folded_quota_line {
+        if use_three_line_header {
+            status_header_lines.push(truncate_to_cols(
+                &format!(
+                    "{:<label_w$} : {}",
+                    quota_hdr.label, quota_hdr.compact_summary
+                ),
+                cols,
+            ));
+        } else {
+            status_header_lines.push(truncate_to_cols(
+                &format!("{}: {}", quota_hdr.label, quota_hdr.compact_summary),
+                cols,
+            ));
+        }
+    }
+
+    let detail_is_active =
+        !accounts.is_empty() && active_slot_id == Some(accounts[cur].id.as_str());
     let keys_line = keys_help_for_width(cols);
     let footer_help_lines: Vec<String> = if detail_view && !accounts.is_empty() {
-        vec![detail_keys_help_for_width(cols)]
+        vec![detail_keys_help_for_width(cols, detail_is_active)]
     } else if rows >= 14 {
         keys_help_two_lines_for_width(cols).to_vec()
     } else {
@@ -3669,7 +3555,7 @@ fn build_dashboard_frame_full(
 
     if detail_view && !accounts.is_empty() {
         let acc = &accounts[cur];
-        let is_sel = selected_id == Some(acc.id.as_str());
+        let is_sel = active_slot_id == Some(acc.id.as_str());
         let is_marked = marked_ids.contains(&acc.id);
         let mut frame_lines: Vec<String> = Vec::with_capacity(rows);
         if rows < 5 {
@@ -3685,7 +3571,7 @@ fn build_dashboard_frame_full(
             let footer_or_status = if !status_line.is_empty() {
                 status_line
             } else {
-                detail_keys_help_for_width(cols)
+                detail_keys_help_for_width(cols, is_sel)
             };
             frame_lines.push(title);
             if rows >= 2 {
@@ -3739,8 +3625,7 @@ fn build_dashboard_frame_full(
 
     let format_compact_row = |idx: usize| -> String {
         let acc = &accounts[idx];
-        let sum = &summaries[idx];
-        let is_sel = selected_id == Some(acc.id.as_str());
+        let is_sel = active_slot_id == Some(acc.id.as_str());
         let is_marked = marked_ids.contains(&acc.id);
         if cols == 1 {
             return if idx == cur {
@@ -3771,18 +3656,13 @@ fn build_dashboard_frame_full(
         if cols <= 3 {
             return truncate_to_cols(marker.trim_end(), cols);
         }
-        let dto = AccountViewDto::from_record(acc, is_sel);
+        let dto = AccountViewDto::from_record_at(acc, is_sel, now_unix);
         let state_tag = if dto.disabled {
             " [disabled]"
         } else if dto.validation_blocked {
             " [verify-blocked]"
         } else {
             ""
-        };
-        let argon_tag = if show_argon {
-            format!(" | Arg {}", sum.argon.format_weekly_compact())
-        } else {
-            String::new()
         };
         let cand_tag = policy
             .candidate_account_ids
@@ -3798,13 +3678,11 @@ fn build_dashboard_frame_full(
             .unwrap_or_default();
         truncate_to_cols(
             &format!(
-                "{marker} #{} {}{} | Gem {} | 3P {}{}{}",
+                "{marker} #{} {}{} | {}{}",
                 idx + 1,
                 format_account_email_with_label(acc),
                 state_tag,
-                sum.gemini.format_dual_compact(),
-                sum.third_party.format_dual_compact(),
-                argon_tag,
+                last_quota_cells[idx],
                 cand_tag
             ),
             cols,
@@ -3891,18 +3769,8 @@ fn build_dashboard_frame_full(
     // Pre-compute global single-line column budgets across ALL accounts so bordered table rows NEVER
     // wrap onto multiple physical lines when long emails or policy labels scroll into the viewport,
     // guaranteeing 100% constant frame height across every cursor position!
-    let gemini_hdr = if compact_cols {
-        "Gemini 5h/W"
-    } else {
-        "Gemini (5h / W)"
-    };
-    let claude_hdr = if compact_cols {
-        "Claude/GPT 5h/W"
-    } else {
-        "Claude/GPT (5h / W)"
-    };
-    let argon_hdr = if compact_cols { "Argon W" } else { "Argon (W)" };
-    let num_table_cols = 8 + usize::from(show_id_col) + usize::from(show_argon);
+    let last_quota_hdr = "Last Quota";
+    let num_table_cols = 7 + usize::from(show_id_col);
     let table_border_overhead = 3 * num_table_cols + 1;
 
     let idx_col_w = accounts.len().to_string().len().max(3); // fits `"..."` and `"12"`
@@ -3917,34 +3785,18 @@ fn build_dashboard_frame_full(
     } else {
         0
     };
-    let plan_col_w = summaries
+    let plan_col_w = plan_cells
         .iter()
-        .map(|s| display_width(&short_plan_label(&s.plan)))
+        .map(|s| display_width(s))
         .max()
         .unwrap_or(4)
         .clamp(4, 14);
-    let gemini_col_w = summaries
+    let last_quota_col_w = last_quota_cells
         .iter()
-        .map(|s| display_width(&s.gemini.format_dual_aligned()))
+        .map(|s| display_width(s))
         .max()
-        .unwrap_or(0)
-        .max(display_width(gemini_hdr));
-    let claude_col_w = summaries
-        .iter()
-        .map(|s| display_width(&s.third_party.format_dual_aligned()))
-        .max()
-        .unwrap_or(0)
-        .max(display_width(claude_hdr));
-    let argon_col_w = if show_argon {
-        summaries
-            .iter()
-            .map(|s| display_width(&s.argon.format_weekly_aligned()))
-            .max()
-            .unwrap_or(0)
-            .max(display_width(argon_hdr))
-    } else {
-        0
-    };
+        .unwrap_or(display_width(last_quota_hdr))
+        .clamp(display_width(last_quota_hdr), 28);
     let policy_str_for = |acc: &crate::domain::account::AccountRecord| -> String {
         policy
             .candidate_account_ids
@@ -3977,7 +3829,8 @@ fn build_dashboard_frame_full(
     let state_col_w = accounts
         .iter()
         .map(|a| {
-            let dto = AccountViewDto::from_record(a, selected_id == Some(a.id.as_str()));
+            let dto =
+                AccountViewDto::from_record_at(a, active_slot_id == Some(a.id.as_str()), now_unix);
             display_width(state_str_for(&dto))
         })
         .max()
@@ -3989,9 +3842,7 @@ fn build_dashboard_frame_full(
         + sel_col_w
         + id_col_w
         + plan_col_w
-        + gemini_col_w
-        + claude_col_w
-        + argon_col_w
+        + last_quota_col_w
         + policy_col_w
         + state_col_w;
     let email_col_budget = cols.saturating_sub(non_email_total);
@@ -4007,11 +3858,7 @@ fn build_dashboard_frame_full(
             }
             headers.push(Cell::new("Email"));
             headers.push(Cell::new("Plan"));
-            headers.push(Cell::new(gemini_hdr).set_alignment(CellAlignment::Center));
-            headers.push(Cell::new(claude_hdr).set_alignment(CellAlignment::Center));
-            if show_argon {
-                headers.push(Cell::new(argon_hdr).set_alignment(CellAlignment::Center));
-            }
+            headers.push(Cell::new(last_quota_hdr));
             headers.push(Cell::new("Policy"));
             headers.push(Cell::new("State"));
 
@@ -4034,10 +3881,6 @@ fn build_dashboard_frame_full(
                 cells.push(Cell::new(""));
                 cells.push(Cell::new(""));
                 cells.push(Cell::new(""));
-                if show_argon {
-                    cells.push(Cell::new(""));
-                }
-                cells.push(Cell::new(""));
                 cells.push(Cell::new(""));
                 cells
             };
@@ -4048,8 +3891,11 @@ fn build_dashboard_frame_full(
 
             for idx in start..end {
                 let acc = &accounts[idx];
-                let sum = &summaries[idx];
-                let dto = AccountViewDto::from_record(acc, selected_id == Some(acc.id.as_str()));
+                let dto = AccountViewDto::from_record_at(
+                    acc,
+                    active_slot_id == Some(acc.id.as_str()),
+                    now_unix,
+                );
                 let is_marked = marked_ids.contains(&acc.id);
                 let row_no = format!("{}", idx + 1);
                 let pointer = if is_marked {
@@ -4067,7 +3913,8 @@ fn build_dashboard_frame_full(
                         (false, false) => "   ",
                     }
                 };
-                let plan_str = truncate_to_cols(&short_plan_label(&sum.plan), plan_col_w);
+                let plan_str = truncate_to_cols(&plan_cells[idx], plan_col_w);
+                let last_quota_str = truncate_to_cols(&last_quota_cells[idx], last_quota_col_w);
                 let policy_str = truncate_to_cols(&policy_str_for(acc), policy_col_w);
                 let state_str = truncate_to_cols(state_str_for(&dto), state_col_w);
                 let mut cells = vec![
@@ -4085,20 +3932,7 @@ fn build_dashboard_frame_full(
                     effective_email_cap,
                 )));
                 cells.push(Cell::new(plan_str));
-                cells.push(
-                    Cell::new(sum.gemini.format_dual_aligned())
-                        .set_alignment(CellAlignment::Center),
-                );
-                cells.push(
-                    Cell::new(sum.third_party.format_dual_aligned())
-                        .set_alignment(CellAlignment::Center),
-                );
-                if show_argon {
-                    cells.push(
-                        Cell::new(sum.argon.format_weekly_aligned())
-                            .set_alignment(CellAlignment::Center),
-                    );
-                }
+                cells.push(Cell::new(last_quota_str));
                 cells.push(Cell::new(policy_str));
                 cells.push(Cell::new(state_str));
                 table.add_row(cells);
@@ -4112,14 +3946,13 @@ fn build_dashboard_frame_full(
             table.to_string()
         };
 
-    // Fixed chrome: 1 title line + `status_header_lines.len()` (3 on `rows >= 11`, 1 on `5..=10`)
-    // + `footer_help_lines.len()` (2 on `rows >= 14`, 1 on `rows < 14`) + 1 reserved status line;
-    // remaining rows belong to the account viewport (`>= 1`).
-    let fixed_chrome_lines = 1 + status_header_lines.len() + footer_help_lines.len() + 1;
+    // Fixed chrome: 1 title line + `status_header_lines.len()` + optional blank gap on tall terminals
+    // (`rows >= 20`) + `footer_help_lines.len()` + 1 reserved status line.
+    let use_table_gap = rows >= 20;
+    let fixed_chrome_lines =
+        1 + status_header_lines.len() + usize::from(use_table_gap) + footer_help_lines.len() + 1;
     let max_table_lines = rows.saturating_sub(fixed_chrome_lines);
-    // Require enough width so every column (including `Email >= 8` chars) fits strictly on 1 physical line.
-    let min_table_cols = if show_argon { 78 } else { 68 };
-    let can_render_single_line_table = cols >= min_table_cols && email_col_budget >= 8;
+    let can_render_single_line_table = cols >= 64 && email_col_budget >= 8;
     let mut frame_lines: Vec<String> = Vec::with_capacity(rows);
 
     if accounts.is_empty() {
@@ -4129,6 +3962,9 @@ fn build_dashboard_frame_full(
             cols,
         ));
         frame_lines.extend(status_header_lines);
+        if use_table_gap {
+            frame_lines.push(String::new());
+        }
         if can_render_single_line_table {
             let empty_tbl = render_slice(0, 0, false, false);
             if empty_tbl.lines().count() <= max_table_lines
@@ -4190,6 +4026,9 @@ fn build_dashboard_frame_full(
 
             frame_lines.push(truncate_to_cols(&title, cols));
             frame_lines.extend(status_header_lines);
+            if use_table_gap {
+                frame_lines.push(String::new());
+            }
             for line in tbl_str.lines() {
                 frame_lines.push(truncate_to_cols(line, cols));
             }
@@ -4200,11 +4039,12 @@ fn build_dashboard_frame_full(
         } else {
             // Compact focus list viewport: 1 physical row per account (plus constant-height `...` rows
             // when scrolling), guaranteed to keep `cur` visible even on narrow/short split panes.
+            let compact_budget = (max_table_lines + usize::from(use_table_gap)).max(1);
             let (start, end, show_top, show_bottom) = compute_viewport_with_indicators(
                 accounts.len(),
                 cur,
                 *view.scroll_offset,
-                max_table_lines.max(1),
+                compact_budget,
             );
             *view.scroll_offset = start;
 
@@ -4367,11 +4207,11 @@ fn keys_help_two_lines_for_width(cols: usize) -> [String; 2] {
     let l2 = if cols >= display_width(TUI_KEYS_LINE_2) {
         TUI_KEYS_LINE_2
     } else if cols >= 80 {
-        "Manage : r/R refresh · c/C cand · p · k cd · e/E · d/D · l lbl · o/O exp · x del"
+        "Manage : r ref (*) · c/C cand · p · k cd · e/E · d/D · l lbl · o/O exp · x del"
     } else if cols >= 62 {
-        "Manage : r/R · c/C · p · k · e/E · d/D · l · o/O · x del"
+        "Manage : r (*) · c/C · p · k · e/E · d/D · l · o/O · x del"
     } else {
-        "Manage : r/R · c/C · p · k · e/E · d/D · l · o/O · x"
+        "Manage : r · c/C · p · k · e/E · d/D · l · o/O · x"
     };
     [truncate_to_cols(l1, cols), truncate_to_cols(l2, cols)]
 }
@@ -4380,15 +4220,15 @@ fn keys_help_for_width(cols: usize) -> String {
     let candidate = if cols >= display_width(TUI_KEYS_HELP_LINE) {
         TUI_KEYS_HELP_LINE
     } else if cols >= 148 {
-        "Keys: ↑/↓ sel · g/G top/end · [/] order · Space mark · s sw · i info · r/R ref · c/C cand · p · k cd · e/E en · d/D dis · l lbl · o/O exp · x del"
+        "Keys: ↑/↓ sel · g/G top/end · [/] order · Space mark · s sw · i info · r ref (*) · c/C cand · p · k cd · e/E en · d/D dis · l lbl · o/O exp · x del"
     } else if cols >= 116 {
-        "Keys: ↑/↓ sel · g/G end · [/] ord · Spc · s sw · i · r/R ref · c/C · p · k · e/E en · d/D dis · l · o/O exp · x del"
+        "Keys: ↑/↓ sel · g/G end · [/] ord · Spc · s sw · i · r ref (*) · c/C · p · k · e/E en · d/D dis · l · o/O exp · x del"
     } else if cols >= 96 {
-        "Keys: ↑/↓ · g/G end · [/] ord · Spc/s/i · r/R · c/C · p/k · e/E en · d/D dis · l · o/O · x del"
+        "Keys: ↑/↓ · g/G end · [/] ord · Spc/s/i · r (*) · c/C · p/k · e/E en · d/D dis · l · o/O · x del"
     } else if cols >= 86 {
-        "Keys: ↑/↓ · g/G end · [/] ord · Spc/s/i · r/R/c/p/k · e/E en · d/D dis · l/o · x del"
+        "Keys: ↑/↓ · g/G end · [/] ord · Spc/s/i · r/c/p/k · e/E en · d/D dis · l/o · x del"
     } else {
-        "Keys: ↑/↓ · g/G · [/] · Spc/s/i · r/R/c/C/p/k · e/E · d/D · l/o/O · x · q"
+        "Keys: ↑/↓ · g/G · [/] · Spc/s/i · r/c/C/p/k · e/E · d/D · l/o/O · x · q"
     };
     truncate_to_cols(candidate, cols)
 }
@@ -4430,57 +4270,6 @@ fn truncate_to_cols(s: &str, max_cols: usize) -> String {
     buf
 }
 
-fn summarize_pools(acc: &crate::domain::account::AccountRecord) -> AccountPoolSummary {
-    let Some(ref q) = acc.quota else {
-        return AccountPoolSummary {
-            plan: "—".into(),
-            gemini: PoolWindowPair::default(),
-            third_party: PoolWindowPair::default(),
-            argon: PoolWindowPair::default(),
-        };
-    };
-    let plan = short_plan_label(
-        &q.subscription_tier
-            .as_deref()
-            .map(terminal_text)
-            .unwrap_or_else(|| "Unknown".into()),
-    );
-
-    let extract_pair = |target_pool: QuotaPool| -> PoolWindowPair {
-        let Some(ref groups) = q.quota_groups else {
-            return PoolWindowPair::default();
-        };
-        let mut pair = PoolWindowPair::default();
-        for g in groups {
-            for b in &g.buckets {
-                if quota_pool(&b.bucket_id, &g.display_name) != Some(target_pool) {
-                    continue;
-                }
-                pair.has_bucket = true;
-                if let Some(pct) =
-                    observed_quota_percentage(b.remaining_fraction, b.remaining_fraction_known)
-                {
-                    let w_low = b.window.trim().to_ascii_lowercase();
-                    let id_low = b.bucket_id.trim().to_ascii_lowercase();
-                    if w_low == "weekly" || id_low.ends_with("-weekly") {
-                        pair.weekly = Some(pair.weekly.map_or(pct, |old| old.min(pct)));
-                    } else if w_low == "5h" || id_low.ends_with("-5h") {
-                        pair.short_5h = Some(pair.short_5h.map_or(pct, |old| old.min(pct)));
-                    }
-                }
-            }
-        }
-        pair
-    };
-
-    AccountPoolSummary {
-        plan,
-        gemini: extract_pair(QuotaPool::Gemini),
-        third_party: extract_pair(QuotaPool::ThirdParty),
-        argon: extract_pair(QuotaPool::Argon),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4489,6 +4278,7 @@ mod tests {
     use crate::domain::token::TokenRecord;
 
     fn make_synthetic_account(idx: usize) -> AccountRecord {
+        let now = crate::domain::clock::current_unix_seconds();
         let mut acc = AccountRecord::new(
             format!("00000000-0000-4000-8000-{idx:012}"),
             format!("synthetic.user.{idx:02}@example.invalid"),
@@ -4504,14 +4294,17 @@ mod tests {
                 project_id: None,
                 is_gcp_tos: true,
             },
-            1_800_000_000,
+            now - 300,
         );
-        let mut obs = QuotaObservation::new(1_800_000_000, QuotaSourceEnv::Daily);
+        let mut obs = QuotaObservation::new(now - 120, QuotaSourceEnv::OfficialCli);
         obs.subscription_tier = Some("Google AI Pro".into());
+        obs.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
         obs.quota_groups = Some(vec![
             QuotaGroup {
                 display_name: "Gemini Models".into(),
-                description: None,
+                description: Some(
+                    "Models within this group: gemini-3.1-pro, gemini-3-flash".into(),
+                ),
                 buckets: vec![
                     QuotaBucket {
                         bucket_id: "gemini-weekly".into(),
@@ -4527,7 +4320,7 @@ mod tests {
                         window: "5h".into(),
                         remaining_fraction: 1.0,
                         remaining_fraction_known: Some(true),
-                        reset_time: "2099-01-01T05:00:00Z".into(),
+                        reset_time: "".into(),
                         display_name: None,
                         description: None,
                     },
@@ -4535,7 +4328,9 @@ mod tests {
             },
             QuotaGroup {
                 display_name: "Claude and GPT models".into(),
-                description: None,
+                description: Some(
+                    "Models within this group: claude-sonnet-4-6, gpt-oss-120b".into(),
+                ),
                 buckets: vec![
                     QuotaBucket {
                         bucket_id: "3p-weekly".into(),
@@ -4592,19 +4387,14 @@ mod tests {
         assert!(!TUI_KEYS_HELP_LINE.contains("k/j"));
         assert!(!TUI_KEYS_HELP_LINE.contains("K/J"));
         assert!(!TUI_KEYS_HELP_LINE.contains("1-9"));
-        assert!(TUI_KEYS_HELP_LINE.contains("r/R refresh · c/C cand · p policy"));
+        assert!(!TUI_KEYS_HELP_LINE.contains("r/R"));
+        assert!(TUI_KEYS_HELP_LINE.contains("r refresh (*) · c/C cand · p policy"));
+        assert!(TUI_KEYS_LINE_2.contains("r refresh (on *)"));
+        assert!(!TUI_KEYS_LINE_2.contains("r/R"));
     }
 
     #[test]
-    fn summarize_pools_orders_5h_before_weekly_aligns_slashes_and_shortens_plan_labels() {
-        let acc1 = make_synthetic_account(1);
-        let sum1 = summarize_pools(&acc1);
-        assert_eq!(sum1.gemini.format_dual_aligned(), "100% /  72%");
-        assert_eq!(sum1.third_party.format_dual_aligned(), " 95% /  37%");
-        assert_eq!(sum1.gemini.format_dual_compact(), "100% / 72%");
-        assert_eq!(sum1.third_party.format_dual_compact(), "95% / 37%");
-        assert!(!sum1.argon.has_bucket);
-
+    fn v127_tui_layout_a1_header_last_quota_interaction_t2_and_detail_groups() {
         assert_eq!(short_plan_label("Google AI Pro"), "Pro");
         assert_eq!(short_plan_label("AI Pro"), "Pro");
         assert_eq!(short_plan_label("g1-pro-tier"), "Pro");
@@ -4626,30 +4416,51 @@ mod tests {
         assert_eq!(short_plan_label("Enterprise"), "Enterprise");
         assert_eq!(short_plan_label("Unknown"), "Unknown");
         assert_eq!(short_plan_label("—"), "—");
+        assert_eq!(short_plan_label("google-ai-pro"), "Pro");
+        assert_eq!(short_plan_label("g1_ultra_tier"), "Ultra");
+        assert_eq!(short_plan_label("free_tier"), "Free");
 
-        // Verify character-level vertical alignment of `/` and `%` across rows with 1/2/3-digit % and disabled candidate `(skip)`!
-        let mut acc2 = make_synthetic_account(2);
-        acc2.quota.as_mut().unwrap().subscription_tier = Some("Google AI Ultra".into());
-        acc2.quota.as_mut().unwrap().quota_groups = Some(vec![
+        let now = 1_800_000_000i64;
+        let ts_1h04m = jiff::Timestamp::from_second(now + 3_840)
+            .unwrap()
+            .to_string();
+        let ts_5d21h = jiff::Timestamp::from_second(now + 5 * 86_400 + 21 * 3_600)
+            .unwrap()
+            .to_string();
+        let ts_2h10m = jiff::Timestamp::from_second(now + 2 * 3_600 + 10 * 60)
+            .unwrap()
+            .to_string();
+        let ts_past = jiff::Timestamp::from_second(now - 600).unwrap().to_string();
+
+        // Account 1 (active): Gemini 97% (1h04m / 5d21h), Claude/GPT 100% unused epoch-0 (—)
+        let mut acc1 = make_synthetic_account(1);
+        acc1.email = "alice@example.com".into();
+        acc1.custom_label = Some("main".into());
+        let mut q1 = QuotaObservation::new(now - 120, QuotaSourceEnv::OfficialCli);
+        q1.subscription_tier = Some("Google AI Pro".into());
+        q1.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
+        q1.quota_groups = Some(vec![
             QuotaGroup {
                 display_name: "Gemini Models".into(),
-                description: None,
+                description: Some(
+                    "Models within this group: gemini-3.1-pro, gemini-3-flash".into(),
+                ),
                 buckets: vec![
                     QuotaBucket {
                         bucket_id: "gemini-5h".into(),
                         window: "5h".into(),
-                        remaining_fraction: 0.05,
+                        remaining_fraction: 0.97,
                         remaining_fraction_known: Some(true),
-                        reset_time: "2099-01-01T05:00:00Z".into(),
+                        reset_time: ts_1h04m,
                         display_name: None,
                         description: None,
                     },
                     QuotaBucket {
                         bucket_id: "gemini-weekly".into(),
                         window: "weekly".into(),
-                        remaining_fraction: 1.0,
+                        remaining_fraction: 0.97,
                         remaining_fraction_known: Some(true),
-                        reset_time: "2099-01-07T00:00:00Z".into(),
+                        reset_time: ts_5d21h,
                         display_name: None,
                         description: None,
                     },
@@ -4657,186 +4468,584 @@ mod tests {
             },
             QuotaGroup {
                 display_name: "Claude and GPT models".into(),
-                description: None,
+                description: Some(
+                    "Models within this group: claude-sonnet-4-6, gpt-oss-120b".into(),
+                ),
                 buckets: vec![
                     QuotaBucket {
                         bucket_id: "3p-5h".into(),
                         window: "5h".into(),
                         remaining_fraction: 1.0,
                         remaining_fraction_known: Some(true),
-                        reset_time: "2099-01-01T05:00:00Z".into(),
+                        reset_time: "1970-01-01T00:00:00Z".into(),
                         display_name: None,
                         description: None,
                     },
                     QuotaBucket {
                         bucket_id: "3p-weekly".into(),
                         window: "weekly".into(),
-                        remaining_fraction: 0.03,
+                        remaining_fraction: 1.0,
                         remaining_fraction_known: Some(true),
-                        reset_time: "2099-01-07T00:00:00Z".into(),
+                        reset_time: "1970-01-01T00:00:00Z".into(),
                         display_name: None,
                         description: None,
                     },
                 ],
             },
         ]);
+        acc1.quota = Some(q1);
+
+        // Account 2 (dormant): low 8% before reset (resets in 2h10m), disabled candidate (skip)
+        let mut acc2 = make_synthetic_account(2);
+        acc2.email = "bob@example.com".into();
+        acc2.custom_label = Some("bak1".into());
         acc2.disabled = true;
+        let mut q2 = QuotaObservation::new(now - 600, QuotaSourceEnv::OfficialCli);
+        q2.subscription_tier = Some("Google AI Pro".into());
+        q2.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
+        q2.quota_groups = Some(vec![QuotaGroup {
+            display_name: "Gemini Models".into(),
+            description: None,
+            buckets: vec![
+                QuotaBucket {
+                    bucket_id: "gemini-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: 0.08,
+                    remaining_fraction_known: Some(true),
+                    reset_time: ts_2h10m,
+                    display_name: None,
+                    description: None,
+                },
+                QuotaBucket {
+                    bucket_id: "gemini-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: 0.50,
+                    remaining_fraction_known: Some(true),
+                    reset_time: "2099-01-07T00:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        }]);
+        acc2.quota = Some(q2);
 
+        // Account 3 (dormant): reset passed (4h ago)
         let mut acc3 = make_synthetic_account(3);
-        acc3.quota = None;
+        acc3.email = "charlie@example.com".into();
+        let mut q3 = QuotaObservation::new(now - 4 * 3_600, QuotaSourceEnv::OfficialCli);
+        q3.subscription_tier = Some("Google AI Pro".into());
+        q3.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
+        q3.quota_groups = Some(vec![QuotaGroup {
+            display_name: "Gemini Models".into(),
+            description: None,
+            buckets: vec![
+                QuotaBucket {
+                    bucket_id: "gemini-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: 0.12,
+                    remaining_fraction_known: Some(true),
+                    reset_time: ts_past,
+                    display_name: None,
+                    description: None,
+                },
+                QuotaBucket {
+                    bucket_id: "gemini-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: 0.80,
+                    remaining_fraction_known: Some(true),
+                    reset_time: "2099-01-07T00:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        }]);
+        acc3.quota = Some(q3);
 
+        // Account 4 (dormant): never refreshed (`—`)
+        let mut acc4 = make_synthetic_account(4);
+        acc4.email = "dave@example.com".into();
+        acc4.quota = None;
+
+        let accounts = vec![acc1.clone(), acc2.clone(), acc3.clone(), acc4.clone()];
         let policy = SwitchPolicy {
             enabled: true,
-            candidate_account_ids: vec![acc1.id.clone(), acc2.id.clone()],
+            candidate_min_percentage: 30,
+            candidate_account_ids: vec![acc1.id.clone(), acc2.id.clone(), acc3.id.clone()],
             ..SwitchPolicy::default()
         };
+        let sess = SessionIdentity::Matched {
+            account_id: acc1.id.clone(),
+            email: acc1.email.clone(),
+            expiry: "2099-01-01T00:00:00Z".into(),
+        };
+        let empty_marks = HashSet::new();
         let mut off = 0usize;
-        let frame = build_dashboard_frame(
-            &[acc1.clone(), acc2.clone(), acc3.clone()],
-            Some(&acc1.id),
-            &policy,
-            &SessionIdentity::Matched {
-                account_id: acc1.id.clone(),
-                email: acc1.email.clone(),
-                expiry: "2026-11-17T02:26:00Z".into(),
+        let mut d_off = 0usize;
+        let frame = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&acc1.id),
+                policy: &policy,
+                session_id: &sess,
+                runtime_st: &RuntimeState::Idle,
+                backend_tag: "dual",
+                daemon_state: None,
+                marked_ids: &empty_marks,
+                detail_view: false,
+                detail_scroll: &mut d_off,
+                cursor_idx: 0,
+                scroll_offset: &mut off,
+                transient_notice: None,
+                now_unix: now,
             },
-            &RuntimeState::Idle,
-            0,
-            &mut off,
-            None,
-            136,
-            20,
+            120,
+            24,
         );
-        assert!(frame.contains("Gemini (5h / W)"));
-        assert!(frame.contains("Claude/GPT (5h / W)"));
-        assert!(!frame.contains("Google AI"));
+
+        // Layout A1 borderless aligned `Quota` header with unused full bucket shown as `(—)`
+        let hdr_lines: Vec<&str> = frame.split("\r\n").collect();
+        assert!(
+            hdr_lines[1].starts_with("Session [dual] : matched (alice@example.com")
+                && hdr_lines[1].ends_with(" · Pro"),
+            "Unexpected Session header line: {}",
+            hdr_lines[1]
+        );
+        assert!(
+            frame.contains("Quota (2m ago) : Gemini      5h  97% (1h04m)  · Weekly  97% (5d21h)")
+        );
+        assert!(frame.contains("                 Claude/GPT  5h 100% (—)      · Weekly 100% (—)"));
+        // Main table has single `Last Quota` column (not split `Gemini (5h / W)` / `Claude/GPT (5h / W)`)
+        assert!(frame.contains("Last Quota"));
+        assert!(!frame.contains("Gemini (5h / W)"));
+        assert!(!frame.contains("Claude/GPT (5h / W)"));
+        assert!(frame.contains("97% (2m ago)"));
+        assert!(frame.contains("low 8% (resets in 2h10m)"));
+        assert!(frame.contains("reset passed (4h ago)"));
         assert!(frame.contains("cand #1"));
         assert!(frame.contains("cand #2 (skip)"));
         assert!(!frame.lines().nth(1).unwrap_or("").contains(&acc1.id));
+        // Colons align vertically across Session / Runtime / Policy / Quota lines!
+        let c1 = hdr_lines[1].find(" : ").unwrap();
+        assert_eq!(hdr_lines[2].find(" : ").unwrap(), c1);
+        assert_eq!(hdr_lines[3].find(" : ").unwrap(), c1);
+        assert_eq!(hdr_lines[4].find(" : ").unwrap(), c1);
 
-        let row1_line = frame
-            .split("\r\n")
-            .find(|l| l.starts_with('│') && l.contains("synthetic.user.01@example.invalid"))
-            .unwrap();
-        let row2_line = frame
-            .split("\r\n")
-            .find(|l| l.starts_with('│') && l.contains("synthetic.user.02@example.invalid"))
-            .unwrap();
-        let row3_line = frame
-            .split("\r\n")
-            .find(|l| l.starts_with('│') && l.contains("synthetic.user.03@example.invalid"))
-            .unwrap();
-
-        let slash_cols_1: Vec<usize> = row1_line
-            .char_indices()
-            .filter(|&(_, c)| c == '/')
-            .map(|(i, _)| UnicodeWidthStr::width(&row1_line[..i]))
-            .collect();
-        let slash_cols_2: Vec<usize> = row2_line
-            .char_indices()
-            .filter(|&(_, c)| c == '/')
-            .map(|(i, _)| UnicodeWidthStr::width(&row2_line[..i]))
-            .collect();
-        assert_eq!(
-            slash_cols_1.len(),
-            2,
-            "expected 2 slashes on row 1: {row1_line}"
-        );
-        assert_eq!(
-            slash_cols_1, slash_cols_2,
-            "slashes must align vertically across rows:\n{row1_line}\n{row2_line}"
-        );
-        let pct_cols_1: Vec<usize> = row1_line
-            .char_indices()
-            .filter(|&(_, c)| c == '%')
-            .map(|(i, _)| UnicodeWidthStr::width(&row1_line[..i]))
-            .collect();
-        let pct_cols_2: Vec<usize> = row2_line
-            .char_indices()
-            .filter(|&(_, c)| c == '%')
-            .map(|(i, _)| UnicodeWidthStr::width(&row2_line[..i]))
-            .collect();
-        assert_eq!(
-            pct_cols_1, pct_cols_2,
-            "% signs must align vertically across rows:\n{row1_line}\n{row2_line}"
-        );
-        // Unrefreshed `—` centers directly underneath the `/` columns!
-        for &slash_col in &slash_cols_1 {
-            let dash_aligned = row3_line
-                .char_indices()
-                .filter(|&(_, c)| c == '—')
-                .any(|(i, _)| UnicodeWidthStr::width(&row3_line[..i]) == slash_col);
-            assert!(
-                dash_aligned,
-                "unrefreshed '—' must align directly under slash col {slash_col}:\n{row1_line}\n{row3_line}"
-            );
-        }
-
-        // Also verify compact-header widths (`cols = 104` and `114` < 116) keep dual-window quota cells
-        // unwrapped and preserve exact vertical `/` and `%` alignment across rows!
-        assert_eq!(short_plan_label("google-ai-pro"), "Pro");
-        assert_eq!(short_plan_label("g1_ultra_tier"), "Ultra");
-        assert_eq!(short_plan_label("free_tier"), "Free");
-        let mut off_compact_hdr = 0usize;
-        let frame_compact_114 = build_dashboard_frame(
-            &[acc1.clone(), acc2.clone(), acc3.clone()],
-            Some(&acc1.id),
-            &policy,
-            &SessionIdentity::Matched {
-                account_id: acc1.id.clone(),
-                email: acc1.email.clone(),
-                expiry: "2026-11-17T02:26:00Z".into(),
+        // Short terminal (`rows = 13 < 14`) folds `Quota` header to a single line!
+        let mut off_short = 0usize;
+        let frame_13 = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&acc1.id),
+                policy: &policy,
+                session_id: &sess,
+                runtime_st: &RuntimeState::Idle,
+                backend_tag: "dual",
+                daemon_state: None,
+                marked_ids: &empty_marks,
+                detail_view: false,
+                detail_scroll: &mut d_off,
+                cursor_idx: 0,
+                scroll_offset: &mut off_short,
+                transient_notice: None,
+                now_unix: now,
             },
-            &RuntimeState::Idle,
-            0,
-            &mut off_compact_hdr,
-            None,
-            115,
+            120,
+            13,
+        );
+        let lines_13: Vec<&str> = frame_13.split("\r\n").collect();
+        assert!(lines_13.len() <= 13);
+        assert!(frame_13.contains("Quota (2m ago) : Gem 97%/97% · 3P 100%/100%"));
+        assert!(!frame_13.contains("Claude/GPT  5h"));
+
+        // Interaction T2: `r` ONLY targets active `*` account; dormant account returns gentle hint
+        // (and is completely decoupled from `Space` marks!)
+        assert_eq!(
+            resolve_r_refresh_target(&accounts, &sess, Some(&acc1.id), 0)
+                .unwrap()
+                .id,
+            acc1.id
+        );
+        assert_eq!(
+            resolve_r_refresh_target(&accounts, &sess, Some(&acc1.id), 1).unwrap_err(),
+            TUI_DORMANT_REFRESH_HINT
+        );
+        assert_eq!(
+            resolve_r_refresh_target(&accounts, &SessionIdentity::Uninitialized, None, 0)
+                .unwrap_err(),
+            TUI_DORMANT_REFRESH_HINT
+        );
+
+        // `i` detail card: OfficialCli without `models` renders `Groups :` descriptions + `resets —`
+        // for unused full epoch-0 buckets, and shows `r refresh` in footer ONLY for active account!
+        let mut d_active = 0usize;
+        let detail_active = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&acc1.id),
+                policy: &policy,
+                session_id: &sess,
+                runtime_st: &RuntimeState::Idle,
+                backend_tag: "dual",
+                daemon_state: None,
+                marked_ids: &empty_marks,
+                detail_view: true,
+                detail_scroll: &mut d_active,
+                cursor_idx: 0,
+                scroll_offset: &mut off,
+                transient_notice: None,
+                now_unix: now,
+            },
+            120,
+            26,
+        );
+        assert!(detail_active.contains("Groups  :"));
+        assert!(detail_active.contains("gemini-3.1-pro"));
+        assert!(detail_active.contains("resets —"));
+        assert!(!detail_active.contains("1970-01-01"));
+        assert!(detail_active.contains("r refresh"));
+
+        let mut d_dormant = 0usize;
+        let detail_dormant = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&acc1.id),
+                policy: &policy,
+                session_id: &sess,
+                runtime_st: &RuntimeState::Idle,
+                backend_tag: "dual",
+                daemon_state: None,
+                marked_ids: &empty_marks,
+                detail_view: true,
+                detail_scroll: &mut d_dormant,
+                cursor_idx: 1,
+                scroll_offset: &mut off,
+                transient_notice: None,
+                now_unix: now,
+            },
+            120,
+            26,
+        );
+        assert!(
+            !detail_dormant.contains("r refresh"),
+            "dormant detail footer must omit `r refresh`: {detail_dormant}"
+        );
+    }
+
+    #[test]
+    fn tui_drifted_known_active_slot_aligns_r_target_table_star_detail_card_and_verify_blocked_notice(
+    ) {
+        let now = 1_800_000_000i64;
+        let mut alice = make_synthetic_account(1);
+        alice.email = "alice@example.com".into();
+        alice.quota = None;
+        let mut bob = make_synthetic_account(2);
+        bob.email = "bob@example.com".into();
+        bob.quota = None;
+        let accounts = vec![alice.clone(), bob.clone()];
+        let policy = SwitchPolicy::default();
+        let empty_marks = HashSet::new();
+
+        // Store `index.selected_account_id` is Alice (`acc-0001`), while the actual official `agy`
+        // slot has drifted externally to Bob (`acc-0002`, `DriftedKnown`).
+        let drifted_sess = SessionIdentity::DriftedKnown {
+            account_id: bob.id.clone(),
+            email: bob.email.clone(),
+            expiry: "2099-01-01T00:00:00Z".into(),
+        };
+
+        // 1. Shared helper resolves actual official slot (`bob`), NOT stale `selected_id` (`alice`).
+        assert_eq!(
+            resolve_active_slot_account_id(&drifted_sess, Some(&alice.id)),
+            Some(bob.id.as_str())
+        );
+        assert_eq!(
+            resolve_active_account(&accounts, Some(&alice.id), &drifted_sess)
+                .map(|a| a.id.as_str()),
+            Some(bob.id.as_str())
+        );
+
+        // 2. Pressing `r` on Bob succeeds (targets Bob), while pressing `r` on Alice returns dormant hint!
+        assert_eq!(
+            resolve_r_refresh_target(&accounts, &drifted_sess, Some(&alice.id), 1)
+                .unwrap()
+                .id,
+            bob.id
+        );
+        assert_eq!(
+            resolve_r_refresh_target(&accounts, &drifted_sess, Some(&alice.id), 0).unwrap_err(),
+            TUI_DORMANT_REFRESH_HINT
+        );
+
+        // 3. Main table places `*` on Bob (cursor=0 on Alice -> Alice has `>` without `*`, Bob has `*`).
+        let mut off = 0usize;
+        let mut d_off = 0usize;
+        let table_frame = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&alice.id),
+                policy: &policy,
+                session_id: &drifted_sess,
+                runtime_st: &RuntimeState::Idle,
+                backend_tag: "dual",
+                daemon_state: None,
+                marked_ids: &empty_marks,
+                detail_view: false,
+                detail_scroll: &mut d_off,
+                cursor_idx: 0,
+                scroll_offset: &mut off,
+                transient_notice: None,
+                now_unix: now,
+            },
+            120,
             24,
         );
-        assert!(frame_compact_114.contains("Gemini 5h/W"));
-        assert!(frame_compact_114.contains("Claude/GPT 5h/W"));
+        let alice_line = table_frame
+            .split("\r\n")
+            .find(|l| l.starts_with('│') && l.contains(&alice.email))
+            .expect("alice row present");
+        let bob_line = table_frame
+            .split("\r\n")
+            .find(|l| l.starts_with('│') && l.contains(&bob.email))
+            .expect("bob row present");
+        assert!(
+            alice_line.contains(">  ") && !alice_line.contains('*'),
+            "stale selected_id row must NOT show `*` when drifted to Bob: {alice_line}"
+        );
+        assert!(
+            bob_line.contains(" * "),
+            "DriftedKnown active slot row MUST show `*`: {bob_line}"
+        );
 
-        let mut off_compact = 0usize;
-        let frame_compact = build_dashboard_frame(
-            &[acc1.clone(), acc2.clone(), acc3.clone()],
-            Some(&acc1.id),
-            &policy,
-            &SessionIdentity::Matched {
-                account_id: acc1.id.clone(),
-                email: acc1.email.clone(),
-                expiry: "2026-11-17T02:26:00Z".into(),
+        // 4. Detail card (`i`) on Bob shows `[active]`, `press r to fetch`, and `r refresh` footer;
+        //    detail card on Alice omits `[active]` and `r refresh` and guides user to switch with `s`.
+        let mut d_bob = 0usize;
+        let detail_bob = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&alice.id),
+                policy: &policy,
+                session_id: &drifted_sess,
+                runtime_st: &RuntimeState::Idle,
+                backend_tag: "dual",
+                daemon_state: None,
+                marked_ids: &empty_marks,
+                detail_view: true,
+                detail_scroll: &mut d_bob,
+                cursor_idx: 1,
+                scroll_offset: &mut off,
+                transient_notice: None,
+                now_unix: now,
             },
-            &RuntimeState::Idle,
-            0,
-            &mut off_compact,
-            None,
-            104,
+            120,
             24,
         );
-        assert!(frame_compact.contains("Gemini 5h/W"));
-        let c_row1 = frame_compact
+        let detail_bob_footer = detail_bob.split("\r\n").last().expect("bob detail footer");
+        assert!(
+            detail_bob.contains("[active]"),
+            "DriftedKnown active detail card must show [active]: {detail_bob}"
+        );
+        assert!(
+            detail_bob_footer.contains("· r refresh ·"),
+            "DriftedKnown active detail card must show `r refresh` in footer: {detail_bob_footer}"
+        );
+        assert!(
+            detail_bob.contains("press r to fetch"),
+            "DriftedKnown active detail card must prompt `press r to fetch`: {detail_bob}"
+        );
+
+        let mut d_alice = 0usize;
+        let detail_alice = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&alice.id),
+                policy: &policy,
+                session_id: &drifted_sess,
+                runtime_st: &RuntimeState::Idle,
+                backend_tag: "dual",
+                daemon_state: None,
+                marked_ids: &empty_marks,
+                detail_view: true,
+                detail_scroll: &mut d_alice,
+                cursor_idx: 0,
+                scroll_offset: &mut off,
+                transient_notice: None,
+                now_unix: now,
+            },
+            120,
+            24,
+        );
+        let detail_alice_footer = detail_alice
             .split("\r\n")
-            .find(|l| l.starts_with('│') && l.contains("100% /  72%"))
-            .expect("compact table row 1 must keep `100% /  72%` unwrapped");
-        let c_row2 = frame_compact
+            .last()
+            .expect("alice detail footer");
+        assert!(
+            !detail_alice.contains("[active]"),
+            "stale selected_id detail card must NOT show [active] under DriftedKnown: {detail_alice}"
+        );
+        assert!(
+            !detail_alice_footer.contains("r refresh"),
+            "stale selected_id detail card must omit `r refresh` in footer under DriftedKnown: {detail_alice_footer}"
+        );
+        assert!(
+            detail_alice.contains("switch with s, then press r"),
+            "stale selected_id detail card must guide switching with s first: {detail_alice}"
+        );
+
+        // 5. `format_tui_refresh_status_notice` warns clearly on `validation_blocked == true`
+        //    (without leaking validation URLs) and stays concise on clean refresh.
+        let mut blocked_acc = bob.clone();
+        blocked_acc.validation_blocked = true;
+        blocked_acc.validation_url = Some("https://accounts.google.com/secret-verify-link".into());
+        let blocked_notice = format_tui_refresh_status_notice(
+            &crate::quota::official_cli::ActiveSlotQuotaRefreshOutcome {
+                account: blocked_acc,
+                validation_blocked: true,
+                token_synced_back: false,
+                verified_checkpoint: None,
+            },
+        );
+        assert!(
+            blocked_notice.contains("verify-blocked")
+                && blocked_notice.contains("open agy to verify")
+                && blocked_notice.contains(&bob.email)
+                && blocked_notice.contains(&bob.id),
+            "validation_blocked refresh notice must warn clearly: {blocked_notice}"
+        );
+        assert!(
+            !blocked_notice.contains("https://") && !blocked_notice.contains("secret-verify-link"),
+            "validation_blocked refresh notice must NEVER expose validation_url: {blocked_notice}"
+        );
+
+        let ok_notice = format_tui_refresh_status_notice(
+            &crate::quota::official_cli::ActiveSlotQuotaRefreshOutcome {
+                account: bob.clone(),
+                validation_blocked: false,
+                token_synced_back: false,
+                verified_checkpoint: None,
+            },
+        );
+        assert_eq!(ok_notice, format!("Refreshed quota for {}.", bob.email));
+
+        // 6. Compact narrow mode (`cols < 50`) and ultra-short mode (`rows < 5`) under `DriftedKnown`:
+        //    `*` stays on Bob (not Alice), and ultra-short detail footer keeps `r` on Bob & omits it on Alice!
+        let mut c_off = 0usize;
+        let mut c_d = 0usize;
+        let narrow_list = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&alice.id),
+                policy: &policy,
+                session_id: &drifted_sess,
+                runtime_st: &RuntimeState::Idle,
+                backend_tag: "dual",
+                daemon_state: None,
+                marked_ids: &empty_marks,
+                detail_view: false,
+                detail_scroll: &mut c_d,
+                cursor_idx: 0,
+                scroll_offset: &mut c_off,
+                transient_notice: None,
+                now_unix: now,
+            },
+            44,
+            12,
+        );
+        let narrow_alice = narrow_list
             .split("\r\n")
-            .find(|l| l.starts_with('│') && l.contains("  5% / 100%"))
-            .expect("compact table row 2 must keep `  5% / 100%` unwrapped");
-        let c_slashes_1: Vec<usize> = c_row1
-            .char_indices()
-            .filter(|&(_, c)| c == '/')
-            .map(|(i, _)| UnicodeWidthStr::width(&c_row1[..i]))
-            .collect();
-        let c_slashes_2: Vec<usize> = c_row2
-            .char_indices()
-            .filter(|&(_, c)| c == '/')
-            .map(|(i, _)| UnicodeWidthStr::width(&c_row2[..i]))
-            .collect();
-        assert_eq!(c_slashes_1.len(), 2);
-        assert_eq!(
-            c_slashes_1, c_slashes_2,
-            "compact table slashes must align:\n{c_row1}\n{c_row2}"
+            .find(|l| l.contains("#1"))
+            .expect("compact alice row");
+        let narrow_bob = narrow_list
+            .split("\r\n")
+            .find(|l| l.contains("#2"))
+            .expect("compact bob row");
+        assert!(
+            narrow_alice.starts_with(">  #1"),
+            "narrow compact list must not show `*` on stale selected Alice: {narrow_alice}"
+        );
+        assert!(
+            narrow_bob.starts_with(" * #2"),
+            "narrow compact list must show `*` on DriftedKnown active Bob: {narrow_bob}"
+        );
+
+        let mut tiny_off = 0usize;
+        let mut tiny_d = 0usize;
+        let tiny_bob_row = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&alice.id),
+                policy: &policy,
+                session_id: &drifted_sess,
+                runtime_st: &RuntimeState::Idle,
+                backend_tag: "dual",
+                daemon_state: None,
+                marked_ids: &empty_marks,
+                detail_view: false,
+                detail_scroll: &mut tiny_d,
+                cursor_idx: 1,
+                scroll_offset: &mut tiny_off,
+                transient_notice: None,
+                now_unix: now,
+            },
+            44,
+            3,
+        );
+        assert!(
+            tiny_bob_row.split("\r\n").any(|l| l.starts_with(">* #2")),
+            "ultra-short rows<5 must show `>*` on DriftedKnown active Bob: {tiny_bob_row}"
+        );
+
+        let mut tiny_det_bob = 0usize;
+        let tiny_detail_bob = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&alice.id),
+                policy: &policy,
+                session_id: &drifted_sess,
+                runtime_st: &RuntimeState::Idle,
+                backend_tag: "dual",
+                daemon_state: None,
+                marked_ids: &empty_marks,
+                detail_view: true,
+                detail_scroll: &mut tiny_det_bob,
+                cursor_idx: 1,
+                scroll_offset: &mut tiny_off,
+                transient_notice: None,
+                now_unix: now,
+            },
+            44,
+            3,
+        );
+        let tiny_bob_footer = tiny_detail_bob.split("\r\n").last().unwrap();
+        assert!(
+            tiny_bob_footer.contains("· r ·"),
+            "ultra-short detail footer for DriftedKnown Bob must include `r`: {tiny_bob_footer}"
+        );
+
+        let mut tiny_det_alice = 0usize;
+        let tiny_detail_alice = build_dashboard_frame_full(
+            &mut TuiFrameView {
+                accounts: &accounts,
+                selected_id: Some(&alice.id),
+                policy: &policy,
+                session_id: &drifted_sess,
+                runtime_st: &RuntimeState::Idle,
+                backend_tag: "dual",
+                daemon_state: None,
+                marked_ids: &empty_marks,
+                detail_view: true,
+                detail_scroll: &mut tiny_det_alice,
+                cursor_idx: 0,
+                scroll_offset: &mut tiny_off,
+                transient_notice: None,
+                now_unix: now,
+            },
+            44,
+            3,
+        );
+        let tiny_alice_footer = tiny_detail_alice.split("\r\n").last().unwrap();
+        assert!(
+            !tiny_alice_footer.contains("· r ·"),
+            "ultra-short detail footer for stale selected Alice must omit `r`: {tiny_alice_footer}"
         );
     }
 
@@ -4895,9 +5104,9 @@ mod tests {
         let runtime_st = RuntimeState::Idle;
         let mut scroll_offset = 0usize;
 
-        // 1. Short & narrow terminal (108 cols x 14 rows): must keep top header + column headers intact,
-        //    embed constant-height `... (<K> more above/below)` rows without frame-height jitter,
-        //    and paginate rows without exceeding 14 lines.
+        // 1. Short & narrow terminal (108 cols x 16 rows): must keep top header + Quota header +
+        //    column headers intact, embed constant-height `... (<K> more above/below)` rows without
+        //    frame-height jitter, and paginate rows without exceeding 16 lines.
         let frame_top = build_dashboard_frame(
             &accounts,
             Some(&accounts[0].id),
@@ -4908,13 +5117,13 @@ mod tests {
             &mut scroll_offset,
             None,
             108,
-            14,
+            16,
         );
         assert!(!frame_top.ends_with("\r\n"));
         let top_lines: Vec<&str> = frame_top.split("\r\n").collect();
         assert!(
-            top_lines.len() <= 14,
-            "Frame exceeded 14 terminal rows (got {}): {frame_top}",
+            top_lines.len() <= 16,
+            "Frame exceeded 16 terminal rows (got {}): {frame_top}",
             top_lines.len()
         );
         assert!(top_lines[0].starts_with("agy-switch-cli Headless SSH Dashboard"));
@@ -4943,7 +5152,7 @@ mod tests {
             &mut scroll_offset,
             None,
             108,
-            14,
+            16,
         );
         let mid_lines: Vec<&str> = frame_mid.split("\r\n").collect();
         assert_eq!(
@@ -4967,7 +5176,7 @@ mod tests {
             &mut scroll_offset,
             None,
             108,
-            14,
+            16,
         );
         let bottom_lines: Vec<&str> = frame_bottom.split("\r\n").collect();
         assert_eq!(
@@ -5362,7 +5571,8 @@ mod tests {
         let two_80 = keys_help_two_lines_for_width(80);
         assert!(two_80[0].contains("Keys   : ↑/↓ select · g/G top/end · [/] reorder"));
         assert!(two_80[0].contains("Space") && two_80[0].contains("i info"));
-        assert!(two_80[1].contains("Manage : r/R refresh · c/C cand"));
+        assert!(two_80[1].contains("Manage : r ref (*) · c/C cand"));
+        assert!(!two_80[1].contains("r/R"));
         assert!(
             two_80[1].contains("k cd") && two_80[1].contains("l lbl") && two_80[1].contains("o/O")
         );
@@ -5468,17 +5678,7 @@ mod tests {
         assert!(short_lines[1].contains(" | Runtime: "));
         assert!(short_lines[1].contains(" | Policy: "));
 
-        // 4. Verify TUI proxy warning formatter places variable-name-only diagnostic at front so narrow terminals never clip it
-        assert_eq!(format_tui_proxy_warning_prefix(&[]), "");
-        assert_eq!(
-            format_tui_proxy_warning_prefix(&[
-                "Ignored unsupported or malformed proxy URL in `HTTPS_PROXY` environment variable."
-                    .into()
-            ]),
-            "[warning: Ignored unsupported or malformed proxy URL in `HTTPS_PROXY` environment variable.] "
-        );
-
-        // 5. Verify `delete_account_in_tui` clears active slot + policy candidates and clamps `cursor_idx`!
+        // 4. Verify `delete_account_in_tui` clears active slot + policy candidates and clamps `cursor_idx`!
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::paths::HeadlessPaths::with_explicit(
             tmp.path().join("home"),
@@ -5804,119 +6004,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn r3_04_tui_batch_refresh_short_circuits_queued_accounts_on_exit_7() {
-        use crate::paths::HeadlessPaths;
-        use crate::session::backend::FileSessionBackend;
-        use crate::transport::client::MockTransport;
-        use std::sync::atomic::AtomicUsize;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = HeadlessPaths::with_explicit(
-            tmp.path().join("home"),
-            tmp.path().join("data"),
-            tmp.path().join("cache"),
-        );
-        let repo = StoreRepository::new(paths.clone()).with_lock_timeout(Duration::from_millis(80));
-        let now = crate::domain::clock::current_unix_seconds();
-
-        let mut targets = Vec::new();
-        for idx in 0..3usize {
-            let mut acc = make_synthetic_account(idx);
-            acc.token.expiry_timestamp = 1; // force `/token` refresh
-            targets.push((acc.id.clone(), acc.email.clone()));
-            repo.with_write_lock(|tx| tx.upsert_account(acc.clone(), idx == 0, now))
-                .unwrap();
-        }
-
-        let token_calls = Arc::new(AtomicUsize::new(0));
-        let token_calls_c = token_calls.clone();
-        let holder_repo = StoreRepository::new(paths.clone());
-        let holder_join: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        let holder_join_c = holder_join.clone();
-
-        let transport: Arc<dyn HttpTransport> = Arc::new(MockTransport::from_handler(move |req| {
-            if req.url.contains("/token") {
-                let call_no = token_calls_c.fetch_add(1, Ordering::SeqCst);
-                if call_no == 0 {
-                    // Preflight L3 already passed; acquire L3 from another thread so post-`/token`
-                    // persistence hits `lock_busy` -> `issued_token_unpersisted` (exit 7)!
-                    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
-                    let r_hold = holder_repo.clone();
-                    let h = std::thread::spawn(move || {
-                        let _ = r_hold.with_write_lock(|_| {
-                            let _ = ready_tx.send(());
-                            std::thread::sleep(Duration::from_millis(250));
-                            Ok(())
-                        });
-                    });
-                    let _ = ready_rx.recv_timeout(Duration::from_secs(2));
-                    *holder_join_c.lock().unwrap() = Some(h);
-                }
-                return Ok(MockTransport::json_response(
-                    200,
-                    serde_json::json!({
-                        "access_token": format!("ya29.tui-rot-{call_no}"),
-                        "refresh_token": format!("1//tui-rot-rt-{call_no}"),
-                        "expires_in": 3600,
-                        "token_type": "Bearer"
-                    }),
-                ));
-            }
-            Ok(MockTransport::json_response(200, serde_json::json!({})))
-        }));
-
-        let registry = Arc::new(OAuthClientRegistry::load(&paths).unwrap());
-        let oauth_ep = Arc::new(OAuthEndpoints::default());
-        let quota_ep = Arc::new(CloudCodeEndpoints::default());
-        let mut scroll_off = 0usize;
-        let mut s1 = None;
-        let mut s2 = None;
-        let mut s3 = None;
-
-        let outcome = run_tui_batch_refresh_loop(
-            &repo,
-            &FileSessionBackend,
-            targets,
-            transport,
-            registry,
-            oauth_ep,
-            quota_ep,
-            "antigravity/hub/4.3.0 (os_type=linux; arch=amd64)".into(),
-            1,
-            0,
-            &mut scroll_off,
-            false,
-            &mut s1,
-            &mut s2,
-            &mut s3,
-        )
-        .await;
-
-        if let Some(h) = holder_join.lock().unwrap().take() {
-            let _ = h.join();
-        }
-
-        assert!(
-            outcome.recovery_error.is_some(),
-            "Expected PartialCommitOrRecovery error to be recorded"
-        );
-        assert_eq!(
-            outcome.recovery_error.as_ref().unwrap().1.exit_code,
-            crate::error::ExitCode::PartialCommitOrRecovery
-        );
-        assert_eq!(
-            outcome.skipped_after_recovery, 2,
-            "Remaining 2 queued accounts MUST be skipped immediately on first exit 7!"
-        );
-        assert_eq!(
-            token_calls.load(Ordering::SeqCst),
-            1,
-            "Queued accounts MUST NOT issue `/token` requests after first exit 7!"
-        );
-    }
-
     #[test]
     fn v122_tui_verify_blocked_switch_status_fits_80_columns() {
         use crate::domain::account::{AccountRecord, RuntimeState, SessionIdentity};
@@ -5957,6 +6044,7 @@ mod tests {
             runtime_warning: None,
             validation_blocked: true,
             validation_warning: Some("warning".into()),
+            committed_checkpoint: None,
         };
         let idle_msg = format_tui_switch_status_notice("", &idle_out);
         let mut scroll = 0usize;

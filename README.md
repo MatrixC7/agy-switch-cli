@@ -8,13 +8,17 @@
 
 ---
 
+> [!WARNING]
+> **账号合规边界与风控提示**：本工具已彻底移除 Google 内部后端接口直连与客户端标识伪造，配额查询统一委托本机官方 `agy -p "/usage"`，日常切号与本地统计均纯离线运行。但按 Google Antigravity 附加服务条款（第 6 节）对个人消费级订阅（`oauth-personal`）的限制，在第三方工具中程序化调用 `agy -p "/usage"`、封装 `agy acp`、同机并发运行多账号或借助后台守护进程频繁轮换账号池，**依然存在触发 `403 TOS_VIOLATION` 账号风控并联动影响同账号 Antigravity / Gemini CLI / Gemini Code Assist 权限的残余风险**。建议优先使用纯离线手动切号与本地统计，降低刷新与巡检频率（`daemon` 默认已放宽至 `900` 秒即 15 分钟）；自动化脚本或编排流水线请改用 Google AI Studio API Key（`GEMINI_API_KEY`）或 Vertex AI 商业凭据。完整风险拆解与降风险实践见[使用手册第 2 节](docs/user-guide.md#2-上手前必读五个核心概念与合规风控边界)。
+
 ## 核心特性
 
 - **纯静态单包全特性开箱即用**：彻底剥离 Tauri / GTK / WebKit，每个架构仅提供**单一完整预编译 `musl` 压缩包**（100% 纯静态单文件 ELF，零外部 `.so` 依赖），同时内置全部 CLI 命令、本地用量统计 `stats`、SSH 交互式看板 `tui` 与纯 Rust D-Bus 系统钥匙串协议栈；默认 `--backend auto` 在无头服务器自动使用本地文件模式（`file`），在 Linux 图形桌面自动启用钥匙串与文件事务性双写（`dual`），亦支持显式指定 `file`、`keyring` 或 `dual`。
-- **无浏览器 OAuth 登录与零丢码保护**：默认免端口监听直接粘贴回调 URL 登录（亦可加 `--ssh` 开启本地端口转发回调）；令牌签发后立即以 `0600` 权限落盘并建立两级防回退指纹库，网络中断可通过 `auth pending --resume` 无损续传。
-- **灵活的手动与自动切号方式**：
+- **官方 CLI 委托查额与离线优先切号**：彻底移除 Google 内部接口直连与自定义请求头伪造，配额查询统一委托本机已安装的官方 `agy -p "/usage" --output-format json` 对当前活跃官方槽位执行；日常 `switch`、`run`、`daemon` 切槽与 `accounts add --from-local` 均为纯本地零网络操作，切出前自动回采当前槽位中由官方 `agy` 刷新或轮换的最新凭据。
+- **无浏览器 OAuth 登录与零丢码保护**：显式 `auth login` / `auth reauthorize` 与裸 `refresh_token` 导入按需访问 Google 标准 OAuth 端点（不附加自定义 `User-Agent`）；默认免端口监听直接粘贴回调 URL 登录（亦可加 `--ssh` 开启本地端口转发回调）；令牌签发后立即以 `0600` 权限落盘并建立两级防回退指纹库，网络中断可通过 `auth pending --resume` 无损续传。
+- **灵活的手动与步进式自动切号方式**：
   - *重要事实*：切换凭据槽位**对切换后新启动的 `agy` 进程立即生效**，已运行中的旧 `agy` 会话保持启动时的登录态而不被打断。
-  - 既可通过 `tui` 终端看板或 `switch` 随时切号后直接运行 `agy`，也可通过 `daemon --install` 一键配置 `systemd --user` 后台巡检服务（或使用可选的 `agy-switch-cli run` 指定 `--account` / `--backend file` 包装启动 `agy`）。
+  - 既可通过 `tui` 终端看板或 `switch` 随时切号后直接运行 `agy`，也可通过 `daemon --install` 一键配置 `systemd --user` 后台巡检服务（默认每 15 分钟巡检当前活跃槽位，跌破水位时按策略单轮有界步进核验候选号；亦可使用可选的 `agy-switch-cli run` 指定 `--account` / `--backend file` 包装启动 `agy`）。
 
 ---
 
@@ -25,7 +29,7 @@
 可直接在终端按当前 CPU 架构（`uname -m` 自动输出 `x86_64` 或 `aarch64`）从 Releases 下载对应的 `.tar.gz` 压缩包与校验文件（也可在浏览器访问 Releases 页面手动下载），无论在远程 SSH 服务器、Docker 容器、WSL2 还是开启了 GNOME Keyring / KDE Wallet 的 Linux 图形桌面上均可直接使用：
 
 ```bash
-VER=v1.2.6
+VER=v1.2.7
 ARCH="$(uname -m)"   # x86_64 或 aarch64
 curl -fLO "https://github.com/MatrixC7/agy-switch-cli/releases/download/${VER}/agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz"
 curl -fLO "https://github.com/MatrixC7/agy-switch-cli/releases/download/${VER}/agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz.sha256"
@@ -63,22 +67,23 @@ agy-switch-cli status
 
 # 2. 登录添加账号（默认零配置手动粘贴回调 URL；如需本地监听可加 --ssh）
 agy-switch-cli auth login --label "primary"
-# 若本机官方 agy 已登录（或桌面端与 agy 在系统钥匙串中共用登录条目），也可读取当前 agy 凭据入库（不读取桌面端独立的 jetski-standalone-oauth-token 回退文件）：
+# 若本机官方 agy 已登录（或桌面端与 agy 在系统钥匙串中共用登录条目），也可纯本地离线读取当前 agy 凭据入库（不读取桌面端独立的 jetski-standalone-oauth-token 回退文件）：
 # agy-switch-cli accounts add --from-local --label "local"
 # 或从原桌面版 ~/.antigravity_tools 只读迁移已有账号（不修改原目录）：
 # agy-switch-cli accounts import --from-legacy
 
-# 3. 联网流式刷新（实时打印 [k/N] 进度）并查看所有账号的最新配额进度表
-agy-switch-cli quota --refresh --all
+# 3. 委托本机官方 agy 刷新当前活跃账号的最新配额，或纯只读查看全部账号已缓存的配额
+agy-switch-cli quota --refresh
+# agy-switch-cli quota --all
 
-# 4. 查看当前生效账号、运行状态与该账号支持的全部模型列表
+# 4. 查看当前生效账号、运行状态与该账号的模型分组信息
 agy-switch-cli current
 
 # 5. 打开交互式看板管理与切号，之后直接运行 agy 即可（也可用可选的 `agy-switch-cli run` 指定账号或 `file` 后端包装启动）
 agy-switch-cli tui
 ```
 
-*(网络代理提示：Linux 图形界面的“系统代理”不会自动注入终端环境。若需走代理连接 Google，单次命令可加 `--proxy http://127.0.0.1:7890`，当前终端免重复传参可执行 `export https_proxy=http://127.0.0.1:7890`，需要跨终端与后台 `daemon` 持久生效则将其写入 `~/.local/share/agy-switch-cli/config.json`，详见使用手册第 6 节。)*
+*(网络代理提示：Linux 图形界面的“系统代理”不会自动注入终端环境。若显式 `auth` 登录/重授权、裸令牌导入或由官方 `agy` 发起的联网请求需走代理，单次命令可加 `--proxy http://127.0.0.1:7890`，当前终端免重复传参可执行 `export https_proxy=http://127.0.0.1:7890`，需要持久生效则将其写入 `~/.local/share/agy-switch-cli/config.json`，详见使用手册第 6 节。)*
 
 ---
 
@@ -88,16 +93,16 @@ agy-switch-cli tui
 |:------------------------------------------------------ |:---------------------------------------------------------------------------------- |
 | `agy-switch-cli status`                                | 只读巡检生效后端、本地仓库、事务日志、槽位初始化、守护进程运行/服务状态、本机官方 `agy` 与已安装桌面端 Antigravity App 版本 |
 | `agy-switch-cli auth login [--ssh]`                    | 通过 PKCE (`S256`) 添加新 Google 账号（默认粘贴回调 URL；重新授权用 `reauthorize`） |
-| `agy-switch-cli accounts list / add / import / export` | 查看账号详情与排序（`--move`/`--order`）、导入本机或外部目标目录已登录号（`--from-local [--target \| --target-dir]`）或文件/标准输入 Token（`--from-file`/`--from-stdin`）、导入导出备份 |
-| `agy-switch-cli current [--target \| --target-dir]`     | 查看当前生效身份、运行中进程状态及该账号支持的全部模型清单（可选指向外部目标应用数据目录） |
-| `agy-switch-cli quota [--refresh] [--all \| --target \| --target-dir]` | 查看双窗口（`Weekly` + `5h`）配额进度表（加 `--refresh` 先流式联网刷新再展示；支持直接查询外部目标目录及未入池游离文件） |
-| `agy-switch-cli refresh [--all \| --target \| --target-dir]` | 批量流式联网刷新账号 OAuth 令牌与远端配额（终端实时输出 `[k/N]` 进度），或刷新并回写指定外部目标目录 |
-| `agy-switch-cli stats summary / list [--watch] [--target \| --target-dir]` | 纯本地只读聚合模型 Token 用量与 `TTFT`/`TPS` 分位统计（`summary`），或列出最近请求明细（`list`），支持 `--watch [秒数]` 实时看板刷新（按 `Tab` 切换视图）与外部目标目录统计 |
-| `agy-switch-cli switch <ID\|EMAIL> [--target \| --target-dir]` | 手动切换生效账号（默认 `auto` 自动适配无头 `file` 与桌面钥匙串 `dual` 双写；加 `--target` / `--target-dir` 可独立切写外部目标目录而不影响官方槽与 `daemon`） |
+| `agy-switch-cli accounts list / add / import / export` | 查看账号详情与排序（`--move`/`--order`）、纯本地离线导入本机官方槽位已登录号（`--from-local`）或文件/标准输入 Token（`--from-file`/`--from-stdin`）、导入导出备份 |
+| `agy-switch-cli current`                               | 查看当前生效身份、运行中进程状态及该账号的模型/分组信息 |
+| `agy-switch-cli quota [--refresh \| <ID\|EMAIL> \| --all]` | 查看双窗口（`Weekly` + `5h`）配额进度表；加 `--refresh` 委托官方 `agy -p "/usage"` 刷新当前活跃官方槽位并展示；不带 `--refresh` 时支持按账号或 `--all` 纯只读查看缓存 |
+| `agy-switch-cli refresh [<ACTIVE_ID\|EMAIL>]`          | 委托本机官方 `agy -p "/usage"` 刷新当前活跃官方槽位配额，并纯本地回采刷新后的令牌与套餐层级 |
+| `agy-switch-cli stats summary / list [--watch]`        | 纯本地只读聚合官方 CLI/桌面端（`--source all\|cli\|app`）模型 Token 用量与 `TTFT`/`TPS` 分位统计（`summary`），或列出最近请求明细（`list`），支持 `--watch [秒数]` 实时看板刷新（按 `Tab` 切换视图） |
+| `agy-switch-cli switch <ID\|EMAIL>`                    | 纯本地离线切换官方活跃槽位（切出前自动回采当前槽位最新令牌；默认 `auto` 自动适配无头 `file` 与桌面钥匙串 `dual` 双写） |
 | `agy-switch-cli policy set --all-candidates ...`       | 配置自动切号水位策略（默认 `reserve = 10%`、`minimum = 30%`，配合 `daemon` 后台自动巡检切号） |
-| `agy-switch-cli daemon [--install \| --uninstall \| --reset-cooldown]` | 运行后台自动切号守护进程（默认每 `180` 秒巡检、切号冷却 `3600` 秒；支持 `--reset-cooldown` 主动解除冷却期；桌面切号/熔断通知默认常驻，可在 `config.json` 调整或用 `--no-notify` 关闭，无头环境自动静默），或安装/卸载 `systemd --user` 服务 |
-| `agy-switch-cli [--backend file] run [--account ...] -- agy ...` | 可选方式：按指定账号或指定后端包装启动 `agy`；显式启用 `file` 后端时自动为子进程屏蔽桌面 D-Bus 钥匙串 |
-| `agy-switch-cli tui`                                   | 打开 SSH 交互式终端看板（支持 `↑/↓` 与 `g/G` 浏览、`Space` 多选联动、`[/]` 调序、`i` 可滚动详情/重置倒计时、`r/R` 刷新、`c/C/p` 策略、`k` 清冷却、`e/E` 与 `d/D` 启停、`l` 改备注、`o/O` `0600` 导出与 `x`+`y` 删号） |
+| `agy-switch-cli daemon [--install \| --uninstall \| --reset-cooldown]` | 运行后台步进式自动切号守护进程（默认每 `900` 秒即 15 分钟巡检当前活跃槽位、切号冷却 `3600` 秒；支持 `--reset-cooldown` 主动解除冷却期；桌面切号/低额保持/熔断通知支持 `config.json` 配置或用 `--no-notify` 关闭，无头环境自动静默），或安装/卸载 `systemd --user` 服务 |
+| `agy-switch-cli [--backend file] run [--account ...] -- agy ...` | 可选方式：纯本地离线按指定账号或指定后端包装启动 `agy`；显式启用 `file` 后端时自动为子进程屏蔽桌面 D-Bus 钥匙串 |
+| `agy-switch-cli tui`                                   | 打开 SSH 交互式终端看板（顶部按池分行展示活跃号双窗口余量与重置倒计时，主表采用单列 `Last Quota`；支持 `↑/↓` 与 `g/G` 浏览、`Space` 多选联动、`[/]` 调序、`i` 可滚动详情/分组说明、仅在活跃 `*` 行按 `r` 委托官方 `agy` 刷新、`c/C/p` 策略、`k` 清冷却、`e/E` 与 `d/D` 启停、`l` 改备注、`o/O` `0600` 导出与 `x`+`y` 删号） |
 
 **关于 `--json` 机器输出与 `0..=8` 稳定退出码的边界说明**：
 - 全屏交互看板 `tui` 与实时刷新模式 `stats ... --watch` 均与 `--json` 互斥并返回退出码 `2`。
