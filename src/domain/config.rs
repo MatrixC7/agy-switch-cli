@@ -9,8 +9,8 @@ fn default_config_schema_version() -> u32 {
 
 /// Optional store-scoped configuration (`<data_dir>/config.json`, `schema_version: 1`)
 /// supporting Blueprint §6.2 item 1 (`network.proxy_url`) and §4.3 item 1 (OAuth client extensions).
-/// Deliberately omits `#[serde(deny_unknown_fields)]` so legacy fields (such as old `targets` entries)
-/// are silently ignored without breaking upgrades.
+/// Deliberately omits `#[serde(deny_unknown_fields)]` so legacy fields (such as old `targets` or
+/// `notifications` entries) are silently ignored without breaking upgrades.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadlessConfig {
     #[serde(default = "default_config_schema_version")]
@@ -21,8 +21,6 @@ pub struct HeadlessConfig {
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
-    pub notifications: NotificationsConfig,
-    #[serde(default)]
     pub oauth: OAuthFileConfig,
 }
 
@@ -32,7 +30,6 @@ impl Default for HeadlessConfig {
             schema_version: STORE_SCHEMA_VERSION,
             backend: None,
             network: NetworkConfig::default(),
-            notifications: NotificationsConfig::default(),
             oauth: OAuthFileConfig::default(),
         }
     }
@@ -55,23 +52,9 @@ impl fmt::Debug for HeadlessConfig {
             .field("schema_version", &self.schema_version)
             .field("backend", &safe_backend)
             .field("network", &self.network)
-            .field("notifications", &self.notifications)
             .field("oauth", &self.oauth)
             .finish()
     }
-}
-
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, Debug)]
-pub struct NotificationsConfig {
-    /// Enable or disable Linux desktop notifications (`org.freedesktop.Notifications`) for `daemon`.
-    /// Defaults to `true` when omitted (auto-skips silently on headless systems).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    /// Keep `Account Switched` desktop notifications on screen until manually dismissed (`expire_timeout = 0`).
-    /// Defaults to `true` when omitted; set to `false` to use the desktop's default auto-dismiss timeout (`-1`).
-    /// `Auto-Switch Paused` alerts always remain persistent (`expire_timeout = 0`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub persistent: Option<bool>,
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,10 +160,6 @@ mod tests {
                 proxy_url: Some("socks5h://proxyuser:PROXY_PASS_SECRET@127.0.0.1:1080".into()),
                 no_proxy: Some("internal.corp".into()),
             },
-            notifications: NotificationsConfig {
-                enabled: Some(false),
-                persistent: Some(true),
-            },
             oauth: OAuthFileConfig {
                 active_client_key: Some("custom".into()),
                 required_scopes: Some(vec!["openid".into()]),
@@ -201,48 +180,20 @@ mod tests {
     }
 
     #[test]
-    fn legacy_targets_field_in_config_json_is_silently_ignored() {
+    fn legacy_targets_and_notifications_fields_in_config_json_are_silently_ignored() {
         let raw = r#"{
             "schema_version": 1,
             "backend": "auto",
             "targets": {
                 "legacy_alias": "/tmp/legacy/slot"
+            },
+            "notifications": {
+                "enabled": true,
+                "persistent": false
             }
         }"#;
         let cfg: HeadlessConfig = serde_json::from_str(raw).unwrap();
         assert_eq!(cfg.schema_version, 1);
         assert_eq!(cfg.backend.as_deref(), Some("auto"));
-    }
-
-    #[test]
-    fn config_notifications_deserializes_explicit_and_defaults_to_none() {
-        let legacy: HeadlessConfig = serde_json::from_str(r#"{"schema_version":1}"#).unwrap();
-        assert_eq!(legacy.notifications.enabled, None);
-        assert_eq!(legacy.notifications.persistent, None);
-
-        let disabled: HeadlessConfig =
-            serde_json::from_str(r#"{"schema_version":1,"notifications":{"enabled":false}}"#)
-                .unwrap();
-        assert_eq!(disabled.notifications.enabled, Some(false));
-        assert_eq!(disabled.notifications.persistent, None);
-
-        let enabled: HeadlessConfig =
-            serde_json::from_str(r#"{"schema_version":1,"notifications":{"enabled":true}}"#)
-                .unwrap();
-        assert_eq!(enabled.notifications.enabled, Some(true));
-        assert_eq!(enabled.notifications.persistent, None);
-
-        let auto_dismiss: HeadlessConfig = serde_json::from_str(
-            r#"{"schema_version":1,"notifications":{"enabled":true,"persistent":false}}"#,
-        )
-        .unwrap();
-        assert_eq!(auto_dismiss.notifications.enabled, Some(true));
-        assert_eq!(auto_dismiss.notifications.persistent, Some(false));
-
-        let persistent_explicit: HeadlessConfig =
-            serde_json::from_str(r#"{"schema_version":1,"notifications":{"persistent":true}}"#)
-                .unwrap();
-        assert_eq!(persistent_explicit.notifications.enabled, None);
-        assert_eq!(persistent_explicit.notifications.persistent, Some(true));
     }
 }

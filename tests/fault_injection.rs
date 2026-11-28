@@ -1,3 +1,5 @@
+mod common;
+
 use agy_switch_cli::domain::account::AccountRecord;
 use agy_switch_cli::domain::token::TokenRecord;
 use agy_switch_cli::error::ExitCode;
@@ -12,48 +14,27 @@ use agy_switch_cli::session::payload::serialize_session_payload;
 use agy_switch_cli::store::locks::ActiveSlotLock;
 use agy_switch_cli::store::repository::StoreRepository;
 use agy_switch_cli::switching::executor::{execute_switch, SwitchOptions};
+use common::{make_synthetic_account, run_isolated_subtest, IsolatedEnv};
 use serde_json::json;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 
 static FAULT_ENV_MUTEX: AsyncMutex<()> = AsyncMutex::const_new(());
 
-struct ScopedEnvVar {
-    key: &'static str,
-    prev: Option<OsString>,
-}
-
-impl ScopedEnvVar {
-    fn set(key: &'static str, val: impl AsRef<OsStr>) -> Self {
-        let prev = std::env::var_os(key);
-        std::env::set_var(key, val);
-        Self { key, prev }
-    }
-}
-
-impl Drop for ScopedEnvVar {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
-
-fn setup_isolated(tmp: &std::path::Path) -> (HeadlessPaths, StoreRepository, ScopedEnvVar) {
+fn paths_and_repo(tmp: &std::path::Path) -> (HeadlessPaths, StoreRepository, PathBuf) {
     let home = tmp.join("home");
     let data = tmp.join("data");
     let cache = tmp.join("cache").join("agy-switch-cli");
     let proc_dir = tmp.join("empty_proc");
     fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
     fs::create_dir_all(&proc_dir).unwrap();
-    let proc_guard = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir);
     let paths = HeadlessPaths::with_explicit(home, data, cache);
     let repo = StoreRepository::new(paths.clone());
-    (paths, repo, proc_guard)
+    (paths, repo, proc_dir)
 }
 
 fn make_account(
@@ -63,31 +44,34 @@ fn make_account(
     expiry: i64,
     now: i64,
 ) -> AccountRecord {
-    let tok = TokenRecord {
-        access_token: format!("ya29.{id}"),
-        refresh_token: refresh_token.into(),
-        expires_in: 3600,
-        expiry_timestamp: expiry,
-        token_type: "Bearer".into(),
-        id_token: None,
-        oauth_client_key: Some("antigravity_enterprise".into()),
-        granted_scopes: Some(vec![
-            "openid".into(),
-            "https://www.googleapis.com/auth/cloud-platform".into(),
-        ]),
-        project_id: None,
-        is_gcp_tos: true,
-    };
-    AccountRecord::new(id.into(), email.into(), tok, now)
+    make_synthetic_account(id, email, refresh_token, expiry, now)
 }
 
 #[tokio::test]
 async fn rotated_refresh_token_is_never_rolled_back_when_slot_write_fails_with_enospc() {
+    let now = 1_800_000_000i64;
+    if let Some(sub_dir) = std::env::var_os("AGY_SUBTEST_FI_ENOSPC_DIR") {
+        let (_, repo, _) = paths_and_repo(&PathBuf::from(sub_dir));
+        let err = execute_switch(
+            &repo,
+            &FileSessionBackend,
+            &OAuthClientRegistry::parse_from_raw(None, None),
+            "acc-target",
+            &SwitchOptions {
+                dry_run: false,
+                allow_running: false,
+            },
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(err.error_code, "disk_full_enospc");
+        return;
+    }
+
     let _guard = FAULT_ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
-    let (paths, repo, _proc_guard) = setup_isolated(tmp.path());
+    let (paths, repo, proc_dir) = paths_and_repo(tmp.path());
     let backend = FileSessionBackend;
-    let now = 1_800_000_000i64;
 
     // Seed acc-old in active slot, and acc-target with an expired access_token so switch refreshes it
     let acc_old = make_account(
@@ -124,28 +108,19 @@ async fn rotated_refresh_token_is_never_rolled_back_when_slot_write_fails_with_e
         .write_slot(&paths, &rotated_old_slot_payload)
         .unwrap();
 
-    // Inject ENOSPC specifically on `antigravity-oauth-token` write!
-    let fault_guard = ScopedEnvVar::set(
-        "AGY_SWITCH_CLI_FAULT_SPEC",
-        "before_write:antigravity-oauth-token:enospc",
+    // Inject ENOSPC specifically on `antigravity-oauth-token` write in an isolated subprocess!
+    run_isolated_subtest(
+        "rotated_refresh_token_is_never_rolled_back_when_slot_write_fails_with_enospc",
+        "AGY_SUBTEST_FI_ENOSPC",
+        &[
+            ("AGY_SUBTEST_FI_ENOSPC_DIR", tmp.path().as_os_str()),
+            ("AGY_SWITCH_CLI_PROC_ROOT", proc_dir.as_os_str()),
+            (
+                "AGY_SWITCH_CLI_FAULT_SPEC",
+                OsStr::new("before_write:antigravity-oauth-token:enospc"),
+            ),
+        ],
     );
-
-    let res = execute_switch(
-        &repo,
-        &backend,
-        &OAuthClientRegistry::parse_from_raw(None, None),
-        "acc-target",
-        &SwitchOptions {
-            dry_run: false,
-            allow_running: false,
-        },
-        now,
-    );
-
-    drop(fault_guard);
-
-    let err = res.unwrap_err();
-    assert_eq!(err.error_code, "disk_full_enospc");
 
     // 1. Active slot retains acc-old untouched
     assert_eq!(
@@ -170,14 +145,46 @@ async fn rotated_refresh_token_is_never_rolled_back_when_slot_write_fails_with_e
 
 #[tokio::test]
 async fn index_failure_after_slot_commit_returns_exit_7_committed_index_pending_and_reconciles() {
+    let now = 1_800_000_000i64;
+    if let Some(sub_dir) = std::env::var_os("AGY_SUBTEST_FI_IDX_DIR") {
+        let (_, repo, _) = paths_and_repo(&PathBuf::from(sub_dir));
+        let target = std::env::var("AGY_SUBTEST_FI_IDX_TARGET").unwrap();
+        let ts: i64 = std::env::var("AGY_SUBTEST_FI_IDX_TS")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let err = execute_switch(
+            &repo,
+            &FileSessionBackend,
+            &OAuthClientRegistry::parse_from_raw(None, None),
+            &target,
+            &SwitchOptions {
+                dry_run: false,
+                allow_running: false,
+            },
+            ts,
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code, ExitCode::PartialCommitOrRecovery);
+        assert_eq!(err.error_code, "committed_index_pending");
+        if target == "acc-b" {
+            assert!(err.message.contains("生效位凭据已切换至目标账号"));
+        }
+        return;
+    }
+
     let _guard = FAULT_ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
-    let (paths, repo, _proc_guard) = setup_isolated(tmp.path());
+    let (paths, repo, proc_dir) = paths_and_repo(tmp.path());
     let backend = FileSessionBackend;
-    let now = 1_800_000_000i64;
 
-    let acc_a = make_account("acc-a", "a@example.invalid", "1//RT_A", now + 7200, now);
-    let acc_b = make_account("acc-b", "b@example.invalid", "1//RT_B", now + 7200, now);
+    let mut acc_a = make_account("acc-a", "a@example.invalid", "1//RT_A", now + 7200, now);
+    acc_a.last_switched_in_at = Some(now - 600);
+    let mut acc_b = make_account("acc-b", "b@example.invalid", "1//RT_B", now + 7200, now);
+    // Give `acc-b` a stale previous session (`last_switched_out_at`) so recovery replay proves
+    // `CommittedIndexPending` clears stale `last_switched_out_at` on the target account!
+    acc_b.last_switched_in_at = Some(now - 1800);
+    acc_b.last_switched_out_at = Some(now - 900);
     repo.with_write_lock(|tx| {
         tx.upsert_account(acc_a.clone(), true, now)?;
         tx.upsert_account(acc_b.clone(), false, now)?;
@@ -189,29 +196,21 @@ async fn index_failure_after_slot_commit_returns_exit_7_committed_index_pending_
         .unwrap();
 
     // Inject EROFS right at `before_index_commit` (AFTER `antigravity-oauth-token` has committed!)
-    let fault_guard = ScopedEnvVar::set(
-        "AGY_SWITCH_CLI_FAULT_SPEC",
-        "before_index_commit:index.json:erofs",
+    let ts1_str = now.to_string();
+    run_isolated_subtest(
+        "index_failure_after_slot_commit_returns_exit_7_committed_index_pending_and_reconciles",
+        "AGY_SUBTEST_FI_IDX_1",
+        &[
+            ("AGY_SUBTEST_FI_IDX_DIR", tmp.path().as_os_str()),
+            ("AGY_SUBTEST_FI_IDX_TARGET", OsStr::new("acc-b")),
+            ("AGY_SUBTEST_FI_IDX_TS", OsStr::new(&ts1_str)),
+            ("AGY_SWITCH_CLI_PROC_ROOT", proc_dir.as_os_str()),
+            (
+                "AGY_SWITCH_CLI_FAULT_SPEC",
+                OsStr::new("before_index_commit:index.json:erofs"),
+            ),
+        ],
     );
-
-    let err = execute_switch(
-        &repo,
-        &backend,
-        &OAuthClientRegistry::parse_from_raw(None, None),
-        "acc-b",
-        &SwitchOptions {
-            dry_run: false,
-            allow_running: false,
-        },
-        now,
-    )
-    .unwrap_err();
-
-    drop(fault_guard);
-
-    assert_eq!(err.exit_code, ExitCode::PartialCommitOrRecovery);
-    assert_eq!(err.error_code, "committed_index_pending");
-    assert!(err.message.contains("生效位凭据已切换至目标账号"));
 
     // Active slot IS already acc-b, while index.json is still acc-a!
     assert!(fs::read_to_string(&paths.active_slot_file)
@@ -236,7 +235,7 @@ async fn index_failure_after_slot_commit_returns_exit_7_committed_index_pending_
         }
     );
 
-    // Reconcile completes index.json alignment!
+    // Reconcile 10s later completes index.json alignment AND preserves verified slot-commit timestamp `now` (P2-01)!
     let l1 = ActiveSlotLock::try_acquire(&paths, false).unwrap();
     let fixed_diag = reconcile_journal_locked(&l1, &repo, &backend, true, now + 10).unwrap();
     drop(l1);
@@ -253,15 +252,104 @@ async fn index_failure_after_slot_commit_returns_exit_7_committed_index_pending_
         Some("acc-b")
     );
     assert!(read_journal_readonly(&paths).unwrap().is_none());
+
+    // Normal `CommittedIndexPending` reconciliation MUST stamp `acc-a.last_switched_out_at`,
+    // set `acc-b.last_switched_in_at` to the verified commit instant (`now`, not replay `now + 10`),
+    // and CLEAR stale `acc-b.last_switched_out_at = None`!
+    let a_rec = repo.read_account_unchecked("acc-a").unwrap();
+    let b_rec = repo.read_account_unchecked("acc-b").unwrap();
+    assert_eq!(a_rec.last_switched_out_at, Some(now));
+    assert_eq!(b_rec.last_switched_in_at, Some(now));
+    assert_eq!(b_rec.last_switched_out_at, None);
+
+    // Now test `CommittedIndexPending` recovery when active slot had drifted to a FOREIGN external
+    // credential (while `selected_account_id == Some("acc-b")`): switching to `acc-a` under
+    // `before_index_commit` fault and reconciling MUST clear `acc-a.last_switched_out_at = None`,
+    // set `acc-a.last_switched_in_at` to `now + 20`, and NEVER fabricate `acc-b.last_switched_out_at`!
+    let foreign_tok = TokenRecord {
+        access_token: "ya29.foreign-ext".into(),
+        refresh_token: "1//RT_FOREIGN_EXT".into(),
+        expires_in: 3600,
+        expiry_timestamp: now + 7200,
+        token_type: "Bearer".into(),
+        id_token: None,
+        oauth_client_key: None,
+        granted_scopes: None,
+        project_id: None,
+        is_gcp_tos: true,
+    };
+    backend
+        .write_slot(&paths, &serialize_session_payload(&foreign_tok).unwrap())
+        .unwrap();
+
+    let ts2_str = (now + 20).to_string();
+    run_isolated_subtest(
+        "index_failure_after_slot_commit_returns_exit_7_committed_index_pending_and_reconciles",
+        "AGY_SUBTEST_FI_IDX_2",
+        &[
+            ("AGY_SUBTEST_FI_IDX_DIR", tmp.path().as_os_str()),
+            ("AGY_SUBTEST_FI_IDX_TARGET", OsStr::new("acc-a")),
+            ("AGY_SUBTEST_FI_IDX_TS", OsStr::new(&ts2_str)),
+            ("AGY_SWITCH_CLI_PROC_ROOT", proc_dir.as_os_str()),
+            (
+                "AGY_SWITCH_CLI_FAULT_SPEC",
+                OsStr::new("before_index_commit:index.json:erofs"),
+            ),
+        ],
+    );
+
+    let l1_2 = ActiveSlotLock::try_acquire(&paths, false).unwrap();
+    let fixed_diag2 = reconcile_journal_locked(&l1_2, &repo, &backend, true, now + 30).unwrap();
+    drop(l1_2);
+    assert!(matches!(
+        fixed_diag2,
+        JournalDiagnosis::CommittedIndexPending { ref target_account_id } if target_account_id == "acc-a"
+    ));
+    let a_after_drift_rec = repo.read_account_unchecked("acc-a").unwrap();
+    let b_after_drift_rec = repo.read_account_unchecked("acc-b").unwrap();
+    assert_eq!(a_after_drift_rec.last_switched_in_at, Some(now + 20));
+    assert_eq!(a_after_drift_rec.last_switched_out_at, None);
+    assert_eq!(
+        b_after_drift_rec.last_switched_out_at, None,
+        "CommittedIndexPending recovery after external drift MUST NOT fabricate last_switched_out_at on stale selected account"
+    );
 }
 
 #[tokio::test]
 async fn failed_slot_readback_and_failed_rollback_records_recovery_incomplete_exit_7() {
+    let now = 1_800_000_000i64;
+    if let Some(sub_dir) = std::env::var_os("AGY_SUBTEST_FI_RB_FAULT_DIR") {
+        let (_, repo, _) = paths_and_repo(&PathBuf::from(sub_dir));
+        let err = execute_switch(
+            &repo,
+            &FileSessionBackend,
+            &OAuthClientRegistry::parse_from_raw(None, None),
+            "acc-b",
+            &SwitchOptions {
+                dry_run: false,
+                allow_running: false,
+            },
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code, ExitCode::PartialCommitOrRecovery);
+        assert_eq!(err.error_code, "recovery_incomplete");
+        return;
+    }
+    if std::env::var_os("AGY_SUBTEST_FI_RB_MAIN").is_none() {
+        let tmp_proc = tempfile::tempdir().unwrap();
+        run_isolated_subtest(
+            "failed_slot_readback_and_failed_rollback_records_recovery_incomplete_exit_7",
+            "AGY_SUBTEST_FI_RB_MAIN",
+            &[("AGY_SWITCH_CLI_PROC_ROOT", tmp_proc.path().as_os_str())],
+        );
+        return;
+    }
+
     let _guard = FAULT_ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
-    let (paths, repo, _proc_guard) = setup_isolated(tmp.path());
+    let (paths, repo, proc_dir) = paths_and_repo(tmp.path());
     let backend = FileSessionBackend;
-    let now = 1_800_000_000i64;
 
     let acc_a = make_account("acc-a", "a@example.invalid", "1//RT_A", now + 7200, now);
     let acc_b = make_account("acc-b", "b@example.invalid", "1//RT_B", now + 7200, now);
@@ -276,34 +364,23 @@ async fn failed_slot_readback_and_failed_rollback_records_recovery_incomplete_ex
         .unwrap();
 
     // Inject readback corruption on slot write AND failure on slot_rollback!
-    let fault_guard = ScopedEnvVar::set(
-        "AGY_SWITCH_CLI_FAULT_SPEC",
-        "after_rename:antigravity-oauth-token:corrupt_after_rename;slot_rollback:antigravity-oauth-token:io",
+    run_isolated_subtest(
+        "failed_slot_readback_and_failed_rollback_records_recovery_incomplete_exit_7",
+        "AGY_SUBTEST_FI_RB_FAULT",
+        &[
+            ("AGY_SUBTEST_FI_RB_FAULT_DIR", tmp.path().as_os_str()),
+            ("AGY_SWITCH_CLI_PROC_ROOT", proc_dir.as_os_str()),
+            (
+                "AGY_SWITCH_CLI_FAULT_SPEC",
+                OsStr::new("after_rename:antigravity-oauth-token:corrupt_after_rename;slot_rollback:antigravity-oauth-token:io"),
+            ),
+        ],
     );
-
-    let err = execute_switch(
-        &repo,
-        &backend,
-        &OAuthClientRegistry::parse_from_raw(None, None),
-        "acc-b",
-        &SwitchOptions {
-            dry_run: false,
-            allow_running: false,
-        },
-        now,
-    )
-    .unwrap_err();
-
-    drop(fault_guard);
-
-    assert_eq!(err.exit_code, ExitCode::PartialCommitOrRecovery);
-    assert_eq!(err.error_code, "recovery_incomplete");
 
     // Read-only `status --json` and `switch --dry-run` MUST report exit code 7 (`RecoveryIncomplete`),
     // while manual `switch` self-heals the journal and completes the switch cleanly!
     let run_dir = tmp.path().join("run");
     fs::create_dir_all(&run_dir).unwrap();
-    let proc_dir = tmp.path().join("empty_proc");
     let no_agy = tmp.path().join("no-host-agy");
 
     let status_check = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
@@ -362,14 +439,12 @@ async fn failed_slot_readback_and_failed_rollback_records_recovery_incomplete_ex
 #[tokio::test]
 async fn subprocess_crash_after_slot_commit_is_detected_by_status_and_reconciled_on_write() {
     let _guard = FAULT_ENV_MUTEX.lock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let (paths, repo, _proc_guard) = setup_isolated(tmp.path());
+    let env = IsolatedEnv::new();
+    env.init_agy_slot_dir();
+    let paths = env.paths();
+    let repo = env.repo();
     let backend = FileSessionBackend;
     let now = jiff::Timestamp::now().as_second();
-    let run_dir = tmp.path().join("run");
-    let proc_dir = tmp.path().join("empty_proc");
-    let no_agy = tmp.path().join("no-host-agy");
-    fs::create_dir_all(&run_dir).unwrap();
 
     let acc_a = make_account("acc-a", "a@example.invalid", "1//RT_A", now + 7200, now);
     let acc_b = make_account("acc-b", "b@example.invalid", "1//RT_B", now + 7200, now);
@@ -384,77 +459,25 @@ async fn subprocess_crash_after_slot_commit_is_detected_by_status_and_reconciled
         .unwrap();
 
     // Crash subprocess immediately after `antigravity-oauth-token` rename (`after_slot_commit:index.json:abort`)
-    let crashed = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", &paths.home_dir)
-        .env("XDG_CACHE_HOME", paths.cache_dir.parent().unwrap())
-        .env("XDG_RUNTIME_DIR", &run_dir)
-        .env(
-            "DBUS_SESSION_BUS_ADDRESS",
-            format!("unix:path={}/no-dbus", run_dir.display()),
-        )
-        .env("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir)
-        .env("AGY_SWITCH_CLI_AGY_BIN", &no_agy)
+    let crashed = env
+        .cli_cmd()
         .env(
             "AGY_SWITCH_CLI_FAULT_SPEC",
             "after_slot_commit:index.json:abort",
         )
-        .args([
-            "--data-dir",
-            paths.data_dir.to_str().unwrap(),
-            "switch",
-            "acc-b",
-        ])
+        .args(["switch", "acc-b"])
         .output()
         .unwrap();
     assert_eq!(crashed.status.code(), Some(137));
 
     // Read-only `status` sees `CommittedIndexPending` (exit code 7)
-    let st1 = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", &paths.home_dir)
-        .env("XDG_CACHE_HOME", paths.cache_dir.parent().unwrap())
-        .env("XDG_RUNTIME_DIR", &run_dir)
-        .env(
-            "DBUS_SESSION_BUS_ADDRESS",
-            format!("unix:path={}/no-dbus", run_dir.display()),
-        )
-        .env("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir)
-        .env("AGY_SWITCH_CLI_AGY_BIN", &no_agy)
-        .args([
-            "--data-dir",
-            paths.data_dir.to_str().unwrap(),
-            "status",
-            "--json",
-        ])
-        .output()
-        .unwrap();
+    let st1 = env.cli_cmd().args(["status", "--json"]).output().unwrap();
     assert_eq!(st1.status.code(), Some(7));
 
     // Subsequent write command reconciles `index.json` to `acc-b`!
-    let reconcile_out = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", &paths.home_dir)
-        .env("XDG_CACHE_HOME", paths.cache_dir.parent().unwrap())
-        .env("XDG_RUNTIME_DIR", &run_dir)
-        .env(
-            "DBUS_SESSION_BUS_ADDRESS",
-            format!("unix:path={}/no-dbus", run_dir.display()),
-        )
-        .env("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir)
-        .env("AGY_SWITCH_CLI_AGY_BIN", &no_agy)
-        .args([
-            "--data-dir",
-            paths.data_dir.to_str().unwrap(),
-            "policy",
-            "set",
-            "--reserve",
-            "10",
-            "--json",
-        ])
+    let reconcile_out = env
+        .cli_cmd()
+        .args(["accounts", "enable", "acc-a", "--json"])
         .output()
         .unwrap();
     assert_eq!(reconcile_out.status.code(), Some(0));
@@ -471,11 +494,35 @@ async fn subprocess_crash_after_slot_commit_is_detected_by_status_and_reconciled
 #[tokio::test]
 async fn journal_reconcile_unwedges_recovery_incomplete_with_bare_imported_prev_account_and_deleted_pending_target(
 ) {
+    let now = 1_800_000_000i64;
+    if let Some(sub_dir) = std::env::var_os("AGY_SUBTEST_FI_UNWEDGE_DIR") {
+        let (_, repo, _) = paths_and_repo(&PathBuf::from(sub_dir));
+        let target = std::env::var("AGY_SUBTEST_FI_UNWEDGE_TARGET").unwrap();
+        let expected_code = std::env::var("AGY_SUBTEST_FI_UNWEDGE_CODE").unwrap();
+        let ts: i64 = std::env::var("AGY_SUBTEST_FI_UNWEDGE_TS")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let err = execute_switch(
+            &repo,
+            &FileSessionBackend,
+            &OAuthClientRegistry::parse_from_raw(None, None),
+            &target,
+            &SwitchOptions {
+                dry_run: false,
+                allow_running: false,
+            },
+            ts,
+        )
+        .unwrap_err();
+        assert_eq!(err.error_code, expected_code);
+        return;
+    }
+
     let _guard = FAULT_ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
-    let (paths, repo, _proc_guard) = setup_isolated(tmp.path());
+    let (paths, repo, proc_dir) = paths_and_repo(tmp.path());
     let backend = FileSessionBackend;
-    let now = 1_800_000_000i64;
 
     // `acc-imported` starts as a valid bare imported account (`access_token == ""`, `expiry_timestamp == 1`)
     let mut acc_imported = make_account("acc-imported", "imp@example.invalid", "1//RT_IMP", 1, now);
@@ -497,24 +544,22 @@ async fn journal_reconcile_unwedges_recovery_incomplete_with_bare_imported_prev_
     .unwrap();
 
     // Inject readback corruption + rollback failure when switching from `acc-imported` (no slot file yet) to `acc-target`
-    let fault_guard1 = ScopedEnvVar::set(
-        "AGY_SWITCH_CLI_FAULT_SPEC",
-        "after_rename:antigravity-oauth-token:corrupt_after_rename;slot_rollback:antigravity-oauth-token:io",
+    let ts1 = now.to_string();
+    run_isolated_subtest(
+        "journal_reconcile_unwedges_recovery_incomplete_with_bare_imported_prev_account_and_deleted_pending_target",
+        "AGY_SUBTEST_FI_UNWEDGE_1",
+        &[
+            ("AGY_SUBTEST_FI_UNWEDGE_DIR", tmp.path().as_os_str()),
+            ("AGY_SUBTEST_FI_UNWEDGE_TARGET", OsStr::new("acc-target")),
+            ("AGY_SUBTEST_FI_UNWEDGE_CODE", OsStr::new("recovery_incomplete")),
+            ("AGY_SUBTEST_FI_UNWEDGE_TS", OsStr::new(&ts1)),
+            ("AGY_SWITCH_CLI_PROC_ROOT", proc_dir.as_os_str()),
+            (
+                "AGY_SWITCH_CLI_FAULT_SPEC",
+                OsStr::new("after_rename:antigravity-oauth-token:corrupt_after_rename;slot_rollback:antigravity-oauth-token:io"),
+            ),
+        ],
     );
-    let err = execute_switch(
-        &repo,
-        &backend,
-        &OAuthClientRegistry::parse_from_raw(None, None),
-        "acc-target",
-        &SwitchOptions {
-            dry_run: false,
-            allow_running: false,
-        },
-        now,
-    )
-    .unwrap_err();
-    drop(fault_guard1);
-    assert_eq!(err.error_code, "recovery_incomplete");
 
     // Simulate an unserializable `acc-imported` record on disk (`expiry_timestamp == 0`):
     // `reconcile_journal_locked` MUST skip unserializable `acc-imported`
@@ -549,24 +594,22 @@ async fn journal_reconcile_unwedges_recovery_incomplete_with_bare_imported_prev_
     );
     repo.with_write_lock(|tx| tx.upsert_account(acc_deleted, false, now + 6))
         .unwrap();
-    let fault_guard2 = ScopedEnvVar::set(
-        "AGY_SWITCH_CLI_FAULT_SPEC",
-        "before_index_commit:index.json:erofs",
+    let ts2 = (now + 7).to_string();
+    run_isolated_subtest(
+        "journal_reconcile_unwedges_recovery_incomplete_with_bare_imported_prev_account_and_deleted_pending_target",
+        "AGY_SUBTEST_FI_UNWEDGE_2",
+        &[
+            ("AGY_SUBTEST_FI_UNWEDGE_DIR", tmp.path().as_os_str()),
+            ("AGY_SUBTEST_FI_UNWEDGE_TARGET", OsStr::new("acc-deleted")),
+            ("AGY_SUBTEST_FI_UNWEDGE_CODE", OsStr::new("committed_index_pending")),
+            ("AGY_SUBTEST_FI_UNWEDGE_TS", OsStr::new(&ts2)),
+            ("AGY_SWITCH_CLI_PROC_ROOT", proc_dir.as_os_str()),
+            (
+                "AGY_SWITCH_CLI_FAULT_SPEC",
+                OsStr::new("before_index_commit:index.json:erofs"),
+            ),
+        ],
     );
-    let err2 = execute_switch(
-        &repo,
-        &backend,
-        &OAuthClientRegistry::parse_from_raw(None, None),
-        "acc-deleted",
-        &SwitchOptions {
-            dry_run: false,
-            allow_running: false,
-        },
-        now + 7,
-    )
-    .unwrap_err();
-    drop(fault_guard2);
-    assert_eq!(err2.error_code, "committed_index_pending");
 
     // User forcibly deletes `acc-deleted` before journal reconciliation
     repo.with_write_lock(|tx| tx.delete_account("acc-deleted", true, now + 8))
@@ -580,16 +623,14 @@ async fn journal_reconcile_unwedges_recovery_incomplete_with_bare_imported_prev_
 }
 
 #[tokio::test]
-async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slot_tmp_files() {
+async fn write_paths_reconcile_journal_and_switch_cleans_slot_tmp_files() {
     let _guard = FAULT_ENV_MUTEX.lock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let (paths, repo, _proc_guard) = setup_isolated(tmp.path());
+    let env = IsolatedEnv::new();
+    env.init_agy_slot_dir();
+    let paths = env.paths();
+    let repo = env.repo();
     let backend = FileSessionBackend;
     let now = jiff::Timestamp::now().as_second();
-    let run_dir = tmp.path().join("run");
-    let proc_dir = tmp.path().join("empty_proc");
-    let no_agy = tmp.path().join("no-host-agy");
-    fs::create_dir_all(&run_dir).unwrap();
 
     let acc_a = make_account("acc-a", "a@example.invalid", "1//RT_A", now + 7200, now);
     let acc_b = make_account("acc-b", "b@example.invalid", "1//RT_B", now + 7200, now);
@@ -603,25 +644,9 @@ async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slo
         .write_slot(&paths, &serialize_session_payload(&acc_a.token).unwrap())
         .unwrap();
 
-    let cli = || {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"));
-        c.env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", &paths.home_dir)
-            .env("XDG_CACHE_HOME", paths.cache_dir.parent().unwrap())
-            .env("XDG_RUNTIME_DIR", &run_dir)
-            .env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={}/no-dbus", run_dir.display()),
-            )
-            .env("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir)
-            .env("AGY_SWITCH_CLI_AGY_BIN", &no_agy)
-            .args(["--data-dir", paths.data_dir.to_str().unwrap()]);
-        c
-    };
-
     // 1. Crash switch after slot commit (`CommittedIndexPending`: slot=acc-b, index.json=acc-a)
-    let crashed = cli()
+    let crashed = env
+        .cli_cmd()
         .env(
             "AGY_SWITCH_CLI_FAULT_SPEC",
             "after_slot_commit:index.json:abort",
@@ -639,10 +664,10 @@ async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slo
         Some("acc-a")
     );
 
-    // `accounts delete acc-b` WITHOUT `--clear-active-slot` and WITHOUT `--force` MUST reconcile
-    // `CommittedIndexPending` first (updating index.json to `acc-b`), and therefore refuse to delete
-    // the active selected account `acc-b` without `--force`!
-    let del_no_force = cli()
+    // `accounts delete acc-b` WITHOUT `--force` MUST reconcile `CommittedIndexPending` first
+    // (updating index.json to `acc-b`), and therefore refuse to delete active `acc-b` without `--force`!
+    let del_no_force = env
+        .cli_cmd()
         .args(["accounts", "delete", "acc-b"])
         .output()
         .unwrap();
@@ -657,8 +682,9 @@ async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slo
     );
     assert!(read_journal_readonly(&paths).unwrap().is_none());
 
-    // 2. Crash another switch to `acc-a`, then verify `policy set` auto-reconciles `CommittedIndexPending`!
-    let crashed2 = cli()
+    // 2. Crash another switch to `acc-a`, then verify `accounts enable` auto-reconciles `CommittedIndexPending`!
+    let crashed2 = env
+        .cli_cmd()
         .env(
             "AGY_SWITCH_CLI_FAULT_SPEC",
             "after_slot_commit:index.json:abort",
@@ -667,11 +693,12 @@ async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slo
         .output()
         .unwrap();
     assert_eq!(crashed2.status.code(), Some(137));
-    let pol_out = cli()
-        .args(["policy", "set", "--reserve", "10"])
+    let en_reconcile = env
+        .cli_cmd()
+        .args(["accounts", "enable", "acc-b"])
         .output()
         .unwrap();
-    assert_eq!(pol_out.status.code(), Some(0));
+    assert_eq!(en_reconcile.status.code(), Some(0));
     assert_eq!(
         repo.read_snapshot()
             .unwrap()
@@ -683,7 +710,8 @@ async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slo
     assert!(read_journal_readonly(&paths).unwrap().is_none());
 
     // 2b. Crash switch BEFORE slot commit (`AbortedUncommitted`), verify `accounts enable` auto-reconciles it!
-    let crashed_pre = cli()
+    let crashed_pre = env
+        .cli_cmd()
         .env(
             "AGY_SWITCH_CLI_FAULT_SPEC",
             "after_token_refreshed:antigravity-oauth-token:abort",
@@ -693,15 +721,13 @@ async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slo
         .unwrap();
     assert_eq!(crashed_pre.status.code(), Some(137));
     assert!(read_journal_readonly(&paths).unwrap().is_some());
-    let en_out = cli()
+    let en_out = env
+        .cli_cmd()
         .args(["accounts", "enable", "acc-b"])
         .output()
         .unwrap();
     assert_eq!(en_out.status.code(), Some(0));
-    assert!(
-        read_journal_readonly(&paths).unwrap().is_none(),
-        "AbortedUncommitted journal must be auto-cleared by write commands"
-    );
+    assert!(read_journal_readonly(&paths).unwrap().is_none());
     assert_eq!(
         repo.read_snapshot()
             .unwrap()
@@ -711,10 +737,7 @@ async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slo
         Some("acc-a")
     );
 
-    // 3. R3-15: Create (a) an EXPIRED tool-owned `.tmp.agy-switch-cli.<uuid>` file, (b) a FRESH
-    //    tool-owned temp file, and (c) a FOREIGN `.tmp.` file in `active_slot_dir`.
-    //    Read-only `status` leaves all untouched; manual `switch` cleans ONLY the expired owned file
-    //    and preserves both the fresh owned file and the foreign `.tmp.` file!
+    // 3. R3-15: Read-only `status` leaves all temp files untouched; manual `switch` cleans ONLY expired owned temp file!
     let expired_owned_tmp = paths.active_slot_dir.join(format!(
         "antigravity-oauth-token{}{}",
         agy_switch_cli::store::fs_atomic::OWNED_TMP_MARKER,
@@ -729,7 +752,6 @@ async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slo
     fs::write(&expired_owned_tmp, b"partial-junk").unwrap();
     fs::write(&fresh_owned_tmp, b"fresh-in-flight").unwrap();
     fs::write(&foreign_tmp, b"foreign-tool-file").unwrap();
-    // Backdate `expired_owned_tmp` mtime by 180 seconds via `File::set_modified`
     {
         let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(180);
         std::fs::OpenOptions::new()
@@ -739,42 +761,25 @@ async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slo
             .set_modified(old_mtime)
             .unwrap();
     }
-    let st_human = cli().arg("status").output().unwrap();
+    let st_human = env.cli_cmd().arg("status").output().unwrap();
     assert_eq!(st_human.status.code(), Some(0));
     let st_stdout = String::from_utf8_lossy(&st_human.stdout);
-    assert!(
-        !st_stdout.contains("Stray slot files:") && !st_stdout.contains("Session identity:"),
-        "status human output must omit stray_slot_files and session_identity: {st_stdout}"
-    );
+    assert!(!st_stdout.contains("Stray slot files:") && !st_stdout.contains("Session identity:"));
     assert!(expired_owned_tmp.exists());
     assert!(fresh_owned_tmp.exists());
     assert!(foreign_tmp.exists());
 
-    let sw_clean_tmp = cli().args(["switch", "acc-a"]).output().unwrap();
-    assert_eq!(
-        sw_clean_tmp.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&sw_clean_tmp.stderr)
-    );
-    assert!(
-        !expired_owned_tmp.exists(),
-        "manual switch must remove expired tool-owned temp file under L1"
-    );
-    assert!(
-        fresh_owned_tmp.exists(),
-        "manual switch must NOT delete fresh (<60s) tool-owned temp file"
-    );
-    assert!(
-        foreign_tmp.exists(),
-        "manual switch must NOT delete foreign `.tmp.` files in shared slot dir"
-    );
+    let sw_clean_tmp = env.cli_cmd().args(["switch", "acc-a"]).output().unwrap();
+    assert_eq!(sw_clean_tmp.status.code(), Some(0));
+    assert!(!expired_owned_tmp.exists());
+    assert!(fresh_owned_tmp.exists());
+    assert!(foreign_tmp.exists());
     fs::remove_file(&fresh_owned_tmp).unwrap();
     fs::remove_file(&foreign_tmp).unwrap();
 
-    // 4. Inject `RecoveryIncomplete`: verify read-only `status` & `switch --dry-run` exit 7,
-    //    `daemon --once` enters `PausedOnFailure`, and manual `switch` self-heals & clears pause!
-    let rec_inc = cli()
+    // 4. Inject `RecoveryIncomplete`: read-only `status` & `switch --dry-run` exit 7, manual `switch` self-heals!
+    let rec_inc = env
+        .cli_cmd()
         .env(
             "AGY_SWITCH_CLI_FAULT_SPEC",
             "after_rename:antigravity-oauth-token:corrupt_after_rename;slot_rollback:antigravity-oauth-token:io",
@@ -788,44 +793,16 @@ async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slo
         vec!["status", "--json"],
         vec!["switch", "--dry-run", "acc-b"],
     ] {
-        let out = cli().args(&ro_blocked).output().unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(7),
-            "Expected exit 7 on {ro_blocked:?}, got {:?} stderr={}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let out = env.cli_cmd().args(&ro_blocked).output().unwrap();
+        assert_eq!(out.status.code(), Some(7));
     }
 
-    // `daemon --once` detects `RecoveryIncomplete` and persists `paused_on_failure = true`!
-    let daemon_out = cli().args(["daemon", "--once"]).output().unwrap();
-    assert_eq!(daemon_out.status.code(), Some(0));
-    let dstate = agy_switch_cli::switching::daemon::read_daemon_state_readonly(&paths).unwrap();
-    assert!(
-        dstate.paused_on_failure,
-        "Daemon must enter PausedOnFailure on RecoveryIncomplete"
-    );
-
-    // Manual `switch acc-b` self-heals `RecoveryIncomplete` AND clears `paused_on_failure`!
-    let manual_sw = cli().args(["switch", "acc-b"]).output().unwrap();
-    assert_eq!(
-        manual_sw.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&manual_sw.stderr)
-    );
+    let manual_sw = env.cli_cmd().args(["switch", "acc-b"]).output().unwrap();
+    assert_eq!(manual_sw.status.code(), Some(0));
     assert!(read_journal_readonly(&paths).unwrap().is_none());
-    let dstate_after =
-        agy_switch_cli::switching::daemon::read_daemon_state_readonly(&paths).unwrap();
-    assert!(
-        !dstate_after.paused_on_failure,
-        "Manual switch must clear daemon paused_on_failure!"
-    );
 
     // 5. `clear_slot_intent` `RecoveryIncomplete` + concurrent external `agy` login on disk:
-    //    `reconcile_pending_journal_before_write` MUST preserve the external credential without clobbering it
-    //    or deleting `acc-b`!
+    //    `reconcile_pending_journal_before_write` preserves external credential and keeps `acc-b`!
     let ext_acc = make_account(
         "acc-ext",
         "ext@example.invalid",
@@ -862,41 +839,39 @@ async fn write_paths_and_daemon_reconcile_journal_or_pause_and_switch_cleans_slo
     )
     .unwrap();
     fs::write(&paths.active_slot_file, &ext_payload).unwrap();
-    let pol_ext_out = cli()
-        .args(["policy", "set", "--reserve", "12"])
+    let en_ext_out = env
+        .cli_cmd()
+        .args(["accounts", "enable", "acc-a"])
         .output()
         .unwrap();
-    assert_eq!(
-        pol_ext_out.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&pol_ext_out.stderr)
-    );
+    assert_eq!(en_ext_out.status.code(), Some(0));
     assert!(read_journal_readonly(&paths).unwrap().is_none());
     assert_eq!(
         fs::read_to_string(&paths.active_slot_file).unwrap(),
-        ext_payload,
-        "External credential on disk must never be clobbered by clear_slot_intent repair!"
+        ext_payload
     );
-    assert!(
-        paths.account_file("acc-b").exists(),
-        "Account must not be deleted when external login superseded incomplete clear_slot_intent!"
-    );
+    assert!(paths.account_file("acc-b").exists());
 }
 
 #[tokio::test]
-async fn concurrent_non_slot_store_writes_succeed_during_slow_network_switch_without_l1_timeout() {
+async fn concurrent_non_slot_store_writes_succeed_during_held_l1_without_timeout() {
+    if std::env::var_os("AGY_SUBTEST_FI_CONC_L1").is_none() {
+        let tmp_proc = tempfile::tempdir().unwrap();
+        run_isolated_subtest(
+            "concurrent_non_slot_store_writes_succeed_during_held_l1_without_timeout",
+            "AGY_SUBTEST_FI_CONC_L1",
+            &[("AGY_SWITCH_CLI_PROC_ROOT", tmp_proc.path().as_os_str())],
+        );
+        return;
+    }
     let _guard = FAULT_ENV_MUTEX.lock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let (paths, repo, _proc_guard) = setup_isolated(tmp.path());
+    let env = IsolatedEnv::new();
+    env.init_agy_slot_dir();
+    let paths = env.paths();
+    let repo = env.repo();
     let backend = FileSessionBackend;
     let now = jiff::Timestamp::now().as_second();
-    let run_dir = tmp.path().join("run");
-    let proc_dir = tmp.path().join("empty_proc");
-    fs::create_dir_all(&run_dir).unwrap();
 
-    // `acc-a` is active; `acc-b` has an expired token so `execute_switch` awaits slow (450ms) network refresh;
-    // `acc-c` is disabled and will be enabled concurrently via subprocess CLI while `switch` holds L1!
     let acc_a = make_account("acc-a", "a@example.invalid", "1//RT_A", now + 7200, now);
     let acc_b = make_account("acc-b", "b@example.invalid", "1//RT_B_OLD", now - 10, now);
     let mut acc_c = make_account("acc-c", "c@example.invalid", "1//RT_C", now + 7200, now);
@@ -913,7 +888,7 @@ async fn concurrent_non_slot_store_writes_succeed_during_slow_network_switch_wit
         .write_slot(&paths, &serialize_session_payload(&acc_a.token).unwrap())
         .unwrap();
 
-    // Hold L1 with an active `Prepared` switch journal (simulating an in-flight switch under L1)
+    // Hold L1 with an active `Prepared` switch journal
     let l1_hold = ActiveSlotLock::try_acquire(&paths, false).unwrap();
     let prepared_journal = SwitchJournal::new_prepared(
         "op-concurrent-l1".into(),
@@ -928,49 +903,30 @@ async fn concurrent_non_slot_store_writes_succeed_during_slow_network_switch_wit
     write_journal(&paths, &prepared_journal).unwrap();
     assert!(paths.switch_journal_file().exists());
 
-    let cli = || {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"));
-        c.env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", &paths.home_dir)
-            .env("XDG_CACHE_HOME", paths.cache_dir.parent().unwrap())
-            .env("XDG_RUNTIME_DIR", &run_dir)
-            .env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={}/no-dbus", run_dir.display()),
-            )
-            .env("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir)
-            .args(["--data-dir", paths.data_dir.to_str().unwrap()]);
-        c
-    };
-
-    // 1. Concurrent `policy set` and `accounts enable` MUST succeed (exit 0) without L1 timeout!
-    let pol_res = cli()
-        .args(["policy", "set", "--reserve", "22", "--minimum", "40"])
+    // 1. Concurrent non-slot writes (`accounts list --move` and `accounts enable`) succeed without L1 timeout!
+    let move_res = env
+        .cli_cmd()
+        .args(["accounts", "list", "--move", "acc-c", "--to", "1"])
         .output()
         .unwrap();
     assert_eq!(
-        pol_res.status.code(),
+        move_res.status.code(),
         Some(0),
-        "policy set failed during held L1 Prepared journal: stderr={}",
-        String::from_utf8_lossy(&pol_res.stderr)
+        "accounts list --move failed during held L1 Prepared journal: stderr={}",
+        String::from_utf8_lossy(&move_res.stderr)
     );
-    let enable_res = cli()
+    let enable_res = env
+        .cli_cmd()
         .args(["accounts", "enable", "acc-c"])
         .output()
         .unwrap();
-    assert_eq!(
-        enable_res.status.code(),
-        Some(0),
-        "accounts enable failed during held L1 Prepared journal: stderr={}",
-        String::from_utf8_lossy(&enable_res.stderr)
-    );
+    assert_eq!(enable_res.status.code(), Some(0));
 
-    // 2. Competing `switch` MUST still fail immediately with exit code 5 (`LockBusyOrConflict`)!
-    let competing_sw = cli().args(["switch", "acc-c"]).output().unwrap();
+    // 2. Competing `switch` fails immediately with exit code 5 (`LockBusyOrConflict`)!
+    let competing_sw = env.cli_cmd().args(["switch", "acc-c"]).output().unwrap();
     assert_eq!(competing_sw.status.code(), Some(5));
 
-    // Release L1 and execute the offline switch to `acc-b` cleanly!
+    // Release L1 and execute offline switch to `acc-b`
     drop(l1_hold);
     let sw_outcome = execute_switch(
         &repo,
@@ -986,32 +942,26 @@ async fn concurrent_non_slot_store_writes_succeed_during_slow_network_switch_wit
     .unwrap();
     assert_eq!(sw_outcome.target_account_id, "acc-b");
 
-    // Verify all concurrent mutations survived cleanly via field-level merge!
     let final_snap = repo.read_snapshot().unwrap();
     assert_eq!(
         final_snap.index.selected_account_id.as_deref(),
         Some("acc-b")
     );
-    assert_eq!(repo.read_policy().unwrap().reserve_percentage, 22);
+    assert_eq!(
+        final_snap.index.account_order.first().map(String::as_str),
+        Some("acc-c")
+    );
     assert!(!repo.read_account_unchecked("acc-c").unwrap().disabled);
 }
 
 #[tokio::test]
-async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_and_pause_clear_failures(
-) {
+async fn synthetic_v120_round3_r301_r302_corrupt_journal_clear_slot_replay_and_orphan_tmp_cleanup()
+{
     let _guard = FAULT_ENV_MUTEX.lock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let paths = HeadlessPaths::with_explicit(
-        tmp.path().join("home"),
-        tmp.path().join("data"),
-        tmp.path().join("cache").join("agy-switch-cli"),
-    );
-    let run_dir = tmp.path().join("run");
-    let proc_dir = tmp.path().join("proc");
-    fs::create_dir_all(&run_dir).unwrap();
-    fs::create_dir_all(&proc_dir).unwrap();
-    fs::create_dir_all(&paths.active_slot_dir).unwrap();
-    let repo = StoreRepository::new(paths.clone());
+    let env = IsolatedEnv::new();
+    env.init_agy_slot_dir();
+    let paths = env.paths();
+    let repo = env.repo();
     let backend = FileSessionBackend;
     let now = 1_850_000_000i64;
 
@@ -1027,49 +977,34 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
     backend.write_slot(&paths, &payload_a).unwrap();
 
     let cli = || {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"));
-        c.env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", &paths.home_dir)
-            .env("XDG_CACHE_HOME", paths.cache_dir.parent().unwrap())
-            .env("XDG_RUNTIME_DIR", &run_dir)
-            .env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={}/no-dbus", run_dir.display()),
-            )
-            .env("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir)
-            .env("AGY_SWITCH_CLI_AGY_BIN", tmp.path().join("no-agy"))
-            .args([
-                "--data-dir",
-                paths.data_dir.to_str().unwrap(),
-                "--backend",
-                "file",
-            ]);
+        let mut c = env.cli_cmd();
+        c.args(["--backend", "file"]);
         c
     };
 
-    // 1. R3-01: Truncated/corrupt `switch_journal.json` in pure `file` env with NO visible D-Bus
-    //    MUST NOT be auto-cleared by `policy set` or `switch` (both `status` and `policy set` exit 7 and preserve journal)!
+    // 1. R3-01: Corrupt `switch_journal.json` in pure `file` env MUST NOT be auto-cleared
     fs::create_dir_all(paths.state_dir()).unwrap();
     fs::write(
         paths.switch_journal_file(),
         b"{\"schema_version\":1,\"phase\":",
     )
     .unwrap();
-    let st_corrupt = cli().args(["--json", "status"]).output().unwrap();
-    assert_eq!(st_corrupt.status.code(), Some(7));
+    assert_eq!(
+        cli()
+            .args(["--json", "status"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(7)
+    );
     assert!(paths.switch_journal_file().exists());
 
-    let pol_corrupt = cli()
-        .args(["--json", "policy", "set", "--reserve", "10"])
+    let en_corrupt = cli()
+        .args(["--json", "accounts", "enable", "acc-b"])
         .output()
         .unwrap();
-    assert_eq!(
-        pol_corrupt.status.code(),
-        Some(7),
-        "Corrupt journal MUST NOT be cleared under file backend! stderr={}",
-        String::from_utf8_lossy(&pol_corrupt.stderr)
-    );
+    assert_eq!(en_corrupt.status.code(), Some(7));
     assert!(paths.switch_journal_file().exists());
     assert_eq!(
         fs::read_to_string(&paths.active_slot_file).unwrap(),
@@ -1077,14 +1012,7 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
     );
     fs::remove_file(paths.switch_journal_file()).unwrap();
 
-    // 2. R3-02 (exact Round-3 reproducer!):
-    //    Persistent `before_write:index.json:io` during `accounts delete acc-a --force --clear-active-slot`:
-    //    - First `delete` clears active slot, fails `index.json`, preserves journal -> exit 7;
-    //    - `status` -> exit 7;
-    //    - Under the SAME persistent `index.json` fault, `policy set` MUST exit 7 and PRESERVE journal (NOT clear it!);
-    //    - `status` STILL exits 7;
-    //    - Once fault is cleared, `policy set` idempotently deletes `acc-a` (policy, index, account file, lineage),
-    //      clears journal, and exits 0!
+    // 2. R3-02: Persistent `before_write:index.json:io` during `accounts delete acc-a --force --clear-active-slot`
     fs::create_dir_all(paths.token_lineage_dir()).unwrap();
     fs::write(
         paths.token_lineage_file("acc-a"),
@@ -1108,28 +1036,6 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
     assert!(!paths.active_slot_file.exists());
     assert!(paths.switch_journal_file().exists());
     assert!(paths.account_file("acc-a").exists());
-
-    let st_after_del = cli().args(["--json", "status"]).output().unwrap();
-    assert_eq!(st_after_del.status.code(), Some(7));
-
-    // Retry under the SAME persistent `index.json` fault -> MUST exit 7 and keep journal!
-    let pol_same_fault = cli()
-        .env("AGY_SWITCH_CLI_FAULT_SPEC", "before_write:index.json:io")
-        .args(["--json", "policy", "set", "--reserve", "10"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        pol_same_fault.status.code(),
-        Some(7),
-        "Replay under persistent index.json fault MUST NOT swallow error or clear journal! stdout={} stderr={}",
-        String::from_utf8_lossy(&pol_same_fault.stdout),
-        String::from_utf8_lossy(&pol_same_fault.stderr)
-    );
-    assert!(
-        paths.switch_journal_file().exists(),
-        "clear_slot_intent journal was lost while index.json fault still existed!"
-    );
-    assert!(paths.account_file("acc-a").exists());
     assert_eq!(
         cli()
             .args(["--json", "status"])
@@ -1140,31 +1046,28 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
         Some(7)
     );
 
-    // Fault on `accounts/acc-a.json` parent dir fsync ALSO preserves journal (exit 7)!
-    let pol_sync_fault = cli()
-        .env("AGY_SWITCH_CLI_FAULT_SPEC", "sync_parent_dir:acc-a.json:io")
-        .args(["--json", "policy", "set", "--reserve", "10"])
+    let replay_same_fault = cli()
+        .env("AGY_SWITCH_CLI_FAULT_SPEC", "before_write:index.json:io")
+        .args(["--json", "accounts", "enable", "acc-b"])
         .output()
         .unwrap();
-    assert_eq!(
-        pol_sync_fault.status.code(),
-        Some(7),
-        "Parent dir fsync failure on account removal MUST preserve journal and exit 7!"
-    );
+    assert_eq!(replay_same_fault.status.code(), Some(7));
+    assert!(paths.switch_journal_file().exists());
+    assert!(paths.account_file("acc-a").exists());
+
+    let replay_sync_fault = cli()
+        .env("AGY_SWITCH_CLI_FAULT_SPEC", "sync_parent_dir:acc-a.json:io")
+        .args(["--json", "accounts", "enable", "acc-b"])
+        .output()
+        .unwrap();
+    assert_eq!(replay_sync_fault.status.code(), Some(7));
     assert!(paths.switch_journal_file().exists());
 
-    // Now clear fault: even though `index.json` ALREADY dropped `acc-a` on the previous attempt,
-    // idempotent replay MUST still remove `token_lineage/acc-a.json`, clear journal, and exit 0!
-    let pol_ok = cli()
-        .args(["--json", "policy", "set", "--reserve", "10"])
+    let replay_ok = cli()
+        .args(["--json", "accounts", "enable", "acc-b"])
         .output()
         .unwrap();
-    assert_eq!(
-        pol_ok.status.code(),
-        Some(0),
-        "Idempotent replay after fault cleared must succeed: stderr={}",
-        String::from_utf8_lossy(&pol_ok.stderr)
-    );
+    assert_eq!(replay_ok.status.code(), Some(0));
     assert!(!paths.switch_journal_file().exists());
     assert!(!paths.account_file("acc-a").exists());
     assert!(!paths.token_lineage_file("acc-a").exists());
@@ -1178,8 +1081,7 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
         Some(0)
     );
 
-    // 3. R3-02 pure file `remove_slot_transactional`: if BOTH `remove_slot` AND restore `write_slot`
-    //    fail `sync_parent_dir`, MUST return exit 7 (`recovery_incomplete`), NOT exit 1!
+    // 3. R3-02 pure file `remove_slot_transactional`: unconfirmed parent-dir fsync returns exit 7
     let payload_b = serialize_session_payload(&acc_b.token).unwrap();
     backend.write_slot(&paths, &payload_b).unwrap();
     let del_sync_fail = cli()
@@ -1197,61 +1099,12 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
         ])
         .output()
         .unwrap();
-    assert_eq!(
-        del_sync_fail.status.code(),
-        Some(7),
-        "Unconfirmed file rollback durability MUST return exit 7, stderr={}",
-        String::from_utf8_lossy(&del_sync_fail.stderr)
-    );
+    assert_eq!(del_sync_fail.status.code(), Some(7));
     assert!(paths.switch_journal_file().exists());
     fs::remove_file(paths.switch_journal_file()).unwrap();
-    // Re-write slot so `acc-b` is clean for step 4
     backend.write_slot(&paths, &payload_b).unwrap();
 
-    // 4. R3-15: Inject `before_rename:daemon_state.json:io` while daemon is paused -> manual `switch`
-    //    MUST NOT return 0 pretending pause cleared (returns exit 7 `daemon_pause_clear_failed`),
-    //    and `status` truthfully still reports `daemon_paused_on_failure == true`!
-    let paused_state = agy_switch_cli::switching::daemon::DaemonPersistentState {
-        paused_on_failure: true,
-        paused_reason: Some("synthetic pause".into()),
-        consecutive_commit_failures: 3,
-        ..agy_switch_cli::switching::daemon::DaemonPersistentState::default()
-    };
-    repo.with_write_lock(|tx| {
-        agy_switch_cli::switching::daemon::save_daemon_state_in_tx(tx.paths(), &paused_state)
-    })
-    .unwrap();
-
-    let sw_pause_fail = cli()
-        .env(
-            "AGY_SWITCH_CLI_FAULT_SPEC",
-            "before_rename:daemon_state.json:io",
-        )
-        .args(["--json", "switch", "acc-b"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        sw_pause_fail.status.code(),
-        Some(7),
-        "Manual switch must surface daemon_state.json save failure (exit 7): stdout={} stderr={}",
-        String::from_utf8_lossy(&sw_pause_fail.stdout),
-        String::from_utf8_lossy(&sw_pause_fail.stderr)
-    );
-    let err_j: serde_json::Value = serde_json::from_slice(&sw_pause_fail.stderr).unwrap();
-    assert_eq!(err_j["error_code"], "daemon_pause_clear_failed");
-    let st_still_paused = cli().args(["--json", "status"]).output().unwrap();
-    assert_eq!(st_still_paused.status.code(), Some(0));
-    let st_j: serde_json::Value = serde_json::from_slice(&st_still_paused.stdout).unwrap();
-    assert_eq!(st_j["daemon_paused_on_failure"], true);
-
-    // Clear the pause state cleanly before step 5
-    let sw_clear_pause = cli().args(["--json", "switch", "acc-b"]).output().unwrap();
-    assert_eq!(sw_clear_pause.status.code(), Some(0));
-
-    // 5. R3-15 (orphan temp cleanup error propagation):
-    //    Place an EXPIRED tool-owned temp file in `active_slot_dir` and inject parent-dir fsync
-    //    failure specifically on `.tmp.agy-switch-cli.` cleanup -> manual `switch` MUST surface
-    //    exit 7 (`slot_temp_cleanup_failed`) instead of silently swallowing it in `write_slot`!
+    // 4. R3-15 (orphan temp cleanup error propagation): surfaced as exit 7 (`slot_temp_cleanup_failed`)
     let expired_tmp_err = paths.active_slot_dir.join(format!(
         "antigravity-oauth-token{}{}",
         agy_switch_cli::store::fs_atomic::OWNED_TMP_MARKER,
@@ -1275,24 +1128,11 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
         .args(["--json", "switch", "acc-b"])
         .output()
         .unwrap();
-    assert_eq!(
-        sw_tmp_sync_fail.status.code(),
-        Some(7),
-        "Orphan temp cleanup parent-dir fsync error MUST be surfaced as exit 7, NOT swallowed! stdout={} stderr={}",
-        String::from_utf8_lossy(&sw_tmp_sync_fail.stdout),
-        String::from_utf8_lossy(&sw_tmp_sync_fail.stderr)
-    );
+    assert_eq!(sw_tmp_sync_fail.status.code(), Some(7));
     let tmp_err_j: serde_json::Value = serde_json::from_slice(&sw_tmp_sync_fail.stderr).unwrap();
     assert_eq!(tmp_err_j["error_code"], "slot_temp_cleanup_failed");
 
-    // 6. R3-01 + R3-02 (`clear_slot_intent` at `CommittedIndexPending` + external credential appearing
-    //    before Stage 2 finishes):
-    //    - Delete `acc-c` with `--clear-active-slot` while `index.json` fails -> Stage 1 clears slot,
-    //      journal persists at `CommittedIndexPending`, `acc-c` remains on disk (exit 7);
-    //    - External `agy` writes a brand new credential (`ext@example.com`) into `active_slot_file`;
-    //    - While `index.json` fault persists, `policy set` MUST exit 7 and preserve journal + external slot;
-    //    - Once fault clears, `policy set` MUST preserve the external slot credential AND complete
-    //      Stage 2 deletion of `acc-c` (`accounts/acc-c.json` removed, journal cleared, exit 0)!
+    // 5. R3-01 + R3-02 (`clear_slot_intent` at `CommittedIndexPending` + external credential appearing)
     let acc_c = make_account("acc-c", "charlie@example.com", "1//RT_C", now + 7200, now);
     let payload_c = serialize_session_payload(&acc_c.token).unwrap();
     repo.with_write_lock(|tx| tx.upsert_account(acc_c.clone(), true, now))
@@ -1328,14 +1168,10 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
 
     let replay_still_fault = cli()
         .env("AGY_SWITCH_CLI_FAULT_SPEC", "before_write:index.json:io")
-        .args(["--json", "policy", "set", "--reserve", "10"])
+        .args(["--json", "accounts", "enable", "acc-b"])
         .output()
         .unwrap();
-    assert_eq!(
-        replay_still_fault.status.code(),
-        Some(7),
-        "CommittedIndexPending clear-slot replay with external slot MUST NOT clear journal when Stage 2 still fails!"
-    );
+    assert_eq!(replay_still_fault.status.code(), Some(7));
     assert!(paths.switch_journal_file().exists());
     assert!(paths.account_file("acc-c").exists());
     assert_eq!(
@@ -1344,29 +1180,18 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
     );
 
     let replay_ext_ok = cli()
-        .args(["--json", "policy", "set", "--reserve", "10"])
+        .args(["--json", "accounts", "enable", "acc-b"])
         .output()
         .unwrap();
-    assert_eq!(
-        replay_ext_ok.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&replay_ext_ok.stderr)
-    );
+    assert_eq!(replay_ext_ok.status.code(), Some(0));
     assert!(!paths.switch_journal_file().exists());
-    assert!(
-        !paths.account_file("acc-c").exists(),
-        "Stage 2 deletion of `acc-c` MUST complete even when an external credential appeared in the slot!"
-    );
+    assert!(!paths.account_file("acc-c").exists());
     assert_eq!(
         fs::read_to_string(&paths.active_slot_file).unwrap(),
-        ext_payload,
-        "External credential in active slot MUST be preserved without overwriting!"
+        ext_payload
     );
 
-    // 7. R3-02 (`clear_slot_intent` target `auth_generation` mismatch guard):
-    //    If target account rotated (`auth_generation` incremented) before replay, replay MUST refuse
-    //    to delete the rotated account and preserve journal (exit 7)!
+    // 6. R3-02 (`clear_slot_intent` target `auth_generation` mismatch guard)
     let acc_d = make_account("acc-d", "dave@example.com", "1//RT_D", now + 7200, now);
     let payload_d = serialize_session_payload(&acc_d.token).unwrap();
     repo.with_write_lock(|tx| tx.upsert_account(acc_d.clone(), true, now))
@@ -1385,8 +1210,6 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
         .output()
         .unwrap();
     assert_eq!(del_d_fail.status.code(), Some(7));
-    assert!(paths.switch_journal_file().exists());
-    // Bump `acc-d` `auth_generation` directly on disk to simulate concurrent reauthorization/rotation
     let mut rotated_d = repo.read_account_unchecked("acc-d").unwrap();
     rotated_d.auth_generation = rotated_d.auth_generation.saturating_add(1);
     fs::write(
@@ -1395,14 +1218,10 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
     )
     .unwrap();
     let mismatch_replay = cli()
-        .args(["--json", "policy", "set", "--reserve", "10"])
+        .args(["--json", "accounts", "enable", "acc-b"])
         .output()
         .unwrap();
-    assert_eq!(
-        mismatch_replay.status.code(),
-        Some(7),
-        "auth_generation mismatch MUST refuse Stage 2 deletion and preserve journal!"
-    );
+    assert_eq!(mismatch_replay.status.code(), Some(7));
     assert!(paths.switch_journal_file().exists());
     assert!(paths.account_file("acc-d").exists());
 }
@@ -1410,41 +1229,17 @@ async fn synthetic_v120_round3_r301_r302_r315_corrupt_journal_clear_slot_replay_
 #[tokio::test]
 async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_dir_fsync() {
     let _guard = FAULT_ENV_MUTEX.lock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let paths = HeadlessPaths::with_explicit(
-        tmp.path().join("home"),
-        tmp.path().join("data"),
-        tmp.path().join("cache").join("agy-switch-cli"),
-    );
-    let run_dir = tmp.path().join("run");
-    let proc_dir = tmp.path().join("proc");
-    fs::create_dir_all(&run_dir).unwrap();
-    fs::create_dir_all(&proc_dir).unwrap();
-    fs::create_dir_all(&paths.active_slot_dir).unwrap();
+    let env = IsolatedEnv::new();
+    env.init_agy_slot_dir();
+    let paths = env.paths();
     fs::create_dir_all(paths.token_lineage_dir()).unwrap();
-    let repo = StoreRepository::new(paths.clone());
+    let repo = env.repo();
     let backend = FileSessionBackend;
     let now = 1_850_000_000i64;
 
     let cli = || {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"));
-        c.env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", &paths.home_dir)
-            .env("XDG_CACHE_HOME", paths.cache_dir.parent().unwrap())
-            .env("XDG_RUNTIME_DIR", &run_dir)
-            .env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={}/no-dbus", run_dir.display()),
-            )
-            .env("AGY_SWITCH_CLI_PROC_ROOT", &proc_dir)
-            .env("AGY_SWITCH_CLI_AGY_BIN", tmp.path().join("no-agy"))
-            .args([
-                "--data-dir",
-                paths.data_dir.to_str().unwrap(),
-                "--backend",
-                "file",
-            ]);
+        let mut c = env.cli_cmd();
+        c.args(["--backend", "file"]);
         c
     };
 
@@ -1458,7 +1253,6 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
         .unwrap();
     };
 
-    // Keep one permanent account and populate 3 disabled accounts as independent replay controls.
     let acc_keep = make_account(
         "acc-keep",
         "keep@example.com",
@@ -1476,15 +1270,6 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
     let mut acc_dis = make_account("acc-dis", "dis1@example.com", "1//RT_DIS1", now + 7200, now);
     acc_dis.disabled = true;
     acc_dis.disabled_code = Some(agy_switch_cli::domain::account::DisableReasonCode::Manual);
-    let mut acc_dis2 = make_account(
-        "acc-dis2",
-        "dis2@example.com",
-        "1//RT_DIS2",
-        now + 7200,
-        now,
-    );
-    acc_dis2.disabled = true;
-    acc_dis2.disabled_code = Some(agy_switch_cli::domain::account::DisableReasonCode::Manual);
     let mut acc_dis3 = make_account(
         "acc-dis3",
         "dis3@example.com",
@@ -1495,15 +1280,11 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
     acc_dis3.disabled = true;
     acc_dis3.disabled_code = Some(agy_switch_cli::domain::account::DisableReasonCode::Manual);
 
-    let mut pol = repo.read_policy().unwrap();
     repo.with_write_lock(|tx| {
         tx.upsert_account(acc_keep.clone(), false, now)?;
         tx.upsert_account(acc_dis.clone(), false, now)?;
-        tx.upsert_account(acc_dis2.clone(), false, now)?;
         tx.upsert_account(acc_dis3.clone(), false, now)?;
         tx.upsert_account(acc_clean.clone(), true, now)?;
-        pol.candidate_account_ids = vec!["acc-clean".into(), "acc-keep".into()];
-        tx.save_policy(&mut pol, None, now)?;
         Ok(())
     })
     .unwrap();
@@ -1515,7 +1296,7 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
         )
         .unwrap();
 
-    // 1. Healthy pure `file` clear-slot delete -> exits 0, removes target + references, no journal, keeps others
+    // 1. Healthy pure `file` clear-slot delete -> exits 0, removes target + index + lineage, no journal
     let clean_out = cli()
         .args([
             "--json",
@@ -1527,22 +1308,11 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
         ])
         .output()
         .unwrap();
-    assert_eq!(
-        clean_out.status.code(),
-        Some(0),
-        "Clean clear-slot delete must exit 0: stderr={}",
-        String::from_utf8_lossy(&clean_out.stderr)
-    );
+    assert_eq!(clean_out.status.code(), Some(0));
     assert!(!paths.active_slot_file.exists());
     assert!(!paths.switch_journal_file().exists());
     assert!(!paths.account_file("acc-clean").exists());
     assert!(!paths.token_lineage_file("acc-clean").exists());
-    assert!(!repo
-        .read_policy()
-        .unwrap()
-        .candidate_account_ids
-        .iter()
-        .any(|id| id == "acc-clean"));
     assert!(!repo
         .read_snapshot()
         .unwrap()
@@ -1551,22 +1321,12 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
         .iter()
         .any(|id| id == "acc-clean"));
     assert!(paths.account_file("acc-keep").exists());
-    assert!(repo.read_account_unchecked("acc-dis").unwrap().disabled);
 
     // 2. Persistent `sync_parent_dir:index.json:io` (post-rename fsync failure):
-    //    First delete -> exit 7 (`committed_index_pending`);
-    //    `accounts enable acc-dis` AND `policy set --reserve 10` under SAME fault -> BOTH exit 7 & preserve journal;
-    //    After fault clears & distinct external cred appears -> `accounts enable acc-dis` exits 0, completes
-    //    Stage 2 cleanup, removes journal, enables `acc-dis`, and preserves external slot credential!
+    //    replay under SAME fault exits 7 & preserves journal; clearing fault finishes Stage 2 & preserves external slot!
     let acc_idx = make_account("acc-idx", "bob@example.com", "1//RT_IDX", now + 7200, now);
-    let mut pol = repo.read_policy().unwrap();
-    repo.with_write_lock(|tx| {
-        tx.upsert_account(acc_idx.clone(), true, now)?;
-        pol.candidate_account_ids = vec!["acc-idx".into(), "acc-keep".into()];
-        tx.save_policy(&mut pol, None, now)?;
-        Ok(())
-    })
-    .unwrap();
+    repo.with_write_lock(|tx| tx.upsert_account(acc_idx.clone(), true, now))
+        .unwrap();
     write_lineage("acc-idx");
     backend
         .write_slot(&paths, &serialize_session_payload(&acc_idx.token).unwrap())
@@ -1591,7 +1351,6 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
         read_journal_readonly(&paths).unwrap().unwrap().phase,
         agy_switch_cli::session::journal::JournalPhase::CommittedIndexPending
     );
-    // Rename already dropped `acc-idx` from `index.json` even though fsync failed
     assert!(!repo
         .read_snapshot()
         .unwrap()
@@ -1606,28 +1365,9 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
         .args(["--json", "accounts", "enable", "acc-dis"])
         .output()
         .unwrap();
-    assert_eq!(
-        idx_replay_enable.status.code(),
-        Some(7),
-        "accounts enable under persistent index.json sync_parent_dir MUST exit 7 and preserve journal! stdout={} stderr={}",
-        String::from_utf8_lossy(&idx_replay_enable.stdout),
-        String::from_utf8_lossy(&idx_replay_enable.stderr)
-    );
+    assert_eq!(idx_replay_enable.status.code(), Some(7));
     assert!(paths.switch_journal_file().exists());
     assert!(repo.read_account_unchecked("acc-dis").unwrap().disabled);
-
-    let idx_replay_policy = cli()
-        .env("AGY_SWITCH_CLI_FAULT_SPEC", "sync_parent_dir:index.json:io")
-        .args(["--json", "policy", "set", "--reserve", "12"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        idx_replay_policy.status.code(),
-        Some(7),
-        "policy set under persistent index.json sync_parent_dir MUST exit 7 and preserve journal!"
-    );
-    assert!(paths.switch_journal_file().exists());
-    assert_eq!(repo.read_policy().unwrap().reserve_percentage, 10);
 
     let ext_after_stage1 = make_account(
         "acc-ext-stage1",
@@ -1643,12 +1383,7 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
         .args(["--json", "accounts", "enable", "acc-dis"])
         .output()
         .unwrap();
-    assert_eq!(
-        idx_replay_ok.status.code(),
-        Some(0),
-        "Replay after fault removal must exit 0: stderr={}",
-        String::from_utf8_lossy(&idx_replay_ok.stderr)
-    );
+    assert_eq!(idx_replay_ok.status.code(), Some(0));
     assert!(!paths.switch_journal_file().exists());
     assert!(!paths.account_file("acc-idx").exists());
     assert!(!paths.token_lineage_file("acc-idx").exists());
@@ -1659,114 +1394,10 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
     );
     backend.remove_slot(&paths).unwrap();
 
-    // 3. Persistent `sync_parent_dir:policy.json:io` (post-rename fsync failure):
-    //    First delete -> exit 7 (`committed_index_pending`);
-    //    `accounts enable acc-dis2` AND `policy set --reserve 10` under SAME fault -> BOTH exit 7 (NOT 0 or 1!) & preserve journal;
-    //    After fault clears -> `accounts enable acc-dis2` exits 0, completes cleanup, removes journal!
-    let acc_pol = make_account(
-        "acc-pol",
-        "charlie@example.com",
-        "1//RT_POL",
-        now + 7200,
-        now,
-    );
-    let mut pol = repo.read_policy().unwrap();
-    repo.with_write_lock(|tx| {
-        tx.upsert_account(acc_pol.clone(), true, now)?;
-        pol.candidate_account_ids = vec!["acc-pol".into(), "acc-keep".into()];
-        tx.save_policy(&mut pol, None, now)?;
-        Ok(())
-    })
-    .unwrap();
-    write_lineage("acc-pol");
-    backend
-        .write_slot(&paths, &serialize_session_payload(&acc_pol.token).unwrap())
-        .unwrap();
-
-    let pol_del = cli()
-        .env(
-            "AGY_SWITCH_CLI_FAULT_SPEC",
-            "sync_parent_dir:policy.json:io",
-        )
-        .args([
-            "--json",
-            "accounts",
-            "delete",
-            "acc-pol",
-            "--force",
-            "--clear-active-slot",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(pol_del.status.code(), Some(7));
-    assert!(paths.switch_journal_file().exists());
-    // Rename already removed `acc-pol` from `policy.json` even though fsync failed
-    assert!(!repo
-        .read_policy()
-        .unwrap()
-        .candidate_account_ids
-        .iter()
-        .any(|id| id == "acc-pol"));
-    assert!(paths.account_file("acc-pol").exists());
-
-    let pol_replay_enable = cli()
-        .env(
-            "AGY_SWITCH_CLI_FAULT_SPEC",
-            "sync_parent_dir:policy.json:io",
-        )
-        .args(["--json", "accounts", "enable", "acc-dis2"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        pol_replay_enable.status.code(),
-        Some(7),
-        "accounts enable under persistent policy.json sync_parent_dir MUST exit 7 and preserve journal! stdout={} stderr={}",
-        String::from_utf8_lossy(&pol_replay_enable.stdout),
-        String::from_utf8_lossy(&pol_replay_enable.stderr)
-    );
-    assert!(paths.switch_journal_file().exists());
-    assert!(repo.read_account_unchecked("acc-dis2").unwrap().disabled);
-
-    let pol_replay_policy = cli()
-        .env(
-            "AGY_SWITCH_CLI_FAULT_SPEC",
-            "sync_parent_dir:policy.json:io",
-        )
-        .args(["--json", "policy", "set", "--reserve", "12"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        pol_replay_policy.status.code(),
-        Some(7),
-        "policy set under persistent policy.json sync_parent_dir MUST exit 7 and preserve journal (NOT exit 1)!"
-    );
-    assert!(paths.switch_journal_file().exists());
-    assert_eq!(repo.read_policy().unwrap().reserve_percentage, 10);
-
-    let pol_replay_ok = cli()
-        .args(["--json", "accounts", "enable", "acc-dis2"])
-        .output()
-        .unwrap();
-    assert_eq!(pol_replay_ok.status.code(), Some(0));
-    assert!(!paths.switch_journal_file().exists());
-    assert!(!paths.account_file("acc-pol").exists());
-    assert!(!paths.token_lineage_file("acc-pol").exists());
-    assert!(!repo.read_account_unchecked("acc-dis2").unwrap().disabled);
-
-    // 4. Stage marker `CommittedIndexPending` failure & early `SlotCommitting` replay durability:
-    //    - Failure persisting `CommittedIndexPending` MUST prevent Stage 2 local cleanup!
-    //    - Replay under `sync_parent_dir:antigravity-oauth-token:io` fails before advancing stage marker;
-    //    - Repeated replays under `sync_parent_dir:switch_journal.json:io` stay exit 7 without entering Stage 2;
-    //    - Clearing fault allows replay to finish Stage 2 and remove journal!
+    // 3. Stage marker `CommittedIndexPending` failure & early `SlotCommitting` replay durability
     let acc_stg = make_account("acc-stg", "eve@example.com", "1//RT_STG", now + 7200, now);
-    let mut pol = repo.read_policy().unwrap();
-    repo.with_write_lock(|tx| {
-        tx.upsert_account(acc_stg.clone(), true, now)?;
-        pol.candidate_account_ids = vec!["acc-stg".into(), "acc-keep".into()];
-        tx.save_policy(&mut pol, None, now)?;
-        Ok(())
-    })
-    .unwrap();
+    repo.with_write_lock(|tx| tx.upsert_account(acc_stg.clone(), true, now))
+        .unwrap();
     write_lineage("acc-stg");
     backend
         .write_slot(&paths, &serialize_session_payload(&acc_stg.token).unwrap())
@@ -1797,12 +1428,6 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
     // Stage marker failed -> Stage 2 MUST NOT have run!
     assert!(paths.account_file("acc-stg").exists());
     assert!(paths.token_lineage_file("acc-stg").exists());
-    assert!(repo
-        .read_policy()
-        .unwrap()
-        .candidate_account_ids
-        .iter()
-        .any(|id| id == "acc-stg"));
     assert!(repo
         .read_snapshot()
         .unwrap()
@@ -1851,12 +1476,6 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
     assert!(!paths.token_lineage_file("acc-stg").exists());
     assert!(!repo.read_account_unchecked("acc-dis3").unwrap().disabled);
     assert!(!repo
-        .read_policy()
-        .unwrap()
-        .candidate_account_ids
-        .iter()
-        .any(|id| id == "acc-stg"));
-    assert!(!repo
         .read_snapshot()
         .unwrap()
         .index
@@ -1866,24 +1485,391 @@ async fn synthetic_v120_round4_r402_clear_slot_replay_enforces_stage_and_parent_
 }
 
 #[tokio::test]
+async fn p1_01_journal_reconcile_skips_id_mismatched_outgoing_account_without_overwriting_other_account(
+) {
+    let env = IsolatedEnv::new();
+    env.init_agy_slot_dir();
+    let paths = env.paths();
+    let repo = env.repo();
+    let backend = FileSessionBackend;
+    let now = 1_800_000_000i64;
+
+    let mut acc1 = make_account("acc-0001", "alice@example.com", "1//RT_A1", now + 7200, now);
+    acc1.last_switched_in_at = Some(now - 600);
+    let acc2 = make_account("acc-0002", "bob@example.com", "1//RT_B2", now + 7200, now);
+    let mut acc3 = make_account(
+        "acc-0003",
+        "charlie@example.com",
+        "1//RT_C3_CURRENT",
+        now + 7200,
+        now,
+    );
+    acc3.auth_generation = 31;
+    acc3.previous_refresh_token_digests = vec!["11".repeat(32)];
+
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc1.clone(), true, now)?;
+        tx.upsert_account(acc2.clone(), false, now)?;
+        tx.upsert_account(acc3.clone(), false, now)?;
+        Ok(())
+    })
+    .unwrap();
+    backend
+        .write_slot(&paths, &serialize_session_payload(&acc1.token).unwrap())
+        .unwrap();
+
+    // 1. Switch `acc-0001 -> acc-0002` fails at `before_index_commit` -> exit 7 (`CommittedIndexPending`).
+    let sw_fail = env
+        .cli_cmd()
+        .env(
+            "AGY_SWITCH_CLI_FAULT_SPEC",
+            "before_index_commit:index.json:io",
+        )
+        .args(["--backend", "file", "--json", "switch", "acc-0002"])
+        .output()
+        .unwrap();
+    assert_eq!(sw_fail.status.code(), Some(7));
+    assert!(paths.switch_journal_file().exists());
+    assert!(fs::read_to_string(&paths.active_slot_file)
+        .unwrap()
+        .contains("1//RT_B2"));
+
+    // 2. Corrupt/misplace `accounts/acc-0001.json` with a parseable STALE backup of `acc-0003`
+    //    (lower `auth_generation = 3`, older RT, empty inline lineage), simulating P1-01!
+    let acc3_orig_bytes = fs::read(paths.account_file("acc-0003")).unwrap();
+    let mut stale_acc3_backup = make_account(
+        "acc-0003",
+        "charlie@example.com",
+        "1//RT_C3_STALE_OLD",
+        now + 3600,
+        now - 1000,
+    );
+    stale_acc3_backup.auth_generation = 3;
+    stale_acc3_backup.previous_refresh_token_digests.clear();
+    let misplaced_bytes = serde_json::to_vec_pretty(&stale_acc3_backup).unwrap();
+    fs::write(paths.account_file("acc-0001"), &misplaced_bytes).unwrap();
+
+    // Direct `load_account_opt` MUST reject ID mismatch with `data_error`!
+    let direct_err = repo
+        .with_write_lock(|tx| tx.load_account_opt("acc-0001").map(|_| ()))
+        .unwrap_err();
+    assert_eq!(direct_err.error_code, "data_error");
+
+    // Read-only `status --json` reports exit 7 (`committed_index_pending`) and `store_ok=false`.
+    let st = env
+        .cli_cmd()
+        .args(["--backend", "file", "--json", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(st.status.code(), Some(7));
+    let st_j: serde_json::Value = serde_json::from_slice(&st.stderr).unwrap();
+    assert_eq!(st_j["details"]["store_ok"], false);
+
+    // 3. Reconcile via `auth pending --purge --json`: MUST exit 0, commit `acc-0002`, clear journal,
+    //    leave misplaced `acc-0001.json` bytes untouched, AND NEVER overwrite `acc-0003.json`!
+    let purge = env
+        .cli_cmd()
+        .args(["--backend", "file", "--json", "auth", "pending", "--purge"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        purge.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&purge.stderr)
+    );
+    assert!(!paths.switch_journal_file().exists());
+    assert_eq!(
+        fs::read(paths.account_file("acc-0001")).unwrap(),
+        misplaced_bytes,
+        "Misplaced outgoing account file must remain untouched"
+    );
+    assert_eq!(
+        fs::read(paths.account_file("acc-0003")).unwrap(),
+        acc3_orig_bytes,
+        "P1-01: Unrelated account file bytes MUST remain byte-for-byte unchanged"
+    );
+    let acc3_after = repo.read_account_unchecked("acc-0003").unwrap();
+    assert_eq!(acc3_after.token.refresh_token, "1//RT_C3_CURRENT");
+    assert_eq!(acc3_after.auth_generation, 31);
+    assert_eq!(acc3_after.previous_refresh_token_digests.len(), 1);
+    let acc2_after = repo.read_account_unchecked("acc-0002").unwrap();
+    assert!(acc2_after.last_switched_in_at.is_some());
+    assert_eq!(acc2_after.last_switched_out_at, None);
+    let idx_raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(paths.index_file()).unwrap()).unwrap();
+    assert_eq!(idx_raw["selected_account_id"], "acc-0002");
+}
+
+#[tokio::test]
+async fn g01_committed_index_pending_persistent_index_fsync_io_returns_exit_7_until_cleared() {
+    let env = IsolatedEnv::new();
+    env.init_agy_slot_dir();
+    let paths = env.paths();
+    let repo = env.repo();
+    let backend = FileSessionBackend;
+    let now = 1_800_000_000i64;
+
+    let mut acc1 = make_account(
+        "acc-0001",
+        "alice@example.com",
+        "1//RT_G01_A",
+        now + 7200,
+        now,
+    );
+    acc1.last_switched_in_at = Some(now - 600);
+    let acc2 = make_account(
+        "acc-0002",
+        "bob@example.com",
+        "1//RT_G01_B",
+        now + 7200,
+        now,
+    );
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc1.clone(), true, now)?;
+        tx.upsert_account(acc2.clone(), false, now)?;
+        Ok(())
+    })
+    .unwrap();
+    backend
+        .write_slot(&paths, &serialize_session_payload(&acc1.token).unwrap())
+        .unwrap();
+
+    // 1. Switch under persistent `sync_parent_dir:index.json:io` commits slot then fails index fsync -> exit 7.
+    let sw_fail = env
+        .cli_cmd()
+        .env("AGY_SWITCH_CLI_FAULT_SPEC", "sync_parent_dir:index.json:io")
+        .args(["--backend", "file", "--json", "switch", "acc-0002"])
+        .output()
+        .unwrap();
+    assert_eq!(sw_fail.status.code(), Some(7));
+    let journal_bytes = fs::read(paths.switch_journal_file()).unwrap();
+    let slot_bytes = fs::read(&paths.active_slot_file).unwrap();
+    let journal_ts = read_journal_readonly(&paths).unwrap().unwrap().updated_at;
+    assert!(String::from_utf8_lossy(&slot_bytes).contains("1//RT_G01_B"));
+
+    // 2. Two consecutive write replays under the SAME persistent fault MUST BOTH exit 7
+    //    (`committed_index_pending`), preserving exact journal & slot bytes!
+    for attempt in 1..=2 {
+        let replay = env
+            .cli_cmd()
+            .env("AGY_SWITCH_CLI_FAULT_SPEC", "sync_parent_dir:index.json:io")
+            .args(["--backend", "file", "--json", "auth", "pending", "--purge"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            replay.status.code(),
+            Some(7),
+            "G-01 replay attempt {attempt} under persistent index fsync fault must return exit 7; stderr={}",
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        let err_j: serde_json::Value = serde_json::from_slice(&replay.stderr).unwrap();
+        assert_eq!(err_j["exit_code"], 7);
+        assert_eq!(err_j["error_code"], "committed_index_pending");
+        assert_eq!(
+            fs::read(paths.switch_journal_file()).unwrap(),
+            journal_bytes
+        );
+        assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_bytes);
+    }
+
+    // Read-only `status --json` continues reporting exit 7 while fault persists.
+    let st = env
+        .cli_cmd()
+        .args(["--backend", "file", "--json", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(st.status.code(), Some(7));
+
+    // 3. Clearing fault -> replay returns 0, commits `acc-0002`, preserves verified `journal_ts`, clears journal!
+    let ok_replay = env
+        .cli_cmd()
+        .args(["--backend", "file", "--json", "auth", "pending", "--purge"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        ok_replay.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&ok_replay.stderr)
+    );
+    assert!(!paths.switch_journal_file().exists());
+    let snap = repo.read_snapshot().unwrap();
+    assert_eq!(snap.index.selected_account_id.as_deref(), Some("acc-0002"));
+    assert_eq!(
+        repo.read_account_unchecked("acc-0001")
+            .unwrap()
+            .last_switched_out_at,
+        Some(journal_ts)
+    );
+    assert_eq!(
+        repo.read_account_unchecked("acc-0002")
+            .unwrap()
+            .last_switched_in_at,
+        Some(journal_ts)
+    );
+}
+
+#[tokio::test]
+async fn r3_01_committed_index_pending_journal_clear_parent_sync_failure_preserves_journal_and_exits_7(
+) {
+    let env = IsolatedEnv::new();
+    env.init_agy_slot_dir();
+    let paths = env.paths();
+    let repo = env.repo();
+    let backend = FileSessionBackend;
+    let now = 1_800_000_000i64;
+
+    let mut acc1 = make_account(
+        "acc-0001",
+        "alice@example.com",
+        "1//RT_R301_A",
+        now + 7200,
+        now,
+    );
+    acc1.last_switched_in_at = Some(now - 600);
+    let acc2 = make_account(
+        "acc-0002",
+        "bob@example.com",
+        "1//RT_R301_B",
+        now + 7200,
+        now,
+    );
+    repo.with_write_lock(|tx| {
+        tx.upsert_account(acc1.clone(), true, now)?;
+        tx.upsert_account(acc2.clone(), false, now)?;
+        Ok(())
+    })
+    .unwrap();
+    backend
+        .write_slot(&paths, &serialize_session_payload(&acc1.token).unwrap())
+        .unwrap();
+
+    // 1. Switch `acc-0001 -> acc-0002` fails at `before_index_commit` -> exit 7 (`CommittedIndexPending`).
+    let sw_fail = env
+        .cli_cmd()
+        .env(
+            "AGY_SWITCH_CLI_FAULT_SPEC",
+            "before_index_commit:index.json:io",
+        )
+        .args(["--backend", "file", "--json", "switch", "acc-0002"])
+        .output()
+        .unwrap();
+    assert_eq!(sw_fail.status.code(), Some(7));
+    let journal_path = paths.switch_journal_file();
+    let orig_journal_bytes = fs::read(&journal_path).unwrap();
+    let slot_bytes = fs::read(&paths.active_slot_file).unwrap();
+    let journal_ts = read_journal_readonly(&paths).unwrap().unwrap().updated_at;
+    assert!(String::from_utf8_lossy(&slot_bytes).contains("1//RT_R301_B"));
+
+    // 2. Persistent `sync_parent_dir:switch_journal.json:io` during replay:
+    //    `clear_journal` unlinks in dcache then fails parent-dir fsync -> MUST restore the
+    //    `0600` journal file without overwriting any concurrent file, keep returning exit 7
+    //    across repeated retries, AND keep `status --json` returning exit 7!
+    for attempt in 1..=2 {
+        let replay = env
+            .cli_cmd()
+            .env(
+                "AGY_SWITCH_CLI_FAULT_SPEC",
+                "sync_parent_dir:switch_journal.json:io",
+            )
+            .args(["--backend", "file", "--json", "auth", "pending", "--purge"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            replay.status.code(),
+            Some(7),
+            "R3-01 replay attempt {attempt} must exit 7; stderr={}",
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        let err_j: serde_json::Value = serde_json::from_slice(&replay.stderr).unwrap();
+        assert_eq!(err_j["exit_code"], 7);
+        assert_eq!(err_j["error_code"], "committed_index_pending");
+        assert!(
+            journal_path.exists(),
+            "R3-01 attempt {attempt}: switch_journal.json must still exist for retry"
+        );
+        assert_eq!(
+            fs::metadata(&journal_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(&journal_path).unwrap(), orig_journal_bytes);
+        assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_bytes);
+
+        let st = env
+            .cli_cmd()
+            .env(
+                "AGY_SWITCH_CLI_FAULT_SPEC",
+                "sync_parent_dir:switch_journal.json:io",
+            )
+            .args(["--backend", "file", "--json", "status"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            st.status.code(),
+            Some(7),
+            "R3-01 attempt {attempt}: status --json must still exit 7 while journal-clear durability is unconfirmed"
+        );
+    }
+
+    // Also verify `restore_regular_file_if_absent_under` (`O_EXCL`) NEVER overwrites an existing file!
+    assert!(
+        agy_switch_cli::store::fs_atomic::restore_regular_file_if_absent_under(
+            &paths.data_dir,
+            &journal_path,
+            b"{\"must_not_overwrite\":true}",
+            "switch journal",
+        )
+        .unwrap()
+    );
+    assert_eq!(fs::read(&journal_path).unwrap(), orig_journal_bytes);
+
+    // 3. Clearing the fault -> next write replay returns 0, durably clears journal, preserves `journal_ts`!
+    let ok_replay = env
+        .cli_cmd()
+        .args(["--backend", "file", "--json", "auth", "pending", "--purge"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        ok_replay.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&ok_replay.stderr)
+    );
+    assert!(!journal_path.exists());
+    let st_clean = env
+        .cli_cmd()
+        .args(["--backend", "file", "--json", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(st_clean.status.code(), Some(0));
+    let snap = repo.read_snapshot().unwrap();
+    assert_eq!(snap.index.selected_account_id.as_deref(), Some("acc-0002"));
+    assert_eq!(
+        repo.read_account_unchecked("acc-0001")
+            .unwrap()
+            .last_switched_out_at,
+        Some(journal_ts)
+    );
+    assert_eq!(
+        repo.read_account_unchecked("acc-0002")
+            .unwrap()
+            .last_switched_in_at,
+        Some(journal_ts)
+    );
+}
+
+#[tokio::test]
 async fn synthetic_v123_r401_rejects_file_prev_uniform_false_and_allows_omitted_default_recovery() {
     use agy_switch_cli::session::payload::bytes_sha256_hex;
 
     let _guard = FAULT_ENV_MUTEX.lock().await;
 
     let setup_fixture = |omit_prev_uniform: bool| {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = HeadlessPaths::with_explicit(
-            tmp.path().join("home"),
-            tmp.path().join("data"),
-            tmp.path().join("cache").join("agy-switch-cli"),
-        );
-        let run_dir = tmp.path().join("run");
-        let proc_dir = tmp.path().join("proc");
-        fs::create_dir_all(&run_dir).unwrap();
-        fs::create_dir_all(&proc_dir).unwrap();
-        fs::create_dir_all(&paths.active_slot_dir).unwrap();
-        let repo = StoreRepository::new(paths.clone());
+        let env = IsolatedEnv::new();
+        env.init_agy_slot_dir();
+        let paths = env.paths();
+        let repo = env.repo();
         let now = 1_850_000_000i64;
 
         let acc_a = make_account(
@@ -1900,11 +1886,9 @@ async fn synthetic_v123_r401_rejects_file_prev_uniform_false_and_allows_omitted_
             now + 3600,
             now,
         );
-        let mut pol = repo.read_policy().unwrap();
         repo.with_write_lock(|tx| {
             tx.upsert_account(acc_a.clone(), true, now)?;
             tx.upsert_account(acc_b, false, now)?;
-            tx.save_policy(&mut pol, None, now)?;
             Ok(())
         })
         .unwrap();
@@ -1954,46 +1938,22 @@ async fn synthetic_v123_r401_rejects_file_prev_uniform_false_and_allows_omitted_
         )
         .unwrap();
 
-        (tmp, paths, repo, run_dir, proc_dir)
+        (env, paths, repo)
     };
 
-    let build_cli = |tmp: &tempfile::TempDir,
-                     paths: &HeadlessPaths,
-                     run_dir: &std::path::Path,
-                     proc_dir: &std::path::Path| {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"));
-        c.env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", &paths.home_dir)
-            .env("XDG_CACHE_HOME", paths.cache_dir.parent().unwrap())
-            .env("XDG_RUNTIME_DIR", run_dir)
-            .env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={}/no-dbus", run_dir.display()),
-            )
-            .env("AGY_SWITCH_CLI_PROC_ROOT", proc_dir)
-            .env("AGY_SWITCH_CLI_AGY_BIN", tmp.path().join("no-agy"))
-            .args([
-                "--data-dir",
-                paths.data_dir.to_str().unwrap(),
-                "--backend",
-                "file",
-            ]);
-        c
-    };
-
-    // 1. Contradictory pure-file record (`file.prev_uniform=false`): BOTH `status` and `policy set`
-    //    MUST return exit 7 and preserve journal, slot, and business files byte-for-byte.
+    // 1. Contradictory pure-file record (`file.prev_uniform=false`): BOTH `status` and `accounts disable`
+    //    MUST return exit 7 and preserve journal, slot, index, and account files byte-for-byte.
     {
-        let (tmp, paths, _repo, run_dir, proc_dir) = setup_fixture(false);
+        let (env, paths, _repo) = setup_fixture(false);
         let journal_before = fs::read(paths.switch_journal_file()).unwrap();
         let slot_before = fs::read(&paths.active_slot_file).unwrap();
         let index_before = fs::read(paths.index_file()).unwrap();
-        let policy_before = fs::read(paths.policy_file()).unwrap();
         let acc_a_before = fs::read(paths.account_file("acc-0001")).unwrap();
+        let acc_b_before = fs::read(paths.account_file("acc-0002")).unwrap();
 
-        let status_out = build_cli(&tmp, &paths, &run_dir, &proc_dir)
-            .args(["--json", "status"])
+        let status_out = env
+            .cli_cmd()
+            .args(["--backend", "file", "--json", "status"])
             .output()
             .unwrap();
         assert_eq!(status_out.status.code(), Some(7));
@@ -2005,51 +1965,57 @@ async fn synthetic_v123_r401_rejects_file_prev_uniform_false_and_allows_omitted_
         );
         assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
         assert_eq!(fs::read(paths.index_file()).unwrap(), index_before);
-        assert_eq!(fs::read(paths.policy_file()).unwrap(), policy_before);
         assert_eq!(
             fs::read(paths.account_file("acc-0001")).unwrap(),
             acc_a_before
         );
+        assert_eq!(
+            fs::read(paths.account_file("acc-0002")).unwrap(),
+            acc_b_before
+        );
 
-        let policy_out = build_cli(&tmp, &paths, &run_dir, &proc_dir)
+        let write_out = env
+            .cli_cmd()
             .args([
+                "--backend",
+                "file",
                 "--json",
-                "policy",
-                "set",
-                "--reserve",
-                "12",
-                "--minimum",
-                "35",
+                "accounts",
+                "disable",
+                "acc-0002",
             ])
             .output()
             .unwrap();
-        assert_eq!(policy_out.status.code(), Some(7));
-        let policy_err: serde_json::Value = serde_json::from_slice(&policy_out.stderr).unwrap();
-        assert_eq!(policy_err["error_code"], "recovery_incomplete");
+        assert_eq!(write_out.status.code(), Some(7));
+        let write_err: serde_json::Value = serde_json::from_slice(&write_out.stderr).unwrap();
+        assert_eq!(write_err["error_code"], "recovery_incomplete");
         assert_eq!(
             fs::read(paths.switch_journal_file()).unwrap(),
             journal_before
         );
         assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
         assert_eq!(fs::read(paths.index_file()).unwrap(), index_before);
-        assert_eq!(fs::read(paths.policy_file()).unwrap(), policy_before);
         assert_eq!(
             fs::read(paths.account_file("acc-0001")).unwrap(),
             acc_a_before
         );
+        assert_eq!(
+            fs::read(paths.account_file("acc-0002")).unwrap(),
+            acc_b_before
+        );
     }
 
     // 2. Recoverable positive control omitting `file.prev_uniform` (defaulting to `true`):
-    //    `status` stays read-only (exit 0) and `policy set` completes reconciliation & clears journal.
+    //    `status` stays read-only (exit 0) and `accounts disable` completes reconciliation & clears journal.
     {
-        let (tmp, paths, repo, run_dir, proc_dir) = setup_fixture(true);
+        let (env, paths, repo) = setup_fixture(true);
         let journal_before = fs::read(paths.switch_journal_file()).unwrap();
         let slot_before = fs::read(&paths.active_slot_file).unwrap();
         let index_before = fs::read(paths.index_file()).unwrap();
-        let policy_before = fs::read(paths.policy_file()).unwrap();
 
-        let status_out = build_cli(&tmp, &paths, &run_dir, &proc_dir)
-            .args(["--json", "status"])
+        let status_out = env
+            .cli_cmd()
+            .args(["--backend", "file", "--json", "status"])
             .output()
             .unwrap();
         assert_eq!(status_out.status.code(), Some(0));
@@ -2061,25 +2027,22 @@ async fn synthetic_v123_r401_rejects_file_prev_uniform_false_and_allows_omitted_
         );
         assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
         assert_eq!(fs::read(paths.index_file()).unwrap(), index_before);
-        assert_eq!(fs::read(paths.policy_file()).unwrap(), policy_before);
 
-        let policy_out = build_cli(&tmp, &paths, &run_dir, &proc_dir)
+        let write_out = env
+            .cli_cmd()
             .args([
+                "--backend",
+                "file",
                 "--json",
-                "policy",
-                "set",
-                "--reserve",
-                "12",
-                "--minimum",
-                "35",
+                "accounts",
+                "disable",
+                "acc-0002",
             ])
             .output()
             .unwrap();
-        assert_eq!(policy_out.status.code(), Some(0));
+        assert_eq!(write_out.status.code(), Some(0));
         assert!(!paths.switch_journal_file().exists());
         assert_eq!(fs::read(&paths.active_slot_file).unwrap(), slot_before);
-        let updated_policy = repo.read_policy().unwrap();
-        assert_eq!(updated_policy.reserve_percentage, 12);
-        assert_eq!(updated_policy.candidate_min_percentage, 35);
+        assert!(repo.read_account_unchecked("acc-0002").unwrap().disabled);
     }
 }

@@ -163,10 +163,6 @@ pub struct QuotaObservation {
     pub is_forbidden: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forbidden_reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subscription_tier: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier_source_env: Option<QuotaSourceEnv>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub model_forwarding_rules: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,8 +180,6 @@ impl QuotaObservation {
             last_updated: now_unix,
             is_forbidden: false,
             forbidden_reason: None,
-            subscription_tier: None,
-            tier_source_env: None,
             model_forwarding_rules: HashMap::new(),
             quota_groups: None,
             source_env,
@@ -245,9 +239,9 @@ fn canonical_bucket_window(raw_window: &str, bucket_id_lower: &str) -> String {
     }
 }
 
-/// Returns `true` when `QuotaObservation` is a metadata-only placeholder (e.g. `user_tier` captured
-/// during offline `--from-local` import before any `/usage` quota observation has been recorded).
-pub fn is_tier_only_placeholder(q: &QuotaObservation) -> bool {
+/// Returns `true` when `QuotaObservation` is a legacy metadata-only placeholder (e.g. written by
+/// `v1.2.7` offline `--from-local` before any `/usage` quota observation was recorded).
+pub fn is_empty_quota_placeholder(q: &QuotaObservation) -> bool {
     q.last_updated <= 0 && q.models.is_empty() && q.quota_groups.is_none() && !q.is_forbidden
 }
 
@@ -312,7 +306,7 @@ pub fn evaluate_quota_observation(
             reason: "quota_forbidden".into(),
         };
     }
-    if is_tier_only_placeholder(q) {
+    if is_empty_quota_placeholder(q) {
         return QuotaEval::Unknown {
             reason: "no_quota".into(),
         };
@@ -380,17 +374,9 @@ fn present_pools_in_groups(groups: &[QuotaGroup]) -> Vec<QuotaPool> {
 }
 
 enum PoolGroupEval {
-    Known {
-        effective_pct: f64,
-        short_5h: Option<f64>,
-        weekly: f64,
-    },
-    Stale {
-        reason: &'static str,
-    },
-    Unknown {
-        reason: &'static str,
-    },
+    Known { effective_pct: f64 },
+    Stale { reason: &'static str },
+    Unknown { reason: &'static str },
 }
 
 fn evaluate_pool_from_groups(
@@ -519,37 +505,14 @@ fn evaluate_pool_from_groups_with_empty_reason(
     if pool == QuotaPool::Argon {
         return PoolGroupEval::Known {
             effective_pct: weekly_pct,
-            short_5h: None,
-            weekly: weekly_pct,
         };
     }
 
-    let same_env_tier = q.source_env != QuotaSourceEnv::LegacyUnknown
-        && (q.tier_source_env == Some(q.source_env)
-            || (q.source_env == QuotaSourceEnv::Production
-                && q.tier_source_env == Some(QuotaSourceEnv::OfficialCli)));
-    let tier_lower = q
-        .subscription_tier
-        .as_deref()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let is_free = same_env_tier && (tier_lower.contains("free") || tier_lower.contains("starter"));
-
-    match short_5h {
-        Some(v) => PoolGroupEval::Known {
-            effective_pct: weekly_pct.min(v),
-            short_5h: Some(v),
-            weekly: weekly_pct,
-        },
-        None if is_free => PoolGroupEval::Known {
-            effective_pct: weekly_pct,
-            short_5h: None,
-            weekly: weekly_pct,
-        },
-        None => PoolGroupEval::Unknown {
-            reason: "missing_5h_bucket",
-        },
-    }
+    let effective_pct = match short_5h {
+        Some(v) => weekly_pct.min(v),
+        None => weekly_pct,
+    };
+    PoolGroupEval::Known { effective_pct }
 }
 
 fn target_pools_for_scope(
@@ -657,40 +620,6 @@ fn evaluate_pure_groups_scope(
     }
 }
 
-fn evaluate_pure_groups_windows(
-    q: &QuotaObservation,
-    monitored_model: &str,
-    now_unix: i64,
-) -> WindowQuotaSnapshot {
-    let Some(ref groups) = q.quota_groups else {
-        return WindowQuotaSnapshot::default();
-    };
-    let Ok(pools) = target_pools_for_scope(monitored_model, groups) else {
-        return WindowQuotaSnapshot::default();
-    };
-    let mut min_5h: Option<f64> = None;
-    let mut min_weekly: Option<f64> = None;
-    for pool in pools {
-        match evaluate_pool_from_groups(q, pool, now_unix) {
-            PoolGroupEval::Known {
-                short_5h, weekly, ..
-            } => {
-                if let Some(v) = short_5h {
-                    min_5h = Some(min_5h.map_or(v, |old| old.min(v)));
-                }
-                min_weekly = Some(min_weekly.map_or(weekly, |old| old.min(weekly)));
-            }
-            PoolGroupEval::Stale { .. } | PoolGroupEval::Unknown { .. } => {
-                return WindowQuotaSnapshot::default();
-            }
-        }
-    }
-    WindowQuotaSnapshot {
-        short_5h_pct: min_5h.map(round_pct),
-        weekly_pct: min_weekly.map(round_pct),
-    }
-}
-
 fn aggregate_family(
     q: &QuotaObservation,
     now_unix: i64,
@@ -732,21 +661,11 @@ fn aggregate_family(
 }
 
 enum SingleModelDetail {
-    Known {
-        effective_pct: f64,
-        short_5h: Option<f64>,
-        weekly: f64,
-    },
-    Stale {
-        reason: &'static str,
-        classified: bool,
-    },
+    Known { effective_pct: f64 },
+    Stale { reason: &'static str },
     Disabled,
     Unclassified,
-    Unknown {
-        reason: &'static str,
-        classified: bool,
-    },
+    Unknown { reason: &'static str },
 }
 
 fn resolve_forwarded_model<'a>(q: &'a QuotaObservation, model: &'a str) -> &'a str {
@@ -773,26 +692,16 @@ fn evaluate_single_model_detail(
     }
 
     let Some(m) = q.models.iter().find(|m| m.name == resolved) else {
-        let orig_display = q
-            .models
-            .iter()
-            .find(|cand| cand.name == model)
-            .and_then(|cand| cand.display_name.as_deref());
-        let classified = model_quota_pool(resolved, None).is_some()
-            || model_quota_pool(model, orig_display).is_some();
         return SingleModelDetail::Unknown {
             reason: "model_not_found",
-            classified,
         };
     };
 
     let pool = model_quota_pool(resolved, m.display_name.as_deref());
-    let classified = pool.is_some();
 
     if m.percentage_known == Some(false) || !(0..=100).contains(&m.percentage) {
         return SingleModelDetail::Unknown {
             reason: "model_percentage_unknown",
-            classified,
         };
     }
 
@@ -808,13 +717,11 @@ fn evaluate_single_model_detail(
                     else {
                         return SingleModelDetail::Unknown {
                             reason: "invalid_primary_reset_time",
-                            classified,
                         };
                     };
                     if parsed_pq_reset_unix <= now_unix {
                         return SingleModelDetail::Stale {
                             reason: "reset_deadline_passed",
-                            classified,
                         };
                     }
                 }
@@ -823,13 +730,11 @@ fn evaluate_single_model_detail(
             Some(_) => {
                 return SingleModelDetail::Unknown {
                     reason: "invalid_primary_fraction",
-                    classified,
                 }
             }
             None => {
                 return SingleModelDetail::Unknown {
                     reason: "missing_primary_fraction",
-                    classified,
                 }
             }
         }
@@ -840,13 +745,11 @@ fn evaluate_single_model_detail(
             else {
                 return SingleModelDetail::Unknown {
                     reason: "invalid_reset_time",
-                    classified,
                 };
             };
             if parsed_m_reset_unix <= now_unix {
                 return SingleModelDetail::Stale {
                     reason: "reset_deadline_passed",
-                    classified,
                 };
             }
         }
@@ -857,32 +760,20 @@ fn evaluate_single_model_detail(
         return SingleModelDetail::Unclassified;
     };
     match evaluate_pool_from_groups_with_empty_reason(q, pool, now_unix, "missing_weekly_bucket") {
-        PoolGroupEval::Known {
-            effective_pct,
-            short_5h,
-            weekly,
-        } => SingleModelDetail::Known {
+        PoolGroupEval::Known { effective_pct } => SingleModelDetail::Known {
             effective_pct: effective_pct.min(model_primary_pct),
-            short_5h,
-            weekly,
         },
-        PoolGroupEval::Stale { reason } => SingleModelDetail::Stale {
-            reason,
-            classified: true,
-        },
-        PoolGroupEval::Unknown { reason } => SingleModelDetail::Unknown {
-            reason,
-            classified: true,
-        },
+        PoolGroupEval::Stale { reason } => SingleModelDetail::Stale { reason },
+        PoolGroupEval::Unknown { reason } => SingleModelDetail::Unknown { reason },
     }
 }
 
 pub fn evaluate_single_model(q: &QuotaObservation, model: &str, now_unix: i64) -> QuotaEval {
     match evaluate_single_model_detail(q, model, now_unix) {
-        SingleModelDetail::Known { effective_pct, .. } => QuotaEval::Known {
+        SingleModelDetail::Known { effective_pct } => QuotaEval::Known {
             remaining_percentage: effective_pct,
         },
-        SingleModelDetail::Stale { reason, .. } => QuotaEval::Stale {
+        SingleModelDetail::Stale { reason } => QuotaEval::Stale {
             reason: reason.into(),
         },
         SingleModelDetail::Disabled => QuotaEval::Unknown {
@@ -891,341 +782,9 @@ pub fn evaluate_single_model(q: &QuotaObservation, model: &str, now_unix: i64) -
         SingleModelDetail::Unclassified => QuotaEval::Unknown {
             reason: "unclassified_model_pool".into(),
         },
-        SingleModelDetail::Unknown { reason, .. } => QuotaEval::Unknown {
+        SingleModelDetail::Unknown { reason } => QuotaEval::Unknown {
             reason: reason.into(),
         },
-    }
-}
-
-/// Effective dual-window remaining quota percentages (`5h` and `Weekly`) across the pools
-/// matched by a policy's `monitored_model`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WindowQuotaSnapshot {
-    pub short_5h_pct: Option<u8>,
-    pub weekly_pct: Option<u8>,
-}
-
-fn round_pct(v: f64) -> u8 {
-    v.clamp(0.0, 100.0).round() as u8
-}
-
-fn evaluate_family_windows(
-    q: &QuotaObservation,
-    now_unix: i64,
-    predicate: impl Fn(&ModelQuota) -> bool,
-) -> WindowQuotaSnapshot {
-    let mut min_5h: Option<f64> = None;
-    let mut min_weekly: Option<f64> = None;
-
-    for m in &q.models {
-        if !predicate(m) {
-            continue;
-        }
-        match evaluate_single_model_detail(q, &m.name, now_unix) {
-            SingleModelDetail::Known {
-                short_5h, weekly, ..
-            } => {
-                if let Some(v) = short_5h {
-                    min_5h = Some(min_5h.map_or(v, |old| old.min(v)));
-                }
-                min_weekly = Some(min_weekly.map_or(weekly, |old| old.min(weekly)));
-            }
-            SingleModelDetail::Disabled
-            | SingleModelDetail::Unclassified
-            | SingleModelDetail::Stale {
-                classified: false, ..
-            }
-            | SingleModelDetail::Unknown {
-                classified: false, ..
-            } => {}
-            SingleModelDetail::Stale {
-                classified: true, ..
-            }
-            | SingleModelDetail::Unknown {
-                classified: true, ..
-            } => {
-                // Fail closed: do not mask an expired, uncertain, incomplete, or conflicting
-                // monitored model/pool with percentages from another pool.
-                return WindowQuotaSnapshot::default();
-            }
-        }
-    }
-
-    WindowQuotaSnapshot {
-        short_5h_pct: min_5h.map(round_pct),
-        weekly_pct: min_weekly.map(round_pct),
-    }
-}
-
-/// Extract minimum valid `5h` and `Weekly` remaining percentages across all quota pools matched
-/// by `monitored_model`, reusing `evaluate_single_model` fail-closed guards and distinguishing
-/// legitimate windowless tiers (Argon / same-env Free/Starter) from unavailable or conflicting pools.
-pub fn evaluate_account_window_quotas(
-    account: &AccountRecord,
-    monitored_model: &str,
-    now_unix: i64,
-    max_age_secs: i64,
-) -> WindowQuotaSnapshot {
-    if account.disabled || account.is_validation_blocked_at(now_unix) {
-        return WindowQuotaSnapshot::default();
-    }
-    let Some(ref q) = account.quota else {
-        return WindowQuotaSnapshot::default();
-    };
-    if q.is_forbidden
-        || is_tier_only_placeholder(q)
-        || q.last_updated > now_unix + 30
-        || now_unix.saturating_sub(q.last_updated) > max_age_secs
-    {
-        return WindowQuotaSnapshot::default();
-    }
-
-    if use_pure_group_evaluation(q) {
-        return evaluate_pure_groups_windows(q, monitored_model, now_unix);
-    }
-
-    let trimmed = monitored_model.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
-        return evaluate_family_windows(q, now_unix, |_| true);
-    }
-    if trimmed.eq_ignore_ascii_case("gemini") {
-        return evaluate_family_windows(q, now_unix, |m| {
-            model_quota_pool(&m.name, m.display_name.as_deref()) == Some(QuotaPool::Gemini)
-        });
-    }
-    if trimmed.eq_ignore_ascii_case("argon") {
-        return evaluate_family_windows(q, now_unix, |m| {
-            model_quota_pool(&m.name, m.display_name.as_deref()) == Some(QuotaPool::Argon)
-        });
-    }
-    if trimmed.eq_ignore_ascii_case("claude")
-        || trimmed.eq_ignore_ascii_case("3p")
-        || trimmed.eq_ignore_ascii_case("non-gemini")
-    {
-        return evaluate_family_windows(q, now_unix, |m| {
-            let lower = m.name.to_ascii_lowercase();
-            lower.starts_with("claude") || lower.starts_with("gpt")
-        });
-    }
-
-    match evaluate_single_model_detail(q, trimmed, now_unix) {
-        SingleModelDetail::Known {
-            short_5h, weekly, ..
-        } => WindowQuotaSnapshot {
-            short_5h_pct: short_5h.map(round_pct),
-            weekly_pct: Some(round_pct(weekly)),
-        },
-        _ => WindowQuotaSnapshot::default(),
-    }
-}
-
-/// Inspect cached quota observations (independent of `DEFAULT_QUOTA_MAX_AGE_SECS` wall-clock age)
-/// to determine whether any monitored window is already known to be strictly below `min_pct`
-/// with a reset deadline still in the future (`reset_time > now_unix`).
-/// Returns `(min_blocking_pct, blocking_reset_unix)` when such a blocking window exists.
-fn find_blocking_low_window_before_reset(
-    q: &QuotaObservation,
-    monitored_model: &str,
-    min_pct: u8,
-    now_unix: i64,
-) -> Option<(f64, i64)> {
-    if q.is_forbidden || is_tier_only_placeholder(q) || q.last_updated > now_unix + 30 {
-        return None;
-    }
-
-    let min_threshold = min_pct as f64;
-    let mut worst: Option<(f64, i64)> = None;
-
-    if let Some(ref groups) = q.quota_groups {
-        if let Ok(pools) = target_pools_for_scope(monitored_model, groups) {
-            for pool in pools {
-                // Collect per-window observations for this pool and ignore conflicting windows.
-                type WindowBucketSample<'a> = (f64, Option<i64>, &'a str);
-                let mut per_window: HashMap<String, Option<WindowBucketSample<'_>>> =
-                    HashMap::new();
-                for group in groups {
-                    for bucket in &group.buckets {
-                        let id = bucket.bucket_id.to_ascii_lowercase();
-                        if quota_pool(&id, &group.display_name) != Some(pool) {
-                            continue;
-                        }
-                        if bucket.remaining_fraction_known == Some(false)
-                            || (pool == QuotaPool::Argon
-                                && bucket.remaining_fraction_known != Some(true))
-                            || !fraction_is_known(Some(bucket.remaining_fraction))
-                        {
-                            continue;
-                        }
-                        let window = canonical_bucket_window(&bucket.window, &id);
-                        let reset_unix = if is_unused_full_bucket_reset_time(
-                            &bucket.reset_time,
-                            bucket.remaining_fraction,
-                            bucket.remaining_fraction_known,
-                        ) {
-                            None
-                        } else {
-                            crate::domain::clock::parse_rfc3339_unix_seconds(&bucket.reset_time)
-                        };
-                        let item = (
-                            bucket.remaining_fraction,
-                            reset_unix,
-                            bucket.bucket_id.as_str(),
-                        );
-                        match per_window.get_mut(&window) {
-                            None => {
-                                per_window.insert(window, Some(item));
-                            }
-                            Some(Some(prev)) if *prev != item => {
-                                *per_window.get_mut(&window).unwrap() = None;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                for entry in per_window.into_values().flatten() {
-                    let pct = entry.0 * 100.0;
-                    if pct < min_threshold {
-                        if let Some(reset_ts) = entry.1.filter(|&ts| ts > now_unix) {
-                            worst = Some(match worst {
-                                None => (pct, reset_ts),
-                                Some((old_pct, old_ts)) => (old_pct.min(pct), old_ts.max(reset_ts)),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Legacy per-model `primary_quota` observations (backward compatibility)
-    if !q.models.is_empty() {
-        let trimmed = monitored_model.trim();
-        for m in &q.models {
-            if m.name.to_ascii_lowercase().ends_with("-disabled") {
-                continue;
-            }
-            let matches_scope = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
-                model_quota_pool(&m.name, m.display_name.as_deref()).is_some()
-            } else if trimmed.eq_ignore_ascii_case("gemini") {
-                model_quota_pool(&m.name, m.display_name.as_deref()) == Some(QuotaPool::Gemini)
-            } else if trimmed.eq_ignore_ascii_case("argon") {
-                model_quota_pool(&m.name, m.display_name.as_deref()) == Some(QuotaPool::Argon)
-            } else if trimmed.eq_ignore_ascii_case("claude")
-                || trimmed.eq_ignore_ascii_case("3p")
-                || trimmed.eq_ignore_ascii_case("non-gemini")
-            {
-                let lower = m.name.to_ascii_lowercase();
-                lower.starts_with("claude") || lower.starts_with("gpt")
-            } else {
-                resolve_forwarded_model(q, trimmed) == m.name
-            };
-            if !matches_scope {
-                continue;
-            }
-            if let Some(ref pq) = m.primary_quota {
-                if let Some(frac) = pq
-                    .remaining_fraction
-                    .filter(|f| fraction_is_known(Some(*f)))
-                {
-                    let pct = frac * 100.0;
-                    if pct < min_threshold {
-                        if let Some(reset_ts) =
-                            crate::domain::clock::parse_rfc3339_unix_seconds(&pq.reset_time)
-                                .filter(|&ts| ts > now_unix)
-                        {
-                            worst = Some(match worst {
-                                None => (pct, reset_ts),
-                                Some((old_pct, old_ts)) => (old_pct.min(pct), old_ts.max(reset_ts)),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    worst
-}
-
-/// Pure-local cache filter for `daemon` Step-and-Verify:
-/// Returns `Some(blocking_reset_unix)` if `account` has cached quota `< min_pct` whose blocking
-/// window reset deadline is still in the future (`reset_time > now_unix`), allowing the daemon
-/// to skip exhausted dormant candidates locally without switching or invoking `agy -p "/usage"`.
-pub fn cached_candidate_known_below_min_before_reset(
-    account: &AccountRecord,
-    monitored_model: &str,
-    min_pct: u8,
-    now_unix: i64,
-) -> Option<i64> {
-    let q = account.quota.as_ref()?;
-    find_blocking_low_window_before_reset(q, monitored_model, min_pct, now_unix)
-        .map(|(_, reset_ts)| reset_ts)
-}
-
-/// Compact summary for the TUI A1 `Last Quota` column.
-#[derive(Debug, Clone, PartialEq)]
-pub enum LastQuotaStatus {
-    NeverRefreshed,
-    Forbidden,
-    LowBeforeReset {
-        percentage: f64,
-        reset_unix: i64,
-        last_updated: i64,
-    },
-    ResetPassed {
-        last_updated: i64,
-    },
-    Known {
-        percentage: f64,
-        last_updated: i64,
-    },
-    Unknown {
-        last_updated: i64,
-    },
-}
-
-/// Summarize an account's cached quota for display in the TUI A1 `Last Quota` column.
-pub fn summarize_last_quota_status(
-    account: &AccountRecord,
-    monitored_model: &str,
-    candidate_min_pct: u8,
-    now_unix: i64,
-) -> LastQuotaStatus {
-    let Some(ref q) = account.quota else {
-        return LastQuotaStatus::NeverRefreshed;
-    };
-    if q.is_forbidden {
-        return LastQuotaStatus::Forbidden;
-    }
-    if is_tier_only_placeholder(q) {
-        return LastQuotaStatus::NeverRefreshed;
-    }
-    if let Some((low_pct, reset_unix)) =
-        find_blocking_low_window_before_reset(q, monitored_model, candidate_min_pct, now_unix)
-    {
-        return LastQuotaStatus::LowBeforeReset {
-            percentage: low_pct,
-            reset_unix,
-            last_updated: q.last_updated,
-        };
-    }
-    match evaluate_quota_observation(q, monitored_model, now_unix, i64::MAX) {
-        QuotaEval::Known {
-            remaining_percentage,
-        } => LastQuotaStatus::Known {
-            percentage: remaining_percentage,
-            last_updated: q.last_updated,
-        },
-        QuotaEval::Stale { reason } if reason == "reset_deadline_passed" => {
-            LastQuotaStatus::ResetPassed {
-                last_updated: q.last_updated,
-            }
-        }
-        QuotaEval::Stale { .. } | QuotaEval::Unknown { .. } | QuotaEval::Unavailable { .. } => {
-            LastQuotaStatus::Unknown {
-                last_updated: q.last_updated,
-            }
-        }
     }
 }
 
@@ -1234,8 +793,8 @@ mod tests {
     use super::*;
     use crate::domain::token::TokenRecord;
 
-    fn sample_window_account(now: i64) -> AccountRecord {
-        let mut acc = AccountRecord::new(
+    fn sample_account(now: i64) -> AccountRecord {
+        AccountRecord::new(
             "acc-win-001".into(),
             "alice@example.com".into(),
             TokenRecord {
@@ -1251,443 +810,7 @@ mod tests {
                 is_gcp_tos: true,
             },
             now,
-        );
-        let mut obs = QuotaObservation::new(now - 30, QuotaSourceEnv::Daily);
-        obs.models = vec![
-            ModelQuota {
-                name: "gemini-3.8-flash-high".into(),
-                percentage: 72,
-                percentage_known: Some(true),
-                observed_remaining_fraction: Some(0.72),
-                primary_quota: None,
-                quota_bucket_id: Some("gemini-weekly".into()),
-                reset_time: "2099-01-07T00:00:00Z".into(),
-                display_name: None,
-                supports_images: None,
-                supports_thinking: None,
-                thinking_budget: None,
-                recommended: None,
-                max_tokens: None,
-                max_output_tokens: None,
-                supported_mime_types: None,
-            },
-            ModelQuota {
-                name: "claude-opus-4-6".into(),
-                percentage: 2,
-                percentage_known: Some(true),
-                observed_remaining_fraction: Some(0.02),
-                primary_quota: None,
-                quota_bucket_id: Some("3p-5h".into()),
-                reset_time: "2099-01-01T05:00:00Z".into(),
-                display_name: None,
-                supports_images: None,
-                supports_thinking: None,
-                thinking_budget: None,
-                recommended: None,
-                max_tokens: None,
-                max_output_tokens: None,
-                supported_mime_types: None,
-            },
-            ModelQuota {
-                name: "gemini-4-argon-high".into(),
-                percentage: 60,
-                percentage_known: Some(true),
-                observed_remaining_fraction: Some(0.60),
-                primary_quota: None,
-                quota_bucket_id: Some("gemini-argon-wtu-weekly".into()),
-                reset_time: "2099-01-07T00:00:00Z".into(),
-                display_name: None,
-                supports_images: None,
-                supports_thinking: None,
-                thinking_budget: None,
-                recommended: None,
-                max_tokens: None,
-                max_output_tokens: None,
-                supported_mime_types: None,
-            },
-        ];
-        obs.quota_groups = Some(vec![
-            QuotaGroup {
-                display_name: "Gemini Models".into(),
-                description: None,
-                buckets: vec![
-                    QuotaBucket {
-                        bucket_id: "gemini-5h".into(),
-                        window: "5h".into(),
-                        remaining_fraction: 0.90,
-                        remaining_fraction_known: Some(true),
-                        reset_time: "2099-01-01T05:00:00Z".into(),
-                        display_name: None,
-                        description: None,
-                    },
-                    QuotaBucket {
-                        bucket_id: "gemini-weekly".into(),
-                        window: "weekly".into(),
-                        remaining_fraction: 0.72,
-                        remaining_fraction_known: Some(true),
-                        reset_time: "2099-01-07T00:00:00Z".into(),
-                        display_name: None,
-                        description: None,
-                    },
-                ],
-            },
-            QuotaGroup {
-                display_name: "Claude and GPT models".into(),
-                description: None,
-                buckets: vec![
-                    QuotaBucket {
-                        bucket_id: "3p-5h".into(),
-                        window: "5h".into(),
-                        remaining_fraction: 0.02,
-                        remaining_fraction_known: Some(true),
-                        reset_time: "2099-01-01T05:00:00Z".into(),
-                        display_name: None,
-                        description: None,
-                    },
-                    QuotaBucket {
-                        bucket_id: "3p-weekly".into(),
-                        window: "weekly".into(),
-                        remaining_fraction: 0.40,
-                        remaining_fraction_known: Some(true),
-                        reset_time: "2099-01-07T00:00:00Z".into(),
-                        display_name: None,
-                        description: None,
-                    },
-                ],
-            },
-            QuotaGroup {
-                display_name: "Gemini 4 Argon".into(),
-                description: None,
-                buckets: vec![QuotaBucket {
-                    bucket_id: "gemini-argon-wtu-weekly".into(),
-                    window: "weekly".into(),
-                    remaining_fraction: 0.60,
-                    remaining_fraction_known: Some(true),
-                    reset_time: "2099-01-07T00:00:00Z".into(),
-                    display_name: None,
-                    description: None,
-                }],
-            },
-        ]);
-        acc.quota = Some(obs);
-        acc
-    }
-
-    #[test]
-    fn evaluate_account_window_quotas_tracks_5h_and_weekly_per_policy_scope() {
-        let now = 1_800_000_000i64;
-        let acc = sample_window_account(now);
-
-        assert_eq!(
-            evaluate_account_window_quotas(&acc, "all", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot {
-                short_5h_pct: Some(2),
-                weekly_pct: Some(40),
-            }
-        );
-        assert_eq!(
-            evaluate_account_window_quotas(&acc, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot {
-                short_5h_pct: Some(90),
-                weekly_pct: Some(72),
-            }
-        );
-        assert_eq!(
-            evaluate_account_window_quotas(&acc, "claude", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot {
-                short_5h_pct: Some(2),
-                weekly_pct: Some(40),
-            }
-        );
-        assert_eq!(
-            evaluate_account_window_quotas(&acc, "argon", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot {
-                short_5h_pct: None,
-                weekly_pct: Some(60),
-            }
-        );
-
-        // Forwarding rule + single model scope
-        let mut forwarded = acc.clone();
-        forwarded
-            .quota
-            .as_mut()
-            .unwrap()
-            .model_forwarding_rules
-            .insert("alias-gemini".into(), "gemini-3.8-flash-high".into());
-        assert_eq!(
-            evaluate_account_window_quotas(
-                &forwarded,
-                "alias-gemini",
-                now,
-                DEFAULT_QUOTA_MAX_AGE_SECS
-            ),
-            WindowQuotaSnapshot {
-                short_5h_pct: Some(90),
-                weekly_pct: Some(72),
-            }
-        );
-
-        // Expired reset_time fails closed
-        let mut expired = acc.clone();
-        expired
-            .quota
-            .as_mut()
-            .unwrap()
-            .quota_groups
-            .as_mut()
-            .unwrap()[1]
-            .buckets[0]
-            .reset_time = "2020-01-01T00:00:00Z".into();
-        assert_eq!(
-            evaluate_account_window_quotas(&expired, "all", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot::default()
-        );
-
-        // Stale observation fails closed
-        assert_eq!(
-            evaluate_account_window_quotas(&acc, "all", now + 4000, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot::default()
-        );
-
-        // Model's own expired reset_time fails closed even while pool buckets remain unexpired
-        let mut expired_model = acc.clone();
-        expired_model.quota.as_mut().unwrap().models[0].reset_time = "2020-01-01T00:00:00Z".into();
-        assert_eq!(
-            evaluate_account_window_quotas(
-                &expired_model,
-                "gemini-3.8-flash-high",
-                now,
-                DEFAULT_QUOTA_MAX_AGE_SECS
-            ),
-            WindowQuotaSnapshot::default()
-        );
-        assert_eq!(
-            evaluate_account_window_quotas(&expired_model, "all", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot::default()
-        );
-
-        // Missing primary_quota.remaining_fraction fails closed on both single-model and `all`
-        let mut missing_primary = acc.clone();
-        missing_primary.quota.as_mut().unwrap().models[0].primary_quota = Some(PrimaryModelQuota {
-            remaining_fraction: None,
-            reset_time: "2099-01-07T00:00:00Z".into(),
-        });
-        assert_eq!(
-            evaluate_account_window_quotas(
-                &missing_primary,
-                "gemini-3.8-flash-high",
-                now,
-                DEFAULT_QUOTA_MAX_AGE_SECS
-            ),
-            WindowQuotaSnapshot::default()
-        );
-        assert_eq!(
-            evaluate_account_window_quotas(
-                &missing_primary,
-                "all",
-                now,
-                DEFAULT_QUOTA_MAX_AGE_SECS
-            ),
-            WindowQuotaSnapshot::default()
-        );
-        // Unrelated healthy family scope remains readable
-        assert_eq!(
-            evaluate_account_window_quotas(
-                &missing_primary,
-                "claude",
-                now,
-                DEFAULT_QUOTA_MAX_AGE_SECS
-            ),
-            WindowQuotaSnapshot {
-                short_5h_pct: Some(2),
-                weekly_pct: Some(40),
-            }
-        );
-
-        // Conflicting bucket in one monitored pool fails closed for `all` instead of masking with other pools
-        let mut conflicting = acc.clone();
-        conflicting
-            .quota
-            .as_mut()
-            .unwrap()
-            .quota_groups
-            .as_mut()
-            .unwrap()[1]
-            .buckets
-            .push(QuotaBucket {
-                bucket_id: "3p-5h".into(),
-                window: "5h".into(),
-                remaining_fraction: 0.99,
-                remaining_fraction_known: Some(true),
-                reset_time: "2099-01-01T05:00:00Z".into(),
-                display_name: None,
-                description: None,
-            });
-        assert_eq!(
-            evaluate_account_window_quotas(&conflicting, "all", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot::default()
-        );
-        assert_eq!(
-            evaluate_account_window_quotas(&conflicting, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot {
-                short_5h_pct: Some(90),
-                weekly_pct: Some(72),
-            }
-        );
-
-        // Missing 5h bucket on non-Free tier fails closed, while same-env Free/Starter legitimately shows `None` for 5h
-        let mut no_5h = acc.clone();
-        no_5h.quota.as_mut().unwrap().quota_groups.as_mut().unwrap()[0]
-            .buckets
-            .retain(|b| b.window != "5h");
-        assert_eq!(
-            evaluate_account_window_quotas(&no_5h, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot::default()
-        );
-        no_5h.quota.as_mut().unwrap().subscription_tier = Some("Google AI Free".into());
-        no_5h.quota.as_mut().unwrap().tier_source_env = Some(QuotaSourceEnv::Daily);
-        assert_eq!(
-            evaluate_account_window_quotas(&no_5h, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot {
-                short_5h_pct: None,
-                weekly_pct: Some(72),
-            }
-        );
-
-        // Unclassified internal model in `q.models` does not poison valid pools under `all`
-        let mut with_unclassified = acc.clone();
-        with_unclassified
-            .quota
-            .as_mut()
-            .unwrap()
-            .models
-            .push(ModelQuota {
-                name: "gemini-4-carbon-high".into(),
-                percentage: 0,
-                percentage_known: Some(false),
-                observed_remaining_fraction: None,
-                primary_quota: None,
-                quota_bucket_id: None,
-                reset_time: String::new(),
-                display_name: None,
-                supports_images: None,
-                supports_thinking: None,
-                thinking_budget: None,
-                recommended: None,
-                max_tokens: None,
-                max_output_tokens: None,
-                supported_mime_types: None,
-            });
-        assert_eq!(
-            evaluate_account_window_quotas(
-                &with_unclassified,
-                "all",
-                now,
-                DEFAULT_QUOTA_MAX_AGE_SECS
-            ),
-            WindowQuotaSnapshot {
-                short_5h_pct: Some(2),
-                weekly_pct: Some(40),
-            }
-        );
-
-        // Unclassified internal model with KNOWN percentage and EXPIRED reset_time (model or primary_quota)
-        // must NOT poison valid pools under `all` in notification display, while keeping `evaluate_single_model` Stale.
-        let mut unclassified_stale_model = acc.clone();
-        unclassified_stale_model
-            .quota
-            .as_mut()
-            .unwrap()
-            .models
-            .push(ModelQuota {
-                name: "gemini-4-carbon-high".into(),
-                percentage: 80,
-                percentage_known: Some(true),
-                observed_remaining_fraction: Some(0.80),
-                primary_quota: None,
-                quota_bucket_id: None,
-                reset_time: "2020-01-01T00:00:00Z".into(),
-                display_name: None,
-                supports_images: None,
-                supports_thinking: None,
-                thinking_budget: None,
-                recommended: None,
-                max_tokens: None,
-                max_output_tokens: None,
-                supported_mime_types: None,
-            });
-        assert!(matches!(
-            evaluate_single_model(
-                unclassified_stale_model.quota.as_ref().unwrap(),
-                "gemini-4-carbon-high",
-                now
-            ),
-            QuotaEval::Stale { .. }
-        ));
-        assert_eq!(
-            evaluate_account_window_quotas(
-                &unclassified_stale_model,
-                "all",
-                now,
-                DEFAULT_QUOTA_MAX_AGE_SECS
-            ),
-            WindowQuotaSnapshot {
-                short_5h_pct: Some(2),
-                weekly_pct: Some(40),
-            }
-        );
-
-        let mut unclassified_stale_primary = unclassified_stale_model.clone();
-        let last_unclassified = unclassified_stale_primary
-            .quota
-            .as_mut()
-            .unwrap()
-            .models
-            .last_mut()
-            .unwrap();
-        last_unclassified.reset_time = "2099-01-07T00:00:00Z".into();
-        last_unclassified.primary_quota = Some(PrimaryModelQuota {
-            remaining_fraction: Some(0.80),
-            reset_time: "2020-01-01T00:00:00Z".into(),
-        });
-        assert!(matches!(
-            evaluate_single_model(
-                unclassified_stale_primary.quota.as_ref().unwrap(),
-                "gemini-4-carbon-high",
-                now
-            ),
-            QuotaEval::Stale { .. }
-        ));
-        assert_eq!(
-            evaluate_account_window_quotas(
-                &unclassified_stale_primary,
-                "all",
-                now,
-                DEFAULT_QUOTA_MAX_AGE_SECS
-            ),
-            WindowQuotaSnapshot {
-                short_5h_pct: Some(2),
-                weekly_pct: Some(40),
-            }
-        );
-
-        // Control: classified model with expired primary_quota still fails closed under `all`
-        let mut classified_stale_primary = acc.clone();
-        classified_stale_primary.quota.as_mut().unwrap().models[0].primary_quota =
-            Some(PrimaryModelQuota {
-                remaining_fraction: Some(0.72),
-                reset_time: "2020-01-01T00:00:00Z".into(),
-            });
-        assert_eq!(
-            evaluate_account_window_quotas(
-                &classified_stale_primary,
-                "all",
-                now,
-                DEFAULT_QUOTA_MAX_AGE_SECS
-            ),
-            WindowQuotaSnapshot::default()
-        );
+        )
     }
 
     #[test]
@@ -1730,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn official_cli_pure_groups_unused_epoch0_and_local_cache_skip() {
+    fn official_cli_pure_groups_unused_epoch0_and_weekly_only_buckets() {
         let now = 1_800_000_000i64;
         assert_eq!(
             serde_json::to_string(&QuotaSourceEnv::OfficialCli).unwrap(),
@@ -1749,10 +872,8 @@ mod tests {
             "2099-01-01T00:00:00Z"
         );
 
-        let mut acc = sample_window_account(now);
+        let mut acc = sample_account(now);
         let mut obs = QuotaObservation::new(now - 60, QuotaSourceEnv::OfficialCli);
-        obs.subscription_tier = Some("PRO".into());
-        obs.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
         obs.summary_source_env = Some(QuotaSourceEnv::OfficialCli);
         obs.quota_groups = Some(vec![
             QuotaGroup {
@@ -1841,13 +962,6 @@ mod tests {
             evaluate_account_quota(&acc, "argon", now, DEFAULT_QUOTA_MAX_AGE_SECS),
             QuotaEval::Unknown { ref reason } if reason == "unknown_pool"
         ));
-        assert_eq!(
-            evaluate_account_window_quotas(&acc, "all", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot {
-                short_5h_pct: Some(95),
-                weekly_pct: Some(97),
-            }
-        );
 
         // Epoch 0 on a partially consumed bucket (< 1.0) MUST still fail closed as Stale.
         let mut partial_epoch0 = acc.clone();
@@ -1865,75 +979,10 @@ mod tests {
             QuotaEval::Stale { ref reason } if reason == "reset_deadline_passed"
         ));
 
-        // Local cache skip: low 8% with future reset (even when last_updated is 2 hours old!) skips locally.
-        let mut low_acc = acc.clone();
-        let future_reset = now + 7200;
-        let future_rfc3339 =
-            crate::domain::clock::format_unix_rfc3339_micros_utc(future_reset).unwrap();
-        low_acc.quota.as_mut().unwrap().last_updated = now - 7200;
-        low_acc
-            .quota
-            .as_mut()
-            .unwrap()
-            .quota_groups
-            .as_mut()
-            .unwrap()[0]
-            .buckets[1]
-            .remaining_fraction = 0.08;
-        low_acc
-            .quota
-            .as_mut()
-            .unwrap()
-            .quota_groups
-            .as_mut()
-            .unwrap()[0]
-            .buckets[1]
-            .reset_time = future_rfc3339;
-        assert_eq!(
-            cached_candidate_known_below_min_before_reset(&low_acc, "all", 30, now),
-            Some(future_reset)
-        );
-        // Unmonitored scope (`claude` is 100%) must NOT skip because of low Gemini.
-        assert_eq!(
-            cached_candidate_known_below_min_before_reset(&low_acc, "claude", 30, now),
-            None
-        );
-        assert!(matches!(
-            summarize_last_quota_status(&low_acc, "all", 30, now),
-            LastQuotaStatus::LowBeforeReset { reset_unix, .. } if reset_unix == future_reset
-        ));
-
-        // Once reset passes (`now_after >= future_reset`), cache skip stops and TUI reports ResetPassed.
-        assert_eq!(
-            cached_candidate_known_below_min_before_reset(&low_acc, "all", 30, future_reset + 1),
-            None
-        );
-        assert!(matches!(
-            summarize_last_quota_status(&low_acc, "all", 30, future_reset + 1),
-            LastQuotaStatus::ResetPassed { .. }
-        ));
-
-        // Tier-only placeholder (from offline `--from-local`) evaluates to `Unknown("no_quota")` and `NeverRefreshed`.
-        let mut tier_only = acc.clone();
-        let mut placeholder = QuotaObservation::new(0, QuotaSourceEnv::OfficialCli);
-        placeholder.subscription_tier = Some("PRO".into());
-        placeholder.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
-        tier_only.quota = Some(placeholder);
-        assert_eq!(
-            evaluate_account_quota(&tier_only, "all", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            QuotaEval::Unknown {
-                reason: "no_quota".into()
-            }
-        );
-        assert_eq!(
-            summarize_last_quota_status(&tier_only, "all", 30, now),
-            LastQuotaStatus::NeverRefreshed
-        );
-
-        // Fail-closed under `all`: if one present pool in `OfficialCli` has conflicting or missing
-        // buckets, `evaluate_account_quota` MUST return `Unknown` rather than masking with another pool!
-        let mut corrupt_pool = acc.clone();
-        corrupt_pool
+        // Weekly-only pool from official `/usage` (e.g. Free/Starter without a `5h` bucket)
+        // evaluates directly from the returned weekly bucket without tier inference.
+        let mut weekly_only = acc.clone();
+        weekly_only
             .quota
             .as_mut()
             .unwrap()
@@ -1941,25 +990,58 @@ mod tests {
             .as_mut()
             .unwrap()[1]
             .buckets
-            .retain(|b| b.window != "5h"); // Pro tier missing 5h bucket on Claude/GPT
-        assert!(matches!(
-            evaluate_account_quota(&corrupt_pool, "all", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            QuotaEval::Unknown { ref reason } if reason == "missing_5h_bucket"
-        ));
+            .retain(|b| b.window != "5h");
         assert_eq!(
-            evaluate_account_window_quotas(&corrupt_pool, "all", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot::default()
+            evaluate_account_quota(&weekly_only, "claude", now, DEFAULT_QUOTA_MAX_AGE_SECS),
+            QuotaEval::Known {
+                remaining_percentage: 100.0
+            }
         );
-        // Healthy isolated scope (`gemini`) remains readable.
         assert_eq!(
-            evaluate_account_quota(&corrupt_pool, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
+            evaluate_account_quota(&weekly_only, "all", now, DEFAULT_QUOTA_MAX_AGE_SECS),
             QuotaEval::Known {
                 remaining_percentage: 95.0
             }
         );
 
-        // Empty `bucket.window` on `gemini-5h` + `gemini-weekly` MUST canonicalize by `bucket_id`
-        // rather than colliding under key `""`!
+        // Conflicting buckets in one present pool still fail closed under `all`.
+        let mut conflicting = acc.clone();
+        conflicting
+            .quota
+            .as_mut()
+            .unwrap()
+            .quota_groups
+            .as_mut()
+            .unwrap()[1]
+            .buckets
+            .push(QuotaBucket {
+                bucket_id: "3p-5h".into(),
+                window: "5h".into(),
+                remaining_fraction: 0.40,
+                remaining_fraction_known: Some(true),
+                reset_time: "2099-01-01T05:00:00Z".into(),
+                display_name: None,
+                description: None,
+            });
+        assert!(matches!(
+            evaluate_account_quota(&conflicting, "all", now, DEFAULT_QUOTA_MAX_AGE_SECS),
+            QuotaEval::Unknown { ref reason } if reason == "conflicting_window_buckets"
+        ));
+
+        // Legacy empty placeholder (from v1.2.7 offline `--from-local`) evaluates to `Unknown("no_quota")`.
+        let mut placeholder_acc = acc.clone();
+        placeholder_acc.quota = Some(QuotaObservation::new(0, QuotaSourceEnv::OfficialCli));
+        assert!(is_empty_quota_placeholder(
+            placeholder_acc.quota.as_ref().unwrap()
+        ));
+        assert_eq!(
+            evaluate_account_quota(&placeholder_acc, "all", now, DEFAULT_QUOTA_MAX_AGE_SECS),
+            QuotaEval::Unknown {
+                reason: "no_quota".into()
+            }
+        );
+
+        // Empty `bucket.window` on `gemini-5h` + `gemini-weekly` canonicalizes by `bucket_id`.
         let mut empty_win = acc.clone();
         for b in &mut empty_win
             .quota
@@ -1977,26 +1059,6 @@ mod tests {
             QuotaEval::Known {
                 remaining_percentage: 95.0
             }
-        );
-        empty_win
-            .quota
-            .as_mut()
-            .unwrap()
-            .quota_groups
-            .as_mut()
-            .unwrap()[0]
-            .buckets[1]
-            .remaining_fraction = 0.05;
-        assert!(
-            cached_candidate_known_below_min_before_reset(&empty_win, "gemini", 30, now).is_some()
-        );
-
-        // Extreme negative `last_updated` must not panic on subtraction overflow.
-        let mut extreme_ts = acc.clone();
-        extreme_ts.quota.as_mut().unwrap().last_updated = i64::MIN;
-        assert_eq!(
-            evaluate_account_window_quotas(&extreme_ts, "all", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            WindowQuotaSnapshot::default()
         );
     }
 }

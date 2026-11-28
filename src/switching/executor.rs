@@ -5,8 +5,7 @@ use crate::error::{CliError, CliResult, ExitCode};
 use crate::oauth::refresh::persist_disable_or_report_io_error;
 use crate::oauth::registry::OAuthClientRegistry;
 use crate::session::backend::{
-    BackendPreWriteSnapshot, BackendReplicaInspection, CredentialBackend, ReplicaCasExpectation,
-    SlotInspectState,
+    BackendPreWriteSnapshot, CredentialBackend, ReplicaCasExpectation, SlotInspectState,
 };
 use crate::session::journal::{
     clear_journal, diagnose_journal_replicas, diagnose_journal_replicas_with_intent,
@@ -18,8 +17,8 @@ use crate::session::journal::{
     ClearSlotTargetMeta, JournalDiagnosis, JournalPhase, JournalReplicaRecord, SwitchJournal,
 };
 use crate::session::payload::{
-    bytes_sha256_hex, extract_session_token_from_bytes, parse_session_payload_bytes,
-    serialize_session_payload_for_account, ExtractedSessionToken, ParsedSessionPayload,
+    bytes_sha256_hex, extract_session_token_from_bytes, serialize_session_payload_for_account,
+    ExtractedSessionToken, ParsedSessionPayload,
 };
 use crate::session::process::observe_runtime_state;
 use crate::store::fs_atomic::{
@@ -57,337 +56,6 @@ impl RunningGuardMode {
     }
 }
 
-/// Expected pre-write state of a single credential replica (`keyring` or `file`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExpectedReplicaState {
-    Absent,
-    Digest(String),
-}
-
-/// Verified per-replica slot checkpoint tracked by `daemon` across Stage 1 -> Stage 5 -> Stage 6
-/// and handed directly into `execute_switch_with_slot_lock_and_guard` to validate EVERY active
-/// replica in `pre_snap` (`file`, `keyring`, and `dual`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct VerifiedSlotCheckpoint {
-    pub keyring: Option<ExpectedReplicaState>,
-    pub file: Option<ExpectedReplicaState>,
-}
-
-impl VerifiedSlotCheckpoint {
-    /// Build a post-commit checkpoint covering all active replicas uniformly written with `target_digest`.
-    pub fn from_committed_digest(uses_keyring: bool, uses_file: bool, target_digest: &str) -> Self {
-        Self {
-            keyring: uses_keyring.then(|| ExpectedReplicaState::Digest(target_digest.to_owned())),
-            file: uses_file.then(|| ExpectedReplicaState::Digest(target_digest.to_owned())),
-        }
-    }
-
-    /// Advance `self` from a post-probe per-replica verification result (`verified`).
-    /// Fail-closed rules:
-    /// - Updates an active replica ONLY when `verified` supplies a `Digest(new_d)` already proven
-    ///   to belong to the expected active account (supporting legitimate single-sided rotations!).
-    /// - NEVER overwrites a `Digest(_)` baseline with `Absent` (unexpected external deletion cancels).
-    /// - NEVER overwrites a baseline when `verified` is `None` (foreign account, corrupt, or
-    ///   unverified replica preserves prior baseline so the next write cancels cleanly!).
-    pub fn advance_from_verified_probe(&mut self, verified: &VerifiedSlotCheckpoint) {
-        if let Some(ExpectedReplicaState::Digest(ref new_d)) = verified.keyring {
-            if self.keyring.is_some() {
-                self.keyring = Some(ExpectedReplicaState::Digest(new_d.clone()));
-            }
-        }
-        if let Some(ExpectedReplicaState::Digest(ref new_d)) = verified.file {
-            if self.file.is_some() {
-                self.file = Some(ExpectedReplicaState::Digest(new_d.clone()));
-            }
-        }
-    }
-}
-
-/// Optional caller-approved per-replica pre-write slot baseline verified directly against the
-/// EXACT `BackendPreWriteSnapshot` (`pre_snap`) used by `execute_switch_with_slot_lock_and_guard`
-/// before any sync-back, journal write, or slot mutation.
-/// - `None`: explicit manual `switch` / `run` (preserves manual switching over external slots).
-/// - `ExactCheckpoint`: daemon hop or normal Stage 6 settle-back (every active replica must match).
-/// - `CheckpointOrSameAccountRotation`: daemon Stage 6 settle-back after shutdown/timeout
-///   interruption — every active replica must either match its exact baseline OR parse as a
-///   verified payload belonging to `account_id`.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum PreSwitchSlotExpectation<'a> {
-    ExactCheckpoint(&'a VerifiedSlotCheckpoint),
-    CheckpointOrSameAccountRotation {
-        expected: &'a VerifiedSlotCheckpoint,
-        account_id: &'a str,
-    },
-}
-
-pub(crate) fn parsed_slot_belongs_to_account(
-    repo: &StoreRepository,
-    snapshot: &StoreSnapshot,
-    parsed: &ParsedSessionPayload,
-    acc: &AccountRecord,
-    allow_superseded_own_rt: bool,
-) -> bool {
-    if acc.token.refresh_token_fingerprint() == parsed.refresh_token_digest {
-        return true;
-    }
-    if slot_matches_selected_rotated_account(repo, snapshot, parsed, acc) {
-        return true;
-    }
-    allow_superseded_own_rt
-        && account_has_superseded_rt_digest_readonly(repo, acc, &parsed.refresh_token_digest)
-            .unwrap_or(false)
-}
-
-/// Extract a full per-replica baseline from Stage 1's `BackendReplicaInspection` for `account_id`.
-/// Returns `None` if keyring collections diverged, any active replica is corrupt/unverified or
-/// belongs to another/foreign account, or all active replicas are absent.
-pub(crate) fn extract_verified_checkpoint_from_replicas(
-    repo: &StoreRepository,
-    snapshot: &StoreSnapshot,
-    replicas: &BackendReplicaInspection,
-    account_id: &str,
-    allow_superseded_non_effective: bool,
-) -> Option<VerifiedSlotCheckpoint> {
-    if !replicas.uses_keyring && !replicas.uses_file {
-        return None;
-    }
-    if replicas.uses_keyring && !replicas.keyring_all_collections_uniform {
-        return None;
-    }
-    let acc = snapshot.accounts.iter().find(|a| a.id == account_id)?;
-    let effective_is_keyring = replicas.uses_keyring
-        && !replicas
-            .keyring
-            .as_ref()
-            .is_none_or(SlotInspectState::is_absent_clean);
-
-    let keyring = if replicas.uses_keyring {
-        match replicas.keyring.as_ref()? {
-            SlotInspectState::Present(p)
-                if parsed_slot_belongs_to_account(
-                    repo,
-                    snapshot,
-                    p,
-                    acc,
-                    allow_superseded_non_effective && !effective_is_keyring,
-                ) =>
-            {
-                Some(ExpectedReplicaState::Digest(p.raw_digest.clone()))
-            }
-            s if s.is_absent_clean() => Some(ExpectedReplicaState::Absent),
-            _ => return None,
-        }
-    } else {
-        None
-    };
-
-    let file = if replicas.uses_file {
-        match &replicas.file {
-            SlotInspectState::Present(p)
-                if parsed_slot_belongs_to_account(
-                    repo,
-                    snapshot,
-                    p,
-                    acc,
-                    allow_superseded_non_effective && effective_is_keyring,
-                ) =>
-            {
-                Some(ExpectedReplicaState::Digest(p.raw_digest.clone()))
-            }
-            s if s.is_absent_clean() => Some(ExpectedReplicaState::Absent),
-            _ => return None,
-        }
-    } else {
-        None
-    };
-
-    let has_any_present = matches!(keyring, Some(ExpectedReplicaState::Digest(_)))
-        || matches!(file, Some(ExpectedReplicaState::Digest(_)));
-    if !has_any_present {
-        return None;
-    }
-    Some(VerifiedSlotCheckpoint { keyring, file })
-}
-
-/// Extract per-replica verified digests after a `/usage` probe for `account_id`.
-/// Each active replica is evaluated independently with `allow_superseded = false`:
-/// - Verified same-account payloads yield `Some(ExpectedReplicaState::Digest(_))` so legitimate
-///   single-sided rotations advance that replica's checkpoint;
-/// - Any foreign, corrupt, unverified, superseded, or absent replica yields `None`, preserving
-///   the caller's prior baseline for that replica so subsequent daemon writes cancel cleanly.
-pub(crate) fn verified_probe_checkpoint_from_replicas(
-    repo: &StoreRepository,
-    snapshot: &StoreSnapshot,
-    replicas: &BackendReplicaInspection,
-    account_id: &str,
-) -> VerifiedSlotCheckpoint {
-    let Some(acc) = snapshot.accounts.iter().find(|a| a.id == account_id) else {
-        return VerifiedSlotCheckpoint::default();
-    };
-    let keyring = if replicas.uses_keyring && replicas.keyring_all_collections_uniform {
-        match replicas.keyring.as_ref() {
-            Some(SlotInspectState::Present(p))
-                if parsed_slot_belongs_to_account(repo, snapshot, p, acc, false) =>
-            {
-                Some(ExpectedReplicaState::Digest(p.raw_digest.clone()))
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let file = if replicas.uses_file {
-        match &replicas.file {
-            SlotInspectState::Present(p)
-                if parsed_slot_belongs_to_account(repo, snapshot, p, acc, false) =>
-            {
-                Some(ExpectedReplicaState::Digest(p.raw_digest.clone()))
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-    VerifiedSlotCheckpoint { keyring, file }
-}
-
-fn single_replica_state_matches_expectation(
-    repo: &StoreRepository,
-    snapshot: &StoreSnapshot,
-    state: &SlotInspectState,
-    expected: &ExpectedReplicaState,
-    rotation_account_id: Option<&str>,
-) -> bool {
-    let exact_ok = match expected {
-        ExpectedReplicaState::Absent => state.is_absent_clean(),
-        ExpectedReplicaState::Digest(exp_d) => state.raw_digest() == Some(exp_d.as_str()),
-    };
-    if exact_ok {
-        return true;
-    }
-    let Some(acc_id) = rotation_account_id else {
-        return false;
-    };
-    let (SlotInspectState::Present(parsed), Some(acc)) =
-        (state, snapshot.accounts.iter().find(|a| a.id == acc_id))
-    else {
-        return false;
-    };
-    parsed_slot_belongs_to_account(repo, snapshot, parsed, acc, false)
-}
-
-pub(crate) fn replica_inspection_matches_expectation(
-    repo: &StoreRepository,
-    snapshot: &StoreSnapshot,
-    replicas: &BackendReplicaInspection,
-    expectation: PreSwitchSlotExpectation<'_>,
-) -> bool {
-    if !replicas.uses_keyring && !replicas.uses_file {
-        return false;
-    }
-    if replicas.uses_keyring && !replicas.keyring_all_collections_uniform {
-        return false;
-    }
-    let (expected, rot_acc_id) = match expectation {
-        PreSwitchSlotExpectation::ExactCheckpoint(cp) => (cp, None),
-        PreSwitchSlotExpectation::CheckpointOrSameAccountRotation {
-            expected,
-            account_id,
-        } => (expected, Some(account_id)),
-    };
-    if replicas.uses_keyring {
-        let (Some(ref kr_state), Some(ref exp_kr)) = (&replicas.keyring, &expected.keyring) else {
-            return false;
-        };
-        if !single_replica_state_matches_expectation(repo, snapshot, kr_state, exp_kr, rot_acc_id) {
-            return false;
-        }
-    }
-    if replicas.uses_file {
-        let Some(ref exp_file) = expected.file else {
-            return false;
-        };
-        if !single_replica_state_matches_expectation(
-            repo,
-            snapshot,
-            &replicas.file,
-            exp_file,
-            rot_acc_id,
-        ) {
-            return false;
-        }
-    }
-    true
-}
-
-fn single_replica_bytes_match_expectation(
-    repo: &StoreRepository,
-    snapshot: &StoreSnapshot,
-    bytes: Option<&[u8]>,
-    expected: &ExpectedReplicaState,
-    rotation_account_id: Option<&str>,
-) -> bool {
-    let exact_ok = match (expected, bytes) {
-        (ExpectedReplicaState::Absent, None) => true,
-        (ExpectedReplicaState::Digest(exp_d), Some(raw)) => bytes_sha256_hex(raw) == *exp_d,
-        _ => false,
-    };
-    if exact_ok {
-        return true;
-    }
-    let (Some(acc_id), Some(raw)) = (rotation_account_id, bytes) else {
-        return false;
-    };
-    let (Ok(parsed), Some(acc)) = (
-        parse_session_payload_bytes(raw),
-        snapshot.accounts.iter().find(|a| a.id == acc_id),
-    ) else {
-        return false;
-    };
-    parsed_slot_belongs_to_account(repo, snapshot, &parsed, acc, false)
-}
-
-fn pre_write_snapshot_matches_expectation(
-    repo: &StoreRepository,
-    snapshot: &StoreSnapshot,
-    pre_snap: &BackendPreWriteSnapshot,
-    expectation: PreSwitchSlotExpectation<'_>,
-) -> bool {
-    if !pre_snap.uses_keyring && !pre_snap.uses_file {
-        return false;
-    }
-    if pre_snap.uses_keyring && !pre_snap.keyring_uniform {
-        return false;
-    }
-    let (expected, rot_acc_id) = match expectation {
-        PreSwitchSlotExpectation::ExactCheckpoint(cp) => (cp, None),
-        PreSwitchSlotExpectation::CheckpointOrSameAccountRotation {
-            expected,
-            account_id,
-        } => (expected, Some(account_id)),
-    };
-    if pre_snap.uses_keyring {
-        let Some(ref exp_kr) = expected.keyring else {
-            return false;
-        };
-        let kr_bytes = pre_snap.keyring_bytes.as_ref().and_then(|o| o.as_deref());
-        if !single_replica_bytes_match_expectation(repo, snapshot, kr_bytes, exp_kr, rot_acc_id) {
-            return false;
-        }
-    }
-    if pre_snap.uses_file {
-        let Some(ref exp_file) = expected.file else {
-            return false;
-        };
-        let file_bytes = pre_snap.file_bytes.as_deref();
-        if !single_replica_bytes_match_expectation(repo, snapshot, file_bytes, exp_file, rot_acc_id)
-        {
-            return false;
-        }
-    }
-    true
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct SwitchOutcome {
     pub dry_run: bool,
@@ -400,14 +68,11 @@ pub struct SwitchOutcome {
     pub validation_blocked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation_warning: Option<String>,
-    /// Verified per-replica checkpoint uniformly committed by this switch (omitted from JSON wire DTO).
-    #[serde(skip_serializing)]
-    pub committed_checkpoint: Option<VerifiedSlotCheckpoint>,
 }
 
 pub(crate) fn format_validation_blocked_warning(target_id: &str) -> String {
     format!(
-        "Note: account `{target_id}` is currently marked verification-required (`verify-blocked`) and remains excluded from daemon auto-switching. Open `agy` to complete Google verification, then run `agy-switch-cli refresh` (or `agy-switch-cli quota --refresh`) to clear this status."
+        "Note: account `{target_id}` is currently marked verification-required (`verify-blocked`). Open `agy` to complete Google verification, then run `agy-switch-cli refresh` (or `agy-switch-cli quota --refresh`) to clear this status."
     )
 }
 
@@ -416,7 +81,6 @@ pub struct SlotSyncBackOutcome {
     pub synced_account_id: Option<String>,
     pub token_updated: bool,
     pub refresh_token_rotated: bool,
-    pub discovered_user_tier: Option<String>,
 }
 
 fn slot_access_token_is_fresher(extracted: &ExtractedSessionToken, existing: &TokenRecord) -> bool {
@@ -569,13 +233,11 @@ fn resolve_sync_back_candidate<'a>(
 fn prefer_file_sync_back_candidate(
     kr: &ResolvedSyncBackCandidate<'_>,
     file: &ResolvedSyncBackCandidate<'_>,
-    selected_account_id: Option<&str>,
 ) -> bool {
     if kr.owner.id != file.owner.id {
-        // Diverged replicas pointing to two different saved accounts (only reachable during
-        // explicit manual switch): prefer the selected account, tie-breaking to keyring.
-        return selected_account_id == Some(file.owner.id.as_str())
-            && selected_account_id != Some(kr.owner.id.as_str());
+        // Diverged replicas pointing to two different saved accounts: keyring is the effective
+        // active slot (matching `effective_slot_state()` and `resolve_outgoing_slot_owner_from_pre_snap`).
+        return false;
     }
 
     // Same owning account across keyring and disk file (`dual`):
@@ -587,8 +249,8 @@ fn prefer_file_sync_back_candidate(
     }
 
     // 2. Both replicas hold the stored RT (or both hold verified rotated RTs):
-    //    prefer strictly fresher AT expiry, then fresher AT, then metadata update (`id_token` /
-    //    `user_tier`), preserving keyring preference on ties.
+    //    prefer strictly fresher AT expiry, then fresher AT, then `id_token` addition,
+    //    preserving keyring preference on ties.
     let kr_exp = kr.extracted.expiry_unix.unwrap_or(0);
     let file_exp = file.extracted.expiry_unix.unwrap_or(0);
     if file_exp != kr_exp {
@@ -608,13 +270,6 @@ fn prefer_file_sync_back_candidate(
         return file_adds_id_token;
     }
 
-    let kr_updates_tier = slot_tier_updates_account(kr.extracted.user_tier.as_deref(), kr.owner);
-    let file_updates_tier =
-        slot_tier_updates_account(file.extracted.user_tier.as_deref(), file.owner);
-    if file_updates_tier != kr_updates_tier {
-        return file_updates_tier;
-    }
-
     false
 }
 
@@ -624,7 +279,7 @@ fn select_sync_back_candidate<'a>(
     kr_extracted: Option<ExtractedSessionToken>,
     file_extracted: Option<ExtractedSessionToken>,
     pinned_owner_id: Option<&str>,
-) -> Option<(ResolvedSyncBackCandidate<'a>, Option<String>)> {
+) -> Option<ResolvedSyncBackCandidate<'a>> {
     let kr_cand = kr_extracted
         .and_then(|ex| resolve_sync_back_candidate(repo, snapshot, ex, pinned_owner_id));
     let file_cand = file_extracted
@@ -632,28 +287,14 @@ fn select_sync_back_candidate<'a>(
 
     match (kr_cand, file_cand) {
         (Some(kr), Some(file)) => {
-            let same_owner = kr.owner.id == file.owner.id;
-            let pick_file = prefer_file_sync_back_candidate(
-                &kr,
-                &file,
-                snapshot.index.selected_account_id.as_deref(),
-            );
-            let (chosen, other_tier) = if pick_file {
-                (file, same_owner.then_some(kr.extracted.user_tier).flatten())
+            if prefer_file_sync_back_candidate(&kr, &file) {
+                Some(file)
             } else {
-                (kr, same_owner.then_some(file.extracted.user_tier).flatten())
-            };
-            let discovered_tier = chosen.extracted.user_tier.clone().or(other_tier);
-            Some((chosen, discovered_tier))
+                Some(kr)
+            }
         }
-        (Some(kr), None) => {
-            let tier = kr.extracted.user_tier.clone();
-            Some((kr, tier))
-        }
-        (None, Some(file)) => {
-            let tier = file.extracted.user_tier.clone();
-            Some((file, tier))
-        }
+        (Some(kr), None) => Some(kr),
+        (None, Some(file)) => Some(file),
         (None, None) => None,
     }
 }
@@ -807,14 +448,6 @@ pub(crate) fn slot_matches_selected_rotated_account(
         .unwrap_or(true)
 }
 
-fn slot_tier_updates_account(user_tier: Option<&str>, account: &AccountRecord) -> bool {
-    account.needs_official_cli_user_tier_update(user_tier)
-}
-
-fn apply_synced_user_tier(account: &mut AccountRecord, user_tier: Option<&str>) -> bool {
-    account.apply_official_cli_user_tier(user_tier)
-}
-
 fn sync_back_extracted_for_owner(
     repo: &StoreRepository,
     owner_id: &str,
@@ -822,7 +455,6 @@ fn sync_back_extracted_for_owner(
     extracted: &ExtractedSessionToken,
     now_unix: i64,
 ) -> CliResult<SlotSyncBackOutcome> {
-    let discovered_user_tier = extracted.user_tier.clone();
     let owner_snapshot = match repo.read_account_unchecked(owner_id) {
         Ok(a) => a,
         Err(_) => {
@@ -830,14 +462,11 @@ fn sync_back_extracted_for_owner(
         }
     };
     let (needs_token_update, _) = slot_token_updates_account(extracted, &owner_snapshot);
-    let needs_tier_update =
-        slot_tier_updates_account(discovered_user_tier.as_deref(), &owner_snapshot);
-    if !needs_token_update && !needs_tier_update {
+    if !needs_token_update {
         return Ok(SlotSyncBackOutcome {
             synced_account_id: Some(owner_id.to_string()),
             token_updated: false,
             refresh_token_rotated: false,
-            discovered_user_tier,
         });
     }
 
@@ -867,20 +496,12 @@ fn sync_back_extracted_for_owner(
             }
         }
         let (still_needs_token, rt_rotated) = slot_token_updates_account(extracted, &latest);
-        let still_needs_tier = slot_tier_updates_account(discovered_user_tier.as_deref(), &latest);
-        if !still_needs_token && !still_needs_tier {
+        if !still_needs_token {
             return Ok((true, false, false));
         }
-        let mut updated_acc = if still_needs_token {
-            let merged = build_synced_token_record(extracted, &latest.token, now_unix);
-            tx.merge_refreshed_token(owner_id, merged, None, now_unix)?
-        } else {
-            latest
-        };
-        if apply_synced_user_tier(&mut updated_acc, discovered_user_tier.as_deref()) {
-            tx.save_account(&updated_acc)?;
-        }
-        Ok((true, still_needs_token, rt_rotated))
+        let merged = build_synced_token_record(extracted, &latest.token, now_unix);
+        let _ = tx.merge_refreshed_token(owner_id, merged, None, now_unix)?;
+        Ok((true, true, rt_rotated))
     })?;
 
     if !accepted {
@@ -891,14 +512,70 @@ fn sync_back_extracted_for_owner(
         synced_account_id: Some(owner_id.to_string()),
         token_updated,
         refresh_token_rotated,
-        discovered_user_tier,
     })
+}
+
+/// Resolve the saved account ID that genuinely owns the **effective active slot** in `pre_snap`
+/// before switching out, so `commit_selected_account_with_slot_owner` never fabricates
+/// `last_switched_out_at` on a stale disk replica when `dual` keyring drifted externally or holds
+/// a corrupt/non-uniform payload.
+///
+/// Effective-slot precedence matches `BackendReplicaInspection::effective_slot_state`:
+/// - When `pre_snap.uses_keyring` and keyring has bytes:
+///   - require `pre_snap.keyring_uniform` and a parseable keyring payload;
+///   - if the keyring payload directly resolves to a saved account (exact RT or Option 1B rotated
+///     RT), that account is the outgoing slot owner;
+///   - otherwise, ONLY if `pre_snap.uses_file` yields a valid `file_cand` whose superseded RT
+///     lineage contains the keyring RT (F-01 single-sided disk rotation where keyring still holds
+///     the older superseded RT), return `file_cand.owner.id`;
+///   - otherwise (genuinely foreign, corrupt, or non-uniform keyring), return `None`.
+/// - When keyring is unused or cleanly absent, fall back to `file` (if `pre_snap.uses_file`).
+fn resolve_outgoing_slot_owner_from_pre_snap(
+    repo: &StoreRepository,
+    pre_snap: &BackendPreWriteSnapshot,
+    snapshot: &StoreSnapshot,
+) -> Option<String> {
+    let file_cand = || -> Option<ResolvedSyncBackCandidate<'_>> {
+        if !pre_snap.uses_file {
+            return None;
+        }
+        let file_ex = pre_snap
+            .file_bytes
+            .as_deref()
+            .and_then(|b| extract_session_token_from_bytes(b, "Active session file").ok())?;
+        resolve_sync_back_candidate(repo, snapshot, file_ex, None)
+    };
+
+    if pre_snap.uses_keyring {
+        if !pre_snap.keyring_uniform {
+            return None;
+        }
+        if let Some(kr_bytes) = pre_snap.keyring_bytes.as_ref().and_then(|o| o.as_deref()) {
+            let kr_ex = extract_session_token_from_bytes(kr_bytes, "Active keyring slot").ok()?;
+            let kr_rt_digest = kr_ex.refresh_token_digest.clone();
+            if let Some(kr_cand) = resolve_sync_back_candidate(repo, snapshot, kr_ex, None) {
+                return Some(kr_cand.owner.id.clone());
+            }
+            if let Some(fc) = file_cand() {
+                if account_has_superseded_rt_digest_readonly(repo, fc.owner, &kr_rt_digest)
+                    .unwrap_or(false)
+                {
+                    return Some(fc.owner.id.clone());
+                }
+            }
+            return None;
+        }
+    }
+
+    file_cand().map(|fc| fc.owner.id.clone())
 }
 
 /// Pre-switch pure-local sync-back under `L1`:
 /// Inspects ALL managed pre-switch active replicas (`keyring` and/or `file`) and merges any
 /// verified non-superseded rotated `refresh_token` or fresher `access_token` back into the owning
-/// account under `L3` before switching out.
+/// account(s) under `L3` before switching out. When `dual` replicas diverged onto two different
+/// saved accounts, preserves any fresher token on the secondary disk replica as well as the
+/// effective keyring slot (returning the effective keyring slot's outcome).
 pub(crate) fn sync_back_pre_switch_snapshot(
     repo: &StoreRepository,
     pre_snap: &BackendPreWriteSnapshot,
@@ -906,29 +583,59 @@ pub(crate) fn sync_back_pre_switch_snapshot(
     now_unix: i64,
 ) -> CliResult<SlotSyncBackOutcome> {
     let (kr_extracted, file_extracted) = extract_replica_tokens_from_pre_snap(pre_snap);
-    let Some((chosen, discovered_tier)) =
-        select_sync_back_candidate(repo, snapshot, kr_extracted, file_extracted, None)
-    else {
-        return Ok(SlotSyncBackOutcome::default());
-    };
-    let mut outcome = sync_back_extracted_for_owner(
-        repo,
-        &chosen.owner.id,
-        chosen.via_email_rotation,
-        &chosen.extracted,
-        now_unix,
-    )?;
-    if outcome.synced_account_id.is_some() && outcome.discovered_user_tier.is_none() {
-        outcome.discovered_user_tier = discovered_tier;
+    let kr_cand = kr_extracted.and_then(|ex| resolve_sync_back_candidate(repo, snapshot, ex, None));
+    let file_cand =
+        file_extracted.and_then(|ex| resolve_sync_back_candidate(repo, snapshot, ex, None));
+
+    match (kr_cand, file_cand) {
+        (Some(kr), Some(file)) if kr.owner.id != file.owner.id => {
+            // Both replicas are about to be overwritten: preserve any fresher token on the
+            // secondary disk replica (no-op if stale) AND prioritize the effective keyring slot!
+            let _ = sync_back_extracted_for_owner(
+                repo,
+                &file.owner.id,
+                file.via_email_rotation,
+                &file.extracted,
+                now_unix,
+            )?;
+            sync_back_extracted_for_owner(
+                repo,
+                &kr.owner.id,
+                kr.via_email_rotation,
+                &kr.extracted,
+                now_unix,
+            )
+        }
+        (Some(kr), Some(file)) => {
+            let chosen = if prefer_file_sync_back_candidate(&kr, &file) {
+                file
+            } else {
+                kr
+            };
+            sync_back_extracted_for_owner(
+                repo,
+                &chosen.owner.id,
+                chosen.via_email_rotation,
+                &chosen.extracted,
+                now_unix,
+            )
+        }
+        (Some(only), None) | (None, Some(only)) => sync_back_extracted_for_owner(
+            repo,
+            &only.owner.id,
+            only.via_email_rotation,
+            &only.extracted,
+            now_unix,
+        ),
+        (None, None) => Ok(SlotSyncBackOutcome::default()),
     }
-    Ok(outcome)
 }
 
 /// Post-`/usage` pure-local sync-back for a known active account:
 /// Independently inspects ALL replicas managed by `backend` (`keyring` and/or `file`, never
 /// touching disk in `keyring`-only mode or D-Bus in `file`-only mode), selects any verified
 /// non-superseded rotated `refresh_token` or fresher `access_token` belonging to `account_id`,
-/// merges it back into `accounts/<account_id>.json`, and returns any discovered `user_tier`.
+/// and merges it back into `accounts/<account_id>.json`.
 pub(crate) fn sync_back_active_slot_for_account(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
@@ -940,7 +647,7 @@ pub(crate) fn sync_back_active_slot_for_account(
         return Ok(SlotSyncBackOutcome::default());
     }
     let snapshot = repo.read_snapshot()?;
-    let Some((chosen, discovered_tier)) = select_sync_back_candidate(
+    let Some(chosen) = select_sync_back_candidate(
         repo,
         &snapshot,
         kr_extracted,
@@ -949,17 +656,13 @@ pub(crate) fn sync_back_active_slot_for_account(
     ) else {
         return Ok(SlotSyncBackOutcome::default());
     };
-    let mut outcome = sync_back_extracted_for_owner(
+    sync_back_extracted_for_owner(
         repo,
         &chosen.owner.id,
         chosen.via_email_rotation,
         &chosen.extracted,
         now_unix,
-    )?;
-    if outcome.synced_account_id.is_some() && outcome.discovered_user_tier.is_none() {
-        outcome.discovered_user_tier = discovered_tier;
-    }
-    Ok(outcome)
+    )
 }
 
 /// Strictly read-only, zero-network dry-run preview for manual credential switching.
@@ -1073,7 +776,6 @@ pub fn preview_switch_dry_run(
         runtime_warning,
         validation_blocked,
         validation_warning,
-        committed_checkpoint: None,
     })
 }
 
@@ -1128,7 +830,7 @@ pub fn execute_switch_with_idle_policy(
     }
 
     execute_switch_with_slot_lock_and_guard(
-        &slot_lock, repo, backend, registry, selector, guard_mode, true, true, None, now_unix,
+        &slot_lock, repo, backend, registry, selector, guard_mode, true, true, now_unix,
     )
 }
 
@@ -1151,7 +853,6 @@ pub fn execute_switch_with_slot_lock(
         RunningGuardMode::from_flags(allow_running, false),
         false,
         false,
-        None,
         now_unix,
     )
 }
@@ -1166,14 +867,13 @@ pub(crate) fn execute_switch_with_slot_lock_and_guard(
     guard_mode: RunningGuardMode,
     allow_repair_incomplete: bool,
     allow_validation_blocked: bool,
-    expected_pre_slot: Option<PreSwitchSlotExpectation<'_>>,
     now_unix: i64,
 ) -> CliResult<SwitchOutcome> {
     let paths = repo.paths();
     let clock = AnchoredClock::new(now_unix);
 
-    // Reconcile any leftover journal (manual switch also repairs safe cross-replica RecoveryIncomplete;
-    // daemon passes `allow_repair_incomplete = false` so incomplete recovery pauses the daemon).
+    // Reconcile any leftover journal (manual switch repairs safe cross-replica RecoveryIncomplete;
+    // callers passing `allow_repair_incomplete = false` fail closed on incomplete recovery).
     reconcile_journal_locked(
         slot_lock,
         repo,
@@ -1221,22 +921,15 @@ pub(crate) fn execute_switch_with_slot_lock_and_guard(
     // Check active slot directory is initialized and snapshot ALL replicas before write
     let pre_snap = backend.snapshot_replicas_before_write(paths)?;
 
-    // R2-01: When invoked by `daemon`, bind the caller's approved pre-write expectation directly
-    // to THIS EXACT `pre_snap` BEFORE any sync-back, journal preparation, or slot mutation so an
-    // external `agy login` slipping between daemon inspection and `pre_snap` cancels cleanly.
-    if let Some(expectation) = expected_pre_slot {
-        if !pre_write_snapshot_matches_expectation(repo, &snapshot, &pre_snap, expectation) {
-            return Err(CliError::conflict(
-                "active_slot_digest_changed",
-                "Active agy credential slot changed externally before switch preparation; daemon plan cancelled without overwriting the slot.",
-            ));
-        }
-    }
+    // Determine the genuine outgoing active-slot owner from the effective pre-switch slot BEFORE
+    // mutating the store, so `dual` single-replica external drift on keyring never stamps
+    // `last_switched_out_at` onto a stale disk replica.
+    let outgoing_slot_owner = resolve_outgoing_slot_owner_from_pre_snap(repo, &pre_snap, &snapshot);
 
     // Pre-Switch Sync-Back (Option 1B): purely locally merge any fresher `access_token` or rotated
     // `refresh_token` from the outgoing active slot back into `accounts/<A>.json` under `L3`
     // BEFORE overwriting the active slot with target account B!
-    let _sync_back = sync_back_pre_switch_snapshot(repo, &pre_snap, &snapshot, clock.now_unix())?;
+    let _ = sync_back_pre_switch_snapshot(repo, &pre_snap, &snapshot, clock.now_unix())?;
 
     let prev_slot_digest = pre_snap.effective_slot_digest();
     let replica_record = JournalReplicaRecord::from_pre_write_snapshot(&pre_snap);
@@ -1247,7 +940,8 @@ pub(crate) fn execute_switch_with_slot_lock_and_guard(
         target_initial.id.clone(),
         prev_slot_digest,
         clock.now_unix(),
-    );
+    )
+    .with_observed_outgoing_slot_owner(outgoing_slot_owner.as_deref());
 
     repo.with_write_lock(|_| write_journal_with_replicas(paths, &journal, Some(&replica_record)))?;
 
@@ -1449,32 +1143,24 @@ pub(crate) fn execute_switch_with_slot_lock_and_guard(
     let _ = repo
         .with_write_lock(|_| write_journal_with_replicas(paths, &journal, Some(&replica_record)));
 
-    // 4. Commit `selected_account_id` + `last_used` in `index.json` under L3 StoreWriteLock, and clear journal
-    let mut daemon_pause_clear_err: Option<CliError> = None;
+    // 4. Commit `selected_account_id`, `last_switched_out_at`, `last_switched_in_at`, and
+    //    `last_used` inside one `L3` StoreWriteLock transaction, and clear journal
     let index_commit = repo.with_write_lock(|tx| {
         check_fault_injection("after_slot_commit", &tx.paths().index_file())?;
         check_fault_injection("before_index_commit", &tx.paths().index_file())?;
-        tx.commit_selected_account(&latest_target.id, post_commit_now)?;
+        tx.commit_selected_account_with_slot_owner(
+            &latest_target.id,
+            Some(outgoing_slot_owner.as_deref()),
+            post_commit_now,
+        )?;
         clear_journal(tx.paths())?;
-        let pause_res = if allow_repair_incomplete {
-            crate::switching::daemon::repair_or_clear_daemon_state_in_tx(
-                tx.paths(),
-                post_commit_now,
-            )
-            .map(|_| ())
-        } else {
-            crate::switching::daemon::clear_daemon_pause_in_tx(tx.paths(), post_commit_now)
-        };
-        if let Err(err) = pause_res {
-            daemon_pause_clear_err = Some(err);
-        }
         Ok(())
     });
 
     if let Err(idx_err) = index_commit {
         journal.phase = JournalPhase::CommittedIndexPending;
         journal.note = Some(idx_err.message.clone());
-        journal.updated_at = clock.now_unix();
+        journal.updated_at = post_commit_now;
         let _ = repo.with_write_lock(|_| {
             write_journal_with_replicas(paths, &journal, Some(&replica_record))
         });
@@ -1488,21 +1174,6 @@ pub(crate) fn execute_switch_with_slot_lock_and_guard(
         )
         .with_details(serde_json::json!({
             "state": "committed_index_pending",
-            "target_account_id": latest_target.id,
-            "target_email": latest_target.email,
-        })));
-    }
-
-    if let Some(pause_err) = daemon_pause_clear_err {
-        return Err(CliError::partial_commit(
-            "daemon_pause_clear_failed",
-            format!(
-                "Active credential slot and index switched to '{}', but clearing daemon failure pause in `daemon_state.json` failed ({}). Daemon remains paused.",
-                latest_target.id, pause_err.message
-            ),
-        )
-        .with_details(serde_json::json!({
-            "state": "daemon_pause_clear_failed",
             "target_account_id": latest_target.id,
             "target_email": latest_target.email,
         })));
@@ -1537,11 +1208,6 @@ pub(crate) fn execute_switch_with_slot_lock_and_guard(
         runtime_warning,
         validation_blocked,
         validation_warning,
-        committed_checkpoint: Some(VerifiedSlotCheckpoint::from_committed_digest(
-            pre_snap.uses_keyring,
-            pre_snap.uses_file,
-            &target_digest,
-        )),
     })
 }
 
@@ -1629,7 +1295,7 @@ fn check_running_guard(
 /// and interactive TUI (`x` / `Delete` -> `y`).
 /// When `clear_active_slot` is true, acquires `L1`, reconciles any pending journal, records a durable
 /// `clear_slot_intent` journal, transactionally clears matching credentials across all replicas, and
-/// removes the account from `policy.json`, `index.json`, `accounts/<id>.json`, and `token_lineage`.
+/// removes the account from `index.json`, `accounts/<id>.json`, and `token_lineage`.
 pub fn execute_account_delete(
     repo: &StoreRepository,
     backend: &dyn CredentialBackend,
@@ -1833,7 +1499,7 @@ pub fn execute_account_delete(
             }
 
             // Stage 1 complete: all active credential replicas verified absent. Durably persist
-            // `CommittedIndexPending` BEFORE Stage 2 local store cleanup (`policy.json`, `index.json`,
+            // `CommittedIndexPending` BEFORE Stage 2 local store cleanup (`index.json`,
             // `accounts/<id>.json`, `token_lineage`).
             journal.phase = JournalPhase::CommittedIndexPending;
             repo.with_write_lock(|_| {
@@ -1898,17 +1564,12 @@ pub fn execute_account_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::quota::{
-        evaluate_account_quota, QuotaBucket, QuotaEval, QuotaGroup, QuotaObservation,
-        QuotaSourceEnv, DEFAULT_QUOTA_MAX_AGE_SECS,
-    };
     use crate::paths::HeadlessPaths;
     use crate::session::backend::FileSessionBackend;
     use std::fs;
 
     #[test]
-    fn sync_back_rejects_superseded_rt_without_leaking_user_tier_and_tags_synced_tier_for_upgrade()
-    {
+    fn sync_back_rejects_superseded_rt_and_preserves_f01_dual_replica_selection() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = HeadlessPaths::with_explicit(
             tmp.path().join("home"),
@@ -1937,9 +1598,6 @@ mod tests {
             now,
         );
         acc.record_superseded_digest(&crate::domain::token::token_digest("1//RT_ALICE_OLD"));
-        // Seed as upgraded v1.2.6 Production observation without subscription_tier yet.
-        let prod_no_tier = QuotaObservation::new(now - 600, QuotaSourceEnv::Production);
-        acc.quota = Some(prod_no_tier);
 
         repo.with_write_lock(|tx| {
             tx.upsert_account(acc.clone(), true, now)?;
@@ -1947,8 +1605,7 @@ mod tests {
         })
         .unwrap();
 
-        // 1. Slot rolled back to superseded RT carrying `user_tier: "FREE"`: MUST be rejected
-        //    with empty outcome (zero `discovered_user_tier` leak, zero mutation on disk).
+        // 1. Slot rolled back to superseded RT MUST be rejected with zero mutation on disk.
         fs::write(
             &paths.active_slot_file,
             serde_json::to_vec(&serde_json::json!({
@@ -1958,8 +1615,7 @@ mod tests {
                     "refresh_token": "1//RT_ALICE_OLD",
                     "expiry": "2099-01-01T00:00:00Z"
                 },
-                "id_token_email": "alice@example.com",
-                "user_tier": "FREE"
+                "id_token_email": "alice@example.com"
             }))
             .unwrap(),
         )
@@ -1969,83 +1625,10 @@ mod tests {
                 .unwrap();
         assert_eq!(rejected.synced_account_id, None);
         assert!(!rejected.token_updated);
-        assert_eq!(rejected.discovered_user_tier, None);
         let after_rej = repo.read_account_unchecked("acc-0001").unwrap();
         assert_eq!(after_rej.token.refresh_token, "1//RT_ALICE_CURRENT");
-        assert_eq!(
-            after_rej
-                .quota
-                .as_ref()
-                .and_then(|q| q.subscription_tier.as_deref()),
-            None
-        );
 
-        // 2. Legitimate active slot carrying `user_tier: "FREE"` synced onto upgraded Production
-        //    observation with `subscription_tier == None` MUST tag `tier_source_env = OfficialCli`
-        //    so a subsequent OfficialCli weekly-only `update_quota` preserves FREE and evaluates Known!
-        fs::write(
-            &paths.active_slot_file,
-            serde_json::to_vec(&serde_json::json!({
-                "token": {
-                    "access_token": "ya29.current",
-                    "token_type": "Bearer",
-                    "refresh_token": "1//RT_ALICE_CURRENT",
-                    "expiry": "2099-01-01T00:00:00Z"
-                },
-                "id_token_email": "alice@example.com",
-                "user_tier": "FREE"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let synced =
-            sync_back_active_slot_for_account(&repo, &FileSessionBackend, "acc-0001", now + 10)
-                .unwrap();
-        assert_eq!(synced.synced_account_id.as_deref(), Some("acc-0001"));
-        assert_eq!(synced.discovered_user_tier.as_deref(), Some("FREE"));
-        let mut after_sync = repo.read_account_unchecked("acc-0001").unwrap();
-        assert_eq!(
-            after_sync
-                .quota
-                .as_ref()
-                .and_then(|q| q.subscription_tier.as_deref()),
-            Some("FREE")
-        );
-        assert_eq!(
-            after_sync.quota.as_ref().and_then(|q| q.tier_source_env),
-            Some(QuotaSourceEnv::OfficialCli)
-        );
-
-        let mut weekly_only = QuotaObservation::new(now + 20, QuotaSourceEnv::OfficialCli);
-        weekly_only.quota_groups = Some(vec![QuotaGroup {
-            display_name: "Gemini Models".into(),
-            description: None,
-            buckets: vec![QuotaBucket {
-                bucket_id: "gemini-weekly".into(),
-                window: "weekly".into(),
-                remaining_fraction: 0.77,
-                remaining_fraction_known: Some(true),
-                reset_time: "2099-01-07T00:00:00Z".into(),
-                display_name: None,
-                description: None,
-            }],
-        }]);
-        after_sync.update_quota(weekly_only);
-        assert_eq!(
-            after_sync
-                .quota
-                .as_ref()
-                .and_then(|q| q.subscription_tier.as_deref()),
-            Some("FREE")
-        );
-        assert_eq!(
-            evaluate_account_quota(&after_sync, "gemini", now + 20, DEFAULT_QUOTA_MAX_AGE_SECS),
-            QuotaEval::Known {
-                remaining_percentage: 77.0
-            }
-        );
-
-        // 3. S3 regression: same RT + fresher stored AT/expiry (`2050000000`) + older slot AT/expiry
+        // 2. S3 regression: same RT + fresher stored AT/expiry (`2050000000`) + older slot AT/expiry
         //    (`1700000000`) with newly added `id_token` MUST keep the fresher stored AT+expiry pair
         //    while merging only the newly added `id_token`!
         let existing_tok = TokenRecord {
@@ -2069,7 +1652,6 @@ mod tests {
             id_token: Some("hdr.pay.sig".into()),
             id_token_email: Some("alice@example.com".into()),
             email_hint: Some("alice@example.com".into()),
-            user_tier: None,
             raw_digest: "digest-s3".into(),
             refresh_token_digest: crate::domain::token::token_digest("1//RT_SAME"),
         };
@@ -2088,7 +1670,7 @@ mod tests {
         assert_eq!(merged_fresher.access_token, "ya29.newer_slot");
         assert_eq!(merged_fresher.expiry_timestamp, 2_060_000_000);
 
-        // 3b. R2-02 regression: rotated RT with non-empty new AT and MISSING `expiry` MUST NOT
+        // 2b. R2-02 regression: rotated RT with non-empty new AT and MISSING `expiry` MUST NOT
         //     borrow the old AT's future `expiry_timestamp` (`2050000000`) or `expires_in` (`3600`);
         //     it must conservatively fall back to `(1, 0)` matching offline `--from-local`!
         let rotated_missing_expiry = ExtractedSessionToken {
@@ -2119,67 +1701,38 @@ mod tests {
 
         // Empty stored AT with placeholder future expiry adopting a slot AT without expiry also
         // uses conservative `(1, 0)` instead of borrowing the placeholder future expiry.
-        let mut empty_at_tok = existing_tok.clone();
+        let mut empty_at_tok = existing_tok;
         empty_at_tok.access_token.clear();
         let slot_same_rt_no_exp = ExtractedSessionToken {
             access_token: Some("ya29.first_real_at".into()),
             expiry: None,
             expiry_unix: None,
-            ..older_slot_with_jwt.clone()
+            ..older_slot_with_jwt
         };
         let merged_from_empty = build_synced_token_record(&slot_same_rt_no_exp, &empty_at_tok, now);
         assert_eq!(merged_from_empty.access_token, "ya29.first_real_at");
         assert_eq!(merged_from_empty.expiry_timestamp, 1);
         assert_eq!(merged_from_empty.expires_in, 0);
 
-        // 4. S5 regression: existing v1.2.6 Production `FREE` tier overridden to `PRO` by explicit
-        //    official slot `user_tier` WITHOUT disguising `source_env` or `last_updated`!
-        let mut prod_free =
-            AccountRecord::new("acc-s5".into(), "s5@example.com".into(), existing_tok, now);
-        let mut old_prod_q = QuotaObservation::new(1_700_123_456, QuotaSourceEnv::Production);
-        old_prod_q.subscription_tier = Some("FREE".into());
-        old_prod_q.tier_source_env = Some(QuotaSourceEnv::Production);
-        prod_free.quota = Some(old_prod_q);
-        assert!(slot_tier_updates_account(Some("PRO"), &prod_free));
-        assert!(apply_synced_user_tier(&mut prod_free, Some("PRO")));
-        let q_after = prod_free.quota.as_ref().unwrap();
-        assert_eq!(q_after.subscription_tier.as_deref(), Some("PRO"));
-        assert_eq!(q_after.tier_source_env, Some(QuotaSourceEnv::OfficialCli));
-        assert_eq!(q_after.source_env, QuotaSourceEnv::Production);
-        assert_eq!(q_after.last_updated, 1_700_123_456);
-        assert!(!slot_tier_updates_account(Some("PRO"), &prod_free));
-
-        // 5. F-01 unit matrix: `select_sync_back_candidate` separates verified non-superseded RT
+        // 3. F-01 unit matrix: `select_sync_back_candidate` separates verified non-superseded RT
         //    rotation from AT expiry comparison symmetrically for both `file` and `keyring`,
         //    while disqualifying superseded historical RTs and preserving keyring preference on ties.
         let snap_f01 = repo.read_snapshot().unwrap();
-        let make_ex =
-            |rt: &str, at: &str, exp: Option<i64>, tier: Option<&str>| ExtractedSessionToken {
-                access_token: Some(at.into()),
-                refresh_token: rt.into(),
-                expiry: exp.map(|_| "2099-01-01T00:00:00Z".into()),
-                expiry_unix: exp,
-                auth_method: Some("consumer".into()),
-                id_token: None,
-                id_token_email: Some("alice@example.com".into()),
-                email_hint: Some("alice@example.com".into()),
-                user_tier: tier.map(str::to_owned),
-                raw_digest: format!("dig-{rt}-{at}"),
-                refresh_token_digest: crate::domain::token::token_digest(rt),
-            };
-        let kr_stored = make_ex(
-            "1//RT_ALICE_CURRENT",
-            "ya29.current",
-            Some(now + 7200),
-            Some("PRO"),
-        );
-        let file_rot_same_exp = make_ex(
-            "1//RT_ALICE_NEW_FILE",
-            "ya29.current",
-            Some(now + 7200),
-            None,
-        );
-        let (chosen_f01, tier_f01) = select_sync_back_candidate(
+        let make_ex = |rt: &str, at: &str, exp: Option<i64>| ExtractedSessionToken {
+            access_token: Some(at.into()),
+            refresh_token: rt.into(),
+            expiry: exp.map(|_| "2099-01-01T00:00:00Z".into()),
+            expiry_unix: exp,
+            auth_method: Some("consumer".into()),
+            id_token: None,
+            id_token_email: Some("alice@example.com".into()),
+            email_hint: Some("alice@example.com".into()),
+            raw_digest: format!("dig-{rt}-{at}"),
+            refresh_token_digest: crate::domain::token::token_digest(rt),
+        };
+        let kr_stored = make_ex("1//RT_ALICE_CURRENT", "ya29.current", Some(now + 7200));
+        let file_rot_same_exp = make_ex("1//RT_ALICE_NEW_FILE", "ya29.current", Some(now + 7200));
+        let chosen_f01 = select_sync_back_candidate(
             &repo,
             &snap_f01,
             Some(kr_stored.clone()),
@@ -2189,17 +1742,12 @@ mod tests {
         .unwrap();
         assert_eq!(chosen_f01.extracted.refresh_token, "1//RT_ALICE_NEW_FILE");
         assert!(chosen_f01.via_email_rotation);
-        assert_eq!(tier_f01.as_deref(), Some("PRO"));
 
         // Mirror: keyring rotated RT with MISSING expiry beats file holding stored RT + later expiry.
-        let kr_rot_no_exp = make_ex("1//RT_ALICE_NEW_KR", "ya29.kr_new", None, None);
-        let file_stored_later = make_ex(
-            "1//RT_ALICE_CURRENT",
-            "ya29.file_later",
-            Some(now + 99_999),
-            None,
-        );
-        let (chosen_mirror, _) = select_sync_back_candidate(
+        let kr_rot_no_exp = make_ex("1//RT_ALICE_NEW_KR", "ya29.kr_new", None);
+        let file_stored_later =
+            make_ex("1//RT_ALICE_CURRENT", "ya29.file_later", Some(now + 99_999));
+        let chosen_mirror = select_sync_back_candidate(
             &repo,
             &snap_f01,
             Some(kr_rot_no_exp),
@@ -2211,16 +1759,11 @@ mod tests {
         assert!(chosen_mirror.via_email_rotation);
 
         // Superseded historical RT in file is disqualified even if it carries a later expiry.
-        let file_superseded = make_ex(
-            "1//RT_ALICE_OLD",
-            "ya29.stale_later",
-            Some(now + 999_999),
-            Some("FREE"),
-        );
-        let (chosen_not_stale, tier_not_stale) = select_sync_back_candidate(
+        let file_superseded = make_ex("1//RT_ALICE_OLD", "ya29.stale_later", Some(now + 999_999));
+        let chosen_not_stale = select_sync_back_candidate(
             &repo,
             &snap_f01,
-            Some(kr_stored.clone()),
+            Some(kr_stored),
             Some(file_superseded),
             Some("acc-0001"),
         )
@@ -2230,19 +1773,6 @@ mod tests {
             "1//RT_ALICE_CURRENT"
         );
         assert!(!chosen_not_stale.via_email_rotation);
-        assert_eq!(tier_not_stale.as_deref(), Some("PRO"));
-
-        // Exact tie with same stored RT preserves keyring preference (not unconditionally file).
-        let file_tie = make_ex(
-            "1//RT_ALICE_CURRENT",
-            "ya29.current",
-            Some(now + 7200),
-            Some("FREE"),
-        );
-        let (chosen_tie, _) =
-            select_sync_back_candidate(&repo, &snap_f01, Some(kr_stored), Some(file_tie), None)
-                .unwrap();
-        assert_eq!(chosen_tie.extracted.user_tier.as_deref(), Some("PRO"));
 
         // P2 regression: when BOTH replicas carry the same stored RT AND the same fresher AT +
         // expiry (relative to the store), but ONLY the disk file additionally supplies a missing
@@ -2251,11 +1781,10 @@ mod tests {
             "1//RT_ALICE_CURRENT",
             "ya29.shared_fresher",
             Some(now + 88_888),
-            None,
         );
         let mut file_fresher_with_id = kr_fresher_no_id.clone();
         file_fresher_with_id.id_token = Some("hdr.alice_payload.sig".into());
-        let (chosen_id, _) = select_sync_back_candidate(
+        let chosen_id = select_sync_back_candidate(
             &repo,
             &snap_f01,
             Some(kr_fresher_no_id.clone()),
@@ -2268,22 +1797,359 @@ mod tests {
             Some("hdr.alice_payload.sig")
         );
 
-        // Likewise when both carry the same fresher AT + expiry without `id_token`, a disk-only
-        // `user_tier` update breaks the tie cleanly; identical metadata still ties back to keyring.
-        let file_fresher_with_tier = make_ex(
+        // Exact tie with identical metadata still ties back to keyring.
+        let file_tie_same = make_ex(
             "1//RT_ALICE_CURRENT",
             "ya29.shared_fresher",
             Some(now + 88_888),
-            Some("PRO"),
         );
-        let (chosen_tier, _) = select_sync_back_candidate(
+        let mut kr_tie_marker = kr_fresher_no_id;
+        kr_tie_marker.raw_digest = "kr-tie-marker".into();
+        let chosen_tie = select_sync_back_candidate(
             &repo,
             &snap_f01,
-            Some(kr_fresher_no_id),
-            Some(file_fresher_with_tier),
+            Some(kr_tie_marker),
+            Some(file_tie_same),
             None,
         )
         .unwrap();
-        assert_eq!(chosen_tier.extracted.user_tier.as_deref(), Some("PRO"));
+        assert_eq!(chosen_tie.extracted.raw_digest, "kr-tie-marker");
+    }
+
+    #[test]
+    fn switch_atomically_updates_switched_in_and_out_timestamps_without_fabricating_on_external_drift(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = HeadlessPaths::with_explicit(
+            tmp.path().join("home"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+        );
+        fs::create_dir_all(&paths.active_slot_dir).unwrap();
+        let repo = StoreRepository::new(paths.clone());
+        let registry = OAuthClientRegistry::load(&paths).unwrap();
+        let t0 = 1_900_000_000i64;
+
+        let mk_acc = |id: &str, email: &str| {
+            AccountRecord::new(
+                id.into(),
+                email.into(),
+                TokenRecord {
+                    access_token: format!("ya29.{id}"),
+                    refresh_token: format!("1//rt-{id}"),
+                    expires_in: 3600,
+                    expiry_timestamp: t0 + 3600,
+                    token_type: "Bearer".into(),
+                    id_token: None,
+                    oauth_client_key: None,
+                    granted_scopes: None,
+                    project_id: None,
+                    is_gcp_tos: true,
+                },
+                t0,
+            )
+        };
+        let acc_a = mk_acc("acc-0001", "alice@example.com");
+        let acc_b = mk_acc("acc-0002", "bob@example.com");
+        let acc_c = mk_acc("acc-0003", "charlie@example.com");
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(acc_a.clone(), true, t0)?;
+            tx.upsert_account(acc_b.clone(), false, t0)?;
+            tx.upsert_account(acc_c.clone(), false, t0)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let opts = SwitchOptions {
+            dry_run: false,
+            allow_running: true,
+        };
+        // 1. Initial switch into A from empty slot -> A gets last_switched_in_at = t1, no out_at.
+        let t1 = t0 + 100;
+        execute_switch(&repo, &FileSessionBackend, &registry, "acc-0001", &opts, t1).unwrap();
+        let a1 = repo.read_account_unchecked("acc-0001").unwrap();
+        assert_eq!(a1.last_switched_in_at, Some(t1));
+        assert_eq!(a1.last_switched_out_at, None);
+        assert_eq!(a1.last_used, t1);
+
+        // 2. Idempotent re-switch into already-active A at t1+300 preserves last_switched_in_at = t1!
+        execute_switch(
+            &repo,
+            &FileSessionBackend,
+            &registry,
+            "acc-0001",
+            &opts,
+            t1 + 300,
+        )
+        .unwrap();
+        let a_same = repo.read_account_unchecked("acc-0001").unwrap();
+        assert_eq!(a_same.last_switched_in_at, Some(t1));
+        assert_eq!(a_same.last_switched_out_at, None);
+
+        // 3. Switch A -> B at t2 = t1 + 2400 -> A gets last_switched_out_at = t2, B gets last_switched_in_at = t2.
+        let t2 = t1 + 2400;
+        execute_switch(&repo, &FileSessionBackend, &registry, "acc-0002", &opts, t2).unwrap();
+        let a2 = repo.read_account_unchecked("acc-0001").unwrap();
+        let b2 = repo.read_account_unchecked("acc-0002").unwrap();
+        assert_eq!(a2.last_switched_in_at, Some(t1));
+        assert_eq!(a2.last_switched_out_at, Some(t2));
+        assert_eq!(a2.last_used, t2);
+        assert_eq!(b2.last_switched_in_at, Some(t2));
+        assert_eq!(b2.last_switched_out_at, None);
+        assert_eq!(b2.last_used, t2);
+
+        // 4. External drift overwrites slot with a foreign account, then switch into C at t3:
+        //    B MUST NOT get a fabricated `last_switched_out_at`!
+        let t3 = t2 + 7200;
+        fs::write(
+            &paths.active_slot_file,
+            serde_json::to_vec(&serde_json::json!({
+                "token": {
+                    "access_token": "ya29.foreign",
+                    "token_type": "Bearer",
+                    "refresh_token": "1//rt-foreign",
+                    "expiry": "2099-01-01T00:00:00Z"
+                },
+                "id_token_email": "stranger@example.com"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        execute_switch(&repo, &FileSessionBackend, &registry, "acc-0003", &opts, t3).unwrap();
+        let b3 = repo.read_account_unchecked("acc-0002").unwrap();
+        let c3 = repo.read_account_unchecked("acc-0003").unwrap();
+        assert_eq!(b3.last_switched_out_at, None);
+        assert_eq!(c3.last_switched_in_at, Some(t3));
+        assert_eq!(c3.last_used, t3);
+    }
+
+    #[test]
+    fn switch_re_switch_in_clears_stale_out_at_even_same_second_and_rollback_and_dual_outgoing_owner_guards_drift(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = HeadlessPaths::with_explicit(
+            tmp.path().join("home"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+        );
+        fs::create_dir_all(&paths.active_slot_dir).unwrap();
+        let repo = StoreRepository::new(paths.clone());
+        let registry = OAuthClientRegistry::load(&paths).unwrap();
+        let t0 = 1_900_000_000i64;
+
+        let mk_acc = |id: &str, email: &str, rt: &str| {
+            AccountRecord::new(
+                id.into(),
+                email.into(),
+                TokenRecord {
+                    access_token: format!("ya29.{id}"),
+                    refresh_token: rt.into(),
+                    expires_in: 3600,
+                    expiry_timestamp: t0 + 3600,
+                    token_type: "Bearer".into(),
+                    id_token: None,
+                    oauth_client_key: None,
+                    granted_scopes: None,
+                    project_id: None,
+                    is_gcp_tos: true,
+                },
+                t0,
+            )
+        };
+        let mut acc_a = mk_acc("acc-0001", "alice@example.com", "1//rt-a-cur");
+        acc_a.record_superseded_digest(&crate::domain::token::token_digest("1//rt-a-old"));
+        let acc_b = mk_acc("acc-0002", "bob@example.com", "1//rt-b-cur");
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(acc_a.clone(), true, t0)?;
+            tx.upsert_account(acc_b.clone(), false, t0)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let opts = SwitchOptions {
+            dry_run: false,
+            allow_running: true,
+        };
+        // 1. Switch A -> B at t2, then switch back B -> A at the EXACT SAME second `t2`:
+        //    A must clear `last_switched_out_at = None`, set `last_switched_in_at = Some(t2)`,
+        //    and preserve `Some(t2)` on subsequent idempotent re-switch into A!
+        let t1 = t0 + 100;
+        let t2 = t1 + 600;
+        execute_switch(&repo, &FileSessionBackend, &registry, "acc-0001", &opts, t1).unwrap();
+        execute_switch(&repo, &FileSessionBackend, &registry, "acc-0002", &opts, t2).unwrap();
+        let a_out = repo.read_account_unchecked("acc-0001").unwrap();
+        assert_eq!(a_out.last_switched_in_at, Some(t1));
+        assert_eq!(a_out.last_switched_out_at, Some(t2));
+
+        execute_switch(&repo, &FileSessionBackend, &registry, "acc-0001", &opts, t2).unwrap();
+        let a_back_same_sec = repo.read_account_unchecked("acc-0001").unwrap();
+        assert_eq!(a_back_same_sec.last_switched_in_at, Some(t2));
+        assert_eq!(a_back_same_sec.last_switched_out_at, None);
+
+        execute_switch(
+            &repo,
+            &FileSessionBackend,
+            &registry,
+            "acc-0001",
+            &opts,
+            t2 + 300,
+        )
+        .unwrap();
+        let a_idem = repo.read_account_unchecked("acc-0001").unwrap();
+        assert_eq!(a_idem.last_switched_in_at, Some(t2));
+        assert_eq!(a_idem.last_switched_out_at, None);
+
+        // 2. NTP clock rollback across switch-out (t3) then switch-back-in (t3 - 120 < t3):
+        //    `last_switched_out_at` is cleared so subsequent idempotent re-switch keeps `t3 - 120`.
+        let t3 = t2 + 1200;
+        execute_switch(&repo, &FileSessionBackend, &registry, "acc-0002", &opts, t3).unwrap();
+        let t_rollback = t3 - 120;
+        execute_switch(
+            &repo,
+            &FileSessionBackend,
+            &registry,
+            "acc-0001",
+            &opts,
+            t_rollback,
+        )
+        .unwrap();
+        let a_rb = repo.read_account_unchecked("acc-0001").unwrap();
+        assert_eq!(a_rb.last_switched_in_at, Some(t_rollback));
+        assert_eq!(a_rb.last_switched_out_at, None);
+
+        execute_switch(
+            &repo,
+            &FileSessionBackend,
+            &registry,
+            "acc-0001",
+            &opts,
+            t_rollback + 45,
+        )
+        .unwrap();
+        let a_rb_idem = repo.read_account_unchecked("acc-0001").unwrap();
+        assert_eq!(a_rb_idem.last_switched_in_at, Some(t_rollback));
+        assert_eq!(a_rb_idem.last_switched_out_at, None);
+
+        // 3. `resolve_outgoing_slot_owner_from_pre_snap` unit matrix for `dual` backend:
+        let snap = repo.read_snapshot().unwrap();
+        let payload_json = |rt: &str, email: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "token": {
+                    "access_token": format!("ya29.{rt}"),
+                    "token_type": "Bearer",
+                    "refresh_token": rt,
+                    "expiry": "2099-01-01T00:00:00Z"
+                },
+                "id_token_email": email
+            }))
+            .unwrap()
+        };
+        let bytes_a_cur = payload_json("1//rt-a-cur", "alice@example.com");
+        let bytes_a_old = payload_json("1//rt-a-old", "alice@example.com");
+        let bytes_a_rot = payload_json("1//rt-a-rot-new", "alice@example.com");
+        let bytes_b_cur = payload_json("1//rt-b-cur", "bob@example.com");
+        let bytes_foreign = payload_json("1//rt-foreign", "stranger@example.com");
+        let mk_dual =
+            |kr: Option<Vec<u8>>, uniform: bool, file: Option<Vec<u8>>| BackendPreWriteSnapshot {
+                backend_name: "dual",
+                uses_keyring: true,
+                uses_file: true,
+                keyring_bytes: Some(kr),
+                keyring_uniform: uniform,
+                keyring_collections: Vec::new(),
+                file_bytes: file,
+            };
+
+        // 3a. Foreign keyring + stale saved A on file -> MUST return None (never stamp A!).
+        let foreign_kr = mk_dual(Some(bytes_foreign), true, Some(bytes_a_cur.clone()));
+        assert_eq!(
+            resolve_outgoing_slot_owner_from_pre_snap(&repo, &foreign_kr, &snap),
+            None
+        );
+
+        // 3b. Corrupt keyring + stale saved A on file -> MUST return None.
+        let corrupt_kr = mk_dual(
+            Some(b"{not-valid-json".to_vec()),
+            true,
+            Some(bytes_a_cur.clone()),
+        );
+        assert_eq!(
+            resolve_outgoing_slot_owner_from_pre_snap(&repo, &corrupt_kr, &snap),
+            None
+        );
+
+        // 3c. Non-uniform keyring + saved A on file -> MUST return None.
+        let non_uniform_kr = mk_dual(Some(bytes_a_cur.clone()), false, Some(bytes_a_cur.clone()));
+        assert_eq!(
+            resolve_outgoing_slot_owner_from_pre_snap(&repo, &non_uniform_kr, &snap),
+            None
+        );
+
+        // 3d. F-01 single-sided disk rotation: superseded RT of A in keyring + current or newly
+        //     rotated RT of A on file -> MUST resolve to `acc-0001`.
+        let f01_cur_file = mk_dual(Some(bytes_a_old.clone()), true, Some(bytes_a_cur.clone()));
+        assert_eq!(
+            resolve_outgoing_slot_owner_from_pre_snap(&repo, &f01_cur_file, &snap).as_deref(),
+            Some("acc-0001")
+        );
+        let f01_rot_file = mk_dual(Some(bytes_a_old), true, Some(bytes_a_rot));
+        assert_eq!(
+            resolve_outgoing_slot_owner_from_pre_snap(&repo, &f01_rot_file, &snap).as_deref(),
+            Some("acc-0001")
+        );
+
+        // 3e. Cleanly absent keyring + saved A on file -> falls back to file (`acc-0001`).
+        let absent_kr = mk_dual(None, true, Some(bytes_a_cur.clone()));
+        assert_eq!(
+            resolve_outgoing_slot_owner_from_pre_snap(&repo, &absent_kr, &snap).as_deref(),
+            Some("acc-0001")
+        );
+
+        // 3f. Keyring holds saved B while file holds stale selected A -> keyring wins (`acc-0002`).
+        let kr_b_file_a = mk_dual(Some(bytes_b_cur), true, Some(bytes_a_cur));
+        assert_eq!(
+            resolve_outgoing_slot_owner_from_pre_snap(&repo, &kr_b_file_a, &snap).as_deref(),
+            Some("acc-0002")
+        );
+
+        // 3g. Diverged `dual` sync-back (`keyring = B` with fresher AT, `file = A (selected)` with
+        //     fresher AT): `select_sync_back_candidate` prioritizes effective keyring `B`, AND
+        //     `sync_back_pre_switch_snapshot` preserves BOTH `B`'s and `A`'s fresher ATs before
+        //     both replicas are overwritten!
+        let bytes_b_fresh = serde_json::to_vec(&serde_json::json!({
+            "token": {
+                "access_token": "ya29.b-fresher-kr",
+                "token_type": "Bearer",
+                "refresh_token": "1//rt-b-cur",
+                "expiry": "2099-05-01T00:00:00Z"
+            },
+            "id_token_email": "bob@example.com"
+        }))
+        .unwrap();
+        let bytes_a_fresh = serde_json::to_vec(&serde_json::json!({
+            "token": {
+                "access_token": "ya29.a-fresher-file",
+                "token_type": "Bearer",
+                "refresh_token": "1//rt-a-cur",
+                "expiry": "2099-04-01T00:00:00Z"
+            },
+            "id_token_email": "alice@example.com"
+        }))
+        .unwrap();
+        let kr_b_ex = extract_session_token_from_bytes(&bytes_b_fresh, "kr").unwrap();
+        let file_a_ex = extract_session_token_from_bytes(&bytes_a_fresh, "file").unwrap();
+        let picked =
+            select_sync_back_candidate(&repo, &snap, Some(kr_b_ex), Some(file_a_ex), None).unwrap();
+        assert_eq!(picked.owner.id, "acc-0002");
+
+        let diverged_fresh = mk_dual(Some(bytes_b_fresh), true, Some(bytes_a_fresh));
+        let sb_out =
+            sync_back_pre_switch_snapshot(&repo, &diverged_fresh, &snap, t3 + 100).unwrap();
+        assert_eq!(sb_out.synced_account_id.as_deref(), Some("acc-0002"));
+        assert!(sb_out.token_updated);
+        let a_synced = repo.read_account_unchecked("acc-0001").unwrap();
+        let b_synced = repo.read_account_unchecked("acc-0002").unwrap();
+        assert_eq!(b_synced.token.access_token, "ya29.b-fresher-kr");
+        assert_eq!(a_synced.token.access_token, "ya29.a-fresher-file");
     }
 }

@@ -11,8 +11,8 @@ use crate::session::payload::{
 use crate::store::fs_atomic::{
     check_fault_injection, confirm_dir_entries_durable_under,
     confirm_file_absent_and_parent_durable_under, ensure_no_symlink_components_under,
-    read_regular_file_opt_bounded, remove_regular_file_durable_under, write_atomic_durable,
-    MAX_STORE_FILE_BYTES,
+    read_regular_file_opt_bounded, remove_regular_file_durable_under,
+    restore_regular_file_if_absent_under, write_atomic_durable, MAX_STORE_FILE_BYTES,
 };
 use crate::store::locks::ActiveSlotLock;
 use crate::store::repository::StoreRepository;
@@ -251,6 +251,17 @@ pub fn keyring_collection_ids_match(
     live_set == exp_set
 }
 
+/// Exact pre-switch outgoing active-slot owner observed before writing the target credential.
+/// Persisted optionally in `switch_journal.json` (contains ZERO plaintext secrets) so crash
+/// recovery replay preserves external-drift and `dual` effective-slot semantics instead of
+/// fabricating `last_switched_out_at` on a stale `selected_account_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ObservedOutgoingSlotOwner {
+    Account { account_id: String },
+    None,
+}
+
 /// Intent journal persisted at `<data_dir>/state/switch_journal.json` (`0600`) per Blueprint §3.3.
 /// Contains ZERO plaintext tokens — only digests and account IDs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +271,8 @@ pub struct SwitchJournal {
     pub phase: JournalPhase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prev_selected_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_outgoing_slot_owner: Option<ObservedOutgoingSlotOwner>,
     pub target_account_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prev_slot_digest: Option<String>,
@@ -1029,6 +1042,51 @@ pub fn narrow_backend_for_journal<'a>(
     }
 }
 
+fn is_reconcile_persistence_io_err(err: &CliError) -> bool {
+    err.exit_code == crate::error::ExitCode::GeneralOrDataError
+        && matches!(
+            err.error_code.as_str(),
+            "io_error" | "disk_full_enospc" | "read_only_fs_erofs" | "permission_denied"
+        )
+}
+
+fn map_committed_slot_reconcile_io_err(target_account_id: &str, err: CliError) -> CliError {
+    if is_reconcile_persistence_io_err(&err) {
+        CliError::partial_commit(
+            "committed_index_pending",
+            format!(
+                "Active credential slot is already committed to '{target_account_id}', but index reconciliation durability could not be confirmed ({}); switch journal preserved.",
+                err.message
+            ),
+        )
+    } else {
+        err
+    }
+}
+
+fn map_committed_slot_journal_clear_io_err(
+    target_account_id: &str,
+    err: CliError,
+    journal_preserved: bool,
+) -> CliError {
+    if is_reconcile_persistence_io_err(&err) {
+        let suffix = if journal_preserved {
+            "switch journal preserved for retry."
+        } else {
+            "switch journal removal durability is unconfirmed and the journal file could not be restored."
+        };
+        CliError::partial_commit(
+            "committed_index_pending",
+            format!(
+                "Active credential slot and index are aligned to '{target_account_id}', but switch journal removal durability could not be confirmed ({}); {suffix}",
+                err.message
+            ),
+        )
+    } else {
+        err
+    }
+}
+
 fn finish_staged_clear_slot_deletion_in_tx(
     tx: &crate::store::repository::StoreWriteTx<'_>,
     target_account_id: &str,
@@ -1201,7 +1259,22 @@ pub fn reconcile_journal_locked(
                 let target_exists = index.account_order.iter().any(|id| id == target_account_id)
                     && tx.load_account_opt(target_account_id)?.is_some();
                 if target_exists {
-                    tx.commit_selected_account(target_account_id, now_unix)?;
+                    let commit_ts = if matches!(
+                        journal.phase,
+                        JournalPhase::CommittedSlot | JournalPhase::CommittedIndexPending
+                    ) && journal.updated_at > 0
+                        && journal.updated_at <= now_unix
+                    {
+                        journal.updated_at
+                    } else {
+                        now_unix
+                    };
+                    tx.commit_selected_account_with_slot_owner(
+                        target_account_id,
+                        journal.observed_outgoing_slot_owner_arg(),
+                        commit_ts,
+                    )
+                    .map_err(|e| map_committed_slot_reconcile_io_err(target_account_id, e))?;
                 } else {
                     if index
                         .selected_account_id
@@ -1209,7 +1282,9 @@ pub fn reconcile_journal_locked(
                         .is_some_and(|sel| !index.account_order.iter().any(|id| id == sel))
                     {
                         index.selected_account_id = None;
-                        tx.save_index(&mut index, now_unix)?;
+                        tx.save_index(&mut index, now_unix).map_err(|e| {
+                            map_committed_slot_reconcile_io_err(target_account_id, e)
+                        })?;
                     }
                     should_remove_deleted_slot = true;
                 }
@@ -1273,7 +1348,34 @@ pub fn reconcile_journal_locked(
                     }
                 }
             }
-            repo.with_write_lock(|_| clear_journal(paths))?;
+            repo.with_write_lock(|_| {
+                let journal_path = paths.switch_journal_file();
+                let orig_journal_bytes = read_regular_file_opt_bounded(
+                    &journal_path,
+                    MAX_STORE_FILE_BYTES,
+                    "switch journal",
+                )?;
+                match clear_journal(paths) {
+                    Ok(()) => Ok(()),
+                    Err(clear_err) => {
+                        let preserved = match orig_journal_bytes.as_deref() {
+                            Some(raw) => restore_regular_file_if_absent_under(
+                                &paths.data_dir,
+                                &journal_path,
+                                raw,
+                                "switch journal",
+                            )
+                            .unwrap_or(false),
+                            None => false,
+                        };
+                        Err(map_committed_slot_journal_clear_io_err(
+                            target_account_id,
+                            clear_err,
+                            preserved,
+                        ))
+                    }
+                }
+            })?;
             Ok(diagnosis)
         }
         JournalDiagnosis::RecoveryIncomplete {
@@ -1450,7 +1552,11 @@ pub fn reconcile_journal_locked(
                         }
                     }
                     if let Some(local_id) = matched_local_id {
-                        tx.commit_selected_account(&local_id, now_unix)?;
+                        tx.commit_selected_account_with_slot_owner(
+                            &local_id,
+                            journal.observed_outgoing_slot_owner_arg(),
+                            now_unix,
+                        )?;
                     } else if index
                         .selected_account_id
                         .as_deref()
@@ -1590,7 +1696,11 @@ pub fn reconcile_journal_locked(
                         }
                     }
                     if let Some(local_id) = matched_local_id {
-                        tx.commit_selected_account(&local_id, now_unix)?;
+                        tx.commit_selected_account_with_slot_owner(
+                            &local_id,
+                            journal.observed_outgoing_slot_owner_arg(),
+                            now_unix,
+                        )?;
                     } else if index
                         .selected_account_id
                         .as_deref()
@@ -1777,7 +1887,11 @@ pub fn reconcile_journal_locked(
                     ));
                 }
                 repo.with_write_lock(|tx| {
-                    tx.commit_selected_account(&repair_id, now_unix)?;
+                    tx.commit_selected_account_with_slot_owner(
+                        &repair_id,
+                        journal.observed_outgoing_slot_owner_arg(),
+                        now_unix,
+                    )?;
                     clear_journal(paths)
                 })?;
             } else {
@@ -1825,6 +1939,7 @@ impl SwitchJournal {
             operation_id,
             phase: JournalPhase::Prepared,
             prev_selected_account_id,
+            observed_outgoing_slot_owner: None,
             target_account_id,
             prev_slot_digest,
             target_slot_digest: None,
@@ -1833,6 +1948,23 @@ impl SwitchJournal {
             updated_at: now_unix,
             note: None,
         }
+    }
+
+    pub fn with_observed_outgoing_slot_owner(mut self, owner: Option<&str>) -> Self {
+        self.observed_outgoing_slot_owner = Some(match owner {
+            Some(id) => ObservedOutgoingSlotOwner::Account {
+                account_id: id.to_string(),
+            },
+            None => ObservedOutgoingSlotOwner::None,
+        });
+        self
+    }
+
+    pub fn observed_outgoing_slot_owner_arg(&self) -> Option<Option<&str>> {
+        self.observed_outgoing_slot_owner.as_ref().map(|o| match o {
+            ObservedOutgoingSlotOwner::Account { account_id } => Some(account_id.as_str()),
+            ObservedOutgoingSlotOwner::None => None,
+        })
     }
 }
 
@@ -2156,6 +2288,7 @@ mod tests {
             operation_id: "op-r401-bad-file-uniform".into(),
             phase: JournalPhase::AbortedUncommitted,
             prev_selected_account_id: Some("acc-1".into()),
+            observed_outgoing_slot_owner: None,
             target_account_id: "acc-2".into(),
             prev_slot_digest: Some("dig-prev".into()),
             target_slot_digest: None,

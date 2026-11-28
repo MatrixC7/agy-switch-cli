@@ -13,7 +13,6 @@ use crate::session::payload::resolve_session_identity;
 use crate::store::repository::{read_headless_config_readonly, StoreRepository};
 use crate::switching::executor::{
     slot_matches_selected_rotated_account, sync_back_active_slot_for_account,
-    verified_probe_checkpoint_from_replicas, VerifiedSlotCheckpoint,
 };
 use crate::transport::client::BoxFuture;
 use crate::transport::proxy::SubprocessProxyOverride;
@@ -728,9 +727,6 @@ pub struct ActiveSlotQuotaRefreshOutcome {
     pub account: AccountRecord,
     pub validation_blocked: bool,
     pub token_synced_back: bool,
-    /// Per-replica verified checkpoint from the same post-probe `BackendReplicaInspection`
-    /// snapshot that passed identity checks (never advances unverified/foreign replicas).
-    pub verified_checkpoint: Option<VerifiedSlotCheckpoint>,
 }
 
 /// Resolve the currently active official slot account ID from `backend` + `StoreRepository`.
@@ -760,7 +756,7 @@ fn resolve_active_official_slot_account_id_detailed(
         | SessionIdentity::DriftedKnown { account_id, .. } => account_id,
         SessionIdentity::DriftedExternal { .. } => {
             // Under Option 1B, official `agy` may have rotated `refresh_token` on the selected
-            // account during interactive usage before the next `refresh` or `daemon` tick.
+            // account during interactive usage before the next `refresh` or `quota --refresh`.
             if let (SlotInspectState::Present(ref parsed), Some(sel_acc)) =
                 (&slot_state, snap.selected_account())
             {
@@ -828,8 +824,8 @@ fn resolve_active_official_slot_account_id_detailed(
 
 /// Refresh quota for the currently active official `agy` slot using `agy -p "/usage" --output-format json`.
 /// - Strictly targets ONLY the active official slot (rejects dormant selectors with exit code 2);
-/// - Synchronizes any refreshed `access_token` / rotated `refresh_token` and `user_tier` written by
-///   official `agy` back into `accounts/<id>.json` purely locally (preserving 66,048-level lineage);
+/// - Synchronizes any refreshed `access_token` / rotated `refresh_token` written by official `agy`
+///   back into `accounts/<id>.json` purely locally (preserving 66,048-level lineage);
 /// - Marks `validation_blocked` on Google verification block responses and clears it on clean success;
 /// - Refuses to write back if another process switched accounts while `agy` was running.
 pub async fn refresh_active_slot_quota_via_official_cli(
@@ -898,9 +894,6 @@ pub enum RefreshActiveSlotError {
     Cli(CliError),
     Probe {
         error: OfficialCliQuotaError,
-        /// Per-replica checkpoint from the post-probe `BackendReplicaInspection` snapshot ALREADY
-        /// verified as belonging to `active_id`.
-        verified_checkpoint: Option<VerifiedSlotCheckpoint>,
     },
 }
 
@@ -908,7 +901,7 @@ impl RefreshActiveSlotError {
     pub fn into_cli_error(self) -> CliError {
         match self {
             Self::PreProbeSlotMismatch(c) | Self::Cli(c) => c,
-            Self::Probe { error, .. } => error.into_cli_error(),
+            Self::Probe { error } => error.into_cli_error(),
         }
     }
 }
@@ -976,31 +969,18 @@ pub async fn refresh_active_slot_quota_detailed(
             "Active account changed concurrently while official `agy -p \"/usage\"` was running; discarded stale quota result.",
         )));
     }
-    let verified_checkpoint = Some(verified_probe_checkpoint_from_replicas(
-        repo,
-        &post_snap,
-        &post_replicas,
-        &active_id,
-    ));
 
-    // Pure-local sync-back captures any fresher access_token / rotated refresh_token and `user_tier`
+    // Pure-local sync-back captures any fresher access_token / rotated refresh_token
     // that official `agy` may have written during `/usage` (even if `/usage` subsequently failed!).
     let sync_outcome =
         sync_back_active_slot_for_account(repo, backend, &active_id, clock.now_unix())
             .map_err(RefreshActiveSlotError::Cli)?;
 
-    let usage_outcome = probe_res.map_err(|error| RefreshActiveSlotError::Probe {
-        error,
-        verified_checkpoint: verified_checkpoint.clone(),
-    })?;
+    let usage_outcome = probe_res.map_err(|error| RefreshActiveSlotError::Probe { error })?;
 
     let obs_now = clock.now_unix();
     let mut obs = QuotaObservation::new(obs_now, QuotaSourceEnv::OfficialCli);
     obs.summary_source_env = Some(QuotaSourceEnv::OfficialCli);
-    if let Some(tier) = sync_outcome.discovered_user_tier {
-        obs.subscription_tier = Some(tier);
-        obs.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
-    }
 
     let (validation_block, allow_clear_validation_block, is_validation_blocked) =
         match usage_outcome {
@@ -1030,7 +1010,6 @@ pub async fn refresh_active_slot_quota_detailed(
         account: updated,
         validation_blocked: is_validation_blocked,
         token_synced_back: sync_outcome.token_updated,
-        verified_checkpoint,
     })
 }
 

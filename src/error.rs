@@ -668,8 +668,9 @@ mod tests {
             (
                 &[
                     "agy-switch-cli",
-                    "daemon",
-                    "--interval",
+                    "auth",
+                    "login",
+                    "--port",
                     "1//PART1'LEAKED_ARGV_SECRET_99999",
                 ],
                 "LEAKED_ARGV_SECRET_99999",
@@ -869,13 +870,10 @@ mod tests {
                 "alice@example.com",
                 "--manual",
             ],
-            &[
-                "agy-switch-cli",
-                "policy",
-                "set",
-                "--strategy",
-                "round_robin",
-            ],
+            &["agy-switch-cli", "policy", "show"],
+            &["agy-switch-cli", "policy", "set", "--enabled", "true"],
+            &["agy-switch-cli", "daemon", "--once"],
+            &["agy-switch-cli", "daemon", "--install"],
             &["agy-switch-cli", "stats", "list", "-n", "10"],
         ] {
             assert!(
@@ -939,10 +937,6 @@ mod tests {
 
         // Verify derived enum words and multi/optional placeholder variants remain covered.
         for word in [
-            "priority",
-            "round-robin",
-            "immediate",
-            "wait",
             "all",
             "cli",
             "app",
@@ -961,11 +955,6 @@ mod tests {
             );
         }
         for ph in [
-            "<ENABLED>",
-            "<STRATEGY>",
-            "<MODE>",
-            "<RESERVE>",
-            "<MINIMUM>",
             "<ID|EMAIL>...",
             "[<LEGACY_DIR>]",
             "[LEGACY_DIR]",
@@ -991,6 +980,15 @@ mod tests {
             "--target",
             "--target-dir",
             "--concurrency",
+            "--interval",
+            "--cooldown",
+            "--no-notify",
+            "--reset-cooldown",
+            "--reserve",
+            "--minimum",
+            "--candidates",
+            "--strategy",
+            "--mode",
         ] {
             assert!(
                 !allowlist.is_known_flag(bad_flag),
@@ -1003,7 +1001,17 @@ mod tests {
                 "Fake placeholder '{bad_ph}' must not be allowlisted"
             );
         }
-        for bad_word in ["1//0gSyntheticSecret", "alice@example.com", "doctor"] {
+        for bad_word in [
+            "1//0gSyntheticSecret",
+            "alice@example.com",
+            "doctor",
+            "daemon",
+            "policy",
+            "priority",
+            "round-robin",
+            "immediate",
+            "wait",
+        ] {
             assert!(
                 !allowlist.is_known_word(bad_word),
                 "Unknown/secret token '{bad_word}' must not be allowlisted"

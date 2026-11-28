@@ -1151,16 +1151,6 @@ impl SecretServiceSessionBackend {
 }
 
 #[cfg(feature = "secret-service-backend")]
-pub(crate) fn discover_verified_dbus_endpoint() -> Option<VerifiedDbusEndpoint> {
-    for cand in extract_candidate_dbus_socket_paths() {
-        if let Some((_, _, _, ep)) = verify_and_pin_socket_endpoint(&cand) {
-            return Some(ep);
-        }
-    }
-    None
-}
-
-#[cfg(feature = "secret-service-backend")]
 pub(crate) async fn connect_verified_session_dbus(
     ep: &VerifiedDbusEndpoint,
     method_timeout: Duration,
@@ -3142,7 +3132,6 @@ mod tests {
                 expiry: Some("2026-11-20T00:00:00Z".into()),
                 auth_method: Some("consumer".into()),
                 email_hint: Some(format!("{tag}@example.com")),
-                user_tier: None,
             })
         };
         let make = |backend_name: &'static str,

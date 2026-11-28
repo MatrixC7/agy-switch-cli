@@ -1,6 +1,6 @@
 # `agy-switch-cli`
 
-面向 **Linux 无头环境（SSH 服务器、Docker 容器、WSL2、CI）** 的官方 Antigravity CLI（`agy`）多账号管理、配额巡检与自动/手动凭据切换工具。
+面向 **Linux 无头环境（SSH 服务器、Docker 容器、WSL2、CI）** 的官方 Antigravity CLI（`agy`）多账号管理、配额查看、本地用量统计与离线凭据切换工具。
 
 > [!IMPORTANT]
 > **开源许可证与非商业使用声明（`CC-BY-NC-SA-4.0`）**  
@@ -9,27 +9,27 @@
 ---
 
 > [!WARNING]
-> **账号合规边界与风控提示**：本工具已彻底移除 Google 内部后端接口直连与客户端标识伪造，配额查询统一委托本机官方 `agy -p "/usage"`，日常切号与本地统计均纯离线运行。但按 Google Antigravity 附加服务条款（第 6 节）对个人消费级订阅（`oauth-personal`）的限制，在第三方工具中程序化调用 `agy -p "/usage"`、封装 `agy acp`、同机并发运行多账号或借助后台守护进程频繁轮换账号池，**依然存在触发 `403 TOS_VIOLATION` 账号风控并联动影响同账号 Antigravity / Gemini CLI / Gemini Code Assist 权限的残余风险**。建议优先使用纯离线手动切号与本地统计，降低刷新与巡检频率（`daemon` 默认已放宽至 `900` 秒即 15 分钟）；自动化脚本或编排流水线请改用 Google AI Studio API Key（`GEMINI_API_KEY`）或 Vertex AI 商业凭据。完整风险拆解与降风险实践见[使用手册第 2 节](docs/user-guide.md#2-上手前必读五个核心概念与合规风控边界)。
+> **账号合规边界与风控提示**：本工具已彻底移除 Google 内部后端接口直连、客户端标识伪造与后台无人值守自动切号守护进程，配额刷新仅在用户按需触发时委托本机官方 `agy -p "/usage"`，日常切号与本地统计均纯离线运行。但按 Google Antigravity 附加服务条款（第 6 节）对个人消费级订阅（`oauth-personal`）的限制，在第三方工具中程序化调用 `agy -p "/usage"`、封装 `agy acp` 或同机高频/并发操作多个消费级账号，**依然存在触发 `403 TOS_VIOLATION` 账号风控并联动影响同账号 Antigravity / Gemini CLI / Gemini Code Assist 权限的残余风险**。建议优先使用纯离线手动切号与本地统计，避免短时间内高频刷新配额；自动化脚本或编排流水线请改用 Google AI Studio API Key（`GEMINI_API_KEY`）或 Vertex AI 商业凭据。完整风险拆解与降风险实践见[使用手册第 2 节](docs/user-guide.md#2-上手前必读核心概念与合规风控边界)。
 
 ## 核心特性
 
 - **纯静态单包全特性开箱即用**：彻底剥离 Tauri / GTK / WebKit，每个架构仅提供**单一完整预编译 `musl` 压缩包**（100% 纯静态单文件 ELF，零外部 `.so` 依赖），同时内置全部 CLI 命令、本地用量统计 `stats`、SSH 交互式看板 `tui` 与纯 Rust D-Bus 系统钥匙串协议栈；默认 `--backend auto` 在无头服务器自动使用本地文件模式（`file`），在 Linux 图形桌面自动启用钥匙串与文件事务性双写（`dual`），亦支持显式指定 `file`、`keyring` 或 `dual`。
-- **官方 CLI 委托查额与离线优先切号**：彻底移除 Google 内部接口直连与自定义请求头伪造，配额查询统一委托本机已安装的官方 `agy -p "/usage" --output-format json` 对当前活跃官方槽位执行；日常 `switch`、`run`、`daemon` 切槽与 `accounts add --from-local` 均为纯本地零网络操作，切出前自动回采当前槽位中由官方 `agy` 刷新或轮换的最新凭据。
-- **无浏览器 OAuth 登录与零丢码保护**：显式 `auth login` / `auth reauthorize` 与裸 `refresh_token` 导入按需访问 Google 标准 OAuth 端点（不附加自定义 `User-Agent`）；默认免端口监听直接粘贴回调 URL 登录（亦可加 `--ssh` 开启本地端口转发回调）；令牌签发后立即以 `0600` 权限落盘并建立两级防回退指纹库，网络中断可通过 `auth pending --resume` 无损续传。
-- **灵活的手动与步进式自动切号方式**：
-  - *重要事实*：切换凭据槽位**对切换后新启动的 `agy` 进程立即生效**，已运行中的旧 `agy` 会话保持启动时的登录态而不被打断。
-  - 既可通过 `tui` 终端看板或 `switch` 随时切号后直接运行 `agy`，也可通过 `daemon --install` 一键配置 `systemd --user` 后台巡检服务（默认每 15 分钟巡检当前活跃槽位，跌破水位时按策略单轮有界步进核验候选号；亦可使用可选的 `agy-switch-cli run` 指定 `--account` / `--backend file` 包装启动 `agy`）。
+- **离线优先切号与按需官方 CLI 查额**：彻底移除 Google 内部接口直连、自定义请求头伪造与后台自动轮换；日常 `switch`、`run` 切槽与 `accounts add --from-local` 均为纯本地零网络操作，切出前自动回采当前槽位中由官方 `agy` 刷新或轮换的最新凭据；按需查额统一委托本机已安装的官方 `agy -p "/usage" --output-format json` 对当前活跃官方槽位执行。
+- **无浏览器 OAuth 登录与零丢码保护**：显式 `auth login` / `auth reauthorize` 与裸 `refresh_token` 导入按需访问 Google 标准 OAuth 端点（不附加自定义 `User-Agent`）；默认免端口监听直接粘贴回调 URL 登录（亦可加 `--ssh` 开启本地端口转发回调）；令牌签发后立即以 `0600` 权限落盘并建立 `66,048` 级防回退指纹库，网络中断可通过 `auth pending --resume` 无损续传。
+- **清晰的手动切号与极简 SSH 交互看板**：
+  - *重要事实*：官方 `agy` 与 ACP 客户端均在启动或新建对话时一次性加载内存凭据，切换凭据槽位**对切换后新启动的 `agy` 进程（或新开的对话）立即生效**，已运行中的旧 `agy` 会话保持启动时的登录态而不被打断。
+  - 可通过 `tui` 终端看板（按池展示当前活跃号配额、主表以 `Last Used (dur)` 追踪各账号最近使用与单次停留时长）或 `switch` 随时切号后直接运行 `agy`，亦可使用可选的 `agy-switch-cli run` 指定 `--account` 或 `--backend file` 包装启动 `agy`。
 
 ---
 
 ## 安装
 
-### 方式一：下载预编译纯静态二进制（推荐）
+### 方式一：下载预编译纯静态二进制
 
-可直接在终端按当前 CPU 架构（`uname -m` 自动输出 `x86_64` 或 `aarch64`）从 Releases 下载对应的 `.tar.gz` 压缩包与校验文件（也可在浏览器访问 Releases 页面手动下载），无论在远程 SSH 服务器、Docker 容器、WSL2 还是开启了 GNOME Keyring / KDE Wallet 的 Linux 图形桌面上均可直接使用：
+可直接在终端按当前 CPU 架构（`uname -m` 自动输出 `x86_64` 或 `aarch64`）从本仓库 Releases 下载对应的 `.tar.gz` 压缩包与校验文件（也可在浏览器访问 Releases 页面手动下载），无论在远程 SSH 服务器、Docker 容器、WSL2 还是开启了 GNOME Keyring / KDE Wallet 的 Linux 图形桌面上均可直接使用：
 
 ```bash
-VER=v1.2.7
+VER=v1.3.0
 ARCH="$(uname -m)"   # x86_64 或 aarch64
 curl -fLO "https://github.com/MatrixC7/agy-switch-cli/releases/download/${VER}/agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz"
 curl -fLO "https://github.com/MatrixC7/agy-switch-cli/releases/download/${VER}/agy-switch-cli-${VER}-${ARCH}-unknown-linux-musl.tar.gz.sha256"
@@ -72,11 +72,11 @@ agy-switch-cli auth login --label "primary"
 # 或从原桌面版 ~/.antigravity_tools 只读迁移已有账号（不修改原目录）：
 # agy-switch-cli accounts import --from-legacy
 
-# 3. 委托本机官方 agy 刷新当前活跃账号的最新配额，或纯只读查看全部账号已缓存的配额
+# 3. 按需委托本机官方 agy 刷新当前活跃账号的最新配额，或纯只读查看全部账号已缓存的配额
 agy-switch-cli quota --refresh
 # agy-switch-cli quota --all
 
-# 4. 查看当前生效账号、运行状态与该账号的模型分组信息
+# 4. 查看当前生效账号、运行状态与对齐后的模型分组信息
 agy-switch-cli current
 
 # 5. 打开交互式看板管理与切号，之后直接运行 agy 即可（也可用可选的 `agy-switch-cli run` 指定账号或 `file` 后端包装启动）
@@ -91,52 +91,51 @@ agy-switch-cli tui
 
 | 命令                                                   | 用途说明                                                                           |
 |:------------------------------------------------------ |:---------------------------------------------------------------------------------- |
-| `agy-switch-cli status`                                | 只读巡检生效后端、本地仓库、事务日志、槽位初始化、守护进程运行/服务状态、本机官方 `agy` 与已安装桌面端 Antigravity App 版本 |
+| `agy-switch-cli status`                                | 只读巡检生效后端、本地仓库、事务日志、槽位初始化、本机官方 `agy` 与已安装桌面端 Antigravity App 版本 |
 | `agy-switch-cli auth login [--ssh]`                    | 通过 PKCE (`S256`) 添加新 Google 账号（默认粘贴回调 URL；重新授权用 `reauthorize`） |
 | `agy-switch-cli accounts list / add / import / export` | 查看账号详情与排序（`--move`/`--order`）、纯本地离线导入本机官方槽位已登录号（`--from-local`）或文件/标准输入 Token（`--from-file`/`--from-stdin`）、导入导出备份 |
-| `agy-switch-cli current`                               | 查看当前生效身份、运行中进程状态及该账号的模型/分组信息 |
-| `agy-switch-cli quota [--refresh \| <ID\|EMAIL> \| --all]` | 查看双窗口（`Weekly` + `5h`）配额进度表；加 `--refresh` 委托官方 `agy -p "/usage"` 刷新当前活跃官方槽位并展示；不带 `--refresh` 时支持按账号或 `--all` 纯只读查看缓存 |
-| `agy-switch-cli refresh [<ACTIVE_ID\|EMAIL>]`          | 委托本机官方 `agy -p "/usage"` 刷新当前活跃官方槽位配额，并纯本地回采刷新后的令牌与套餐层级 |
+| `agy-switch-cli current`                               | 查看当前生效身份、运行中进程状态及该账号的模型或对齐后的模型分组信息 |
+| `agy-switch-cli quota [--refresh \| <ID\|EMAIL> \| --all]` | 查看全部配额池的双窗口（`Weekly` + `5h`）配额进度表；加 `--refresh` 委托官方 `agy -p "/usage"` 刷新当前活跃官方槽位并展示；不带 `--refresh` 时支持按账号或 `--all` 纯只读查看缓存 |
+| `agy-switch-cli refresh [<ACTIVE_ID\|EMAIL>]`          | 委托本机官方 `agy -p "/usage"` 刷新当前活跃官方槽位配额，并纯本地回采刷新后的最新令牌 |
 | `agy-switch-cli stats summary / list [--watch]`        | 纯本地只读聚合官方 CLI/桌面端（`--source all\|cli\|app`）模型 Token 用量与 `TTFT`/`TPS` 分位统计（`summary`），或列出最近请求明细（`list`），支持 `--watch [秒数]` 实时看板刷新（按 `Tab` 切换视图） |
-| `agy-switch-cli switch <ID\|EMAIL>`                    | 纯本地离线切换官方活跃槽位（切出前自动回采当前槽位最新令牌；默认 `auto` 自动适配无头 `file` 与桌面钥匙串 `dual` 双写） |
-| `agy-switch-cli policy set --all-candidates ...`       | 配置自动切号水位策略（默认 `reserve = 10%`、`minimum = 30%`，配合 `daemon` 后台自动巡检切号） |
-| `agy-switch-cli daemon [--install \| --uninstall \| --reset-cooldown]` | 运行后台步进式自动切号守护进程（默认每 `900` 秒即 15 分钟巡检当前活跃槽位、切号冷却 `3600` 秒；支持 `--reset-cooldown` 主动解除冷却期；桌面切号/低额保持/熔断通知支持 `config.json` 配置或用 `--no-notify` 关闭，无头环境自动静默），或安装/卸载 `systemd --user` 服务 |
+| `agy-switch-cli switch <ID\|EMAIL>`                    | 纯本地离线切换官方活跃槽位（切出前自动回采当前槽位最新令牌并记录切换时间；默认 `auto` 自动适配无头 `file` 与桌面钥匙串 `dual` 双写） |
 | `agy-switch-cli [--backend file] run [--account ...] -- agy ...` | 可选方式：纯本地离线按指定账号或指定后端包装启动 `agy`；显式启用 `file` 后端时自动为子进程屏蔽桌面 D-Bus 钥匙串 |
-| `agy-switch-cli tui`                                   | 打开 SSH 交互式终端看板（顶部按池分行展示活跃号双窗口余量与重置倒计时，主表采用单列 `Last Quota`；支持 `↑/↓` 与 `g/G` 浏览、`Space` 多选联动、`[/]` 调序、`i` 可滚动详情/分组说明、仅在活跃 `*` 行按 `r` 委托官方 `agy` 刷新、`c/C/p` 策略、`k` 清冷却、`e/E` 与 `d/D` 启停、`l` 改备注、`o/O` `0600` 导出与 `x`+`y` 删号） |
+| `agy-switch-cli tui`                                   | 打开 SSH 交互式终端看板（顶部按池分行展示当前活跃号双窗口余量与重置倒计时，主表精简展示 `# \| Sel \| [ID] \| Email \| Last Used (dur) \| State`；支持 `↑/↓` 与 `g/G` 浏览、`Space` 多选联动、`[/]` 调序、`i` 可滚动详情/分组说明、仅在活跃 `*` 行按 `r` 委托官方 `agy` 刷新、`e/E` 与 `d/D` 启停、`l` 改备注、`o/O` `0600` 导出与 `x`+`y` 删号） |
 
 **关于 `--json` 机器输出与 `0..=8` 稳定退出码的边界说明**：
 - 全屏交互看板 `tui` 与实时刷新模式 `stats ... --watch` 均与 `--json` 互斥并返回退出码 `2`。
 - 可选包装器 `run` 在前置准备失败时向 `stderr` 输出错误信封，就绪后直接继承子进程标准输入输出并透传其退出码。
-- `daemon --install --json`、`daemon --uninstall --json`、`daemon --reset-cooldown --json` 与单轮 `daemon --once --json` 向 `stdout` 输出标准 `schema_version: 1` JSON 信封（单轮被外部信号提前取消时静默返回 `0`）；常驻 `daemon --json` 正常轮次保持静默，仅在启动、策略、锁或运行期致命错误时向 `stderr` 输出错误信封。
 - 其余子命令均按 `schema_version: 1` 契约向 `stdout` 输出标准 JSON 信封。
 
 ---
 
 ## 详细文档导航
 
-- **[完整使用、配置与部署手册 (`docs/user-guide.md`)](docs/user-guide.md)**：安装指南、四种凭据后端（`auto`/`dual`/`file`/`keyring`）、全量命令与退出码参考、`config.json` 代理与自定义 OAuth 客户端配置、`daemon --install` 与容器常驻方案、常见问题排查及完整卸载清单。
-- **[技术架构、安全机制与验收台账 (`docs/architecture-and-verification.md`)](docs/architecture-and-verification.md)**：目录拓扑、四级单向锁与授权世代防回退设计、跨架构 Release 体积/性能矩阵及诚实验收边界说明。
+- **[完整使用、配置与部署手册 (`docs/user-guide.md`)](docs/user-guide.md)**：安装指南、四种凭据后端（`auto`/`dual`/`file`/`keyring`）、全量命令与退出码参考、`config.json` 代理与自定义 OAuth 客户端配置、常见问题排查、`v1.2.x` 升级旧服务清理及完整卸载清单。
+- **[技术架构、安全机制与验收台账 (`docs/architecture-and-verification.md`)](docs/architecture-and-verification.md)**：目录拓扑、四级单向锁与授权世代防回退设计、零写入 SQLite VFS 原理、跨架构构建与诚实验收边界说明。
 - **[重构溯源与第三方合规声明 (`PROVENANCE.md`)](PROVENANCE.md)** ＆ **[许可证全文 (`LICENSE`)](LICENSE)**。
 
 ---
 
 ## 卸载与本地残留清理
 
-如需卸载本工具，建议按“停服务 → 删程序 → 清理自有数据目录”三步操作：
+如需卸载本工具，可按“删程序 → 清理自有数据目录”两步操作（若曾从 `v1.2.x` 升级并安装过旧版后台 `systemd` 服务，请先停用并清理旧单元）：
 
 ```bash
-# 1. 如曾安装后台定时服务，先停用并移除 systemd user unit
-agy-switch-cli daemon --uninstall
-
-# 2. 按安装方式卸载可执行文件（二选一）
+# 1. 按安装方式卸载可执行文件（二选一）
 rm -f ~/.local/bin/agy-switch-cli    # 手动解压或源码编译安装
 # yay -Rns agy-switch-cli-bin        # AUR 安装（或使用 paru / sudo pacman -Rns）
 
-# 3. 按需清理本工具自有的本地数据、锁与缓存目录（不会影响官方 ~/.gemini 目录）
+# 2. 如曾于 v1.2.x 安装过旧版 systemd 用户服务，先停用并清理旧服务单元（兼容自定义 XDG_CONFIG_HOME）
+systemctl --user disable --now agy-switch-cli.service 2>/dev/null || true
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/agy-switch-cli.service"
+systemctl --user daemon-reload 2>/dev/null || true
+
+# 3. 按需清理本工具自有的本地数据与缓存目录（不会影响官方 ~/.gemini 目录）
 rm -rf ~/.local/share/agy-switch-cli ~/.cache/agy-switch-cli ~/.local/state/agy-switch-cli
 ```
 
-完整目录清单、系统钥匙串及避免误删官方 `~/.gemini` 凭据的详细说明见[完整使用手册第 9 节](docs/user-guide.md#9-完整卸载与本地遗留文件清理清单)。
+完整目录清单、`v1.2.x` 升级清理步骤及避免误删官方 `~/.gemini` 凭据的详细说明见[完整使用手册第 8 节](docs/user-guide.md#8-完整卸载与本地遗留文件清理清单)。
 
 ---
 

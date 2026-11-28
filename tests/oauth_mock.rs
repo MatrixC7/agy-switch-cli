@@ -1,3 +1,5 @@
+mod common;
+
 use agy_switch_cli::domain::account::{AccountRecord, DisableReasonCode};
 use agy_switch_cli::domain::quota::{QuotaBucket, QuotaGroup};
 use agy_switch_cli::domain::token::TokenRecord;
@@ -8,7 +10,7 @@ use agy_switch_cli::oauth::flow::{
 };
 use agy_switch_cli::oauth::refresh::{
     complete_reauthorize_exchange_locked, ensure_account_token_fresh_locked,
-    exchange_authorization_code, OAuthEndpoints,
+    exchange_authorization_code,
 };
 use agy_switch_cli::oauth::registry::OAuthClientRegistry;
 use agy_switch_cli::paths::HeadlessPaths;
@@ -21,9 +23,11 @@ use agy_switch_cli::session::payload::serialize_session_payload;
 use agy_switch_cli::store::repository::StoreRepository;
 use agy_switch_cli::transport::client::{HttpResponse, MockTransport, RequestBody, TransportError};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use common::{fast_oauth_endpoints, run_isolated_subtest};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -32,41 +36,12 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-fn fast_oauth_endpoints() -> OAuthEndpoints {
-    OAuthEndpoints {
-        base_backoff: Duration::from_millis(5),
-        ..OAuthEndpoints::default()
-    }
-}
-
 fn new_repo(tmp: &std::path::Path) -> StoreRepository {
     let paths = HeadlessPaths::with_explicit(tmp.join("home"), tmp.join("data"), tmp.join("cache"));
     StoreRepository::new(paths)
 }
 
 static OAUTH_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-struct ScopedEnv {
-    key: &'static str,
-    prev: Option<std::ffi::OsString>,
-}
-
-impl ScopedEnv {
-    fn set(key: &'static str, val: &str) -> Self {
-        let prev = std::env::var_os(key);
-        std::env::set_var(key, val);
-        Self { key, prev }
-    }
-}
-
-impl Drop for ScopedEnv {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
 
 #[tokio::test]
 async fn loopback_oauth_ignores_stray_requests_verifies_pkce_s256_and_records_true_scopes() {
@@ -644,10 +619,15 @@ async fn validation_required_403_marks_blocked_hides_url_clears_on_200_and_merge
 
 #[tokio::test]
 async fn scope_reauth_required_is_set_on_missing_known_scopes_and_upstream_insufficient_scope() {
+    if std::env::var_os("AGY_SUBTEST_SCOPE_REAUTH").is_none() {
+        run_isolated_subtest(
+            "scope_reauth_required_is_set_on_missing_known_scopes_and_upstream_insufficient_scope",
+            "AGY_SUBTEST_SCOPE_REAUTH",
+            &[],
+        );
+        return;
+    }
     let _env_guard = OAUTH_ENV_MUTEX.lock().await;
-    let _c1 = ScopedEnv::set("ANTIGRAVITY_OAUTH_CLIENTS", "");
-    let _c2 = ScopedEnv::set("ANTIGRAVITY_OAUTH_CLIENT_KEY", "");
-    let _c3 = ScopedEnv::set("ANTIGRAVITY_REQUIRED_SCOPES", "");
     let tmp = tempfile::tempdir().unwrap();
     let repo = new_repo(tmp.path());
     let now = 1_800_000_000i64;
@@ -886,17 +866,62 @@ async fn socks5h_remote_dns_config_file_proxy_no_proxy_and_loopback_bypass_work_
     use agy_switch_cli::transport::proxy::ProxyMode;
     use tokio::net::TcpListener;
 
-    let _env_guard = OAUTH_ENV_MUTEX.lock().await;
-    let _clear_https = ScopedEnv::set("HTTPS_PROXY", "");
-    let _clear_https_l = ScopedEnv::set("https_proxy", "");
-    let _clear_http = ScopedEnv::set("HTTP_PROXY", "");
-    let _clear_http_l = ScopedEnv::set("http_proxy", "");
-    let _clear_all = ScopedEnv::set("ALL_PROXY", "");
-    let _clear_all_l = ScopedEnv::set("all_proxy", "");
-    let _clear_np = ScopedEnv::set("NO_PROXY", "");
-    let _clear_np_l = ScopedEnv::set("no_proxy", "");
-    let _clear_cli = ScopedEnv::set("AGY_SWITCH_CLI_PROXY", "");
+    if std::env::var_os("AGY_SUBTEST_SOCKS_E").is_some() {
+        let http_port: u16 = std::env::var("AGY_SUBTEST_HTTP_PORT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let env_mode = ProxyMode::resolve(None).unwrap();
+        let env_transport = ReqwestTransport::build(env_mode).unwrap();
+        let ok_env_resp = env_transport
+            .execute(HttpRequest::get(
+                format!("http://env-proxied.example.invalid:{http_port}/env"),
+                TimeoutClass::VersionCheck,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ok_env_resp.status, 200);
+        let bypass_env_res = env_transport
+            .execute(HttpRequest::get(
+                format!("http://env-bypass.example.invalid:{http_port}/direct"),
+                TimeoutClass::VersionCheck,
+            ))
+            .await;
+        assert!(bypass_env_res.is_err());
+        return;
+    }
+    if std::env::var_os("AGY_SUBTEST_SOCKS_E2A").is_some() {
+        let http_port: u16 = std::env::var("AGY_SUBTEST_HTTP_PORT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let kde_mode = ProxyMode::resolve(None).unwrap();
+        let kde_transport = ReqwestTransport::build(kde_mode).unwrap();
+        let kde_resp = kde_transport
+            .execute(HttpRequest::get(
+                format!("http://kde-space-proxied.example.invalid:{http_port}/kde"),
+                TimeoutClass::VersionCheck,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(kde_resp.status, 200);
+        return;
+    }
+    if std::env::var_os("AGY_SUBTEST_SOCKS_E2B").is_some() {
+        let mixed_mode = ProxyMode::resolve(None).unwrap();
+        assert!(ReqwestTransport::build(mixed_mode).is_ok());
+        return;
+    }
+    if std::env::var_os("AGY_SUBTEST_SOCKS_MAIN").is_none() {
+        run_isolated_subtest(
+            "socks5h_remote_dns_config_file_proxy_no_proxy_and_loopback_bypass_work_end_to_end",
+            "AGY_SUBTEST_SOCKS_MAIN",
+            &[],
+        );
+        return;
+    }
 
+    let _env_guard = OAUTH_ENV_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let repo = new_repo(tmp.path());
     std::fs::create_dir_all(&repo.paths().data_dir).unwrap();
@@ -1096,70 +1121,78 @@ async fn socks5h_remote_dns_config_file_proxy_no_proxy_and_loopback_bypass_work_
 
     // E. Standard `ALL_PROXY=socks5h://...` + `NO_PROXY=env-bypass.example.invalid` env vars
     //    route non-bypassed domains via remote DNS (`ATYP == 0x03`) and bypass `NO_PROXY` hosts!
+    let http_port_str = http_port.to_string();
+    let socks_proxy_url = format!("socks5h://127.0.0.1:{socks_port}");
     {
-        let _g5 = ScopedEnv::set("ALL_PROXY", &format!("socks5h://127.0.0.1:{socks_port}"));
-        let _g6 = ScopedEnv::set("NO_PROXY", "env-bypass.example.invalid");
-
-        let env_mode = ProxyMode::resolve(None).unwrap();
-        let env_transport = ReqwestTransport::build(env_mode).unwrap();
-
-        let ok_env_resp = env_transport
-            .execute(HttpRequest::get(
-                format!("http://env-proxied.example.invalid:{http_port}/env"),
-                TimeoutClass::VersionCheck,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(ok_env_resp.status, 200);
-        assert_eq!(observed_socks.lock().unwrap().len(), 2);
-        assert_eq!(
-            observed_socks.lock().unwrap()[1],
-            (0x03, "env-proxied.example.invalid".to_string(), http_port)
-        );
-
-        let bypass_env_res = env_transport
-            .execute(HttpRequest::get(
-                format!("http://env-bypass.example.invalid:{http_port}/direct"),
-                TimeoutClass::VersionCheck,
-            ))
-            .await;
-        assert!(bypass_env_res.is_err());
-        assert_eq!(
-            observed_socks.lock().unwrap().len(),
-            2,
-            "NO_PROXY env host MUST bypass SOCKS5 proxy!"
-        );
+        let hp = http_port_str.clone();
+        let sp = socks_proxy_url.clone();
+        tokio::task::spawn_blocking(move || {
+            run_isolated_subtest(
+                "socks5h_remote_dns_config_file_proxy_no_proxy_and_loopback_bypass_work_end_to_end",
+                "AGY_SUBTEST_SOCKS_E",
+                &[
+                    ("AGY_SUBTEST_HTTP_PORT", OsStr::new(&hp)),
+                    ("ALL_PROXY", OsStr::new(&sp)),
+                    ("NO_PROXY", OsStr::new("env-bypass.example.invalid")),
+                ],
+            );
+        })
+        .await
+        .unwrap();
     }
+    assert_eq!(
+        observed_socks.lock().unwrap().len(),
+        2,
+        "NO_PROXY env host MUST bypass SOCKS5 proxy!"
+    );
+    assert_eq!(
+        observed_socks.lock().unwrap()[1],
+        (0x03, "env-proxied.example.invalid".to_string(), http_port)
+    );
 
     // E2. Unnormalized desktop/CLI proxy env formats (`socks://127.0.0.1 <port>`, bare `127.0.0.1:<port>`,
     //     and broken `ALL_PROXY=pac+http://...` alongside valid `HTTPS_PROXY=127.0.0.1:<port>`) work cleanly!
+    let kde_proxy_url = format!("socks://127.0.0.1 {socks_port}");
     {
-        let _g_socks_kde = ScopedEnv::set("ALL_PROXY", &format!("socks://127.0.0.1 {socks_port}"));
-        let kde_mode = ProxyMode::resolve(None).unwrap();
-        let kde_transport = ReqwestTransport::build(kde_mode).unwrap();
-        let kde_resp = kde_transport
-            .execute(HttpRequest::get(
-                format!("http://kde-space-proxied.example.invalid:{http_port}/kde"),
-                TimeoutClass::VersionCheck,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(kde_resp.status, 200);
-        assert_eq!(observed_socks.lock().unwrap().len(), 3);
-        assert_eq!(
-            observed_socks.lock().unwrap()[2],
-            (
-                0x03,
-                "kde-space-proxied.example.invalid".to_string(),
-                http_port
-            )
-        );
+        let hp = http_port_str.clone();
+        let kp = kde_proxy_url.clone();
+        tokio::task::spawn_blocking(move || {
+            run_isolated_subtest(
+                "socks5h_remote_dns_config_file_proxy_no_proxy_and_loopback_bypass_work_end_to_end",
+                "AGY_SUBTEST_SOCKS_E2A",
+                &[
+                    ("AGY_SUBTEST_HTTP_PORT", OsStr::new(&hp)),
+                    ("ALL_PROXY", OsStr::new(&kp)),
+                ],
+            );
+        })
+        .await
+        .unwrap();
     }
+    assert_eq!(observed_socks.lock().unwrap().len(), 3);
+    assert_eq!(
+        observed_socks.lock().unwrap()[2],
+        (
+            0x03,
+            "kde-space-proxied.example.invalid".to_string(),
+            http_port
+        )
+    );
+    let bare_https_proxy = format!("127.0.0.1:{http_port}");
     {
-        let _g_https_bare = ScopedEnv::set("HTTPS_PROXY", &format!("127.0.0.1:{http_port}"));
-        let _g_all_broken = ScopedEnv::set("ALL_PROXY", "pac+http://127.0.0.1/wpad.dat");
-        let mixed_mode = ProxyMode::resolve(None).unwrap();
-        assert!(ReqwestTransport::build(mixed_mode).is_ok());
+        let bp = bare_https_proxy.clone();
+        tokio::task::spawn_blocking(move || {
+            run_isolated_subtest(
+                "socks5h_remote_dns_config_file_proxy_no_proxy_and_loopback_bypass_work_end_to_end",
+                "AGY_SUBTEST_SOCKS_E2B",
+                &[
+                    ("HTTPS_PROXY", OsStr::new(&bp)),
+                    ("ALL_PROXY", OsStr::new("pac+http://127.0.0.1/wpad.dat")),
+                ],
+            );
+        })
+        .await
+        .unwrap();
     }
 
     // F. Authenticated RFC 1929 `socks5h://user:pass@127.0.0.1:<port>`:

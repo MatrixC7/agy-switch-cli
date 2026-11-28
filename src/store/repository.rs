@@ -5,7 +5,6 @@ use crate::domain::account::{
     STORE_SCHEMA_VERSION,
 };
 use crate::domain::config::HeadlessConfig;
-use crate::domain::policy::SwitchPolicy;
 use crate::domain::quota::QuotaObservation;
 use crate::domain::token::{token_digest, TokenRecord};
 use crate::error::{format_safe_json_error, CliError, CliResult};
@@ -484,32 +483,6 @@ impl StoreRepository {
         .map(|a| a.id.clone()))
     }
 
-    /// Pure read-only policy fetch: returns `SwitchPolicy::default()` when `policy.json` is absent without creating files.
-    pub fn read_policy(&self) -> CliResult<SwitchPolicy> {
-        let path = self.paths.policy_file();
-        ensure_no_symlink_components_under(&self.paths.data_dir, &path)?;
-        let Some(bytes) =
-            read_regular_file_opt_bounded(&path, MAX_STORE_FILE_BYTES, "Policy file")?
-        else {
-            return Ok(SwitchPolicy::default());
-        };
-        let policy: SwitchPolicy = serde_json::from_slice(&bytes).map_err(|e| {
-            CliError::data(format_safe_json_error(
-                &format!("Policy file '{}'", path.display()),
-                &e,
-            ))
-        })?;
-        if policy.schema_version != STORE_SCHEMA_VERSION {
-            return Err(CliError::data(format!(
-                "Unsupported policy schema_version {} in '{}'.",
-                policy.schema_version,
-                path.display()
-            )));
-        }
-        policy.validate(None).map_err(CliError::data)?;
-        Ok(policy)
-    }
-
     /// Pure read-only strict lookup of monotonic `AuthSequenceState` (`<data_dir>/state/auth_sequence.json`).
     pub fn read_auth_sequence_readonly(&self) -> CliResult<Option<AuthSequenceState>> {
         let path = self.paths.auth_sequence_file();
@@ -887,6 +860,19 @@ impl<'a> StoreWriteTx<'a> {
                 &e,
             ))
         })?;
+        if acc.schema_version != STORE_SCHEMA_VERSION {
+            return Err(CliError::data(format!(
+                "Unsupported account schema_version {} in '{}'.",
+                acc.schema_version,
+                path.display()
+            )));
+        }
+        if acc.id != id {
+            return Err(CliError::data(format!(
+                "Account file ID mismatch in '{}': expected '{id}'.",
+                path.display()
+            )));
+        }
         Ok(Some(acc))
     }
 
@@ -1489,7 +1475,6 @@ impl<'a> StoreWriteTx<'a> {
                 latest.disabled_detail = None;
                 latest.disabled_at = None;
             }
-            latest.last_used = now_unix;
             self.save_account(&latest)?;
             return Ok((latest, false));
         }
@@ -1635,7 +1620,6 @@ impl<'a> StoreWriteTx<'a> {
                 latest.disabled_detail = None;
                 latest.disabled_at = None;
             }
-            latest.last_used = now_unix;
             self.save_account(&latest)?;
             if !same_rt {
                 self.cleanup_idle_superseded_reauth_pendings_in_tx(None, &mut latest)?;
@@ -2035,10 +2019,25 @@ impl<'a> StoreWriteTx<'a> {
         Ok(latest)
     }
 
-    /// Commit `selected_account_id` and `last_used` after the active slot has been updated.
+    /// Commit `selected_account_id`, `last_switched_out_at`, `last_switched_in_at`, and `last_used`
+    /// after the active slot has been updated.
     pub fn commit_selected_account(
         &self,
         account_id: &str,
+        now_unix: i64,
+    ) -> CliResult<(StoreIndex, AccountRecord)> {
+        self.commit_selected_account_with_slot_owner(account_id, None, now_unix)
+    }
+
+    /// Commit `selected_account_id` and per-account switch timestamps inside a single `L3` transaction:
+    /// - `observed_slot_owner == Some(Some(prev_id))`: live switch observed `prev_id` in the outgoing slot;
+    /// - `observed_slot_owner == Some(None)`: live switch observed an empty or foreign external slot
+    ///   (never fabricates `last_switched_out_at` on a stale `selected_account_id`);
+    /// - `observed_slot_owner == None`: journal recovery replay falls back to `index.selected_account_id`.
+    pub fn commit_selected_account_with_slot_owner(
+        &self,
+        account_id: &str,
+        observed_slot_owner: Option<Option<&str>>,
         now_unix: i64,
     ) -> CliResult<(StoreIndex, AccountRecord)> {
         let mut index = self.load_index_or_init(now_unix)?;
@@ -2047,11 +2046,51 @@ impl<'a> StoreWriteTx<'a> {
                 "Target account '{account_id}' was removed before index commit."
             )));
         }
+        let outgoing_id = match observed_slot_owner {
+            Some(owner) => owner,
+            None => index.selected_account_id.as_deref(),
+        };
+        if let Some(prev_id) = outgoing_id.filter(|prev| *prev != account_id) {
+            match self.load_account_opt(prev_id) {
+                Ok(Some(mut prev_acc))
+                    if prev_acc.id == prev_id
+                        && prev_acc.schema_version == STORE_SCHEMA_VERSION
+                        && prev_acc.token.expiry_timestamp > 0 =>
+                {
+                    prev_acc.last_switched_out_at = Some(now_unix);
+                    prev_acc.last_used = now_unix;
+                    self.save_account(&prev_acc)?;
+                }
+                Ok(_) => {}
+                Err(e) if e.error_code == "data_error" => {
+                    // Best-effort outgoing `last_switched_out_at` must never wedge switching
+                    // or journal reconciliation away from a corrupt or ID-mismatched previous
+                    // account record, and must NEVER write to any mismatched account path.
+                }
+                Err(e) => return Err(e),
+            }
+        }
         let mut latest = self.load_account_opt(account_id)?.ok_or_else(|| {
             CliError::not_found(format!(
                 "Target account file '{account_id}' is missing before index commit."
             ))
         })?;
+        let selected_matches_or_unset = index
+            .selected_account_id
+            .as_deref()
+            .is_none_or(|sel| sel == account_id);
+        let already_active_session = outgoing_id == Some(account_id)
+            && selected_matches_or_unset
+            && latest.last_switched_in_at.is_some_and(|in_at| {
+                in_at > 0
+                    && latest
+                        .last_switched_out_at
+                        .is_none_or(|out_at| in_at > out_at)
+            });
+        if !already_active_session {
+            latest.last_switched_in_at = Some(now_unix);
+        }
+        latest.last_switched_out_at = None;
         latest.last_used = now_unix;
         self.save_account(&latest)?;
         index.selected_account_id = Some(account_id.to_string());
@@ -2092,7 +2131,7 @@ impl<'a> StoreWriteTx<'a> {
     }
 
     /// Delete account with explicit selected-account semantics per Blueprint §8.2 rule 6.
-    /// Propagates policy cleanup, index save, account removal, lineage removal, AND parent directory
+    /// Propagates index save, account removal, lineage removal, AND parent directory
     /// `fsync` failures so no partial deletion is silently treated as complete!
     pub fn delete_account(&self, account_id: &str, force: bool, now_unix: i64) -> CliResult<bool> {
         self.delete_account_impl(account_id, force, false, None, None, now_unix)
@@ -2100,7 +2139,7 @@ impl<'a> StoreWriteTx<'a> {
 
     /// Idempotent, transactional-version-bound account deletion replay used after clearing active
     /// credential replicas (`clear_slot_intent` journal recovery). Completes cleanup across
-    /// `policy.json`, `index.json`, `accounts/<id>.json`, `state/token_lineage/<id>.json`, and parent
+    /// `index.json`, `accounts/<id>.json`, `state/token_lineage/<id>.json`, and parent
     /// directory `fsync`s even if `index.json` was already updated before a crash, and propagates
     /// EVERY failure so callers preserve the recovery journal until durable cleanup is verified!
     pub fn complete_account_deletion_idempotent(
@@ -2197,32 +2236,9 @@ impl<'a> StoreWriteTx<'a> {
             }
         }
 
-        // 1. Clean `account_id` (and any already-stale non-indexed IDs) from `policy.json` FIRST and propagate any I/O failure (`?`)!
-        let policy_path = self.repo.paths.policy_file();
+        // 1. Remove from `index.json` (idempotent when already removed during an interrupted replay)
         let index_path = self.repo.paths.index_file();
-        let mut policy_saved = false;
         let mut index_saved = false;
-
-        let mut policy = self.repo.read_policy()?;
-        let known_remaining: HashSet<&str> = index
-            .account_order
-            .iter()
-            .map(String::as_str)
-            .filter(|id| *id != account_id)
-            .collect();
-        let before_cands = policy.candidate_account_ids.len();
-        policy
-            .candidate_account_ids
-            .retain(|id| id != account_id && known_remaining.contains(id.as_str()));
-        if policy.candidate_account_ids.len() != before_cands {
-            if policy.candidate_account_ids.is_empty() {
-                policy.enabled = false;
-            }
-            self.save_policy(&mut policy, None, now_unix)?;
-            policy_saved = true;
-        }
-
-        // 2. Remove from `index.json` (idempotent when already removed during an interrupted replay)
         if in_index || was_selected {
             index.account_order.retain(|id| id != account_id);
             if was_selected {
@@ -2232,52 +2248,26 @@ impl<'a> StoreWriteTx<'a> {
             index_saved = true;
         }
 
-        // During idempotent replay, visible `policy.json` / `index.json` updates after a crash or
-        // `sync_parent_dir` failure cause the branches above to be skipped; explicitly confirm
-        // parent directory durability for any skipped store file before advancing!
-        if idempotent_replay {
-            ensure_no_symlink_components_under(&self.repo.paths.data_dir, &policy_path)?;
+        // During idempotent replay, visible `index.json` updates after a crash or `sync_parent_dir`
+        // failure cause the branch above to be skipped; explicitly confirm parent directory
+        // durability before advancing!
+        if idempotent_replay && !index_saved {
             ensure_no_symlink_components_under(&self.repo.paths.data_dir, &index_path)?;
-            let policy_exists = match fs::symlink_metadata(&policy_path) {
-                Ok(m) if m.file_type().is_file() => true,
-                Ok(_) => {
-                    return Err(CliError::data(format!(
-                        "Policy file '{}' is not a regular file.",
-                        policy_path.display()
-                    )));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                Err(e) => {
-                    return Err(map_io_error(
-                        e,
-                        &format!("Cannot inspect policy file '{}'", policy_path.display()),
-                    ));
-                }
-            };
-            let mut unconfirmed_targets: Vec<&Path> = Vec::new();
-            if policy_exists && !policy_saved {
-                unconfirmed_targets.push(&policy_path);
-            }
-            if !index_saved {
-                unconfirmed_targets.push(&index_path);
-            }
-            if !unconfirmed_targets.is_empty() {
-                confirm_dir_entries_durable_under(
-                    &self.repo.paths.data_dir,
-                    &self.repo.paths.data_dir,
-                    &unconfirmed_targets,
-                )?;
-            }
+            confirm_dir_entries_durable_under(
+                &self.repo.paths.data_dir,
+                &self.repo.paths.data_dir,
+                &[&index_path],
+            )?;
         }
 
-        // 3. Durably remove `accounts/<id>.json` AND fsync `accounts/` parent directory (propagating all errors!)
+        // 2. Durably remove `accounts/<id>.json` AND fsync `accounts/` parent directory (propagating all errors!)
         let _ = remove_regular_file_durable_under(
             &self.repo.paths.data_dir,
             &acc_path,
             "account file",
         )?;
 
-        // 4. Durably remove overflow `state/token_lineage/<id>.json` AND fsync `token_lineage/` parent directory
+        // 3. Durably remove overflow `state/token_lineage/<id>.json` AND fsync `token_lineage/` parent directory
         let _ = remove_regular_file_durable_under(
             &self.repo.paths.data_dir,
             &lineage_path,
@@ -2285,37 +2275,6 @@ impl<'a> StoreWriteTx<'a> {
         )?;
 
         Ok(was_selected)
-    }
-
-    pub fn save_policy(
-        &self,
-        policy: &mut SwitchPolicy,
-        expected_revision: Option<u64>,
-        now_unix: i64,
-    ) -> CliResult<SwitchPolicy> {
-        let current = self.repo.read_policy()?;
-        if let Some(expected) = expected_revision {
-            if current.revision != expected {
-                return Err(CliError::conflict(
-                    "policy_revision_conflict",
-                    format!(
-                        "Policy changed concurrently (expected revision {expected}, found {}). Reload and retry.",
-                        current.revision
-                    ),
-                ));
-            }
-        }
-        let index = self.load_index_or_init(now_unix)?;
-        let known_ids: HashSet<String> = index.account_order.into_iter().collect();
-        policy.validate(Some(&known_ids)).map_err(CliError::usage)?;
-
-        policy.schema_version = STORE_SCHEMA_VERSION;
-        policy.revision = current.revision.saturating_add(1);
-        policy.updated_at = now_unix;
-        let bytes = serde_json::to_vec_pretty(policy)
-            .map_err(|_| CliError::data("Failed to serialize policy.json."))?;
-        write_atomic_durable(&self.repo.paths.policy_file(), &bytes)?;
-        Ok(policy.clone())
     }
 }
 

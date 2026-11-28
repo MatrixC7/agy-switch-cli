@@ -7,8 +7,6 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct HeadlessPaths {
     pub home_dir: PathBuf,
-    /// User XDG configuration base (`$XDG_CONFIG_HOME` or `~/.config`) for user service unit installation
-    pub config_dir: PathBuf,
     /// Independent versioned store (`~/.local/share/agy-switch-cli`, 0700)
     pub data_dir: PathBuf,
     /// User-global lock and cache scope (`~/.cache/agy-switch-cli`, 0700), never overridden by `--data-dir`
@@ -22,10 +20,6 @@ pub struct HeadlessPaths {
 impl HeadlessPaths {
     pub fn resolve(explicit_data_dir: Option<&Path>) -> CliResult<Self> {
         let home_dir = resolve_home_dir()?;
-        let config_dir = match non_empty_env_path("XDG_CONFIG_HOME") {
-            Some(xdg_cfg) if xdg_cfg.is_absolute() => normalize_components(&xdg_cfg),
-            _ => home_dir.join(".config"),
-        };
         let data_dir = if let Some(explicit) = explicit_data_dir {
             if crate::error::path_looks_like_accidental_secret(explicit) {
                 return Err(CliError::usage(
@@ -52,7 +46,6 @@ impl HeadlessPaths {
 
         Ok(Self {
             home_dir,
-            config_dir,
             data_dir,
             cache_dir,
             active_slot_dir,
@@ -61,25 +54,15 @@ impl HeadlessPaths {
     }
 
     pub fn with_explicit(home_dir: PathBuf, data_dir: PathBuf, cache_dir: PathBuf) -> Self {
-        let config_dir = home_dir.join(".config");
         let active_slot_dir = home_dir.join(".gemini").join("antigravity-cli");
         let active_slot_file = active_slot_dir.join("antigravity-oauth-token");
         Self {
             home_dir,
-            config_dir,
             data_dir,
             cache_dir,
             active_slot_dir,
             active_slot_file,
         }
-    }
-
-    pub fn systemd_user_dir(&self) -> PathBuf {
-        self.config_dir.join("systemd").join("user")
-    }
-
-    pub fn systemd_user_unit_file(&self) -> PathBuf {
-        self.systemd_user_dir().join("agy-switch-cli.service")
     }
 
     pub fn index_file(&self) -> PathBuf {
@@ -94,10 +77,6 @@ impl HeadlessPaths {
         self.accounts_dir().join(format!("{id}.json"))
     }
 
-    pub fn policy_file(&self) -> PathBuf {
-        self.data_dir.join("policy.json")
-    }
-
     pub fn config_file(&self) -> PathBuf {
         self.data_dir.join("config.json")
     }
@@ -108,10 +87,6 @@ impl HeadlessPaths {
 
     pub fn switch_journal_file(&self) -> PathBuf {
         self.state_dir().join("switch_journal.json")
-    }
-
-    pub fn daemon_state_file(&self) -> PathBuf {
-        self.state_dir().join("daemon_state.json")
     }
 
     pub fn auth_sequence_file(&self) -> PathBuf {
@@ -153,10 +128,6 @@ impl HeadlessPaths {
 
     pub fn store_lock_file(&self) -> PathBuf {
         self.store_locks_dir().join("store.lock")
-    }
-
-    pub fn daemon_lock_file(&self) -> PathBuf {
-        self.store_locks_dir().join("daemon.lock")
     }
 
     pub fn account_refresh_lock_file(&self, account_id: &str) -> PathBuf {

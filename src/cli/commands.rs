@@ -6,10 +6,8 @@ use crate::cli::secret_input::{
 };
 use crate::domain::account::{AccountRecord, DisableReasonCode};
 use crate::domain::clock::{Clock, SystemClock};
-use crate::domain::policy::{PolicyMode, PolicyStrategy};
 use crate::domain::quota::{
-    evaluate_account_quota, is_tier_only_placeholder, QuotaEval, QuotaObservation, QuotaSourceEnv,
-    DEFAULT_QUOTA_MAX_AGE_SECS,
+    evaluate_account_quota, is_empty_quota_placeholder, QuotaEval, DEFAULT_QUOTA_MAX_AGE_SECS,
 };
 use crate::domain::token::TokenRecord;
 use crate::error::{CliError, CliResult, ExitCode};
@@ -24,9 +22,7 @@ use crate::oauth::refresh::{
 };
 use crate::oauth::registry::OAuthClientRegistry;
 use crate::paths::HeadlessPaths;
-use crate::quota::official_cli::{
-    refresh_active_slot_quota_via_official_cli_with_proxy, SystemOfficialCliRunner,
-};
+use crate::quota::official_cli::refresh_active_slot_quota_via_official_cli_with_proxy;
 use crate::session::backend::{
     detect_dbus_session_socket_warning, read_local_active_session_token,
     resolve_credential_backend_with_config, validate_backend_choice, BackendChoice,
@@ -38,28 +34,16 @@ use crate::session::journal::{
 };
 use crate::session::payload::{resolve_session_identity, ExtractedSessionToken};
 use crate::session::process::observe_runtime_state;
-use crate::store::locks::{
-    probe_daemon_lock_readonly, with_account_refresh_lock, DaemonInstanceLock,
-};
+use crate::store::locks::with_account_refresh_lock;
 use crate::store::repository::StoreRepository;
 use crate::store::transfer::{
     export_transfer_bundle_file, import_from_legacy_dir, import_transfer_bundle_file,
-};
-use crate::switching::daemon::{
-    build_daemon_runtime_status, format_local_ts as format_daemon_local_ts,
-    read_daemon_state_readonly, repair_or_clear_daemon_state_in_tx, reset_daemon_cooldown,
-    run_foreground_daemon_with_shutdown, spawn_shutdown_signal_watcher, DaemonConfigOverrides,
-    DaemonPolicyOverlay, DEFAULT_DAEMON_COOLDOWN_SECS, DEFAULT_DAEMON_INTERVAL_SECS,
 };
 use crate::switching::executor::{
     execute_account_delete, execute_switch_with_idle_policy, format_validation_blocked_warning,
     preview_switch_dry_run, slot_matches_selected_rotated_account, SwitchOptions,
 };
-use crate::switching::runner::{ordered_candidate_ids, run_managed_agy};
-use crate::switching::systemd::{
-    install_systemd_user_service_with_reset, probe_systemd_user_service_readonly,
-    uninstall_systemd_user_service, DaemonServiceInstallOptions,
-};
+use crate::switching::runner::run_managed_agy;
 use crate::transport::client::{HttpTransport, ReqwestTransport};
 use crate::transport::proxy::{ProxyMode, SubprocessProxyOverride};
 use crate::transport::user_agent::{
@@ -67,7 +51,6 @@ use crate::transport::user_agent::{
     LocalAntigravityAppProbeOutcome, CLI_PKG_VERSION,
 };
 use serde::Serialize;
-use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -84,10 +67,6 @@ fn command_uses_backend(cmd: &Commands) -> bool {
         }
         Commands::Accounts(AccountsCommand::Export(_)) => false,
         Commands::Quota(args) => args.refresh,
-        Commands::Policy(PolicyCommand::Show | PolicyCommand::Eval) => false,
-        Commands::Daemon(args) => {
-            !(args.install || args.uninstall || (args.reset_cooldown && !args.once))
-        }
         Commands::Stats(_) => false,
         _ => true,
     }
@@ -811,8 +790,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
 
             // Read snapshot (strictly zero network & zero disk writes when `args.refresh == false`)
             let snap = repo.read_snapshot()?;
-            let policy = repo.read_policy()?;
-            let monitored_model = policy.monitored_model.as_str();
+            let monitored_model = "all";
             if args.all {
                 let items: Vec<serde_json::Value> = snap
                     .accounts
@@ -829,7 +807,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                             "email": acc.email,
                             "monitored_model": monitored_model,
                             "evaluation": eval,
-                            "quota": acc.quota.as_ref().filter(|q| !is_tier_only_placeholder(q)).map(QuotaViewDto::from_observation),
+                            "quota": acc.quota.as_ref().filter(|q| !is_empty_quota_placeholder(q)).map(QuotaViewDto::from_observation),
                         })
                     })
                     .collect();
@@ -851,7 +829,11 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
                             effective_now,
                             DEFAULT_QUOTA_MAX_AGE_SECS,
                         );
-                        match acc.quota.as_ref().filter(|q| !is_tier_only_placeholder(q)) {
+                        match acc
+                            .quota
+                            .as_ref()
+                            .filter(|q| !is_empty_quota_placeholder(q))
+                        {
                             Some(q) => println!(
                                 "{}",
                                 QuotaViewDto::from_observation(q).human_multiline_at(
@@ -893,7 +875,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             let Some(q_obs) = target
                 .quota
                 .as_ref()
-                .filter(|q| !is_tier_only_placeholder(q))
+                .filter(|q| !is_empty_quota_placeholder(q))
             else {
                 return Err(CliError::quota_unavailable(
                     "no_cached_quota",
@@ -1051,507 +1033,7 @@ pub async fn dispatch(cli: Cli) -> CliResult<i32> {
             Ok(ExitCode::Ok.as_i32())
         }
 
-        // ==================== 6. POLICY & DAEMON ====================
-        Commands::Policy(PolicyCommand::Show) => {
-            // Strictly read-only
-            let policy = repo.read_policy()?;
-            if cli.json {
-                print_json(&serde_json::json!({ "policy": policy }))?;
-            } else {
-                let snap_opt = repo.read_snapshot().ok();
-                println!(
-                    "Auto-switch : {}",
-                    if policy.enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
-                println!("Mode        : {:?}", policy.mode);
-                println!("Strategy    : {:?}", policy.strategy);
-                println!(
-                    "Thresholds  : reserve {}%  /  candidate minimum {}%",
-                    policy.reserve_percentage, policy.candidate_min_percentage
-                );
-                println!("Model scope : {}", terminal_text(&policy.monitored_model));
-                if policy.candidate_account_ids.is_empty() {
-                    println!("Candidates  : (none configured)");
-                } else {
-                    println!(
-                        "Candidates  : {} configured",
-                        policy.candidate_account_ids.len()
-                    );
-                    for (idx, cid) in policy.candidate_account_ids.iter().enumerate() {
-                        let email_label = snap_opt
-                            .as_ref()
-                            .and_then(|s| s.accounts.iter().find(|a| &a.id == cid))
-                            .map(|a| {
-                                format!("{}  ({})", terminal_text(&a.email), terminal_text(cid))
-                            })
-                            .unwrap_or_else(|| terminal_text(cid));
-                        println!("  {}. {}", idx + 1, email_label);
-                    }
-                }
-            }
-            Ok(ExitCode::Ok.as_i32())
-        }
-        Commands::Policy(PolicyCommand::Set(args)) => {
-            reconcile_pending_journal_before_write(&repo, backend, now_unix)?;
-            let snap = repo.read_snapshot()?;
-            let mut policy = repo.read_policy()?;
-            let prev_rev = policy.revision;
-
-            if let Some(en) = args.enabled {
-                policy.enabled = en;
-            }
-            if let Some(st) = args.strategy {
-                policy.strategy = match st {
-                    CliStrategy::Priority => PolicyStrategy::Priority,
-                    CliStrategy::RoundRobin => PolicyStrategy::RoundRobin,
-                };
-            }
-            if let Some(m) = args.mode {
-                policy.mode = match m {
-                    CliMode::Immediate => PolicyMode::Immediate,
-                    CliMode::Wait => PolicyMode::Wait,
-                };
-            }
-            if let Some(r) = args.reserve {
-                policy.reserve_percentage = r;
-            }
-            if let Some(min) = args.minimum {
-                policy.candidate_min_percentage = min;
-            }
-            if let Some(ref model) = args.model {
-                policy.monitored_model = model.clone();
-            }
-            if args.clear_candidates {
-                policy.candidate_account_ids.clear();
-            } else if args.all_candidates {
-                let all_enabled: Vec<String> = snap
-                    .accounts
-                    .iter()
-                    .filter(|a| !a.disabled)
-                    .map(|a| a.id.clone())
-                    .collect();
-                if all_enabled.is_empty() {
-                    return Err(CliError::usage(
-                        "No enabled accounts available for `--all-candidates`.",
-                    ));
-                }
-                policy.candidate_account_ids = all_enabled;
-            } else if let Some(ref raw_cands) = args.candidates {
-                let mut resolved = Vec::with_capacity(raw_cands.len());
-                for sel in raw_cands {
-                    resolved.push(snap.select(sel)?.id.clone());
-                }
-                policy.candidate_account_ids = resolved;
-            }
-
-            let mut daemon_pause_err: Option<CliError> = None;
-            let saved = repo.with_write_lock(|tx| {
-                let out = tx.save_policy(&mut policy, Some(prev_rev), now_unix)?;
-                if let Err(err) = repair_or_clear_daemon_state_in_tx(tx.paths(), now_unix) {
-                    daemon_pause_err = Some(err);
-                }
-                Ok(out)
-            })?;
-            if let Some(pause_err) = daemon_pause_err {
-                return Err(CliError::partial_commit(
-                    "daemon_pause_clear_failed",
-                    format!(
-                        "Saved policy (revision {}), but failed to durably clear daemon failure pause in `daemon_state.json` ({}). Daemon remains paused.",
-                        saved.revision, pause_err.message
-                    ),
-                ));
-            }
-
-            if cli.json {
-                print_json(&serde_json::json!({ "policy": saved }))?;
-            } else {
-                println!(
-                    "Saved policy (revision {}, {} candidate(s)).",
-                    saved.revision,
-                    saved.candidate_account_ids.len()
-                );
-            }
-            Ok(ExitCode::Ok.as_i32())
-        }
-        Commands::Policy(PolicyCommand::Order { selectors }) => {
-            reconcile_pending_journal_before_write(&repo, backend, now_unix)?;
-            let snap = repo.read_snapshot()?;
-            let mut policy = repo.read_policy()?;
-            let prev_rev = policy.revision;
-
-            let mut resolved = Vec::with_capacity(selectors.len());
-            for sel in selectors {
-                resolved.push(snap.select(sel)?.id.clone());
-            }
-
-            if resolved.len() != policy.candidate_account_ids.len() {
-                return Err(CliError::usage(format!(
-                    "`policy order` requires every configured candidate account exactly once (expected {}, got {}).",
-                    policy.candidate_account_ids.len(),
-                    resolved.len()
-                )));
-            }
-            let existing: HashSet<&str> = policy
-                .candidate_account_ids
-                .iter()
-                .map(String::as_str)
-                .collect();
-            let mut seen = HashSet::new();
-            for id in &resolved {
-                if !existing.contains(id.as_str()) {
-                    return Err(CliError::usage(format!(
-                        "Account '{id}' is not in the current policy candidate list."
-                    )));
-                }
-                if !seen.insert(id.as_str()) {
-                    return Err(CliError::usage(format!(
-                        "Duplicate candidate '{id}' in `policy order`."
-                    )));
-                }
-            }
-            policy.candidate_account_ids = resolved;
-            let mut daemon_pause_err: Option<CliError> = None;
-            let saved = repo.with_write_lock(|tx| {
-                let out = tx.save_policy(&mut policy, Some(prev_rev), now_unix)?;
-                if let Err(err) = repair_or_clear_daemon_state_in_tx(tx.paths(), now_unix) {
-                    daemon_pause_err = Some(err);
-                }
-                Ok(out)
-            })?;
-            if let Some(pause_err) = daemon_pause_err {
-                return Err(CliError::partial_commit(
-                    "daemon_pause_clear_failed",
-                    format!(
-                        "Saved policy (revision {}), but failed to durably clear daemon failure pause in `daemon_state.json` ({}). Daemon remains paused.",
-                        saved.revision, pause_err.message
-                    ),
-                ));
-            }
-            if cli.json {
-                print_json(&serde_json::json!({ "policy": saved }))?;
-            } else {
-                println!(
-                    "Updated policy candidate order (revision {}).",
-                    saved.revision
-                );
-            }
-            Ok(ExitCode::Ok.as_i32())
-        }
-        Commands::Policy(PolicyCommand::Eval) => {
-            // Strictly read-only dry-run evaluation
-            let snap = repo.read_snapshot()?;
-            let policy = repo.read_policy()?;
-            let dstate = read_daemon_state_readonly(&paths)?;
-
-            let source_acc = snap.selected_account();
-            let source_eval = source_acc.map(|acc| {
-                evaluate_account_quota(
-                    acc,
-                    &policy.monitored_model,
-                    now_unix,
-                    DEFAULT_QUOTA_MAX_AGE_SECS,
-                )
-            });
-
-            let src_id_str = source_acc.map(|a| a.id.as_str()).unwrap_or("");
-            let ordered = ordered_candidate_ids(
-                &policy.candidate_account_ids,
-                src_id_str,
-                policy.strategy,
-                dstate.last_rotated_candidate_id.as_deref(),
-            );
-
-            let mut cand_dtos = Vec::new();
-            let mut first_qualified: Option<String> = None;
-
-            for cid in ordered {
-                if let Some(cacc) = snap.accounts.iter().find(|a| a.id == cid) {
-                    let ceval = evaluate_account_quota(
-                        cacc,
-                        &policy.monitored_model,
-                        now_unix,
-                        DEFAULT_QUOTA_MAX_AGE_SECS,
-                    );
-                    let qualified = matches!(
-                        ceval,
-                        QuotaEval::Known { remaining_percentage } if remaining_percentage >= policy.candidate_min_percentage as f64
-                    );
-                    if qualified && first_qualified.is_none() {
-                        first_qualified = Some(cacc.id.clone());
-                    }
-                    cand_dtos.push(PolicyEvalCandidateDto {
-                        id: cacc.id.clone(),
-                        email: cacc.email.clone(),
-                        evaluation: ceval,
-                        qualified,
-                    });
-                }
-            }
-
-            let (would_switch, recommended_target_id, decision_reason) =
-                match (&source_eval, &first_qualified) {
-                    (None, _) => (false, None, "no_selected_account".into()),
-                    (
-                        Some(QuotaEval::Known {
-                            remaining_percentage,
-                        }),
-                        _,
-                    ) if *remaining_percentage > policy.reserve_percentage as f64 => {
-                        (false, None, "source_quota_above_reserve".into())
-                    }
-                    (Some(QuotaEval::Known { .. }), Some(tid)) => {
-                        if !policy.enabled {
-                            (
-                                false,
-                                Some(tid.clone()),
-                                "policy_disabled_would_select_candidate".into(),
-                            )
-                        } else {
-                            (
-                                true,
-                                Some(tid.clone()),
-                                "source_below_reserve_and_candidate_qualified".into(),
-                            )
-                        }
-                    }
-                    (Some(QuotaEval::Known { .. }), None) => (
-                        false,
-                        None,
-                        "source_below_reserve_but_no_qualified_candidate".into(),
-                    ),
-                    (Some(QuotaEval::Stale { reason }), _) => {
-                        (false, None, format!("hold_source_stale:{reason}"))
-                    }
-                    (Some(QuotaEval::Unknown { reason }), _) => {
-                        (false, None, format!("hold_source_unknown:{reason}"))
-                    }
-                    (Some(QuotaEval::Unavailable { reason }), _) => {
-                        (false, None, format!("hold_source_unavailable:{reason}"))
-                    }
-                };
-
-            let eval_view = PolicyEvalViewDto {
-                policy,
-                source_account_id: source_acc.map(|a| a.id.clone()),
-                source_evaluation: source_eval,
-                would_switch,
-                recommended_target_id,
-                decision_reason,
-                candidates: cand_dtos,
-            };
-
-            if cli.json {
-                print_json(&serde_json::json!({ "evaluation": eval_view }))?;
-            } else {
-                println!(
-                    "Policy eval: would_switch={} target={:?} reason={}",
-                    eval_view.would_switch,
-                    eval_view.recommended_target_id,
-                    terminal_text(&eval_view.decision_reason)
-                );
-            }
-            Ok(ExitCode::Ok.as_i32())
-        }
-        Commands::Daemon(args) => {
-            let has_temp_policy_flags = args.mode.is_some()
-                || args.strategy.is_some()
-                || args.reserve.is_some()
-                || args.minimum.is_some()
-                || args.model.is_some();
-            if args.install {
-                if has_temp_policy_flags {
-                    return Err(CliError::usage(
-                        "Policy flags (`--mode`, `--strategy`, `--reserve`, `--minimum`, `--model`) are single-run in-memory overrides; persist them with `agy-switch-cli policy set ...` first, then run `agy-switch-cli daemon --install`.",
-                    ));
-                }
-                if cli.proxy.is_some() {
-                    return Err(CliError::usage(
-                        "`--proxy` is a single-run override and is not written into the systemd unit file. Persist `network.proxy_url` in `config.json` (0600) first, then run `agy-switch-cli daemon --install`.",
-                    ));
-                }
-                let has_env_backend = std::env::var_os("AGY_SWITCH_CLI_BACKEND").is_some();
-                let explicit_backend = if cli.backend.is_some() || has_env_backend {
-                    Some(validate_backend_choice(cli.backend.as_deref(), None)?)
-                } else {
-                    None
-                };
-                let outcome = install_systemd_user_service_with_reset(
-                    &paths,
-                    &DaemonServiceInstallOptions {
-                        explicit_interval_secs: args.interval,
-                        explicit_cooldown_secs: args.cooldown,
-                        explicit_backend,
-                        explicit_no_notify: args.no_notify,
-                    },
-                    args.reset_cooldown,
-                )
-                .await?;
-                if cli.json {
-                    print_json(&outcome)?;
-                } else {
-                    if outcome.enabled_and_started {
-                        println!(
-                            "Installed and started user service `{}`.",
-                            outcome.service_name
-                        );
-                    } else {
-                        println!(
-                            "Installed and enabled user service `{}` (currently `{}`; inspect progress with `agy-switch-cli status` or `journalctl --user -u {}`).",
-                            outcome.service_name,
-                            outcome.active_state,
-                            outcome.service_name
-                        );
-                    }
-                    println!(
-                        "  Unit file : {}",
-                        terminal_text(&outcome.unit_path.to_string_lossy())
-                    );
-                    println!("  ExecStart : {}", terminal_text(&outcome.exec_start));
-                    if outcome.cooldown_reset == Some(true) {
-                        if outcome.cooldown_was_active == Some(true) {
-                            let prev = outcome.previous_cooldown_until.unwrap_or(0);
-                            println!(
-                                "  Cooldown  : cleared (was active until {})",
-                                format_daemon_local_ts(prev)
-                            );
-                        } else {
-                            println!("  Cooldown  : cleared (no active cooldown)");
-                        }
-                    }
-                    println!(
-                        "  Status    : systemctl --user status {}",
-                        outcome.service_name
-                    );
-                    println!(
-                        "  Logs      : journalctl --user -u {} -f",
-                        outcome.service_name
-                    );
-                    println!(
-                        "  SSH note  : Run `{}` on remote servers so the user service stays running after SSH logout.",
-                        outcome.linger_hint
-                    );
-                }
-                return Ok(ExitCode::Ok.as_i32());
-            }
-            if args.uninstall {
-                if has_temp_policy_flags
-                    || cli.proxy.is_some()
-                    || args.no_notify
-                    || args.reset_cooldown
-                {
-                    return Err(CliError::usage(
-                        "Policy, `--proxy`, `--no-notify`, or `--reset-cooldown` flags cannot be combined with `daemon --uninstall`.",
-                    ));
-                }
-                let outcome = uninstall_systemd_user_service(&paths).await?;
-                if cli.json {
-                    print_json(&outcome)?;
-                } else if outcome.removed_unit_file {
-                    println!(
-                        "Removed user service `{}` ({}).",
-                        outcome.service_name,
-                        terminal_text(&outcome.unit_path.to_string_lossy())
-                    );
-                } else {
-                    println!(
-                        "User service `{}` is already uninstalled ({} not present).",
-                        outcome.service_name,
-                        terminal_text(&outcome.unit_path.to_string_lossy())
-                    );
-                }
-                return Ok(ExitCode::Ok.as_i32());
-            }
-            if args.reset_cooldown && !args.once {
-                let has_explicit_interval = args.interval.is_some() && !args.interval_from_env;
-                let has_explicit_cooldown = args.cooldown.is_some() && !args.cooldown_from_env;
-                if has_temp_policy_flags
-                    || has_explicit_interval
-                    || has_explicit_cooldown
-                    || args.no_notify
-                    || cli.proxy.is_some()
-                {
-                    return Err(CliError::usage(
-                        "Standalone `daemon --reset-cooldown` only clears the persisted cooldown and cannot be combined with runtime override flags (`--interval`, `--cooldown`, `--no-notify`, `--mode`, `--strategy`, `--reserve`, `--minimum`, `--model`, `--proxy`). Add `--once` to run a single tick immediately or `--install` to update the systemd service.",
-                    ));
-                }
-                let outcome = reset_daemon_cooldown(&repo, now_unix)?;
-                if cli.json {
-                    print_json(&outcome)?;
-                } else if outcome.cooldown_was_active {
-                    println!(
-                        "Cleared active daemon cooldown (was active until {}).",
-                        format_daemon_local_ts(outcome.previous_cooldown_until)
-                    );
-                } else {
-                    println!("No active daemon cooldown to clear.");
-                }
-                return Ok(ExitCode::Ok.as_i32());
-            }
-
-            let interval_secs = args.interval.unwrap_or(DEFAULT_DAEMON_INTERVAL_SECS);
-            let cooldown_secs = args.cooldown.unwrap_or(DEFAULT_DAEMON_COOLDOWN_SECS);
-            if interval_secs == 0 {
-                return Err(CliError::usage("`--interval` must be at least 1 second."));
-            }
-            if cooldown_secs < 0 {
-                return Err(CliError::usage("`--cooldown` must be >= 0 seconds."));
-            }
-
-            let shutdown_rx = spawn_shutdown_signal_watcher();
-            let registry = OAuthClientRegistry::load(&paths)?;
-            let policy_overlay = DaemonPolicyOverlay {
-                mode: args.mode.map(|m| match m {
-                    CliMode::Immediate => PolicyMode::Immediate,
-                    CliMode::Wait => PolicyMode::Wait,
-                }),
-                strategy: args.strategy.map(|s| match s {
-                    CliStrategy::Priority => PolicyStrategy::Priority,
-                    CliStrategy::RoundRobin => PolicyStrategy::RoundRobin,
-                }),
-                reserve_percentage: args.reserve,
-                candidate_min_percentage: args.minimum,
-                monitored_model: args.model.clone(),
-            };
-            let notify_override = if args.no_notify {
-                Some(false)
-            } else {
-                crate::switching::notify::parse_notify_env_override()?
-            };
-            let cfg = repo.read_config()?;
-            let _ = SubprocessProxyOverride::resolve(cli.proxy.as_deref(), Some(&cfg.network))?;
-            let _ =
-                crate::switching::daemon::resolve_effective_daemon_policy(&repo, &policy_overlay)?;
-            let daemon_lock = DaemonInstanceLock::try_acquire(&paths)?;
-            let runner = SystemOfficialCliRunner::with_proxy(cli.proxy.clone());
-
-            run_foreground_daemon_with_shutdown(
-                daemon_lock,
-                &repo,
-                backend,
-                &runner,
-                &registry,
-                DaemonConfigOverrides {
-                    interval_secs,
-                    cooldown_secs,
-                    explicit_file_backend,
-                    once: args.once,
-                    reset_cooldown: args.reset_cooldown,
-                    json_mode: cli.json,
-                    notify_override,
-                    policy_overlay,
-                    ..DaemonConfigOverrides::default()
-                },
-                shutdown_rx,
-            )
-            .await?;
-            Ok(ExitCode::Ok.as_i32())
-        }
-
-        // ==================== 7. READ-ONLY LOCAL STATS ====================
+        // ==================== 6. READ-ONLY LOCAL STATS ====================
         Commands::Stats(sub) => {
             #[cfg(feature = "stats")]
             {
@@ -1662,12 +1144,6 @@ fn print_numbered_accounts_human(snap: &crate::store::repository::StoreSnapshot,
         } else {
             " "
         };
-        let plan = acc
-            .quota
-            .as_ref()
-            .and_then(|q| q.subscription_tier.as_deref())
-            .map(|p| format!("  [{}]", terminal_text(p)))
-            .unwrap_or_default();
         let label = acc
             .custom_label
             .as_deref()
@@ -1688,7 +1164,7 @@ fn print_numbered_accounts_human(snap: &crate::store::repository::StoreSnapshot,
         let email_clean = terminal_text(&acc.email);
         let pad = " ".repeat(email_w.saturating_sub(email_clean.chars().count()));
         println!(
-            "{:>2}. {mark} {email_clean}{pad}{plan}{label}{status_flag}  ({})",
+            "{:>2}. {mark} {email_clean}{pad}{label}{status_flag}  ({})",
             idx + 1,
             terminal_text(&acc.id)
         );
@@ -1696,9 +1172,9 @@ fn print_numbered_accounts_human(snap: &crate::store::repository::StoreSnapshot,
 }
 
 /// Purely offline local credential import (`accounts add --from-local`, Option 1B).
-/// Reads full local credential payload (`id_token` JWT email or `agy 1.5+` compact `id_token_email`
-/// plus optional `user_tier`), coordinates under `L2 -> L3`, refuses to roll back superseded
-/// historical refresh tokens, and preserves any existing cached quota on account updates.
+/// Reads full local credential payload (`id_token` JWT email or `agy 1.5+` compact `id_token_email`),
+/// coordinates under `L2 -> L3`, refuses to roll back superseded historical refresh tokens,
+/// records `last_switched_in_at` for the active slot, and preserves any existing cached quota.
 async fn import_local_session_offline(
     repo: &StoreRepository,
     extracted: ExtractedSessionToken,
@@ -1748,9 +1224,8 @@ async fn import_local_session_offline(
         project_id: None,
         is_gcp_tos: true,
     };
-    let user_tier = extracted.user_tier;
 
-    let build_new_record = |tok: TokenRecord, lbl: Option<String>, tier: Option<String>| {
+    let build_new_record = |tok: TokenRecord, lbl: Option<String>| {
         let mut rec = AccountRecord::new(
             format!("acc-{}", Uuid::new_v4().simple()),
             email.clone(),
@@ -1758,20 +1233,15 @@ async fn import_local_session_offline(
             now_unix,
         );
         rec.custom_label = lbl;
-        if let Some(t) = tier {
-            let mut placeholder = QuotaObservation::new(0, QuotaSourceEnv::OfficialCli);
-            placeholder.subscription_tier = Some(t);
-            placeholder.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
-            rec.quota = Some(placeholder);
-        }
+        rec.last_switched_in_at = Some(now_unix);
+        rec.last_used = now_unix;
         rec
     };
 
     let merge_into_existing_in_tx = |tx: &crate::store::repository::StoreWriteTx<'_>,
                                      existing_id: &str,
                                      tok: &TokenRecord,
-                                     lbl: Option<&str>,
-                                     tier: Option<&str>|
+                                     lbl: Option<&str>|
      -> CliResult<AccountRecord> {
         let mut latest = tx.load_account_opt(existing_id)?.ok_or_else(|| {
             CliError::not_found(format!(
@@ -1838,7 +1308,23 @@ async fn import_local_session_offline(
         if let Some(l) = lbl {
             latest.custom_label = Some(l.to_string());
         }
-        latest.apply_official_cli_user_tier(tier);
+        let index = tx.load_index_or_init(now_unix)?;
+        let selected_matches_or_unset = index
+            .selected_account_id
+            .as_deref()
+            .is_none_or(|sel| sel == existing_id);
+        let already_active_session = selected_matches_or_unset
+            && latest.last_switched_in_at.is_some_and(|in_at| {
+                in_at > 0
+                    && latest
+                        .last_switched_out_at
+                        .is_none_or(|out_at| in_at > out_at)
+            });
+        if !already_active_session {
+            latest.last_switched_in_at = Some(now_unix);
+        }
+        latest.last_switched_out_at = None;
+        latest.last_used = latest.last_used.max(now_unix);
         if latest.disabled
             && matches!(
                 latest.disabled_code,
@@ -1865,21 +1351,13 @@ async fn import_local_session_offline(
         if let Some(eid) = candidate_eid.take() {
             let tok_c = token.clone();
             let lbl_c = clean_label.clone();
-            let tier_c = user_tier.clone();
             let merged_opt =
                 with_account_refresh_lock(repo.paths(), &eid, Duration::from_secs(20), || async {
                     repo.with_write_lock(|tx| {
                         if tx.load_account_opt(&eid)?.is_none() {
                             return Ok(None);
                         }
-                        merge_into_existing_in_tx(
-                            tx,
-                            &eid,
-                            &tok_c,
-                            lbl_c.as_deref(),
-                            tier_c.as_deref(),
-                        )
-                        .map(Some)
+                        merge_into_existing_in_tx(tx, &eid, &tok_c, lbl_c.as_deref()).map(Some)
                     })
                 })
                 .await?;
@@ -1910,7 +1388,7 @@ async fn import_local_session_offline(
                     }
                 }
             }
-            let record = build_new_record(token.clone(), clean_label.clone(), user_tier.clone());
+            let record = build_new_record(token.clone(), clean_label.clone());
             let (saved, created) = tx.upsert_account(record, true, now_unix)?;
             Ok(FastPath::Created(Box::new((saved, created))))
         })?;
@@ -1991,7 +1469,7 @@ fn collect_current_view(
     };
     let effective_quota = model_source_acc
         .and_then(|a| a.quota.as_ref())
-        .filter(|q| !is_tier_only_placeholder(q));
+        .filter(|q| !is_empty_quota_placeholder(q));
     let supported_models = effective_quota.map(extract_supported_models);
     let group_descriptions = effective_quota
         .map(extract_quota_group_descriptions)
@@ -2033,11 +1511,6 @@ fn handle_current(
     } else {
         match &current.view.selected_account {
             Some(sel) => {
-                let plan_part = sel
-                    .subscription_tier
-                    .as_deref()
-                    .map(|t| format!("  [{}]", terminal_text(t)))
-                    .unwrap_or_default();
                 let label_part = sel
                     .custom_label
                     .as_deref()
@@ -2052,9 +1525,8 @@ fn handle_current(
                     ""
                 };
                 println!(
-                    "Selected account : {}{}{}{}  ({})",
+                    "Selected account : {}{}{}  ({})",
                     terminal_text(&sel.email),
-                    plan_part,
                     label_part,
                     flag_part,
                     terminal_text(&sel.id)
@@ -2092,7 +1564,6 @@ async fn handle_status(
 ) -> CliResult<()> {
     let paths = repo.paths();
     let snap_res = repo.read_snapshot();
-    let policy_res = repo.read_policy();
     let pending_auth_res = repo.list_pending_auth_readonly();
     let pending_auth_count = pending_auth_res.as_ref().map(|v| v.len()).unwrap_or(0);
     let mut pending_auth_warnings: Vec<String> = Vec::new();
@@ -2148,16 +1619,6 @@ async fn handle_status(
     let dbus_warning = (!backend.uses_keyring())
         .then(detect_dbus_session_socket_warning)
         .flatten();
-    let now_unix = SystemClock.now_unix();
-    let dstate_res = read_daemon_state_readonly(paths);
-    let daemon_lock_probe = probe_daemon_lock_readonly(paths);
-    let daemon_systemd_probe = probe_systemd_user_service_readonly(paths).await;
-    let daemon_runtime = build_daemon_runtime_status(
-        daemon_lock_probe,
-        &daemon_systemd_probe,
-        dstate_res.as_ref().ok(),
-        now_unix,
-    );
     let agy_probe = probe_local_agy_for_status().await;
     let app_probe = probe_local_antigravity_app_for_status();
 
@@ -2208,30 +1669,11 @@ async fn handle_status(
         .map(|(_, w)| w.clone())
         .unwrap_or_default();
 
-    let dangling_policy_candidates: Vec<String> = match (&snap_res, &policy_res) {
-        (Ok(snap), Ok(pol)) => {
-            let known: HashSet<&str> = snap
-                .index
-                .account_order
-                .iter()
-                .map(String::as_str)
-                .collect();
-            pol.candidate_account_ids
-                .iter()
-                .filter(|cid| !known.contains(cid.as_str()))
-                .cloned()
-                .collect()
-        }
-        _ => Vec::new(),
-    };
-
     let report = serde_json::json!({
         "cli_version": CLI_PKG_VERSION,
         "backend": backend.name(),
         "store_ok": store_ok,
         "store_error": snap_res.as_ref().err().map(|e| &e.message),
-        "policy_ok": policy_res.is_ok() && dangling_policy_candidates.is_empty(),
-        "policy_dangling_candidates": dangling_policy_candidates,
         "pending_auth_ok": pending_auth_res.is_ok() && pending_auth_warnings.is_empty(),
         "pending_auth_count": pending_auth_count,
         "pending_auth_error": pending_auth_res.as_ref().err().map(|e| &e.message),
@@ -2244,10 +1686,6 @@ async fn handle_status(
         "journal_status": journal_diag,
         "slot_initialized": slot_initialized,
         "slot_corrupt": slot_corrupt,
-        "daemon_state_ok": dstate_res.is_ok(),
-        "daemon_state_error": dstate_res.as_ref().err().map(|e| &e.message),
-        "daemon_paused_on_failure": dstate_res.as_ref().ok().map(|d| d.paused_on_failure),
-        "daemon_runtime": daemon_runtime,
         "dbus_keyring_warning": dbus_warning,
         "agy_probe": agy_json,
         "antigravity_app_probe": app_json,
@@ -2271,18 +1709,6 @@ async fn handle_status(
         return Err(store_err.with_details(report));
     }
 
-    if let Err(pol_err) = policy_res {
-        return Err(pol_err.with_details(report));
-    }
-
-    if !dangling_policy_candidates.is_empty() {
-        return Err(CliError::data(format!(
-            "Policy references non-existent candidate account ID(s): {:?}. Update candidates via `agy-switch-cli policy set`.",
-            dangling_policy_candidates
-        ))
-        .with_details(report));
-    }
-
     if let Err(cfg_err) = cfg_res {
         return Err(cfg_err.with_details(report));
     }
@@ -2293,10 +1719,6 @@ async fn handle_status(
 
     if let Err(lin_err) = lineage_res {
         return Err(lin_err.with_details(report));
-    }
-
-    if let Err(ds_err) = dstate_res {
-        return Err(ds_err.with_details(report));
     }
 
     if let SlotInspectState::Corrupt(detail) = slot_state {
@@ -2327,12 +1749,6 @@ async fn handle_status(
         println!("  Store status:      OK");
         println!("  Journal status:    {:?}", journal_diag);
         println!("  Slot initialized:  {}", slot_initialized);
-        if let Ok(ref ds) = dstate_res {
-            println!(
-                "  Daemon state:      {}",
-                daemon_runtime.format_human(Some(ds))
-            );
-        }
         match &agy_probe {
             LocalAgyProbeOutcome::Detected {
                 executable,
@@ -2926,8 +2342,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn synthetic_v127_offline_from_local_import_extracts_email_tier_and_guards_lineage() {
-        use crate::domain::quota::{QuotaBucket, QuotaGroup};
+    async fn synthetic_v130_offline_from_local_import_sets_switched_in_and_guards_lineage() {
+        use crate::domain::quota::{QuotaBucket, QuotaGroup, QuotaObservation, QuotaSourceEnv};
         use crate::session::payload::extract_session_token_from_bytes;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2939,7 +2355,8 @@ mod tests {
         let repo = StoreRepository::new(paths.clone());
         let now = 1_900_000_000i64;
 
-        // 1. Compact `agy 1.5+` payload (`id_token_email` + `user_tier`, no `id_token` JWT) imports purely offline!
+        // 1. Compact `agy 1.5+` payload (`id_token_email`, no `id_token` JWT) imports purely offline,
+        //    silently ignores legacy `user_tier`, and records `last_switched_in_at` / `last_used`!
         let compact_bytes = serde_json::to_vec(&serde_json::json!({
             "token": {
                 "access_token": "ya29.local-v1",
@@ -2961,13 +2378,10 @@ mod tests {
         assert_eq!(acc1.custom_label.as_deref(), Some("main"));
         assert_eq!(acc1.token.access_token, "ya29.local-v1");
         assert_eq!(acc1.token.refresh_token, "1//rt-local-v1");
-        assert_eq!(
-            acc1.quota
-                .as_ref()
-                .and_then(|q| q.subscription_tier.as_deref()),
-            Some("PRO")
-        );
-        assert!(is_tier_only_placeholder(acc1.quota.as_ref().unwrap()));
+        assert_eq!(acc1.last_switched_in_at, Some(now));
+        assert_eq!(acc1.last_switched_out_at, None);
+        assert_eq!(acc1.last_used, now);
+        assert!(acc1.quota.is_none());
         assert_eq!(
             evaluate_account_quota(&acc1, "all", now, DEFAULT_QUOTA_MAX_AGE_SECS),
             QuotaEval::Unknown {
@@ -2975,10 +2389,9 @@ mod tests {
             }
         );
 
-        // Seed real cached quota onto `acc1`, then re-import rotated local token -> preserves cached quota & advances lineage!
+        // Seed real cached quota onto `acc1`, then re-import rotated local token -> preserves cached quota,
+        // preserves original active `last_switched_in_at`, and advances lineage!
         let mut real_q = QuotaObservation::new(now - 30, QuotaSourceEnv::OfficialCli);
-        real_q.subscription_tier = Some("PRO".into());
-        real_q.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
         real_q.quota_groups = Some(vec![QuotaGroup {
             display_name: "Gemini Models".into(),
             description: None,
@@ -3013,8 +2426,7 @@ mod tests {
                 "refresh_token": "1//rt-local-v2",
                 "expiry": "2099-01-02T00:00:00Z"
             },
-            "id_token_email": "alice@example.com",
-            "user_tier": "ULTRA"
+            "id_token_email": "alice@example.com"
         }))
         .unwrap();
         let ex2 = extract_session_token_from_bytes(&rotated_bytes, "local").unwrap();
@@ -3025,13 +2437,9 @@ mod tests {
         assert_eq!(acc2.id, acc1.id);
         assert_eq!(acc2.token.refresh_token, "1//rt-local-v2");
         assert_eq!(acc2.token.access_token, "ya29.local-v2");
+        assert_eq!(acc2.last_switched_in_at, Some(now));
+        assert_eq!(acc2.last_used, now + 10);
         assert!(acc2.quota.as_ref().unwrap().quota_groups.is_some());
-        assert_eq!(
-            acc2.quota
-                .as_ref()
-                .and_then(|q| q.subscription_tier.as_deref()),
-            Some("ULTRA")
-        );
 
         // 3. Re-importing superseded `1//rt-local-v1` MUST be rejected (`stale_rotated_refresh_token`, exit 5).
         let stale_ex = extract_session_token_from_bytes(&compact_bytes, "local").unwrap();
@@ -3056,5 +2464,134 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.exit_code, ExitCode::GeneralOrDataError);
         assert!(err.message.contains("email"));
+    }
+
+    #[tokio::test]
+    async fn import_local_session_offline_clears_switched_out_and_resets_in_at_when_other_selected()
+    {
+        use crate::session::payload::extract_session_token_from_bytes;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = HeadlessPaths::with_explicit(
+            tmp.path().join("home"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+        );
+        let repo = StoreRepository::new(paths);
+        let t0 = 1_900_000_000i64;
+
+        let mk_bytes = |rt: &str, email: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "token": {
+                    "access_token": format!("ya29.{rt}"),
+                    "token_type": "Bearer",
+                    "refresh_token": rt,
+                    "expiry": "2099-01-01T00:00:00Z"
+                },
+                "id_token_email": email
+            }))
+            .unwrap()
+        };
+
+        // Seed Alice (selected initially) and Bob.
+        let (alice0, created_a) = import_local_session_offline(
+            &repo,
+            extract_session_token_from_bytes(&mk_bytes("1//rt-a1", "alice@example.com"), "local")
+                .unwrap(),
+            None,
+            None,
+            t0,
+        )
+        .await
+        .unwrap();
+        assert!(created_a);
+        assert_eq!(alice0.last_switched_in_at, Some(t0));
+        assert_eq!(alice0.last_switched_out_at, None);
+
+        let bob_rec = AccountRecord::new(
+            "acc-bob-0002".into(),
+            "bob@example.com".into(),
+            TokenRecord {
+                access_token: "ya29.b1".into(),
+                refresh_token: "1//rt-b1".into(),
+                expires_in: 3600,
+                expiry_timestamp: t0 + 3600,
+                token_type: "Bearer".into(),
+                id_token: None,
+                oauth_client_key: None,
+                granted_scopes: None,
+                project_id: None,
+                is_gcp_tos: true,
+            },
+            t0,
+        );
+        repo.with_write_lock(|tx| {
+            tx.upsert_account(bob_rec, false, t0)?;
+            // Switch Alice -> Bob at t1 = t0 + 600: Alice gets `last_switched_out_at = Some(t1)`
+            // and `selected_account_id = Some("acc-bob-0002")`.
+            tx.commit_selected_account_with_slot_owner(
+                "acc-bob-0002",
+                Some(Some(&alice0.id)),
+                t0 + 600,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let alice_dormant = repo.read_account_unchecked(&alice0.id).unwrap();
+        assert_eq!(alice_dormant.last_switched_in_at, Some(t0));
+        assert_eq!(alice_dormant.last_switched_out_at, Some(t0 + 600));
+
+        // 1. Re-importing Alice from local slot at the EXACT same second `t0 + 600` MUST clear
+        //    stale `last_switched_out_at` and start a fresh `last_switched_in_at = Some(t0 + 600)`.
+        let (alice1, created_a1) = import_local_session_offline(
+            &repo,
+            extract_session_token_from_bytes(&mk_bytes("1//rt-a2", "alice@example.com"), "local")
+                .unwrap(),
+            None,
+            None,
+            t0 + 600,
+        )
+        .await
+        .unwrap();
+        assert!(!created_a1);
+        assert_eq!(alice1.last_switched_in_at, Some(t0 + 600));
+        assert_eq!(alice1.last_switched_out_at, None);
+
+        // 2. While `selected_account_id` is STILL Bob (NOT Alice), externally re-importing Alice
+        //    later at `t0 + 1800` MUST reset `last_switched_in_at = Some(t0 + 1800)` instead of
+        //    treating Alice as continuously active while Bob was selected!
+        let (alice2, created_a2) = import_local_session_offline(
+            &repo,
+            extract_session_token_from_bytes(&mk_bytes("1//rt-a3", "alice@example.com"), "local")
+                .unwrap(),
+            None,
+            None,
+            t0 + 1800,
+        )
+        .await
+        .unwrap();
+        assert!(!created_a2);
+        assert_eq!(alice2.last_switched_in_at, Some(t0 + 1800));
+        assert_eq!(alice2.last_switched_out_at, None);
+
+        // 3. Once Alice IS selected (matching `index.selected_account_id`), re-importing Alice at
+        //    `t0 + 2400` preserves her active `last_switched_in_at` and keeps `last_switched_out_at = None`.
+        repo.with_write_lock(|tx| {
+            tx.commit_selected_account_with_slot_owner(&alice0.id, None, t0 + 2000)?;
+            Ok(())
+        })
+        .unwrap();
+        let (alice3, _) = import_local_session_offline(
+            &repo,
+            extract_session_token_from_bytes(&mk_bytes("1//rt-a4", "alice@example.com"), "local")
+                .unwrap(),
+            None,
+            None,
+            t0 + 2400,
+        )
+        .await
+        .unwrap();
+        assert_eq!(alice3.last_switched_in_at, Some(t0 + 2000));
+        assert_eq!(alice3.last_switched_out_at, None);
     }
 }

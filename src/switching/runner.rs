@@ -1,7 +1,6 @@
 use crate::cli::dto::terminal_text;
 use crate::domain::account::{AccountRecord, DisableReasonCode, RuntimeState};
 use crate::domain::clock::{AnchoredClock, Clock};
-use crate::domain::policy::PolicyStrategy;
 use crate::error::{CliError, CliResult};
 use crate::oauth::refresh::persist_disable_or_report_io_error;
 use crate::oauth::registry::OAuthClientRegistry;
@@ -98,7 +97,7 @@ pub async fn run_managed_agy(
     if target_validation_blocked {
         let safe_id = terminal_text(&active_account_id);
         eprintln!(
-            "Note: account `{safe_id}` is currently marked verification-required (`verify-blocked`) and remains excluded from daemon auto-switching. Complete Google verification in `agy`, then run `agy-switch-cli refresh` (or `agy-switch-cli quota --refresh`) to clear this status."
+            "Note: account `{safe_id}` is currently marked verification-required (`verify-blocked`). Complete Google verification in `agy`, then run `agy-switch-cli refresh` (or `agy-switch-cli quota --refresh`) to clear this status."
         );
     }
 
@@ -299,35 +298,4 @@ fn ensure_no_conflicting_managed_session(
         }
     }
     Ok(())
-}
-
-pub fn ordered_candidate_ids(
-    candidates: &[String],
-    source_id: &str,
-    strategy: PolicyStrategy,
-    last_rotated_cursor: Option<&str>,
-) -> Vec<String> {
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-    let start_idx = match strategy {
-        PolicyStrategy::Priority => 0,
-        PolicyStrategy::RoundRobin => {
-            let pivot = last_rotated_cursor.unwrap_or(source_id);
-            candidates
-                .iter()
-                .position(|id| id == pivot)
-                .map(|idx| (idx + 1) % candidates.len())
-                .unwrap_or(0)
-        }
-    };
-
-    let mut out = Vec::with_capacity(candidates.len());
-    for offset in 0..candidates.len() {
-        let id = &candidates[(start_idx + offset) % candidates.len()];
-        if id != source_id && !out.contains(id) {
-            out.push(id.clone());
-        }
-    }
-    out
 }

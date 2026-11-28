@@ -500,11 +500,9 @@ pub async fn import_from_legacy_dir(
             } else {
                 now_unix
             },
-            last_used: if leg.last_used > 0 {
-                leg.last_used
-            } else {
-                now_unix
-            },
+            last_used: if leg.last_used > 0 { leg.last_used } else { 0 },
+            last_switched_in_at: None,
+            last_switched_out_at: None,
         };
 
         let cand_id = summary.id.clone();

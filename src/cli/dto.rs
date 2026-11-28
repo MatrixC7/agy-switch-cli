@@ -1,7 +1,6 @@
 use crate::domain::account::{
     AccountRecord, DisableReasonCode, RuntimeState, SessionIdentity, STORE_SCHEMA_VERSION,
 };
-use crate::domain::policy::SwitchPolicy;
 use crate::domain::quota::{
     is_unused_full_bucket_reset_time, observed_quota_percentage, quota_pool, ModelQuota,
     QuotaBucket, QuotaEval, QuotaGroup, QuotaObservation, QuotaPool, QuotaSourceEnv,
@@ -62,6 +61,10 @@ pub struct AccountViewDto {
     pub granted_scopes: Option<Vec<String>>,
     pub last_used: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_switched_in_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_switched_out_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<QuotaViewDto>,
 }
 
@@ -88,6 +91,8 @@ impl AccountViewDto {
             scopes_known: rec.token.granted_scopes.is_some(),
             granted_scopes: rec.token.granted_scopes.clone(),
             last_used: rec.last_used,
+            last_switched_in_at: rec.last_switched_in_at,
+            last_switched_out_at: rec.last_switched_out_at,
             quota: rec.quota.as_ref().map(QuotaViewDto::from_observation),
         }
     }
@@ -127,8 +132,6 @@ pub struct QuotaViewDto {
     pub source_env: QuotaSourceEnv,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_source_env: Option<QuotaSourceEnv>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subscription_tier: Option<String>,
     pub is_forbidden: bool,
     pub models: Vec<ModelViewDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -193,7 +196,6 @@ impl QuotaViewDto {
             last_updated: obs.last_updated,
             source_env: obs.source_env,
             summary_source_env: obs.summary_source_env,
-            subscription_tier: obs.subscription_tier.clone(),
             is_forbidden: obs.is_forbidden,
             models: obs.models.iter().map(ModelViewDto::from_model).collect(),
             quota_groups: obs
@@ -226,18 +228,9 @@ impl QuotaViewDto {
         eval_ctx: Option<(&QuotaEval, &str)>,
         now_unix: i64,
     ) -> String {
-        let plan_str = self
-            .subscription_tier
-            .as_deref()
-            .map(terminal_text)
-            .unwrap_or_else(|| "Unknown".into());
         let age_str = format_relative_age(self.last_updated, now_unix);
 
-        let mut lines = vec![format!(
-            "Account : {}  [{}]",
-            terminal_text(email),
-            plan_str
-        )];
+        let mut lines = vec![format!("Account : {}", terminal_text(email))];
         if let Some((eval, monitored_model)) = eval_ctx {
             let refresh_hint = if matches!(eval, QuotaEval::Stale { .. }) {
                 " — add --refresh to refresh"
@@ -306,20 +299,20 @@ impl QuotaViewDto {
         if !rows.is_empty() {
             let pool_w = rows
                 .iter()
-                .map(|r| r.pool_col.chars().count())
+                .map(|r| terminal_display_width(&r.pool_col))
                 .max()
                 .unwrap_or(4)
                 .max("Pool".len());
             let win_w = rows
                 .iter()
-                .map(|r| r.win_col.chars().count())
+                .map(|r| terminal_display_width(&r.win_col))
                 .max()
                 .unwrap_or(6)
                 .max("Window".len());
             let bar_w = 18usize;
             let reset_w = rows
                 .iter()
-                .map(|r| r.reset_col.chars().count())
+                .map(|r| terminal_display_width(&r.reset_col))
                 .max()
                 .unwrap_or(16)
                 .max("Resets (Local)".len());
@@ -328,16 +321,16 @@ impl QuotaViewDto {
             lines.push(String::new());
             lines.push(format!(
                 "  {}   {}   {}   Resets (Local)",
-                pad_right_chars("Pool", pool_w),
-                pad_right_chars("Window", win_w),
-                pad_right_chars("Remaining", bar_w),
+                pad_right_display_width("Pool", pool_w),
+                pad_right_display_width("Window", win_w),
+                pad_right_display_width("Remaining", bar_w),
             ));
             lines.push(format!("  {}", "─".repeat(divider_len)));
             for r in &rows {
                 lines.push(format!(
                     "  {}   {}   {}   {}",
-                    pad_right_chars(&r.pool_col, pool_w),
-                    pad_right_chars(&r.win_col, win_w),
+                    pad_right_display_width(&r.pool_col, pool_w),
+                    pad_right_display_width(&r.win_col, win_w),
                     r.bar_col,
                     r.reset_col
                 ));
@@ -353,12 +346,66 @@ impl QuotaViewDto {
     }
 }
 
-fn pad_right_chars(s: &str, width: usize) -> String {
-    let len = s.chars().count();
-    if len >= width {
+#[cfg(any(feature = "tui", feature = "stats"))]
+fn terminal_display_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+#[cfg(not(any(feature = "tui", feature = "stats")))]
+fn char_display_width_fallback(ch: char) -> usize {
+    let cp = ch as u32;
+    if ch.is_control()
+        || matches!(
+            cp,
+            0x0300..=0x036F
+                | 0x1AB0..=0x1AFF
+                | 0x1DC0..=0x1DFF
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x206F
+                | 0x20D0..=0x20FF
+                | 0x3099..=0x309A
+                | 0xFE00..=0xFE0F
+                | 0xFE20..=0xFE2F
+                | 0xE0100..=0xE01EF
+        )
+    {
+        return 0;
+    }
+    if matches!(
+        cp,
+        0x1100..=0x115F
+            | 0x2329..=0x232A
+            | 0x2E80..=0x303E
+            | 0x3040..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0xA4CF
+            | 0xA960..=0xA97C
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6F
+            | 0xFF01..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1FAFF
+            | 0x20000..=0x3FFFD
+    ) {
+        return 2;
+    }
+    1
+}
+
+#[cfg(not(any(feature = "tui", feature = "stats")))]
+fn terminal_display_width(s: &str) -> usize {
+    s.chars().map(char_display_width_fallback).sum()
+}
+
+fn pad_right_display_width(s: &str, width: usize) -> String {
+    let cur = terminal_display_width(s);
+    if cur >= width {
         s.to_string()
     } else {
-        format!("{s}{}", " ".repeat(width - len))
+        format!("{s}{}", " ".repeat(width - cur))
     }
 }
 
@@ -541,8 +588,6 @@ pub struct SelectedAccountBriefDto {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_label: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subscription_tier: Option<String>,
     pub disabled: bool,
     pub validation_blocked: bool,
 }
@@ -554,7 +599,6 @@ impl SelectedAccountBriefDto {
             email: rec.email.clone(),
             name: rec.name.clone(),
             custom_label: rec.custom_label.clone(),
-            subscription_tier: rec.quota.as_ref().and_then(|q| q.subscription_tier.clone()),
             disabled: rec.disabled,
             validation_blocked: rec.is_validation_blocked_at(now_unix),
         }
@@ -575,21 +619,39 @@ pub fn extract_supported_models(obs: &QuotaObservation) -> Vec<String> {
     models
 }
 
+const OFFICIAL_GROUP_DESC_PREFIX: &str = "models within this group:";
+
+fn format_group_description_for_display(raw: &str) -> Option<String> {
+    let safe = terminal_text(raw);
+    let trimmed = safe.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() >= OFFICIAL_GROUP_DESC_PREFIX.len()
+        && trimmed.is_char_boundary(OFFICIAL_GROUP_DESC_PREFIX.len())
+        && trimmed[..OFFICIAL_GROUP_DESC_PREFIX.len()]
+            .eq_ignore_ascii_case(OFFICIAL_GROUP_DESC_PREFIX)
+    {
+        let rest = trimmed[OFFICIAL_GROUP_DESC_PREFIX.len()..]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        return (!rest.is_empty()).then_some(rest);
+    }
+    Some(trimmed.to_string())
+}
+
 /// Extract `(display_name, description)` pairs from `quota_groups` for `OfficialCli` observations
-/// where per-model catalog entries (`models`) are absent.
+/// where per-model catalog entries (`models`) are absent. Strips the redundant case-insensitive
+/// `"Models within this group:"` prefix at display time while keeping non-prefix descriptions
+/// verbatim (after terminal control sanitization) without mutating cached JSON on disk.
 pub fn extract_quota_group_descriptions(obs: &QuotaObservation) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for g in obs.quota_groups.iter().flatten() {
         if let Some(desc) = g
             .description
             .as_deref()
-            .map(|s| {
-                terminal_text(s)
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .filter(|s| !s.is_empty())
+            .and_then(format_group_description_for_display)
         {
             let name = terminal_text(g.display_name.trim());
             let label = if name.is_empty() {
@@ -603,7 +665,8 @@ pub fn extract_quota_group_descriptions(obs: &QuotaObservation) -> Vec<(String, 
     out
 }
 
-/// Render cached supported models or official `quota_groups` descriptions for `current`.
+/// Render cached supported models or official `quota_groups` descriptions for `current`,
+/// aligning colons across group names by maximum terminal display column width.
 pub fn format_supported_models_or_groups_human(
     models: Option<&[String]>,
     group_descriptions: &[(String, String)],
@@ -612,12 +675,20 @@ pub fn format_supported_models_or_groups_human(
         return format_supported_models_human(models);
     }
     if !group_descriptions.is_empty() {
+        let max_name_w = group_descriptions
+            .iter()
+            .map(|(name, _)| terminal_display_width(name))
+            .max()
+            .unwrap_or(0);
         let mut out = vec![format!(
             "Model groups     : {} group(s) (from official agy /usage)",
             group_descriptions.len()
         )];
         for (name, desc) in group_descriptions {
-            out.push(format!("  {name} : {desc}"));
+            out.push(format!(
+                "  {} : {desc}",
+                pad_right_display_width(name, max_name_w)
+            ));
         }
         return out;
     }
@@ -692,14 +763,6 @@ pub fn format_supported_models_human(models: Option<&[String]>) -> Vec<String> {
     out
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct PolicyEvalCandidateDto {
-    pub id: String,
-    pub email: String,
-    pub evaluation: QuotaEval,
-    pub qualified: bool,
-}
-
 pub fn format_session_identity_human(id: &SessionIdentity) -> String {
     match id {
         SessionIdentity::Matched { email, expiry, .. } => format!(
@@ -758,17 +821,6 @@ pub fn format_runtime_state_human(rt: &RuntimeState) -> String {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct PolicyEvalViewDto {
-    pub policy: SwitchPolicy,
-    pub source_account_id: Option<String>,
-    pub source_evaluation: Option<QuotaEval>,
-    pub would_switch: bool,
-    pub recommended_target_id: Option<String>,
-    pub decision_reason: String,
-    pub candidates: Vec<PolicyEvalCandidateDto>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,11 +829,12 @@ mod tests {
     fn quota_table_hides_model_dump_by_default_and_shows_aligned_weekly_and_5h_bars() {
         let now = 1_794_829_000i64;
         let mut obs = QuotaObservation::new(now - 120, QuotaSourceEnv::Daily);
-        obs.subscription_tier = Some("Google AI Pro".into());
         obs.quota_groups = Some(vec![
             QuotaGroup {
                 display_name: "Gemini Models".into(),
-                description: None,
+                description: Some(
+                    "Models within this group: Gemini 4 Hydrogen, Gemini 3.8 Flash".into(),
+                ),
                 buckets: vec![
                     QuotaBucket {
                         bucket_id: "gemini-5h".into(),
@@ -805,7 +858,10 @@ mod tests {
             },
             QuotaGroup {
                 display_name: "Claude and GPT models".into(),
-                description: None,
+                description: Some(
+                    "  models WITHIN this GROUP:  Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B "
+                        .into(),
+                ),
                 buckets: vec![
                     QuotaBucket {
                         bucket_id: "3p-weekly".into(),
@@ -852,7 +908,9 @@ mod tests {
         };
 
         let compact = dto.human_multiline_at("user@example.invalid", Some((&eval, "all")), now);
-        assert!(compact.contains("Account : user@example.invalid  [Google AI Pro]"));
+        assert!(compact.contains("Account : user@example.invalid"));
+        assert!(!compact.contains("[Unknown]"));
+        assert!(!compact.contains("[Google AI Pro]"));
         assert!(compact.contains("updated 2m ago (source: Daily)"));
         assert!(compact.contains("Gemini"));
         assert!(compact.contains("Claude / GPT"));
@@ -877,12 +935,79 @@ mod tests {
         assert!(stale_out.contains("add --refresh to refresh"));
         assert!(!stale_out.contains("add -r"));
 
-        // Non-TUI `quota` human output preserves upstream `"Antigravity Starter Quota"` verbatim!
-        let mut starter_obs = obs.clone();
-        starter_obs.subscription_tier = Some("Antigravity Starter Quota".into());
-        let starter_dto = QuotaViewDto::from_observation(&starter_obs);
-        let starter_out = starter_dto.human_multiline_at("alice@example.com", None, now);
-        assert!(starter_out.contains("Account : alice@example.com  [Antigravity Starter Quota]"));
+        // `extract_quota_group_descriptions` strips case-insensitive `"Models within this group:"`
+        // while keeping non-matching descriptions verbatim and aligning colons in `current`.
+        let group_descs = extract_quota_group_descriptions(&obs);
+        assert_eq!(
+            group_descs,
+            vec![
+                (
+                    "Gemini Models".into(),
+                    "Gemini 4 Hydrogen, Gemini 3.8 Flash".into(),
+                ),
+                (
+                    "Claude and GPT models".into(),
+                    "Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B".into(),
+                ),
+            ]
+        );
+        let aligned_lines = format_supported_models_or_groups_human(None, &group_descs);
+        assert_eq!(
+            aligned_lines,
+            vec![
+                "Model groups     : 2 group(s) (from official agy /usage)".to_string(),
+                "  Gemini Models         : Gemini 4 Hydrogen, Gemini 3.8 Flash".to_string(),
+                "  Claude and GPT models : Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B"
+                    .to_string(),
+            ]
+        );
+
+        let mut custom_obs = QuotaObservation::new(now, QuotaSourceEnv::OfficialCli);
+        custom_obs.quota_groups = Some(vec![
+            QuotaGroup {
+                display_name: "Custom Pool".into(),
+                description: Some("Shared  double   space  models without prefix".into()),
+                buckets: Vec::new(),
+            },
+            QuotaGroup {
+                display_name: "Empty After Prefix".into(),
+                description: Some("Models within this group:   ".into()),
+                buckets: Vec::new(),
+            },
+            QuotaGroup {
+                display_name: "中文模型组".into(),
+                description: Some("Models within this group:   Model-A,   Model-B".into()),
+                buckets: Vec::new(),
+            },
+            QuotaGroup {
+                display_name: "カ\u{3099}組".into(),
+                description: Some("Decomposed  kana  preserved".into()),
+                buckets: Vec::new(),
+            },
+        ]);
+        let custom_descs = extract_quota_group_descriptions(&custom_obs);
+        assert_eq!(
+            custom_descs,
+            vec![
+                (
+                    "Custom Pool".into(),
+                    "Shared  double   space  models without prefix".into(),
+                ),
+                ("中文模型组".into(), "Model-A, Model-B".into()),
+                ("カ\u{3099}組".into(), "Decomposed  kana  preserved".into()),
+            ]
+        );
+        // CJK + decomposed kana (`U+3099`) + ASCII display-width alignment places `:` at the exact same terminal column!
+        assert_eq!(terminal_display_width("カ\u{3099}組"), 4);
+        let mixed_lines = format_supported_models_or_groups_human(None, &custom_descs);
+        let colon_cols: Vec<usize> = mixed_lines[1..]
+            .iter()
+            .map(|line| {
+                let before_colon = line.split(" : ").next().unwrap();
+                terminal_display_width(before_colon)
+            })
+            .collect();
+        assert_eq!(colon_cols, vec![13, 13, 13]);
 
         let models = extract_supported_models(&obs);
         assert_eq!(models, vec!["gemini-3.8-flash-high".to_string()]);

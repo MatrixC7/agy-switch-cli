@@ -1,4 +1,4 @@
-use crate::domain::quota::{QuotaObservation, QuotaSourceEnv};
+use crate::domain::quota::QuotaObservation;
 use crate::domain::token::{token_digest, TokenRecord};
 use crate::paths::hex_encode;
 use serde::{Deserialize, Serialize};
@@ -110,6 +110,10 @@ pub struct AccountRecord {
 
     pub created_at: i64,
     pub last_used: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_switched_in_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_switched_out_at: Option<i64>,
 }
 
 impl fmt::Debug for AccountRecord {
@@ -142,6 +146,8 @@ impl fmt::Debug for AccountRecord {
             )
             .field("created_at", &self.created_at)
             .field("last_used", &self.last_used)
+            .field("last_switched_in_at", &self.last_switched_in_at)
+            .field("last_switched_out_at", &self.last_switched_out_at)
             .finish()
     }
 }
@@ -169,7 +175,9 @@ impl AccountRecord {
             validation_url: None,
             protected_models: HashSet::new(),
             created_at: now_unix,
-            last_used: now_unix,
+            last_used: 0,
+            last_switched_in_at: None,
+            last_switched_out_at: None,
         }
     }
 
@@ -240,71 +248,7 @@ impl AccountRecord {
         self.previous_refresh_token_digests.iter().any(|d| d == &fp)
     }
 
-    /// Returns `true` when an authoritative `user_tier` observed on the official `agy` slot
-    /// (`QuotaSourceEnv::OfficialCli`) should update `self.quota`.
-    /// - Writes if `self.quota` is `None` or `subscription_tier` differs (including overriding a
-    ///   stale `Production` tier such as `FREE` -> `PRO` without altering `source_env` or
-    ///   `last_updated`).
-    /// - Skips redundant writes when `subscription_tier` already matches and its `tier_source_env`
-    ///   is already `OfficialCli` or `Production`.
-    pub fn needs_official_cli_user_tier_update(&self, user_tier: Option<&str>) -> bool {
-        let Some(tier) = user_tier else {
-            return false;
-        };
-        match self.quota.as_ref() {
-            Some(q) if q.subscription_tier.as_deref() == Some(tier) => !matches!(
-                q.tier_source_env,
-                Some(QuotaSourceEnv::OfficialCli) | Some(QuotaSourceEnv::Production)
-            ),
-            _ => true,
-        }
-    }
-
-    /// Apply an authoritative `user_tier` observed on the official `agy` slot without disguising
-    /// an existing quota observation as a fresh probe (`source_env` and `last_updated` remain
-    /// untouched when `self.quota` already exists).
-    pub fn apply_official_cli_user_tier(&mut self, user_tier: Option<&str>) -> bool {
-        let Some(tier) = user_tier else {
-            return false;
-        };
-        if !self.needs_official_cli_user_tier_update(Some(tier)) {
-            return false;
-        }
-        match self.quota.as_mut() {
-            Some(q) => {
-                q.subscription_tier = Some(tier.to_string());
-                q.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
-                true
-            }
-            None => {
-                let mut placeholder = QuotaObservation::new(0, QuotaSourceEnv::OfficialCli);
-                placeholder.subscription_tier = Some(tier.to_string());
-                placeholder.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
-                self.quota = Some(placeholder);
-                true
-            }
-        }
-    }
-
-    /// Update quota while preserving previously discovered `subscription_tier` ONLY when the
-    /// previous tier explicitly recorded `tier_source_env == Some(quota.source_env)` — or when
-    /// upgrading a `QuotaSourceEnv::Production` tier into `QuotaSourceEnv::OfficialCli`
-    /// (preventing untagged or non-production cross-environment `Free` tier pollution).
-    pub fn update_quota(&mut self, mut quota: QuotaObservation) {
-        if let Some(ref existing) = self.quota {
-            let compatible_tier_env = existing.tier_source_env == Some(quota.source_env)
-                || (quota.source_env == QuotaSourceEnv::OfficialCli
-                    && existing.tier_source_env == Some(QuotaSourceEnv::Production));
-            if quota.subscription_tier.is_none()
-                && quota.source_env != QuotaSourceEnv::LegacyUnknown
-                && compatible_tier_env
-            {
-                quota.subscription_tier = existing.subscription_tier.clone();
-                if quota.subscription_tier.is_some() {
-                    quota.tier_source_env = Some(quota.source_env);
-                }
-            }
-        }
+    pub fn update_quota(&mut self, quota: QuotaObservation) {
         self.quota = Some(quota);
     }
 }
@@ -532,158 +476,40 @@ mod tests {
     }
 
     #[test]
-    fn update_quota_preserves_production_tier_on_official_cli_upgrade_for_pro_and_free() {
-        use crate::domain::quota::{
-            evaluate_account_quota, QuotaBucket, QuotaEval, QuotaGroup, DEFAULT_QUOTA_MAX_AGE_SECS,
-        };
+    fn legacy_account_json_with_subscription_tier_deserializes_and_new_switch_fields_are_optional()
+    {
+        let raw = r#"{
+            "schema_version": 1,
+            "id": "acc-0001",
+            "email": "alice@example.com",
+            "token": {
+                "access_token": "ya29.legacy",
+                "refresh_token": "1//legacy-rt",
+                "expires_in": 3600,
+                "expiry_timestamp": 1900000000,
+                "token_type": "Bearer"
+            },
+            "quota": {
+                "models": [],
+                "last_updated": 1800000000,
+                "is_forbidden": false,
+                "subscription_tier": "PRO",
+                "tier_source_env": "official_cli",
+                "source_env": "official_cli"
+            },
+            "created_at": 1700000000,
+            "last_used": 1750000000
+        }"#;
+        let rec: AccountRecord = serde_json::from_str(raw).unwrap();
+        assert_eq!(rec.id, "acc-0001");
+        assert_eq!(rec.last_used, 1_750_000_000);
+        assert_eq!(rec.last_switched_in_at, None);
+        assert_eq!(rec.last_switched_out_at, None);
 
-        let now = 1_800_000_000i64;
-        let make_account = |id: &str, email: &str| {
-            AccountRecord::new(
-                id.into(),
-                email.into(),
-                TokenRecord {
-                    access_token: "synthetic_at".into(),
-                    refresh_token: "1//synthetic_rt".into(),
-                    expires_in: 3600,
-                    expiry_timestamp: now + 3600,
-                    token_type: "Bearer".into(),
-                    id_token: None,
-                    project_id: None,
-                    oauth_client_key: None,
-                    granted_scopes: None,
-                    is_gcp_tos: false,
-                },
-                now,
-            )
-        };
-
-        // 1. Upgraded v1.2.6 Pro account (`tier_source_env == Some(Production)`) keeps Plan after
-        //    OfficialCli refresh with `subscription_tier == None`.
-        let mut pro = make_account("acc-0001", "alice@example.com");
-        let mut v126_pro = QuotaObservation::new(now - 600, QuotaSourceEnv::Production);
-        v126_pro.subscription_tier = Some("PRO".into());
-        v126_pro.tier_source_env = Some(QuotaSourceEnv::Production);
-        pro.quota = Some(v126_pro);
-
-        let mut official_pro = QuotaObservation::new(now, QuotaSourceEnv::OfficialCli);
-        official_pro.quota_groups = Some(vec![QuotaGroup {
-            display_name: "Gemini Models".into(),
-            description: None,
-            buckets: vec![
-                QuotaBucket {
-                    bucket_id: "gemini-weekly".into(),
-                    window: "weekly".into(),
-                    remaining_fraction: 0.90,
-                    remaining_fraction_known: Some(true),
-                    reset_time: "2099-01-07T00:00:00Z".into(),
-                    display_name: None,
-                    description: None,
-                },
-                QuotaBucket {
-                    bucket_id: "gemini-5h".into(),
-                    window: "5h".into(),
-                    remaining_fraction: 0.85,
-                    remaining_fraction_known: Some(true),
-                    reset_time: "2099-01-01T05:00:00Z".into(),
-                    display_name: None,
-                    description: None,
-                },
-            ],
-        }]);
-        pro.update_quota(official_pro);
-        let q_pro = pro.quota.as_ref().unwrap();
-        assert_eq!(q_pro.subscription_tier.as_deref(), Some("PRO"));
-        assert_eq!(q_pro.tier_source_env, Some(QuotaSourceEnv::OfficialCli));
-
-        // 2. Upgraded v1.2.6 Free/Starter account with weekly-only `/usage` buckets (no `5h` bucket)
-        //    preserves Free tier and evaluates to `Known` instead of `Unknown("missing_5h_bucket")`.
-        let mut free = make_account("acc-0002", "bob@example.com");
-        let mut v126_free = QuotaObservation::new(now - 600, QuotaSourceEnv::Production);
-        v126_free.subscription_tier = Some("FREE".into());
-        v126_free.tier_source_env = Some(QuotaSourceEnv::Production);
-        free.quota = Some(v126_free);
-
-        let mut official_free = QuotaObservation::new(now, QuotaSourceEnv::OfficialCli);
-        official_free.quota_groups = Some(vec![QuotaGroup {
-            display_name: "Gemini Models".into(),
-            description: None,
-            buckets: vec![QuotaBucket {
-                bucket_id: "gemini-weekly".into(),
-                window: "weekly".into(),
-                remaining_fraction: 0.72,
-                remaining_fraction_known: Some(true),
-                reset_time: "2099-01-07T00:00:00Z".into(),
-                display_name: None,
-                description: None,
-            }],
-        }]);
-        free.update_quota(official_free);
-        let q_free = free.quota.as_ref().unwrap();
-        assert_eq!(q_free.subscription_tier.as_deref(), Some("FREE"));
-        assert_eq!(q_free.tier_source_env, Some(QuotaSourceEnv::OfficialCli));
-        assert_eq!(
-            evaluate_account_quota(&free, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-            QuotaEval::Known {
-                remaining_percentage: 72.0
-            }
-        );
-
-        // 3. Explicit new `subscription_tier` from OfficialCli overrides existing Production tier.
-        let mut explicit_new = QuotaObservation::new(now + 10, QuotaSourceEnv::OfficialCli);
-        explicit_new.subscription_tier = Some("ULTRA".into());
-        explicit_new.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
-        pro.update_quota(explicit_new);
-        assert_eq!(
-            pro.quota.as_ref().unwrap().subscription_tier.as_deref(),
-            Some("ULTRA")
-        );
-        assert_eq!(
-            pro.quota.as_ref().unwrap().tier_source_env,
-            Some(QuotaSourceEnv::OfficialCli)
-        );
-
-        // 4. Non-production/untrusted environments (`Daily`, `Sandbox`, `LegacyUnknown`, `None`)
-        //    MUST NOT carry `Free` tier into `OfficialCli`!
-        for env in [
-            Some(QuotaSourceEnv::Daily),
-            Some(QuotaSourceEnv::Sandbox),
-            Some(QuotaSourceEnv::LegacyUnknown),
-            None,
-        ] {
-            let mut acc = make_account("acc-0003", "charlie@example.com");
-            let mut old = QuotaObservation::new(now - 600, env.unwrap_or(QuotaSourceEnv::Daily));
-            old.subscription_tier = Some("FREE".into());
-            old.tier_source_env = env;
-            acc.quota = Some(old);
-
-            let mut official_weekly_only = QuotaObservation::new(now, QuotaSourceEnv::OfficialCli);
-            official_weekly_only.quota_groups = Some(vec![QuotaGroup {
-                display_name: "Gemini Models".into(),
-                description: None,
-                buckets: vec![QuotaBucket {
-                    bucket_id: "gemini-weekly".into(),
-                    window: "weekly".into(),
-                    remaining_fraction: 0.80,
-                    remaining_fraction_known: Some(true),
-                    reset_time: "2099-01-07T00:00:00Z".into(),
-                    display_name: None,
-                    description: None,
-                }],
-            }]);
-            acc.update_quota(official_weekly_only);
-            let q = acc.quota.as_ref().unwrap();
-            assert_eq!(
-                q.subscription_tier, None,
-                "tier from {env:?} must not leak into OfficialCli"
-            );
-            assert_eq!(q.tier_source_env, None);
-            assert_eq!(
-                evaluate_account_quota(&acc, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-                QuotaEval::Unknown {
-                    reason: "missing_5h_bucket".into()
-                }
-            );
-        }
+        let reserialized = serde_json::to_string(&rec).unwrap();
+        assert!(!reserialized.contains("subscription_tier"));
+        assert!(!reserialized.contains("tier_source_env"));
+        assert!(!reserialized.contains("last_switched_in_at"));
+        assert!(!reserialized.contains("last_switched_out_at"));
     }
 }

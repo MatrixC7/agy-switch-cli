@@ -30,7 +30,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Read-only environment, store, journal, daemon, and official `agy` status
+    /// Read-only environment, store, journal, and official `agy` status
     Status,
 
     /// OAuth 2.0 authorization management (manual callback URL paste by default, or `--ssh` local listener)
@@ -55,13 +55,6 @@ pub enum Commands {
 
     /// Refresh quota for the currently active official `agy` slot via official `agy -p "/usage"`
     Refresh(RefreshArgs),
-
-    /// Auto-switch policy configuration and dry-run evaluation
-    #[command(subcommand)]
-    Policy(PolicyCommand),
-
-    /// Foreground step-and-verify auto-switch daemon (managed by systemd --user or container init)
-    Daemon(DaemonArgs),
 
     /// Read-only local SQLite token usage statistics (`summary` and `list`)
     #[command(subcommand)]
@@ -139,7 +132,7 @@ pub struct AuthReauthorizeArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AccountsCommand {
-    /// List saved accounts with plan/status details, or reorder accounts (`--move` / `--order`)
+    /// List saved accounts with status details, or reorder accounts (`--move` / `--order`)
     List(AccountsListArgs),
     /// Add accounts via masked TTY prompt, `--from-local`, `--from-stdin`, or `0600` `--from-file` (no positional token!)
     Add(AccountsAddArgs),
@@ -306,139 +299,6 @@ pub struct RefreshArgs {
     /// Optional account selector (must match the currently active official `agy` slot; dormant accounts exit 2)
     #[arg(value_name = "ID|EMAIL")]
     pub selector: Option<String>,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum PolicyCommand {
-    /// Show current auto-switch policy (pure read-only)
-    Show,
-    /// Validate and persist policy updates
-    Set(PolicySetArgs),
-    /// Reorder configured policy candidate accounts
-    Order {
-        #[arg(required = true, num_args = 1.., value_name = "ID|EMAIL")]
-        selectors: Vec<String>,
-    },
-    /// Dry-run evaluate switching decision against local cached quotas (zero writes/network)
-    Eval,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum CliStrategy {
-    Priority,
-    #[value(name = "round-robin")]
-    RoundRobin,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum CliMode {
-    Immediate,
-    Wait,
-}
-
-#[derive(Debug, Args)]
-pub struct PolicySetArgs {
-    #[arg(long)]
-    pub enabled: Option<bool>,
-
-    #[arg(long, value_enum)]
-    pub strategy: Option<CliStrategy>,
-
-    #[arg(long, value_enum)]
-    pub mode: Option<CliMode>,
-
-    #[arg(long)]
-    pub reserve: Option<u8>,
-
-    #[arg(long)]
-    pub minimum: Option<u8>,
-
-    #[arg(long, value_name = "MODEL")]
-    pub model: Option<String>,
-
-    #[arg(
-        long,
-        num_args = 1..,
-        value_name = "ID|EMAIL",
-        conflicts_with_all = ["clear_candidates", "all_candidates"]
-    )]
-    pub candidates: Option<Vec<String>>,
-
-    /// Automatically add all currently enabled accounts (in `accounts list` order) as candidates
-    #[arg(long, conflicts_with_all = ["candidates", "clear_candidates"])]
-    pub all_candidates: bool,
-
-    #[arg(long, conflicts_with_all = ["candidates", "all_candidates"])]
-    pub clear_candidates: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct DaemonArgs {
-    /// Poll interval in seconds (default: 900 / 15 minutes; in-memory unless persisted via `--install` or `AGY_SWITCH_CLI_INTERVAL`)
-    #[arg(
-        long,
-        env = "AGY_SWITCH_CLI_INTERVAL",
-        hide_env_values = true,
-        value_name = "INTERVAL"
-    )]
-    pub interval: Option<u64>,
-
-    /// Post-switch cooldown in seconds (default: 3600 / 1 hour; in-memory unless persisted via `--install` or `AGY_SWITCH_CLI_COOLDOWN`)
-    #[arg(
-        long,
-        env = "AGY_SWITCH_CLI_COOLDOWN",
-        hide_env_values = true,
-        value_name = "COOLDOWN"
-    )]
-    pub cooldown: Option<i64>,
-
-    /// Run a single step-and-verify evaluation/switch tick and exit
-    #[arg(long, conflicts_with_all = ["install", "uninstall"])]
-    pub once: bool,
-
-    /// Install and start `~/.config/systemd/user/agy-switch-cli.service` via `systemctl --user`
-    #[arg(long, conflicts_with_all = ["once", "uninstall"])]
-    pub install: bool,
-
-    /// Stop, disable, and remove `~/.config/systemd/user/agy-switch-cli.service` via `systemctl --user`
-    #[arg(long, conflicts_with_all = ["once", "install"])]
-    pub uninstall: bool,
-
-    /// Disable Linux desktop notifications (`org.freedesktop.Notifications`) for daemon switch/pause events (overrides AGY_SWITCH_CLI_NOTIFY and `config.json`)
-    #[arg(long, conflicts_with = "uninstall")]
-    pub no_notify: bool,
-
-    /// Clear any active post-switch cooldown in `state/daemon_state.json` (works standalone while a daemon is running, or combined with `--once` / `--install`)
-    #[arg(long, conflicts_with = "uninstall")]
-    pub reset_cooldown: bool,
-
-    /// In-memory override for active-process guard mode (`immediate` or `wait`; overrides AGY_SWITCH_CLI_MODE and `policy.json`)
-    #[arg(long, value_enum)]
-    pub mode: Option<CliMode>,
-
-    /// In-memory override for candidate selection strategy (`priority` or `round-robin`; overrides AGY_SWITCH_CLI_STRATEGY and `policy.json`)
-    #[arg(long, value_enum)]
-    pub strategy: Option<CliStrategy>,
-
-    /// In-memory override for reserve threshold (`1..=98`; overrides AGY_SWITCH_CLI_RESERVE and `policy.json`)
-    #[arg(long)]
-    pub reserve: Option<u8>,
-
-    /// In-memory override for candidate minimum threshold (`2..=100`; overrides AGY_SWITCH_CLI_MINIMUM and `policy.json`)
-    #[arg(long)]
-    pub minimum: Option<u8>,
-
-    /// In-memory override for monitored model/pool (`all`, `gemini`, `claude`, `argon`, or `<MODEL_ID>`; overrides AGY_SWITCH_CLI_MODEL and `policy.json`)
-    #[arg(long, value_name = "MODEL")]
-    pub model: Option<String>,
-
-    /// Internal marker set by the CLI parser when `--interval` came solely from `AGY_SWITCH_CLI_INTERVAL`
-    #[arg(skip)]
-    pub interval_from_env: bool,
-
-    /// Internal marker set by the CLI parser when `--cooldown` came solely from `AGY_SWITCH_CLI_COOLDOWN`
-    #[arg(skip)]
-    pub cooldown_from_env: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]

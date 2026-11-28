@@ -1,5 +1,4 @@
 use crate::domain::account::{AccountRecord, SessionIdentity};
-use crate::domain::quota::QuotaSourceEnv;
 use crate::domain::token::{
     extract_email_hint_from_jwt, sanitize_email_hint, token_digest, TokenRecord,
 };
@@ -11,7 +10,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fmt;
 
-const MAX_USER_TIER_BYTES: usize = 128;
 const MAX_AUTH_METHOD_BYTES: usize = 64;
 const MAX_EXPIRY_BYTES: usize = 64;
 
@@ -79,35 +77,22 @@ fn validate_optional_session_secret_field<'a>(
 /// and control characters. Permits empty `access_token` (e.g. accounts imported from refresh-only
 /// transfer bundles) so offline `switch` can write the slot and let official `agy` refresh on launch.
 pub fn serialize_session_payload(token: &TokenRecord) -> CliResult<String> {
-    serialize_session_payload_with_meta(token, None, None, None)
+    serialize_session_payload_with_meta(token, None, None)
 }
 
 /// Serialize the active official `agy` slot payload for a verified `AccountRecord`, preserving
-/// compact `id_token_email` and any production-trusted `user_tier` (`OfficialCli` / `Production`)
-/// so offline `accounts add --from-local` round-trips cleanly after `switch` or `run`.
+/// compact `id_token_email` so offline `accounts add --from-local` round-trips cleanly after
+/// `switch` or `run`.
 pub fn serialize_session_payload_for_account(account: &AccountRecord) -> CliResult<String> {
-    let user_tier = account.quota.as_ref().and_then(|q| {
-        let trusted = matches!(
-            q.tier_source_env,
-            Some(QuotaSourceEnv::OfficialCli) | Some(QuotaSourceEnv::Production)
-        );
-        trusted.then_some(q.subscription_tier.as_deref()).flatten()
-    });
-    serialize_session_payload_with_meta(
-        &account.token,
-        None,
-        Some(account.email.as_str()),
-        user_tier,
-    )
+    serialize_session_payload_with_meta(&account.token, None, Some(account.email.as_str()))
 }
 
-/// Strict serializer for `antigravity-oauth-token` payloads with optional metadata (`auth_method`,
-/// compact `id_token_email` used by official `agy 1.5+`, and optional `user_tier`).
+/// Strict serializer for `antigravity-oauth-token` payloads with optional metadata (`auth_method`
+/// and compact `id_token_email` used by official `agy 1.5+`).
 pub fn serialize_session_payload_with_meta(
     token: &TokenRecord,
     auth_method: Option<&str>,
     id_token_email: Option<&str>,
-    user_tier: Option<&str>,
 ) -> CliResult<String> {
     let access_token = validate_optional_session_secret_field(
         Some(token.access_token.as_str()),
@@ -160,16 +145,12 @@ pub fn serialize_session_payload_with_meta(
         id_token: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         id_token_email: Option<&'a str>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        user_tier: Option<&'a str>,
     }
 
     let effective_auth_method = auth_method
         .and_then(|s| sanitize_bounded_meta_field(s, MAX_AUTH_METHOD_BYTES))
         .unwrap_or_else(|| "consumer".to_string());
     let effective_email = id_token_email.and_then(sanitize_email_hint);
-    let effective_tier =
-        user_tier.and_then(|s| sanitize_bounded_meta_field(s, MAX_USER_TIER_BYTES));
 
     serde_json::to_string(&Payload {
         token: TokenDetails {
@@ -181,7 +162,6 @@ pub fn serialize_session_payload_with_meta(
         auth_method: &effective_auth_method,
         id_token,
         id_token_email: effective_email.as_deref(),
-        user_tier: effective_tier.as_deref(),
     })
     .map_err(|_| CliError::data("Failed to serialize session credential payload."))
 }
@@ -202,12 +182,6 @@ fn extract_email_hint_from_session_json(
         .or_else(|| compact_id_token_email.map(str::to_owned))
 }
 
-fn extract_user_tier_from_session_json(json: &serde_json::Value) -> Option<String> {
-    json.get("user_tier")
-        .and_then(|v| v.as_str())
-        .and_then(|s| sanitize_bounded_meta_field(s, MAX_USER_TIER_BYTES))
-}
-
 #[derive(Clone)]
 pub struct ParsedSessionPayload {
     pub raw_digest: String,
@@ -215,7 +189,6 @@ pub struct ParsedSessionPayload {
     pub expiry: Option<String>,
     pub auth_method: Option<String>,
     pub email_hint: Option<String>,
-    pub user_tier: Option<String>,
 }
 
 impl fmt::Debug for ParsedSessionPayload {
@@ -226,7 +199,6 @@ impl fmt::Debug for ParsedSessionPayload {
             .field("expiry", &self.expiry)
             .field("auth_method", &self.auth_method)
             .field("email_hint", &self.email_hint)
-            .field("user_tier", &self.user_tier)
             .finish()
     }
 }
@@ -301,7 +273,6 @@ pub struct ExtractedSessionToken {
     pub id_token_email: Option<String>,
     /// Derived email hint (`id_token` JWT `email` claim, falling back to `id_token_email`).
     pub email_hint: Option<String>,
-    pub user_tier: Option<String>,
     pub raw_digest: String,
     pub refresh_token_digest: String,
 }
@@ -320,7 +291,6 @@ impl fmt::Debug for ExtractedSessionToken {
             .field("id_token", &self.id_token.as_ref().map(|_| "[REDACTED]"))
             .field("id_token_email", &self.id_token_email)
             .field("email_hint", &self.email_hint)
-            .field("user_tier", &self.user_tier)
             .field("raw_digest", &self.raw_digest)
             .field("refresh_token_digest", &self.refresh_token_digest)
             .finish()
@@ -385,7 +355,6 @@ pub fn extract_session_token_from_bytes(
         .map(str::to_owned);
     let id_token_email = extract_compact_id_token_email_from_session_json(&json);
     let email_hint = extract_email_hint_from_session_json(&json, id_token_email.as_deref());
-    let user_tier = extract_user_tier_from_session_json(&json);
 
     Ok(ExtractedSessionToken {
         access_token,
@@ -396,7 +365,6 @@ pub fn extract_session_token_from_bytes(
         id_token,
         id_token_email,
         email_hint,
-        user_tier,
         raw_digest: bytes_sha256_hex(bytes),
         refresh_token_digest: token_digest(refresh_token),
     })
@@ -451,7 +419,6 @@ pub fn parse_session_payload_bytes(bytes: &[u8]) -> Result<ParsedSessionPayload,
         .and_then(|s| sanitize_bounded_meta_field(s, MAX_AUTH_METHOD_BYTES));
     let compact_email = extract_compact_id_token_email_from_session_json(&json);
     let email_hint = extract_email_hint_from_session_json(&json, compact_email.as_deref());
-    let user_tier = extract_user_tier_from_session_json(&json);
 
     Ok(ParsedSessionPayload {
         raw_digest: bytes_sha256_hex(bytes),
@@ -459,7 +426,6 @@ pub fn parse_session_payload_bytes(bytes: &[u8]) -> Result<ParsedSessionPayload,
         expiry,
         auth_method,
         email_hint,
-        user_tier,
     })
 }
 
@@ -555,14 +521,14 @@ mod tests {
         let parsed = parse_session_payload_bytes(encoded.as_bytes()).unwrap();
         assert_eq!(parsed.refresh_token_digest, token_digest("fixture-refresh"));
 
-        // Official `agy 1.5+` compact `id_token_email` + `user_tier` fallback when `id_token` JWT is absent
+        // Official `agy 1.5+` compact `id_token_email` fallback when `id_token` JWT is absent
+        // (optional legacy `user_tier` field on disk is silently ignored)
         let compact = br#"{"token":{"access_token":"ya29.c","token_type":"Bearer","refresh_token":"1//rt-c","expiry":"2099-01-01T00:00:00Z"},"auth_method":"consumer","id_token_email":"alice@example.com","user_tier":"PRO"}"#;
         let parsed_compact = parse_session_payload_bytes(compact).unwrap();
         assert_eq!(
             parsed_compact.email_hint.as_deref(),
             Some("alice@example.com")
         );
-        assert_eq!(parsed_compact.user_tier.as_deref(), Some("PRO"));
         let extracted_compact = extract_session_token_from_bytes(compact, "slot").unwrap();
         assert_eq!(
             extracted_compact.id_token_email.as_deref(),
@@ -572,7 +538,6 @@ mod tests {
             extracted_compact.email_hint.as_deref(),
             Some("alice@example.com")
         );
-        assert_eq!(extracted_compact.user_tier.as_deref(), Some("PRO"));
 
         // P2-04: JWT and compact `id_token_email` coexist with different values ->
         // display `email_hint` prefers JWT while `id_token_email` preserves original compact field.
@@ -586,8 +551,7 @@ mod tests {
             "token": {"access_token": "ya29.b", "token_type": "Bearer", "refresh_token": "1//rt-b", "expiry": "2099-01-01T00:00:00Z"},
             "auth_method": "consumer",
             "id_token": mk_jwt("jwt-user@example.com"),
-            "id_token_email": "compact-user@example.com",
-            "user_tier": "ULTRA"
+            "id_token_email": "compact-user@example.com"
         });
         let both_bytes = serde_json::to_vec(&both_json).unwrap();
         let ex_both = extract_session_token_from_bytes(&both_bytes, "slot").unwrap();
@@ -600,11 +564,11 @@ mod tests {
             &sample_token(1_800_000_000),
             ex_both.auth_method.as_deref(),
             ex_both.id_token_email.as_deref(),
-            ex_both.user_tier.as_deref(),
         )
         .unwrap();
         let rewritten_val: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
         assert_eq!(rewritten_val["id_token_email"], "compact-user@example.com");
+        assert!(rewritten_val.get("user_tier").is_none());
 
         // Offline switch for transfer-bundle imported accounts (`access_token == ""`, `expiry_timestamp == 1`)
         let mut empty_at_tok = sample_token(1);
@@ -618,21 +582,17 @@ mod tests {
         );
 
         // Bad JWT or JWT with internal OR trailing control characters (LF/CR/TAB) falls back cleanly to `id_token_email`.
-        for (bad_jwt, bad_tier) in [
-            ("not-a-jwt".to_string(), "PRO\x07"),
-            (mk_jwt("evil\x1b[31m@example.com"), "PRO\n"),
-            (mk_jwt("trailing-lf@example.com\n"), "\rPRO"),
-            (mk_jwt("trailing-tab@example.com\t"), "PRO\t"),
-            (
-                mk_jwt(&format!("{}@example.com", "a".repeat(320))),
-                "ULTRA\n",
-            ),
+        for bad_jwt in [
+            "not-a-jwt".to_string(),
+            mk_jwt("evil\x1b[31m@example.com"),
+            mk_jwt("trailing-lf@example.com\n"),
+            mk_jwt("trailing-tab@example.com\t"),
+            mk_jwt(&format!("{}@example.com", "a".repeat(320))),
         ] {
             let payload_json = serde_json::json!({
                 "token": {"access_token": "ya29.x", "token_type": "Bearer", "refresh_token": "1//rt-x", "expiry": "2099-01-01T00:00:00Z"},
                 "id_token": bad_jwt,
-                "id_token_email": "fallback@example.com",
-                "user_tier": bad_tier
+                "id_token_email": "fallback@example.com"
             });
             let raw = serde_json::to_vec(&payload_json).unwrap();
             let parsed_fb = parse_session_payload_bytes(&raw).unwrap();
@@ -640,14 +600,12 @@ mod tests {
                 parsed_fb.email_hint.as_deref(),
                 Some("fallback@example.com")
             );
-            assert_eq!(parsed_fb.user_tier, None);
             let ex_fb = extract_session_token_from_bytes(&raw, "slot").unwrap();
             assert_eq!(ex_fb.email_hint.as_deref(), Some("fallback@example.com"));
             assert_eq!(
                 ex_fb.id_token_email.as_deref(),
                 Some("fallback@example.com")
             );
-            assert_eq!(ex_fb.user_tier, None);
         }
 
         // R2-03: Unified length & control-char bounds on raw credential fields across read, extract, and serialize (zero echo!)
@@ -814,12 +772,10 @@ mod tests {
 
         let overlong_meta_json = serde_json::to_vec(&serde_json::json!({
             "token": {"refresh_token": "1//rt-ok"},
-            "id_token_email": format!("{}@example.com", "b".repeat(320)),
-            "user_tier": "T".repeat(200)
+            "id_token_email": format!("{}@example.com", "b".repeat(320))
         }))
         .unwrap();
         let parsed_over = parse_session_payload_bytes(&overlong_meta_json).unwrap();
         assert_eq!(parsed_over.email_hint, None);
-        assert_eq!(parsed_over.user_tier, None);
     }
 }

@@ -1,6 +1,6 @@
-use agy_switch_cli::domain::account::{AccountRecord, DisableReasonCode};
-use agy_switch_cli::domain::clock::ManualClock;
-use agy_switch_cli::domain::policy::{PolicyMode, PolicyStrategy, SwitchPolicy};
+mod common;
+
+use agy_switch_cli::domain::account::DisableReasonCode;
 use agy_switch_cli::domain::quota::{
     evaluate_quota_observation, QuotaObservation, QuotaSourceEnv, DEFAULT_QUOTA_MAX_AGE_SECS,
 };
@@ -17,27 +17,28 @@ use agy_switch_cli::oauth::refresh::{
 use agy_switch_cli::oauth::registry::OAuthClientRegistry;
 use agy_switch_cli::paths::HeadlessPaths;
 use agy_switch_cli::quota::official_cli::{
-    refresh_active_slot_quota_with_runner, OfficialCliQuotaError, OfficialCliQuotaRunner,
-    OfficialCliUsageOutcome,
+    refresh_active_slot_quota_with_runner, OfficialCliQuotaError, OfficialCliUsageOutcome,
 };
 use agy_switch_cli::session::backend::{CredentialBackend, FileSessionBackend, SlotInspectState};
 use agy_switch_cli::session::journal::{read_journal_readonly, reconcile_journal_locked};
 use agy_switch_cli::session::payload::serialize_session_payload;
-use agy_switch_cli::session::process::observe_runtime_state;
 use agy_switch_cli::store::locks::{
     with_account_refresh_lock, with_store_write_lock, ActiveSlotLock,
 };
 use agy_switch_cli::store::repository::StoreRepository;
 use agy_switch_cli::store::transfer::{export_transfer_bundle_file, import_transfer_bundle_file};
-use agy_switch_cli::switching::daemon::{DaemonConfigOverrides, DaemonEngine, TickStageOutcome};
 use agy_switch_cli::switching::executor::execute_switch_with_slot_lock;
 use agy_switch_cli::transport::client::{
     BoxFuture, HttpRequest, HttpResponse, HttpTransport, MockTransport, TimeoutClass,
     TransportError,
 };
 use agy_switch_cli::transport::proxy::ProxyMode;
+use common::{
+    fast_oauth_endpoints as fast_oauth, make_synthetic_account as make_acc, make_usage_outcome,
+    run_isolated_subtest, IsolatedEnv, KillChildOnDrop, SlotQuotaRunner as AuditSlotQuotaRunner,
+};
 use serde_json::json;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CString, OsStr};
 use std::fs;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -46,67 +47,26 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use url::Url;
 
 static ENV_MUTEX: AsyncMutex<()> = AsyncMutex::const_new(());
 
-struct ScopedEnvVar {
-    key: &'static str,
-    prev: Option<OsString>,
-}
-
-impl ScopedEnvVar {
-    fn set(key: &'static str, val: impl AsRef<OsStr>) -> Self {
-        let prev = std::env::var_os(key);
-        std::env::set_var(key, val);
-        Self { key, prev }
-    }
-}
-
-impl Drop for ScopedEnvVar {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
-
-struct KillChildOnDrop(Option<std::process::Child>);
-
-impl KillChildOnDrop {
-    fn new(child: std::process::Child) -> Self {
-        Self(Some(child))
-    }
-
-    fn as_mut(&mut self) -> &mut std::process::Child {
-        self.0.as_mut().expect("child active")
-    }
-
-    fn take(&mut self) -> std::process::Child {
-        self.0.take().expect("child active")
-    }
-}
-
-impl Drop for KillChildOnDrop {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+struct TmpPathRef(PathBuf);
+impl TmpPathRef {
+    fn path(&self) -> &Path {
+        &self.0
     }
 }
 
 struct IsolatedHarness {
-    pub tmp: TempDir,
+    pub env: IsolatedEnv,
+    pub tmp: TmpPathRef,
     pub home: PathBuf,
-    pub data_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub runtime_dir: PathBuf,
     pub proc_dir: PathBuf,
@@ -114,24 +74,17 @@ struct IsolatedHarness {
 
 impl IsolatedHarness {
     fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let data_dir = tmp.path().join("data");
-        let cache_dir = tmp.path().join("cache");
-        let runtime_dir = tmp.path().join("run");
-        let proc_dir = tmp.path().join("proc");
-        fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
-        fs::set_permissions(
-            home.join(".gemini/antigravity-cli"),
-            fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
-        fs::create_dir_all(&runtime_dir).unwrap();
-        fs::create_dir_all(&proc_dir).unwrap();
+        let env = IsolatedEnv::new();
+        env.init_agy_slot_dir();
+        let tmp = TmpPathRef(env.tmp_path().to_path_buf());
+        let home = env.home.clone();
+        let cache_dir = env.cache_dir.clone();
+        let runtime_dir = env.runtime_dir.clone();
+        let proc_dir = env.proc_dir.clone();
         Self {
+            env,
             tmp,
             home,
-            data_dir,
             cache_dir,
             runtime_dir,
             proc_dir,
@@ -139,135 +92,20 @@ impl IsolatedHarness {
     }
 
     fn paths(&self) -> HeadlessPaths {
-        HeadlessPaths::with_explicit(
-            self.home.clone(),
-            self.data_dir.clone(),
-            self.cache_dir.join("agy-switch-cli"),
-        )
+        self.env.paths()
     }
 
     fn cli(&self) -> Command {
-        self.cli_for_data_dir(&self.data_dir)
+        self.env.cli_cmd()
     }
 
     fn cli_for_data_dir(&self, data_dir: &Path) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"));
-        c.env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", &self.home)
-            .env("XDG_DATA_HOME", self.tmp.path().join("xdg_data"))
-            .env("XDG_CACHE_HOME", &self.cache_dir)
-            .env("XDG_CONFIG_HOME", self.tmp.path().join("xdg_cfg"))
-            .env("XDG_RUNTIME_DIR", &self.runtime_dir)
-            .env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={}/no-dbus", self.runtime_dir.display()),
-            )
-            .env("AGY_SWITCH_CLI_PROC_ROOT", &self.proc_dir)
-            .env(
-                "AGY_SWITCH_CLI_AGY_BIN",
-                self.tmp.path().join("no-host-agy"),
-            )
-            .env("NO_PROXY", "*")
-            .env("AGY_SWITCH_CLI_PROXY", "direct")
-            .args(["--data-dir", data_dir.to_str().unwrap()]);
-        c
-    }
-}
-
-fn make_acc(id: &str, email: &str, rt: &str, expiry: i64, now: i64) -> AccountRecord {
-    AccountRecord::new(
-        id.into(),
-        email.into(),
-        TokenRecord {
-            access_token: format!("ya29.AT_{id}"),
-            refresh_token: rt.into(),
-            expires_in: 3600,
-            expiry_timestamp: expiry,
-            token_type: "Bearer".into(),
-            id_token: None,
-            oauth_client_key: Some("antigravity_enterprise".into()),
-            granted_scopes: Some(vec![
-                "openid".into(),
-                "https://www.googleapis.com/auth/cloud-platform".into(),
-            ]),
-            project_id: None,
-            is_gcp_tos: true,
-        },
-        now,
-    )
-}
-
-fn fast_oauth() -> OAuthEndpoints {
-    OAuthEndpoints {
-        base_backoff: Duration::from_millis(5),
-        ..OAuthEndpoints::default()
-    }
-}
-
-type AuditSlotUsageFn = dyn Fn(&HeadlessPaths, bool, &str) -> Result<OfficialCliUsageOutcome, OfficialCliQuotaError>
-    + Send
-    + Sync;
-
-struct AuditSlotQuotaRunner {
-    handler: Arc<AuditSlotUsageFn>,
-}
-
-impl AuditSlotQuotaRunner {
-    fn from_handler<F>(f: F) -> Self
-    where
-        F: Fn(&HeadlessPaths, bool, &str) -> Result<OfficialCliUsageOutcome, OfficialCliQuotaError>
-            + Send
-            + Sync
-            + 'static,
-    {
-        Self {
-            handler: Arc::new(f),
-        }
-    }
-}
-
-impl OfficialCliQuotaRunner for AuditSlotQuotaRunner {
-    fn query_active_usage<'a>(
-        &'a self,
-        paths: &'a HeadlessPaths,
-        explicit_file_backend: bool,
-    ) -> BoxFuture<'a, Result<OfficialCliUsageOutcome, OfficialCliQuotaError>> {
-        Box::pin(async move {
-            let slot_text = fs::read_to_string(&paths.active_slot_file).unwrap_or_default();
-            (self.handler)(paths, explicit_file_backend, &slot_text)
-        })
+        self.env.cli_cmd_with_data_dir(data_dir)
     }
 }
 
 fn audit_quota_outcome(frac: f64, reset_str: &str) -> OfficialCliUsageOutcome {
-    OfficialCliUsageOutcome::Quota {
-        description: None,
-        groups: vec![agy_switch_cli::domain::quota::QuotaGroup {
-            display_name: "Gemini Models".into(),
-            description: Some("Models within this group: gemini-3.1-pro".into()),
-            buckets: vec![
-                agy_switch_cli::domain::quota::QuotaBucket {
-                    bucket_id: "gemini-5h".into(),
-                    window: "5h".into(),
-                    remaining_fraction: frac,
-                    remaining_fraction_known: Some(true),
-                    reset_time: reset_str.into(),
-                    display_name: None,
-                    description: None,
-                },
-                agy_switch_cli::domain::quota::QuotaBucket {
-                    bucket_id: "gemini-weekly".into(),
-                    window: "weekly".into(),
-                    remaining_fraction: frac,
-                    remaining_fraction_known: Some(true),
-                    reset_time: reset_str.into(),
-                    display_name: None,
-                    description: None,
-                },
-            ],
-        }],
-    }
+    make_usage_outcome(frac, frac, reset_str)
 }
 
 // ============================================================================
@@ -909,215 +747,10 @@ async fn a06_lock_hierarchy_invariants_hold_on_current_thread_executor() {
 }
 
 // ============================================================================
-// A07 + A08: Daemon Prepare in-flight policy reorder & real commit-time clock revalidation
+// A09 + A10: Direct weekly-only bucket eval, missing primary fraction, and OfficialCli validation-block isolation
 // ============================================================================
 #[tokio::test]
-async fn a07_and_a08_daemon_cancels_on_prepare_policy_reorder_and_clock_reset_expiration() {
-    let _g = ENV_MUTEX.lock().await;
-    let h = IsolatedHarness::new();
-    let _pg = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir);
-    let paths = h.paths();
-    let repo = StoreRepository::new(paths.clone());
-    let backend = FileSessionBackend;
-    let reg = OAuthClientRegistry::parse_from_raw(None, None);
-    let now = 1_800_000_000i64;
-
-    let make_q = |pct: f64, reset_unix: i64| -> QuotaObservation {
-        let reset_str = jiff::Timestamp::from_second(reset_unix)
-            .unwrap()
-            .to_string();
-        let mut q = QuotaObservation::new(now, QuotaSourceEnv::Production);
-        q.subscription_tier = Some("Google AI Pro".into());
-        q.tier_source_env = Some(QuotaSourceEnv::Production);
-        q.models.push(agy_switch_cli::domain::quota::ModelQuota {
-            name: "gemini-3.8-flash".into(),
-            percentage: (pct * 100.0).round() as i32,
-            percentage_known: Some(true),
-            observed_remaining_fraction: Some(pct),
-            primary_quota: Some(agy_switch_cli::domain::quota::PrimaryModelQuota {
-                remaining_fraction: Some(pct),
-                reset_time: reset_str.clone(),
-            }),
-            quota_bucket_id: Some("gemini-weekly".into()),
-            reset_time: reset_str.clone(),
-            display_name: None,
-            supports_images: None,
-            supports_thinking: None,
-            thinking_budget: None,
-            recommended: None,
-            max_tokens: None,
-            max_output_tokens: None,
-            supported_mime_types: None,
-        });
-        q.quota_groups = Some(vec![agy_switch_cli::domain::quota::QuotaGroup {
-            display_name: "Gemini Models".into(),
-            description: None,
-            buckets: vec![
-                agy_switch_cli::domain::quota::QuotaBucket {
-                    bucket_id: "gemini-weekly".into(),
-                    window: "weekly".into(),
-                    remaining_fraction: pct,
-                    remaining_fraction_known: Some(true),
-                    reset_time: reset_str.clone(),
-                    display_name: None,
-                    description: None,
-                },
-                agy_switch_cli::domain::quota::QuotaBucket {
-                    bucket_id: "gemini-5h".into(),
-                    window: "5h".into(),
-                    remaining_fraction: pct,
-                    remaining_fraction_known: Some(true),
-                    reset_time: reset_str,
-                    display_name: None,
-                    description: None,
-                },
-            ],
-        }]);
-        q
-    };
-
-    let mut src = make_acc("src", "src@example.invalid", "1//RT_SRC", now + 7200, now);
-    src.quota = Some(make_q(0.05, now + 3600));
-    // `c1` has near-expiry token (`now + 10`) so Stage 3 `Prepare` calls `/token`!
-    let mut c1 = make_acc("c1", "c1@example.invalid", "1//RT_C1", now + 10, now);
-    c1.name = Some("C1".into());
-    c1.quota = Some(make_q(0.80, now + 3600));
-    let mut c2 = make_acc("c2", "c2@example.invalid", "1//RT_C2", now + 7200, now);
-    c2.name = Some("C2".into());
-    c2.quota = Some(make_q(0.90, now + 3600));
-
-    repo.with_write_lock(|tx| {
-        tx.upsert_account(src.clone(), true, now)?;
-        tx.upsert_account(c1, false, now)?;
-        tx.upsert_account(c2, false, now)?;
-        let mut pol = SwitchPolicy {
-            enabled: true,
-            mode: PolicyMode::Wait,
-            strategy: PolicyStrategy::Priority,
-            reserve_percentage: 10,
-            candidate_min_percentage: 30,
-            monitored_model: "gemini".into(),
-            candidate_account_ids: vec!["c1".into(), "c2".into()],
-            ..SwitchPolicy::default()
-        };
-        tx.save_policy(&mut pol, None, now)?;
-        Ok(())
-    })
-    .unwrap();
-    backend
-        .write_slot(&paths, &serialize_session_payload(&src.token).unwrap())
-        .unwrap();
-
-    // A07: User reorders policy to `[c2, c1]` right before Stage 5 Revalidate -> MUST cancel stale plan!
-    let repo_in_revalidate = repo.clone();
-    let reordered_flag = Arc::new(AtomicBool::new(false));
-    let rf = reordered_flag.clone();
-    let mut engine = DaemonEngine::new();
-    engine.before_revalidate_hook = Some(Arc::new(move || {
-        if !rf.swap(true, Ordering::SeqCst) {
-            repo_in_revalidate
-                .with_write_lock(|tx| {
-                    let mut pol = repo_in_revalidate.read_policy()?;
-                    let prev = pol.revision;
-                    pol.candidate_account_ids = vec!["c2".into(), "c1".into()];
-                    tx.save_policy(&mut pol, Some(prev), now + 1)?;
-                    Ok(())
-                })
-                .unwrap();
-        }
-    }));
-
-    let runner_a07 = AuditSlotQuotaRunner::from_handler(|_, _, _| {
-        Ok(audit_quota_outcome(0.85, "2099-01-01T00:00:00Z"))
-    });
-    let out_a07 = engine
-        .run_single_tick(
-            &repo,
-            &backend,
-            &runner_a07,
-            &reg,
-            &DaemonConfigOverrides {
-                step_buffer_delay: Duration::ZERO,
-                ..DaemonConfigOverrides::default()
-            },
-            now,
-        )
-        .await
-        .unwrap();
-    engine.before_revalidate_hook = None;
-    assert_eq!(
-        out_a07,
-        TickStageOutcome::CancelledStalePlan {
-            reason: "policy_revision_changed_or_disabled".into()
-        },
-        "In-flight policy reorder MUST cancel stale plan!"
-    );
-    assert_eq!(
-        repo.read_snapshot()
-            .unwrap()
-            .index
-            .selected_account_id
-            .as_deref(),
-        Some("src")
-    );
-
-    // A08: Candidate `c2` live `/usage` returns `reset = now + 1s`, while `ManualClock` advances by 2s
-    //      during the probe (`now + 2 > reset`) -> evaluated as `Stale` (NOT qualified) and NOT landed!
-    let clock = Arc::new(ManualClock::new(now));
-    let reset_plus_1 = jiff::Timestamp::from_second(now + 1).unwrap().to_string();
-    let clock_in_probe = clock.clone();
-    let reset_for_c2 = reset_plus_1.clone();
-    let runner_a08 = AuditSlotQuotaRunner::from_handler(move |_, _, slot| {
-        if slot.contains("1//RT_C2") {
-            clock_in_probe.advance(2);
-            Ok(audit_quota_outcome(0.90, &reset_for_c2))
-        } else {
-            Ok(audit_quota_outcome(0.05, "2099-01-01T00:00:00Z"))
-        }
-    });
-    repo.with_write_lock(|tx| {
-        let mut pol = repo.read_policy()?;
-        let prev = pol.revision;
-        pol.candidate_account_ids = vec!["c2".into()];
-        tx.save_policy(&mut pol, Some(prev), now + 2)?;
-        Ok(())
-    })
-    .unwrap();
-
-    let mut engine_clock = DaemonEngine::with_clock(clock.clone());
-    let out_a08 = engine_clock
-        .run_single_tick(
-            &repo,
-            &backend,
-            &runner_a08,
-            &reg,
-            &DaemonConfigOverrides {
-                step_buffer_delay: Duration::ZERO,
-                ..DaemonConfigOverrides::default()
-            },
-            now,
-        )
-        .await
-        .unwrap();
-    assert!(
-        matches!(out_a08, TickStageOutcome::NoQualifiedCandidate { .. }),
-        "Candidate whose reset_time passed during probe MUST NOT land: got {out_a08:?}"
-    );
-    assert_eq!(
-        repo.read_snapshot()
-            .unwrap()
-            .index
-            .selected_account_id
-            .as_deref(),
-        Some("src")
-    );
-}
-
-// ============================================================================
-// A09 + A10: Single-env tier guard, missing primary fraction, and OfficialCli validation-block isolation
-// ============================================================================
-#[tokio::test]
-async fn a09_and_a10_quota_single_env_missing_primary_and_error_evidence_chains() {
+async fn a09_and_a10_quota_missing_primary_and_error_evidence_chains() {
     let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let repo = StoreRepository::new(h.paths());
@@ -1131,11 +764,9 @@ async fn a09_and_a10_quota_single_env_missing_primary_and_error_evidence_chains(
         .write_slot(&h.paths(), &serialize_session_payload(&acc.token).unwrap())
         .unwrap();
 
-    // 1. A09(A): Cross-env `tier_source_env != source_env` Free tier without 5h bucket MUST stay Unknown!
-    let mut obs_cross = QuotaObservation::new(now, QuotaSourceEnv::Daily);
-    obs_cross.subscription_tier = Some("Free Tier".into());
-    obs_cross.tier_source_env = Some(QuotaSourceEnv::Sandbox);
-    obs_cross
+    // 1. A09(A): Weekly-only bucket evaluates directly to `Known` without subscription_tier inference!
+    let mut obs_weekly = QuotaObservation::new(now, QuotaSourceEnv::Daily);
+    obs_weekly
         .models
         .push(agy_switch_cli::domain::quota::ModelQuota {
             name: "gemini-3.8-flash".into(),
@@ -1157,7 +788,7 @@ async fn a09_and_a10_quota_single_env_missing_primary_and_error_evidence_chains(
             max_output_tokens: None,
             supported_mime_types: None,
         });
-    obs_cross.quota_groups = Some(vec![agy_switch_cli::domain::quota::QuotaGroup {
+    obs_weekly.quota_groups = Some(vec![agy_switch_cli::domain::quota::QuotaGroup {
         display_name: "Gemini Models".into(),
         description: None,
         buckets: vec![agy_switch_cli::domain::quota::QuotaBucket {
@@ -1170,15 +801,15 @@ async fn a09_and_a10_quota_single_env_missing_primary_and_error_evidence_chains(
             description: None,
         }],
     }]);
-    assert!(matches!(
-        evaluate_quota_observation(&obs_cross, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-        agy_switch_cli::domain::quota::QuotaEval::Unknown { .. }
-    ));
+    assert_eq!(
+        evaluate_quota_observation(&obs_weekly, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
+        agy_switch_cli::domain::quota::QuotaEval::Known {
+            remaining_percentage: 80.0
+        }
+    );
 
     // 2. A09(B): Model `primary_quota.remaining_fraction == None` MUST remain Unknown even with complete summary!
-    let mut obs_mp = obs_cross.clone();
-    obs_mp.tier_source_env = Some(QuotaSourceEnv::Daily);
-    obs_mp.subscription_tier = Some("Google AI Pro".into());
+    let mut obs_mp = obs_weekly.clone();
     obs_mp.models[0].primary_quota = Some(agy_switch_cli::domain::quota::PrimaryModelQuota {
         remaining_fraction: None,
         reset_time: "2099-01-01T00:00:00Z".into(),
@@ -1261,6 +892,32 @@ async fn a09_and_a10_quota_single_env_missing_primary_and_error_evidence_chains(
 // ============================================================================
 #[tokio::test]
 async fn a11_reauthorize_preserves_manual_disable_and_propagates_state_write_erofs() {
+    if let Some(sub_dir) = std::env::var_os("AGY_SUBTEST_A11_EROFS_DIR") {
+        let base = PathBuf::from(sub_dir);
+        let paths = HeadlessPaths::with_explicit(
+            base.join("home"),
+            base.join("data"),
+            base.join("cache").join("agy-switch-cli"),
+        );
+        let repo = StoreRepository::new(paths);
+        let reg = OAuthClientRegistry::parse_from_raw(None, None);
+        let now = 1_800_000_000i64;
+        let erofs_err = ensure_account_token_fresh_locked(
+            &repo,
+            &MockTransport::default(),
+            &fast_oauth(),
+            &reg,
+            "acc-erofs",
+            false,
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(erofs_err.exit_code, ExitCode::GeneralOrDataError);
+        assert_eq!(erofs_err.error_code, "read_only_fs_erofs");
+        return;
+    }
+
     let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let repo = StoreRepository::new(h.paths());
@@ -1345,32 +1002,24 @@ async fn a11_reauthorize_preserves_manual_disable_and_propagates_state_write_ero
     repo.with_write_lock(|tx| tx.upsert_account(acc_erofs, false, now))
         .unwrap();
 
-    let fault = ScopedEnvVar::set(
-        "AGY_SWITCH_CLI_FAULT_SPEC",
-        "before_write:acc-erofs.json:erofs",
+    run_isolated_subtest(
+        "a11_reauthorize_preserves_manual_disable_and_propagates_state_write_erofs",
+        "AGY_SUBTEST_A11_EROFS",
+        &[
+            ("AGY_SUBTEST_A11_EROFS_DIR", h.tmp.path().as_os_str()),
+            (
+                "AGY_SWITCH_CLI_FAULT_SPEC",
+                OsStr::new("before_write:acc-erofs.json:erofs"),
+            ),
+        ],
     );
-    let erofs_err = ensure_account_token_fresh_locked(
-        &repo,
-        &MockTransport::default(),
-        &fast_oauth(),
-        &reg,
-        "acc-erofs",
-        false,
-        now,
-    )
-    .await
-    .unwrap_err();
-    drop(fault);
-
-    assert_eq!(erofs_err.exit_code, ExitCode::GeneralOrDataError);
-    assert_eq!(erofs_err.error_code, "read_only_fs_erofs");
 }
 
 // ============================================================================
-// A12 + A13 + A14 + A15 + A21: Fail-closed proc, 127.attacker host, FIFOs, manual --json, delete policy I/O
+// A12 + A13 + A14 + A15: Fail-closed proc, 127.attacker host, FIFOs, manual --json, account delete
 // ============================================================================
 #[tokio::test]
-async fn a12_a13_a14_a15_a21_proc_fail_closed_loopback_host_fifo_json_and_delete_policy() {
+async fn a12_a13_a14_a15_proc_fail_closed_loopback_host_fifo_json_and_delete_account() {
     let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let paths = h.paths();
@@ -1400,22 +1049,30 @@ async fn a12_a13_a14_a15_a21_proc_fail_closed_loopback_host_fifo_json_and_delete
     fs::set_permissions(&h.proc_dir, fs::Permissions::from_mode(0o000)).unwrap();
     let proc_open_failed = fs::read_dir(&h.proc_dir).is_err();
     if proc_open_failed {
-        let _pg = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir);
-        assert!(matches!(
-            observe_runtime_state(&paths),
-            agy_switch_cli::domain::account::RuntimeState::Unverified { .. }
-        ));
+        let cur_000 = h
+            .cli()
+            .env("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir)
+            .args(["--json", "current"])
+            .output()
+            .unwrap();
+        assert_eq!(cur_000.status.code(), Some(0));
+        let j_000: serde_json::Value = serde_json::from_slice(&cur_000.stdout).unwrap();
+        assert_eq!(j_000["runtime_state"]["state"], "unverified");
     }
     fs::set_permissions(&h.proc_dir, fs::Permissions::from_mode(0o700)).unwrap();
     // Also test a live numeric PID dir with malformed/empty `stat` (works even if container root has DAC_OVERRIDE!)
     fs::create_dir_all(h.proc_dir.join("9999")).unwrap();
     fs::write(h.proc_dir.join("9999/stat"), b"corrupt-stat").unwrap();
     {
-        let _pg = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir);
-        assert!(matches!(
-            observe_runtime_state(&paths),
-            agy_switch_cli::domain::account::RuntimeState::Unverified { .. }
-        ));
+        let cur_corrupt = h
+            .cli()
+            .env("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir)
+            .args(["--json", "current"])
+            .output()
+            .unwrap();
+        assert_eq!(cur_corrupt.status.code(), Some(0));
+        let j_corrupt: serde_json::Value = serde_json::from_slice(&cur_corrupt.stdout).unwrap();
+        assert_eq!(j_corrupt["runtime_state"]["state"], "unverified");
     }
     fs::remove_dir_all(h.proc_dir.join("9999")).unwrap();
 
@@ -1447,45 +1104,25 @@ async fn a12_a13_a14_a15_a21_proc_fail_closed_loopback_host_fifo_json_and_delete
     assert_eq!(err_env["ok"], false);
     assert_eq!(err_env["exit_code"], 2);
 
-    // Seed accounts + policy for A21 and A14 tests
+    // Seed accounts for A14 FIFO tests
     let acc_a = make_acc("acc-a", "a@example.invalid", "1//RT_A", now + 7200, now);
     let acc_b = make_acc("acc-b", "b@example.invalid", "1//RT_B", now + 7200, now);
     repo.with_write_lock(|tx| {
         tx.upsert_account(acc_a, true, now)?;
         tx.upsert_account(acc_b, false, now)?;
-        let mut pol = SwitchPolicy {
-            enabled: true,
-            candidate_account_ids: vec!["acc-b".into()],
-            ..SwitchPolicy::default()
-        };
-        tx.save_policy(&mut pol, None, now)?;
         Ok(())
     })
     .unwrap();
 
-    // A21: `before_write:policy.json:enospc` on `accounts delete acc-b` MUST fail (exit 1), NOT exit 0!
-    let del_fail = h
-        .cli()
-        .env(
-            "AGY_SWITCH_CLI_FAULT_SPEC",
-            "before_write:policy.json:enospc",
-        )
-        .args(["accounts", "delete", "acc-b", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(del_fail.status.code(), Some(1));
-    assert!(repo.read_account_unchecked("acc-b").is_ok());
-
-    // Without fault, `accounts delete acc-b` cleans both account AND policy!
+    // `accounts delete acc-b` deletes account cleanly
     let del_ok = h
         .cli()
         .args(["accounts", "delete", "acc-b", "--json"])
         .output()
         .unwrap();
     assert_eq!(del_ok.status.code(), Some(0));
-    assert!(repo.read_policy().unwrap().candidate_account_ids.is_empty());
 
-    // A14: Replace `policy.json`, `state/switch_journal.json`, `accounts/acc-a.json`, `index.json` with 0600 FIFOs
+    // A14: Replace `state/switch_journal.json`, `accounts/acc-a.json`, `index.json` with 0600 FIFOs
     // and assert commands fail fast (< 500ms) instead of blocking forever!
     let make_fifo = |p: &Path| {
         if p.exists() {
@@ -1496,10 +1133,6 @@ async fn a12_a13_a14_a15_a21_proc_fail_closed_loopback_host_fifo_json_and_delete
     };
 
     for (fifo_target, args) in [
-        (
-            paths.policy_file(),
-            vec!["policy", "set", "--reserve", "10"],
-        ),
         (
             paths.switch_journal_file(),
             vec!["accounts", "enable", "acc-a"],
@@ -1535,41 +1168,20 @@ async fn a12_a13_a14_a15_a21_proc_fail_closed_loopback_host_fifo_json_and_delete
 }
 
 // ============================================================================
-// A16 + A17: External SIGTERM on TUI restores PTY ECHO & `daemon --once` exits 0 on SIGTERM
+// A16: External SIGTERM on TUI restores PTY ECHO
 // ============================================================================
+#[cfg(feature = "tui")]
 #[tokio::test]
-async fn a16_and_a17_sigterm_graceful_daemon_once_and_pty_tui_echo_restore() {
+async fn a16_sigterm_pty_tui_echo_restore() {
     let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let paths = h.paths();
     let repo = StoreRepository::new(paths.clone());
     let now = jiff::Timestamp::now().as_second();
 
-    // Seed low-quota source account + slow synthetic `agy` binary so `daemon --once` blocks in Stage 1 `/usage`!
-    let slow_agy = h.tmp.path().join("slow-daemon-once-agy");
-    let started_marker = h.tmp.path().join("daemon-once-agy-started");
-    fs::write(
-        &slow_agy,
-        format!(
-            "#!/bin/sh\necho started > \"{}\"\nsleep 30\n",
-            started_marker.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&slow_agy, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let mut acc = make_acc("acc-d", "d@example.invalid", "1//RT_D", now + 7200, now);
-    acc.quota = None; // Unknown -> Stage 1 triggers official CLI probe!
+    let acc = make_acc("acc-d", "d@example.invalid", "1//RT_D", now + 7200, now);
     repo.with_write_lock(|tx| {
         tx.upsert_account(acc.clone(), true, now)?;
-        let acc2 = make_acc("acc-d2", "d2@example.invalid", "1//RT_D2", now + 7200, now);
-        tx.upsert_account(acc2, false, now)?;
-        let mut pol = SwitchPolicy {
-            enabled: true,
-            candidate_account_ids: vec!["acc-d2".into()],
-            ..SwitchPolicy::default()
-        };
-        tx.save_policy(&mut pol, None, now)?;
         Ok(())
     })
     .unwrap();
@@ -1577,35 +1189,6 @@ async fn a16_and_a17_sigterm_graceful_daemon_once_and_pty_tui_echo_restore() {
         .write_slot(&paths, &serialize_session_payload(&acc.token).unwrap())
         .unwrap();
 
-    let mut d_once = h
-        .cli()
-        .env("AGY_SWITCH_CLI_AGY_BIN", &slow_agy)
-        .args(["daemon", "--once"])
-        .spawn()
-        .unwrap();
-
-    for _ in 0..100 {
-        if started_marker.exists() {
-            break;
-        }
-        ::tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        started_marker.exists(),
-        "daemon --once did not invoke synthetic `agy`"
-    );
-    unsafe {
-        libc::kill(d_once.id() as i32, libc::SIGTERM);
-    }
-    let st = d_once.wait().unwrap();
-    assert_eq!(
-        st.code(),
-        Some(0),
-        "`daemon --once` MUST exit gracefully with code 0 on SIGTERM (got status {st:?})"
-    );
-
-    // A16 (`#[cfg(feature = "tui")]`): External SIGTERM while TUI is in raw mode MUST restore PTY ECHO!
-    #[cfg(feature = "tui")]
     {
         use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -1799,7 +1382,7 @@ fn real_sigkill_signal_9_after_slot_commit_recovers_cleanly_via_status_and_write
 
     let fix = h
         .cli()
-        .args(["policy", "set", "--reserve", "10", "--json"])
+        .args(["accounts", "enable", "acc-a", "--json"])
         .output()
         .unwrap();
     assert_eq!(fix.status.code(), Some(0));
@@ -1812,179 +1395,6 @@ fn real_sigkill_signal_9_after_slot_commit_recovers_cleanly_via_status_and_write
         Some("acc-b")
     );
     assert!(read_journal_readonly(&paths).unwrap().is_none());
-}
-
-// ============================================================================
-// §4.2 #5: Daemon candidate probe budget <= 3 cancels lower-priority while preserving rotated RT
-// ============================================================================
-#[tokio::test]
-async fn daemon_candidate_budget_cancels_lower_priority_probe_while_preserving_its_rotated_rt() {
-    let _g = ENV_MUTEX.lock().await;
-    let h = IsolatedHarness::new();
-    let _pg = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir);
-    let paths = h.paths();
-    let repo = StoreRepository::new(paths.clone());
-    let backend = FileSessionBackend;
-    let reg = OAuthClientRegistry::parse_from_raw(None, None);
-    let now = 1_800_000_000i64;
-
-    let mut src = make_acc("src", "src@example.invalid", "1//RT_SRC", now + 7200, now);
-    let mut sq = QuotaObservation::new(now, QuotaSourceEnv::Production);
-    sq.subscription_tier = Some("Google AI Pro".into());
-    sq.tier_source_env = Some(QuotaSourceEnv::Production);
-    sq.models.push(agy_switch_cli::domain::quota::ModelQuota {
-        name: "gemini-3.8-flash".into(),
-        percentage: 5,
-        percentage_known: Some(true),
-        observed_remaining_fraction: Some(0.05),
-        primary_quota: Some(agy_switch_cli::domain::quota::PrimaryModelQuota {
-            remaining_fraction: Some(0.05),
-            reset_time: "2099-01-01T00:00:00Z".into(),
-        }),
-        quota_bucket_id: Some("gemini-weekly".into()),
-        reset_time: "2099-01-01T00:00:00Z".into(),
-        display_name: None,
-        supports_images: None,
-        supports_thinking: None,
-        thinking_budget: None,
-        recommended: None,
-        max_tokens: None,
-        max_output_tokens: None,
-        supported_mime_types: None,
-    });
-    sq.quota_groups = Some(vec![agy_switch_cli::domain::quota::QuotaGroup {
-        display_name: "Gemini Models".into(),
-        description: None,
-        buckets: vec![
-            agy_switch_cli::domain::quota::QuotaBucket {
-                bucket_id: "gemini-weekly".into(),
-                window: "weekly".into(),
-                remaining_fraction: 0.05,
-                remaining_fraction_known: Some(true),
-                reset_time: "2099-01-01T00:00:00Z".into(),
-                display_name: None,
-                description: None,
-            },
-            agy_switch_cli::domain::quota::QuotaBucket {
-                bucket_id: "gemini-5h".into(),
-                window: "5h".into(),
-                remaining_fraction: 0.05,
-                remaining_fraction_known: Some(true),
-                reset_time: "2099-01-01T00:00:00Z".into(),
-                display_name: None,
-                description: None,
-            },
-        ],
-    }]);
-    src.quota = Some(sq);
-
-    // c1: fresh token, missing quota -> wins with 85%!
-    let mut c1 = make_acc("c1", "c1@example.invalid", "1//RT_C1", now + 7200, now);
-    c1.name = Some("C1".into());
-    // c2: expired token -> rotates to `1//C2_ROTATED_SURVIVES_DROP`, then blocks in `:loadCodeAssist`!
-    let mut c2 = make_acc("c2", "c2@example.invalid", "1//RT_C2_OLD", now + 10, now);
-    c2.name = Some("C2".into());
-    // c3, c4, c5: also missing quota
-    let mut c3 = make_acc("c3", "c3@example.invalid", "1//RT_C3", now + 7200, now);
-    c3.name = Some("C3".into());
-    let c4 = make_acc("c4", "c4@example.invalid", "1//RT_C4", now + 7200, now);
-    let c5 = make_acc("c5", "c5@example.invalid", "1//RT_C5", now + 7200, now);
-
-    repo.with_write_lock(|tx| {
-        tx.upsert_account(src.clone(), true, now)?;
-        for c in [&c1, &c2, &c3, &c4, &c5] {
-            tx.upsert_account(c.clone(), false, now)?;
-        }
-        let mut pol = SwitchPolicy {
-            enabled: true,
-            reserve_percentage: 10,
-            candidate_min_percentage: 50,
-            monitored_model: "gemini".into(),
-            candidate_account_ids: vec![
-                "c1".into(),
-                "c2".into(),
-                "c3".into(),
-                "c4".into(),
-                "c5".into(),
-            ],
-            ..SwitchPolicy::default()
-        };
-        tx.save_policy(&mut pol, None, now)?;
-        Ok(())
-    })
-    .unwrap();
-    backend
-        .write_slot(&paths, &serialize_session_payload(&src.token).unwrap())
-        .unwrap();
-
-    // Step-and-Verify probes candidates sequentially ONE AT A TIME (`peak == 1`):
-    // `c1` returns 20% (< 50%) AND rotates its refresh_token inside the slot during `/usage` ->
-    // rotated RT is synced back and SURVIVES when Step-and-Verify advances to `c2` (85% winner)!
-    // `c3`, `c4`, `c5` are NEVER probed!
-    let active = Arc::new(AtomicUsize::new(0));
-    let peak = Arc::new(AtomicUsize::new(0));
-    let active_c = active.clone();
-    let peak_c = peak.clone();
-    let runner = AuditSlotQuotaRunner::from_handler(move |p, _, slot| {
-        let cur = active_c.fetch_add(1, Ordering::SeqCst) + 1;
-        peak_c.fetch_max(cur, Ordering::SeqCst);
-        let res = if slot.contains("1//RT_C1") {
-            // Simulate official `agy` rotating c1's refresh_token during `/usage`!
-            fs::write(
-                &p.active_slot_file,
-                serde_json::to_vec(&json!({
-                    "access_token": "ya29.AT_c1_NEW",
-                    "refresh_token": "1//C1_ROTATED_SURVIVES_HOP",
-                    "token_type": "Bearer",
-                    "expiry": "2099-01-01T00:00:00Z",
-                    "id_token_email": "c1@example.invalid"
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-            Ok(audit_quota_outcome(0.20, "2099-01-01T00:00:00Z"))
-        } else if slot.contains("1//RT_C2_OLD") {
-            Ok(audit_quota_outcome(0.85, "2099-01-01T00:00:00Z"))
-        } else {
-            panic!("Candidates c3/c4/c5 must NEVER be probed after c2 lands! slot={slot}");
-        };
-        active_c.fetch_sub(1, Ordering::SeqCst);
-        res
-    });
-
-    let mut engine = DaemonEngine::new();
-    let out = engine
-        .run_single_tick(
-            &repo,
-            &backend,
-            &runner,
-            &reg,
-            &DaemonConfigOverrides {
-                step_buffer_delay: Duration::ZERO,
-                ..DaemonConfigOverrides::default()
-            },
-            now,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        out,
-        TickStageOutcome::CommittedSwitch {
-            source_id: "src".into(),
-            target_id: "c2".into()
-        }
-    );
-    assert_eq!(peak.load(Ordering::SeqCst), 1);
-    assert_eq!(active.load(Ordering::SeqCst), 0);
-    // `c1`'s rotated refresh_token MUST survive advancing to `c2`!
-    assert_eq!(
-        repo.read_account_unchecked("c1")
-            .unwrap()
-            .token
-            .refresh_token,
-        "1//C1_ROTATED_SURVIVES_HOP"
-    );
 }
 
 // ============================================================================
@@ -2056,13 +1466,17 @@ async fn review_r1_run_managed_agy_fails_closed_on_unreadable_proc_and_truncated
     fs::write(h.proc_dir.join("4242/comm"), "custom-agy-wrap\n").unwrap();
 
     {
-        let _pg = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir);
-        let _bg = ScopedEnvVar::set("AGY_SWITCH_CLI_AGY_BIN", &long_agy);
-        assert!(
-            matches!(
-                observe_runtime_state(&paths),
-                agy_switch_cli::domain::account::RuntimeState::Unverified { .. }
-            ),
+        let cur_trunc = h
+            .cli()
+            .env("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir)
+            .env("AGY_SWITCH_CLI_AGY_BIN", &long_agy)
+            .args(["--json", "current"])
+            .output()
+            .unwrap();
+        assert_eq!(cur_trunc.status.code(), Some(0));
+        let j_trunc: serde_json::Value = serde_json::from_slice(&cur_trunc.stdout).unwrap();
+        assert_eq!(
+            j_trunc["runtime_state"]["state"], "unverified",
             "15-byte truncated comm on non-dumpable candidate must return Unverified!"
         );
     }
@@ -2079,10 +1493,10 @@ async fn review_r1_run_managed_agy_fails_closed_on_unreadable_proc_and_truncated
 }
 
 // ============================================================================
-// Review R2 (A09 / A10 / §4.2 #2): `pool-0` group-named buckets, untagged Free rejection, prod project_id, summary 401
+// Review R2 (A09 / A10 / §4.2 #2): `pool-0` group-named buckets, direct weekly-only eval, prod project_id
 // ============================================================================
 #[tokio::test]
-async fn review_r2_quota_eval_supports_group_named_pool0_buckets_rejects_untagged_free_and_protects_prod_project(
+async fn review_r2_quota_eval_supports_group_named_pool0_buckets_weekly_only_direct_and_protects_prod_project(
 ) {
     let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
@@ -2215,10 +1629,8 @@ async fn review_r2_quota_eval_supports_group_named_pool0_buckets_rejects_untagge
         }
     );
 
-    // Expired `pool-0` 5h bucket MUST mark observation `Stale(reset_deadline_passed)` even on a Free account!
+    // Expired `pool-0` 5h bucket MUST mark observation `Stale(reset_deadline_passed)`!
     let mut expired_pool0 = obs.clone();
-    expired_pool0.subscription_tier = Some("Free Tier".into());
-    expired_pool0.tier_source_env = Some(obs.source_env);
     expired_pool0.quota_groups.as_mut().unwrap()[0].buckets[1].reset_time =
         "2020-01-01T00:00:00Z".into();
     assert_eq!(
@@ -2228,17 +1640,17 @@ async fn review_r2_quota_eval_supports_group_named_pool0_buckets_rejects_untagge
         }
     );
 
-    // 2. Untagged `tier_source_env: None` with `"Free Tier"` and missing 5h MUST remain `Unknown`!
-    let mut untagged_free = obs.clone();
-    untagged_free.subscription_tier = Some("Free Tier".into());
-    untagged_free.tier_source_env = None;
-    untagged_free.quota_groups.as_mut().unwrap()[0]
+    // 2. Weekly-only pool-0 bucket evaluates directly to `Known(75%)` without tier inference!
+    let mut weekly_only = obs.clone();
+    weekly_only.quota_groups.as_mut().unwrap()[0]
         .buckets
         .retain(|b| b.window == "weekly");
-    assert!(matches!(
-        evaluate_quota_observation(&untagged_free, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
-        agy_switch_cli::domain::quota::QuotaEval::Unknown { .. }
-    ));
+    assert_eq!(
+        evaluate_quota_observation(&weekly_only, "gemini", now, DEFAULT_QUOTA_MAX_AGE_SECS),
+        agy_switch_cli::domain::quota::QuotaEval::Known {
+            remaining_percentage: 75.0
+        }
+    );
 }
 
 // ============================================================================
@@ -2614,14 +2026,11 @@ async fn review_r4_stale_rt_client_binding_overwrite_disable_recovery_and_pendin
 // Review R5 (A05 / A07 / §4.2 #4): Uninitialized journal reconcile, usable repair priority, Wait-mode qualify, foreground loop
 // ============================================================================
 #[tokio::test]
-async fn review_r5_journal_reconcile_uninitialized_slot_usable_priority_wait_qualify_and_foreground_loop(
-) {
+async fn review_r5_journal_reconcile_uninitialized_slot_and_usable_priority() {
     let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let paths = h.paths();
     let repo = StoreRepository::new(paths.clone());
-    let backend = FileSessionBackend;
-    let reg = OAuthClientRegistry::parse_from_raw(None, None);
     let now = 1_800_000_000i64;
 
     let mut disabled_prev = make_acc(
@@ -2649,6 +2058,7 @@ async fn review_r5_journal_reconcile_uninitialized_slot_usable_priority_wait_qua
         operation_id: "op-uninit".into(),
         phase: agy_switch_cli::session::journal::JournalPhase::RecoveryIncomplete,
         prev_selected_account_id: Some("acc-dis".into()),
+        observed_outgoing_slot_owner: None,
         target_account_id: "acc-ok".into(),
         prev_slot_digest: Some("abc".into()),
         target_slot_digest: None,
@@ -2664,7 +2074,7 @@ async fn review_r5_journal_reconcile_uninitialized_slot_usable_priority_wait_qua
 
     let fix_uninit = h
         .cli()
-        .args(["policy", "set", "--reserve", "10", "--json"])
+        .args(["accounts", "enable", "acc-ok", "--json"])
         .output()
         .unwrap();
     assert_eq!(
@@ -2684,7 +2094,7 @@ async fn review_r5_journal_reconcile_uninitialized_slot_usable_priority_wait_qua
     .unwrap();
     let fix_usable = h
         .cli()
-        .args(["policy", "set", "--reserve", "12", "--json"])
+        .args(["accounts", "enable", "acc-ok", "--json"])
         .output()
         .unwrap();
     assert_eq!(fix_usable.status.code(), Some(0));
@@ -2698,208 +2108,6 @@ async fn review_r5_journal_reconcile_uninitialized_slot_usable_priority_wait_qua
             .selected_account_id
             .as_deref(),
         Some("acc-ok")
-    );
-
-    // 3. `daemon` `PolicyMode::Wait`: higher-priority non-disabled `c1` gains qualified quota while `c2` plan is waiting!
-    let make_q = |pct: f64| -> QuotaObservation {
-        let mut q = QuotaObservation::new(now, QuotaSourceEnv::Production);
-        q.subscription_tier = Some("Google AI Pro".into());
-        q.tier_source_env = Some(QuotaSourceEnv::Production);
-        q.models.push(agy_switch_cli::domain::quota::ModelQuota {
-            name: "gemini-3.8-flash".into(),
-            percentage: (pct * 100.0).round() as i32,
-            percentage_known: Some(true),
-            observed_remaining_fraction: Some(pct),
-            primary_quota: Some(agy_switch_cli::domain::quota::PrimaryModelQuota {
-                remaining_fraction: Some(pct),
-                reset_time: "2099-01-01T00:00:00Z".into(),
-            }),
-            quota_bucket_id: Some("gemini-weekly".into()),
-            reset_time: "2099-01-01T00:00:00Z".into(),
-            display_name: None,
-            supports_images: None,
-            supports_thinking: None,
-            thinking_budget: None,
-            recommended: None,
-            max_tokens: None,
-            max_output_tokens: None,
-            supported_mime_types: None,
-        });
-        q.quota_groups = Some(vec![agy_switch_cli::domain::quota::QuotaGroup {
-            display_name: "Gemini Models".into(),
-            description: None,
-            buckets: vec![
-                agy_switch_cli::domain::quota::QuotaBucket {
-                    bucket_id: "gemini-weekly".into(),
-                    window: "weekly".into(),
-                    remaining_fraction: pct,
-                    remaining_fraction_known: Some(true),
-                    reset_time: "2099-01-01T00:00:00Z".into(),
-                    display_name: None,
-                    description: None,
-                },
-                agy_switch_cli::domain::quota::QuotaBucket {
-                    bucket_id: "gemini-5h".into(),
-                    window: "5h".into(),
-                    remaining_fraction: pct,
-                    remaining_fraction_known: Some(true),
-                    reset_time: "2099-01-01T00:00:00Z".into(),
-                    display_name: None,
-                    description: None,
-                },
-            ],
-        }]);
-        q
-    };
-
-    let mut c1 = make_acc("c1", "c1@example.invalid", "1//RT_C1", now + 7200, now);
-    c1.quota = Some(make_q(0.15)); // Below minimum 50% (NOT disabled!)
-    let mut c2 = make_acc("c2", "c2@example.invalid", "1//RT_C2", now + 7200, now);
-    c2.quota = Some(make_q(0.80)); // Qualified!
-    repo.with_write_lock(|tx| {
-        let mut src = tx.load_account_opt("acc-ok")?.unwrap();
-        src.quota = Some(make_q(0.05));
-        tx.save_account(&src)?;
-        tx.upsert_account(c1, false, now)?;
-        tx.upsert_account(c2, false, now)?;
-        let mut pol = SwitchPolicy {
-            enabled: true,
-            mode: PolicyMode::Wait,
-            strategy: PolicyStrategy::Priority,
-            reserve_percentage: 10,
-            candidate_min_percentage: 50,
-            monitored_model: "gemini".into(),
-            candidate_account_ids: vec!["c1".into(), "c2".into()],
-            ..SwitchPolicy::default()
-        };
-        tx.save_policy(&mut pol, None, now)?;
-        Ok(())
-    })
-    .unwrap();
-
-    // Simulate active `agy` process during Tick 1
-    fs::create_dir_all(h.proc_dir.join("8888")).unwrap();
-    fs::write(
-        h.proc_dir.join("8888/stat"),
-        "8888 (agy) S 1 8888 8888 0 -1 0 0 0 0 0 1 1 0 0 20 0 1 0 777777 1000 10",
-    )
-    .unwrap();
-    fs::write(h.proc_dir.join("8888/comm"), "agy\n").unwrap();
-
-    let clock = Arc::new(ManualClock::new(now));
-    let mut engine = DaemonEngine::with_clock(clock.clone());
-    let runner_r5 = AuditSlotQuotaRunner::from_handler(|_, _, slot| {
-        if slot.contains("1//RT_C1") {
-            Ok(audit_quota_outcome(0.95, "2099-01-01T00:00:00Z"))
-        } else if slot.contains("1//RT_C2") {
-            Ok(audit_quota_outcome(0.85, "2099-01-01T00:00:00Z"))
-        } else {
-            Ok(audit_quota_outcome(0.05, "2099-01-01T00:00:00Z"))
-        }
-    });
-    let r5_overrides = DaemonConfigOverrides {
-        step_buffer_delay: Duration::ZERO,
-        ..DaemonConfigOverrides::default()
-    };
-    {
-        let _pg = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir);
-        let t1 = engine
-            .run_single_tick(&repo, &backend, &runner_r5, &reg, &r5_overrides, now)
-            .await
-            .unwrap();
-        assert_eq!(
-            t1,
-            TickStageOutcome::BlockedByActiveProcess {
-                target_id: "c2".into()
-            }
-        );
-    }
-
-    // While waiting, `c1` quota refreshes externally to 95%, and `agy` exits!
-    fs::remove_dir_all(h.proc_dir.join("8888")).unwrap();
-    repo.with_write_lock(|tx| {
-        let mut c1_now = tx.load_account_opt("c1")?.unwrap();
-        c1_now.quota = Some(make_q(0.95));
-        tx.save_account(&c1_now)
-    })
-    .unwrap();
-
-    {
-        let _pg = ScopedEnvVar::set("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir);
-        // Under Step-and-Verify, Priority order immediately evaluates `c1` first and lands directly on `c1`!
-        let t2 = engine
-            .run_single_tick(&repo, &backend, &runner_r5, &reg, &r5_overrides, now + 1)
-            .await
-            .unwrap();
-        assert_eq!(
-            t2,
-            TickStageOutcome::CommittedSwitch {
-                source_id: "acc-ok".into(),
-                target_id: "c1".into()
-            }
-        );
-    }
-
-    // 4. Audit §4.2 #4: Actual foreground `daemon` loop never re-enters concurrently under slow `agy -p "/usage"`!
-    let slow_agy = h.tmp.path().join("slow-daemon-agy");
-    let active_lock_dir = h.tmp.path().join("agy-in-flight-lock");
-    let overlap_marker = h.tmp.path().join("agy-overlap-detected");
-    let hit_marker = h.tmp.path().join("agy-hit");
-    fs::write(
-        &slow_agy,
-        format!(
-            "#!/bin/sh\n\
-             if ! mkdir \"{lock}\" 2>/dev/null; then\n\
-               echo overlap > \"{ov}\"\n\
-               exit 1\n\
-             fi\n\
-             echo hit > \"{hit}\"\n\
-             sleep 0.15\n\
-             rmdir \"{lock}\"\n\
-             printf '%s\\n' '{{\"conversation_id\":\"\",\"status\":\"SUCCESS\",\"command\":{{\"name\":\"usage\",\"data\":{{\"groups\":[]}}}}}}'\n",
-            lock = active_lock_dir.display(),
-            ov = overlap_marker.display(),
-            hit = hit_marker.display(),
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&slow_agy, fs::Permissions::from_mode(0o755)).unwrap();
-
-    repo.with_write_lock(|tx| {
-        let mut c1_u = tx.load_account_opt("c1")?.unwrap();
-        c1_u.quota = None; // Trigger Stage 1 official CLI probe
-        tx.save_account(&c1_u)?;
-        let mut dstate = agy_switch_cli::switching::daemon::read_daemon_state_readonly(tx.paths())?;
-        dstate.cooldown_until = 0;
-        agy_switch_cli::switching::daemon::save_daemon_state_in_tx(tx.paths(), &dstate)
-    })
-    .unwrap();
-
-    let mut d_loop = h
-        .cli()
-        .env("AGY_SWITCH_CLI_AGY_BIN", &slow_agy)
-        .args(["daemon", "--interval", "1", "--cooldown", "0"])
-        .spawn()
-        .unwrap();
-    for _ in 0..50 {
-        if hit_marker.exists() {
-            break;
-        }
-        ::tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    ::tokio::time::sleep(Duration::from_millis(200)).await;
-    unsafe {
-        libc::kill(d_loop.id() as i32, libc::SIGTERM);
-    }
-    let loop_st = d_loop.wait().unwrap();
-    assert_eq!(loop_st.code(), Some(0));
-    assert!(
-        hit_marker.exists(),
-        "Daemon loop must have invoked synthetic agy"
-    );
-    assert!(
-        !overlap_marker.exists(),
-        "Foreground daemon loop must NEVER overlap two concurrent ticks!"
     );
 }
 
@@ -2976,6 +2184,7 @@ fn review_r6_real_sigkill_signal_9_prepared_and_index_committed_boundaries() {
                         operation_id: "op-idx".into(),
                         phase: agy_switch_cli::session::journal::JournalPhase::CommittedSlot,
                         prev_selected_account_id: Some("acc-a".into()),
+                        observed_outgoing_slot_owner: None,
                         target_account_id: "acc-b".into(),
                         prev_slot_digest: None,
                         target_slot_digest: Some(target_dig),
@@ -3073,7 +2282,7 @@ fn review_r6_real_sigkill_signal_9_prepared_and_index_committed_boundaries() {
 
         let fix = h
             .cli()
-            .args(["policy", "set", "--reserve", "10", "--json"])
+            .args(["accounts", "enable", "acc-a", "--json"])
             .output()
             .unwrap();
         assert_eq!(fix.status.code(), Some(0), "stage={stage}");
@@ -3091,7 +2300,7 @@ fn review_r6_real_sigkill_signal_9_prepared_and_index_committed_boundaries() {
 }
 
 #[tokio::test]
-async fn review_r7_single_quote_clap_redaction_client_key_policy_and_daemon_startup_sigterm() {
+async fn review_r7_single_quote_clap_redaction_and_client_key_guards() {
     let _g = ENV_MUTEX.lock().await;
     let h = IsolatedHarness::new();
     let paths = h.paths();
@@ -3117,15 +2326,17 @@ async fn review_r7_single_quote_clap_redaction_client_key_policy_and_daemon_star
         ),
         (
             None,
-            vec!["daemon", "--interval", "1//PART1'LEAKED_ARGV_SECRET_99999"],
+            vec![
+                "accounts",
+                "list",
+                "--to",
+                "1//PART1'LEAKED_ARGV_SECRET_99999",
+            ],
             "leaked_argv_secret_99999",
         ),
         (
-            Some((
-                "AGY_SWITCH_CLI_INTERVAL",
-                "1//PART1'LEAKED_ENV_SECRET_99999",
-            )),
-            vec!["daemon"],
+            Some(("AGY_SWITCH_CLI_BACKEND", "1//PART1'LEAKED_ENV_SECRET_99999")),
+            vec!["status"],
             "leaked_env_secret_99999",
         ),
     ] {
@@ -3152,7 +2363,7 @@ async fn review_r7_single_quote_clap_redaction_client_key_policy_and_daemon_star
     }
 
     // 2. Malformed `ANTIGRAVITY_OAUTH_CLIENTS`, accidental `--client <SECRET>`, `--from-file <SECRET>`,
-    //    `--model <SECRET>`, and corrupted `policy.json` candidate IDs MUST NEVER echo secrets (case-insensitive)!
+    //    and bound-account client mismatch MUST NEVER echo secrets (case-insensitive)!
     let clients_out = h
         .cli()
         .env(
@@ -3197,7 +2408,6 @@ async fn review_r7_single_quote_clap_redaction_client_key_policy_and_daemon_star
         .to_ascii_lowercase()
         .contains("literaltokenpassedtotokenfile55555"));
 
-    // Bound-account `--client <SECRET>` mismatch in `bootstrap_and_persist_refresh_token`
     let acc_bound = make_acc(
         "acc-bound",
         "bound@example.invalid",
@@ -3236,56 +2446,10 @@ async fn review_r7_single_quote_clap_redaction_client_key_policy_and_daemon_star
         .to_ascii_lowercase()
         .contains("accidentalrefreshtokeninclientflag44444"));
 
-    // `--model <SECRET>` rejected without echo; corrupted `policy.json` candidate secret rejected without echo
-    let bad_model = h
-        .cli()
-        .args(["policy", "set", "--model", "1//0gModelTokenSecret33333"])
-        .output()
-        .unwrap();
-    assert_eq!(bad_model.status.code(), Some(2));
-    assert!(!String::from_utf8_lossy(&bad_model.stderr)
-        .to_ascii_lowercase()
-        .contains("modeltokensecret33333"));
-
+    // 3. `accounts delete` succeeds cleanly even when legacy `policy.json` exists on disk
     fs::write(
-        paths.policy_file(),
-        serde_json::to_vec(&json!({
-            "schema_version": 1,
-            "revision": 1,
-            "enabled": true,
-            "mode": "wait",
-            "strategy": "priority",
-            "reserve_percentage": 10,
-            "candidate_min_percentage": 30,
-            "monitored_model": "all",
-            "candidate_account_ids": ["1//0gDupPolicySecret22222", "1//0gDupPolicySecret22222"],
-            "updated_at": now
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let corrupt_pol = h.cli().args(["policy", "show", "--json"]).output().unwrap();
-    assert_eq!(corrupt_pol.status.code(), Some(1));
-    assert!(!String::from_utf8_lossy(&corrupt_pol.stderr)
-        .to_ascii_lowercase()
-        .contains("duppolicysecret22222"));
-
-    // 3. `accounts delete` succeeds cleanly even when `policy.json` already contains another stale candidate ID
-    fs::write(
-        paths.policy_file(),
-        serde_json::to_vec(&json!({
-            "schema_version": 1,
-            "revision": 2,
-            "enabled": true,
-            "mode": "wait",
-            "strategy": "priority",
-            "reserve_percentage": 10,
-            "candidate_min_percentage": 30,
-            "monitored_model": "all",
-            "candidate_account_ids": ["acc-other", "acc-already-stale"],
-            "updated_at": now
-        }))
-        .unwrap(),
+        paths.data_dir.join("policy.json"),
+        b"{\"schema_version\":1,\"candidate_account_ids\":[\"acc-other\"]}",
     )
     .unwrap();
     let del_out = h
@@ -3299,44 +2463,16 @@ async fn review_r7_single_quote_clap_redaction_client_key_policy_and_daemon_star
         "stderr={}",
         String::from_utf8_lossy(&del_out.stderr)
     );
-    let cleaned_pol = repo.read_policy().unwrap();
-    assert!(cleaned_pol.candidate_account_ids.is_empty());
-    assert!(!cleaned_pol.enabled);
 
-    // 4. Under v1.2.7, the legacy remote UA version fetcher is completely removed:
-    //    `daemon --once` makes ZERO startup HTTP connections even when `--proxy` is set, and
-    //    the removed `--no-remote-version` flag exits `2`!
-    let daemon_no_http = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", &h.home)
-        .env("XDG_DATA_HOME", h.tmp.path().join("xdg_data"))
-        .env("XDG_CACHE_HOME", &h.cache_dir)
-        .env("XDG_CONFIG_HOME", h.tmp.path().join("xdg_cfg"))
-        .env("XDG_RUNTIME_DIR", &h.runtime_dir)
-        .env(
-            "DBUS_SESSION_BUS_ADDRESS",
-            format!("unix:path={}/no-dbus", h.runtime_dir.display()),
-        )
-        .env("AGY_SWITCH_CLI_PROC_ROOT", &h.proc_dir)
-        .args([
-            "--data-dir",
-            h.data_dir.to_str().unwrap(),
-            "--proxy",
-            "http://127.0.0.1:1",
-            "daemon",
-            "--once",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(daemon_no_http.status.code(), Some(0));
-
-    let removed_flag = h
-        .cli()
-        .args(["--no-remote-version", "status"])
-        .output()
-        .unwrap();
-    assert_eq!(removed_flag.status.code(), Some(2));
+    // 4. Removed `--no-remote-version`, `daemon`, and `policy` flags/subcommands exit `2` without echoing secrets!
+    for removed_args in [
+        vec!["--no-remote-version", "status"],
+        vec!["daemon", "--once"],
+        vec!["policy", "show"],
+    ] {
+        let out = h.cli().args(&removed_args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "args={removed_args:?}");
+    }
 }
 
 #[tokio::test]
@@ -3882,11 +3018,10 @@ fn r2_03_deep_ancestor_symlinks_rejected_across_all_read_write_import_export_and
     // 1. Store read & write CLI commands via `--data-dir alias/deep/data` MUST reject the deep symlink ancestor!
     for args in [
         vec!["accounts", "list", "--json"],
-        vec!["policy", "show", "--json"],
         vec!["status", "--json"],
         vec!["auth", "pending", "--json"],
         vec!["accounts", "disable", "acc-real", "--json"],
-        vec!["policy", "set", "--reserve", "10", "--json"],
+        vec!["accounts", "enable", "acc-real", "--json"],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_agy-switch-cli"))
             .env_clear()
@@ -3986,8 +3121,7 @@ fn r2_03_deep_ancestor_symlinks_rejected_across_all_read_write_import_export_and
 }
 
 #[test]
-fn r2_04_status_surfaces_daemon_state_fifo_and_corrupt_errors_honestly() {
-    use std::os::unix::fs::FileTypeExt;
+fn v130_status_ignores_legacy_policy_and_daemon_files_while_surfacing_corrupt_store_errors() {
     let _g = ENV_MUTEX.blocking_lock();
     let h = IsolatedHarness::new();
     let paths = h.paths();
@@ -3995,72 +3129,70 @@ fn r2_04_status_surfaces_daemon_state_fifo_and_corrupt_errors_honestly() {
     fs::set_permissions(&paths.data_dir, fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(paths.state_dir(), fs::Permissions::from_mode(0o700)).unwrap();
 
-    // 1. Replace `state/daemon_state.json` with a zero-writer `0600` FIFO:
-    //    `status --json` MUST NOT block, MUST exit `1`, and MUST report `daemon_state_ok: false` + `daemon_paused_on_failure: null`!
-    let ds_path = paths.daemon_state_file();
-    let c_fifo = CString::new(ds_path.as_os_str().as_bytes()).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+    // 1. Legacy v1.2.x `policy.json`, `state/daemon_state.json` (even as 0600 FIFOs!), and
+    //    `config.json` with legacy `"notifications"` + `"targets"` keys are silently ignored!
+    let legacy_policy = paths.data_dir.join("policy.json");
+    let legacy_daemon = paths.state_dir().join("daemon_state.json");
+    for legacy_path in [&legacy_policy, &legacy_daemon] {
+        let c_fifo = CString::new(legacy_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+    }
+    fs::write(
+        paths.config_file(),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "backend": "file",
+            "notifications": { "enabled": true, "persistent": true },
+            "targets": { "work": "/tmp/legacy-work" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(paths.config_file(), fs::Permissions::from_mode(0o600)).unwrap();
 
     let t0 = Instant::now();
-    let st_fifo = h.cli().args(["status", "--json"]).output().unwrap();
+    let st_ok = h.cli().args(["status", "--json"]).output().unwrap();
     assert!(t0.elapsed() < Duration::from_secs(2));
-    assert_eq!(st_fifo.status.code(), Some(1));
-    assert!(st_fifo.stdout.is_empty());
-    let err_json: serde_json::Value = serde_json::from_slice(&st_fifo.stderr).unwrap();
-    assert_eq!(err_json["ok"], false);
-    assert_eq!(err_json["details"]["daemon_state_ok"], false);
-    assert!(err_json["details"]["daemon_state_error"].is_string());
-    assert!(err_json["details"]["daemon_paused_on_failure"].is_null());
+    assert_eq!(
+        st_ok.status.code(),
+        Some(0),
+        "Legacy v1.2.x files/config keys must be ignored: stderr={}",
+        String::from_utf8_lossy(&st_ok.stderr)
+    );
+    let st_j: serde_json::Value = serde_json::from_slice(&st_ok.stdout).unwrap();
+    assert_eq!(st_j["store_ok"], true);
+    assert!(st_j.get("policy_ok").is_none());
+    assert!(st_j.get("daemon_state").is_none());
+    assert!(st_j.get("daemon_state_ok").is_none());
+    assert!(st_j.get("systemd_service").is_none());
 
-    // `policy set` (`repair_or_clear_daemon_state_in_tx`) preserves non-regular FIFO without unlinking it!
-    let pol_fifo = h
-        .cli()
-        .args(["policy", "set", "--reserve", "10", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(pol_fifo.status.code(), Some(0));
-    assert!(fs::symlink_metadata(&ds_path)
-        .unwrap()
-        .file_type()
-        .is_fifo());
-    fs::remove_file(&ds_path).unwrap();
-
-    // 2. Corrupt regular `daemon_state.json` -> `status` exits `1`, `policy set` resets it so `status` exits `0`!
-    fs::write(&ds_path, b"{corrupt-daemon-state").unwrap();
-    fs::set_permissions(&ds_path, fs::Permissions::from_mode(0o600)).unwrap();
+    // 2. Genuine corrupt `index.json` or FIFO `config.json` still fails fast with exit 1!
+    fs::write(paths.index_file(), b"{corrupt-index-json").unwrap();
+    fs::set_permissions(paths.index_file(), fs::Permissions::from_mode(0o600)).unwrap();
     let st_corrupt = h.cli().args(["status", "--json"]).output().unwrap();
     assert_eq!(st_corrupt.status.code(), Some(1));
-
-    let heal_corrupt = h
-        .cli()
-        .args(["policy", "set", "--reserve", "12", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(heal_corrupt.status.code(), Some(0));
-    let st_healed = h.cli().args(["status", "--json"]).output().unwrap();
-    assert_eq!(
-        st_healed.status.code(),
-        Some(0),
-        "stderr={}",
-        String::from_utf8_lossy(&st_healed.stderr)
-    );
-    let fixed_json: serde_json::Value = serde_json::from_slice(&st_healed.stdout).unwrap();
-    assert_eq!(fixed_json["daemon_state_ok"], true);
-    assert_eq!(fixed_json["daemon_paused_on_failure"], false);
+    assert!(st_corrupt.stdout.is_empty());
+    let err_json: serde_json::Value = serde_json::from_slice(&st_corrupt.stderr).unwrap();
+    assert_eq!(err_json["ok"], false);
+    assert_eq!(err_json["details"]["store_ok"], false);
 }
 
 #[test]
 fn r2_05_explicit_help_never_echoes_misconfigured_env_values() {
     let _g = ENV_MUTEX.blocking_lock();
     let h = IsolatedHarness::new();
-    let synthetic_interval = "1//synthetic_secret_fixture'equals=tail\nnext_line_0123456789";
-    let synthetic_cooldown = "GOCSPX-CooldownHelpSecret987654";
+    let synthetic_backend = "1//synthetic_secret_fixture'equals=tail\nnext_line_0123456789";
+    let synthetic_proxy = "GOCSPX-ProxyHelpSecret987654";
 
-    for args in [vec!["daemon", "--help"], vec!["daemon", "--help", "--json"]] {
+    for args in [
+        vec!["--help"],
+        vec!["switch", "--help"],
+        vec!["status", "--help"],
+    ] {
         let out = h
             .cli()
-            .env("AGY_SWITCH_CLI_INTERVAL", synthetic_interval)
-            .env("AGY_SWITCH_CLI_COOLDOWN", synthetic_cooldown)
+            .env("AGY_SWITCH_CLI_BACKEND", synthetic_backend)
+            .env("AGY_SWITCH_CLI_PROXY", synthetic_proxy)
             .args(&args)
             .output()
             .unwrap();
@@ -4071,19 +3203,17 @@ fn r2_05_explicit_help_never_echoes_misconfigured_env_values() {
             String::from_utf8_lossy(&out.stderr)
         );
         let lower = combined.to_ascii_lowercase();
-        assert!(combined.contains("AGY_SWITCH_CLI_INTERVAL"));
-        assert!(combined.contains("AGY_SWITCH_CLI_COOLDOWN"));
         assert!(
             !lower.contains("synthetic_secret_fixture"),
-            "Help echoed AGY_SWITCH_CLI_INTERVAL value for {args:?}: {combined}"
+            "Help echoed AGY_SWITCH_CLI_BACKEND value for {args:?}: {combined}"
         );
         assert!(
             !lower.contains("next_line_0123456789"),
             "Help echoed multiline env tail for {args:?}: {combined}"
         );
         assert!(
-            !lower.contains("cooldownhelpsecret987654"),
-            "Help echoed AGY_SWITCH_CLI_COOLDOWN value for {args:?}: {combined}"
+            !lower.contains("proxyhelpsecret987654"),
+            "Help echoed AGY_SWITCH_CLI_PROXY value for {args:?}: {combined}"
         );
     }
 }
@@ -5965,23 +5095,9 @@ fn v127_cli_defaults_token_parser_builtin_client_and_order_contract_regressions(
     let now = 1_800_010_000i64;
 
     assert_eq!(DEFAULT_QUOTA_MAX_AGE_SECS, 3600);
-    assert_eq!(
-        agy_switch_cli::switching::daemon::DEFAULT_DAEMON_INTERVAL_SECS,
-        900
-    );
-    assert_eq!(
-        agy_switch_cli::switching::daemon::CANDIDATE_REFRESH_BACKOFF_SECS,
-        900
-    );
-    assert_eq!(
-        agy_switch_cli::switching::daemon::DEFAULT_DAEMON_COOLDOWN_SECS,
-        3600
-    );
 
     // 1. Unpooled `gemini-4-carbon-high` and `-disabled` models never pollute shared Gemini or evaluate as Known
     let mut obs = QuotaObservation::new(now, QuotaSourceEnv::OfficialCli);
-    obs.subscription_tier = Some("Google AI Pro".into());
-    obs.tier_source_env = Some(QuotaSourceEnv::OfficialCli);
     obs.quota_groups = Some(vec![
         agy_switch_cli::domain::quota::QuotaGroup {
             display_name: "Gemini Models".into(),
